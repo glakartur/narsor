@@ -102,6 +102,7 @@ impl ActionExecutor for HumanExecutor {
                     agent_session_id: None,
                     prefilled_answer: None,
                     permission: None,
+                    gate_watch: None,
                 }),
             ))
         })

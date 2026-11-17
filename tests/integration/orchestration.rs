@@ -260,6 +260,7 @@ fn safe_point_snapshot(sequence: u64) -> RunnerSnapshot {
         execution_cursor: Default::default(),
         event_cursor: 0,
         pending_input: None,
+        gate_watch: None,
         event_wait: None,
         conversation: Default::default(),
         timeline: None,

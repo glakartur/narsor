@@ -641,6 +641,7 @@ async fn report_problem(
         },
         event_cursor,
         pending_input: None,
+        gate_watch: None,
         event_wait: None,
         conversation: narsor_protocol::controller::ConversationAvailability::Unavailable {
             reason: problem.message.clone(),

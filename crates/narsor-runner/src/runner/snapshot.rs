@@ -70,6 +70,7 @@ pub(crate) fn build(
             execution_cursor: ExecutionCursor::default(),
             event_cursor: 0,
             pending_input: None,
+            gate_watch: None,
             event_wait: None,
             conversation: ConversationAvailability::default(),
             timeline: None,
@@ -106,6 +107,11 @@ pub(crate) fn build(
     let event_wait = engine
         .pending_event(execution_id)?
         .map(|pending| pending.event_wait());
+    // Reported beside the request it belongs to: the request's id is the
+    // gate's episode.
+    let gate_watch = pending
+        .as_ref()
+        .and_then(|pending| pending.request.gate_watch.clone());
     let pending_input = pending.map(|pending| PendingInputRef {
         id: pending.episode_key().to_string(),
         attempt_id: (pending.continuation == InputContinuation::ResumeAgent)
@@ -146,6 +152,7 @@ pub(crate) fn build(
         },
         event_cursor,
         pending_input,
+        gate_watch,
         event_wait,
         conversation,
         timeline: Some(timeline),

@@ -39,7 +39,9 @@ use crate::domain::{
     ResolvedEnvironment, ResourceProfile, TaskRepository, TaskRepositorySource, TaskWorkspace,
 };
 use crate::engine::{ActionExecutor, ActionKind, ActionOutcome, ActionRequest, UsageReporter};
-use narsor_protocol::controller::{AttentionKind, OperatorCommand};
+use narsor_protocol::controller::{
+    AttentionKind, GateWatch, GateWatchChoice, GateWatchVariable, OperatorCommand,
+};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -2857,190 +2859,176 @@ async fn a_comment_on_an_unknown_execution_goes_with_its_recovery() {
 }
 
 // ---------------------------------------------------------------------------
-// A `wait` step (U4)
+// A `decision` gate on an observer queue (U2)
 // ---------------------------------------------------------------------------
 
-/// A `wait` step for an approval, then an agent step that reads the event.
-const WAITING: &str = r#"
-name: waiting
+/// An agent step that reports a merge request, then a gate on the queue
+/// `mr-review` whose params name it.
+const WATCHED_GATE: &str = r#"
+schema: v2
+name: watched-gate
 version: 1
 states:
-  await_review:
-    action:
-      type: wait
-      event_type: review.approved
-      filter:
-        mr: "17"
-    choices: [received]
-    transitions:
-      received: merge
-  merge:
+  work:
     action:
       type: agent
-      prompt: "Merge; {{ context.event.data.by }} approved it."
-    choices: [done]
-    transitions:
-      done: completed
+      prompt: Open the merge request.
+    variables:
+      - { name: mr_url, description: The merge request. }
+    exit:
+      requires_variables: [mr_url]
+      next: review
+  review:
+    action:
+      type: decision
+      by: human
+      message: Review the merge request.
+      watch:
+        queue: mr-review
+        params:
+          mr_url: "{{ context.mr_url }}"
+          label: w CR
+    variables:
+      - { name: comment, type: text, description: What to change. }
+    choices:
+      approve:
+        description: Merge it.
+        next: completed
+      revise:
+        requires_variables: [comment]
+        next: work
   completed:
     description: Done.
-terminal_states: [completed]
+terminal_states:
+  completed: completed
 "#;
 
-/// The approval of MR 17 by `by`, for wait `episode`.
-fn approval(input_id: &str, episode: &str, by: &str) -> DeliveredEvent {
-    DeliveredEvent {
-        input_id: input_id.to_string(),
-        episode_id: episode.to_string(),
-        delivery: EventDelivery::Event {
-            event_type: "review.approved".to_string(),
-            source: "gitlab".to_string(),
-            data: json!({"mr": 17, "by": by}),
-        },
+const MR_URL: &str = "https://git.example.com/a/-/merge_requests/17";
+
+/// The gate watch [`WATCHED_GATE`] reports, its params rendered.
+fn expected_gate_watch() -> GateWatch {
+    GateWatch {
+        step: "review".to_string(),
+        queue: "mr-review".to_string(),
+        params: [("label", "w CR"), ("mr_url", MR_URL)]
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect(),
+        choices: vec![
+            GateWatchChoice {
+                name: "approve".to_string(),
+                description: Some("Merge it.".to_string()),
+                requires_variables: Vec::new(),
+            },
+            GateWatchChoice {
+                name: "revise".to_string(),
+                description: None,
+                requires_variables: vec!["comment".to_string()],
+            },
+        ],
+        variables: vec![GateWatchVariable {
+            name: "comment".to_string(),
+            variable_type: Some("text".to_string()),
+            description: Some("What to change.".to_string()),
+            options: Vec::new(),
+        }],
     }
 }
 
-/// A runner whose execution waits in the `wait` step; and its episode.
-async fn waiting_for_the_approval(root: &TempRoot, storage: &Path) -> (Fixture, String) {
+/// A runner whose execution waits at the watched gate.
+async fn waiting_at_the_watched_gate(root: &TempRoot, storage: &Path, pod: &str) -> Fixture {
     let path = harness_path(root, &["claude"]);
     let mut fixture = Fixture::new(
         root,
         storage,
-        "pod-1",
-        &spec(WAITING, "claude-code"),
-        Agent::new(vec![], Reply::Label("done")),
+        pod,
+        &spec(WATCHED_GATE, "claude-code"),
+        Agent::new(
+            vec![Reply::Variables("exit", json!({ "mr_url": MR_URL }))],
+            Reply::Label("exit"),
+        ),
         Conductor::silent(),
         &path,
     );
     fixture.begin().await;
     fixture.settled().await;
-    assert_eq!(fixture.status(), ExecutionStatus::WaitingForEvent);
-    let episode = fixture
-        .session
-        .event_wait_id()
-        .unwrap()
-        .expect("the runner names the wait it is in");
-    (fixture, episode)
+    assert_eq!(fixture.status(), ExecutionStatus::InputNeeded);
+    fixture
 }
 
-/// The runner reports the wait, takes the event for it once, and the next
-/// step reads the event's data.
+/// Key Flow 1: the snapshot carries the gate's watch, params rendered when
+/// the gate started, beside the pending input whose id is the episode; the
+/// wire form keeps it.
 #[tokio::test]
-async fn a_waiting_runner_reports_its_wait_and_takes_the_event_for_it_once() {
+async fn a_watched_gate_reports_its_rendered_watch_beside_the_pending_input() {
     let root = TempRoot::new();
-    let (mut fixture, episode) = waiting_for_the_approval(&root, &root.dir("storage")).await;
+    let mut fixture = waiting_at_the_watched_gate(&root, &root.dir("storage"), "pod-1").await;
+
     let snapshot = fixture.snapshot();
-    assert_eq!(snapshot.execution_status, ExecutionStatus::WaitingForEvent);
-    let wait = snapshot.event_wait.expect("the snapshot carries the wait");
-    assert_eq!(wait.episode_id, episode);
-    assert_eq!(wait.event_type, "review.approved");
-    assert_eq!(wait.filter, json!({"mr": "17"}));
-    assert!(fixture.agent.calls().is_empty());
 
+    assert_eq!(snapshot.gate_watch, Some(expected_gate_watch()));
+    let pending = snapshot.pending_input.as_ref().expect("the gate waits");
     assert_eq!(
-        fixture
-            .session
-            .take_event(approval("event-1", &episode, "alice"))
-            .unwrap(),
-        InputVerdict::Taken { first: true }
+        Some(pending.id.clone()),
+        fixture.session.pending_input_id().unwrap()
     );
-    fixture.settled().await;
-
-    assert_eq!(fixture.status(), ExecutionStatus::Completed);
-    let calls = fixture.agent.calls();
-    assert_eq!(calls.len(), 1);
-    assert!(
-        calls[0].prompt.contains("alice approved it"),
-        "{}",
-        calls[0].prompt
-    );
-    let received = fixture
-        .events()
-        .into_iter()
-        .filter(|data| matches!(data, EventData::ExternalEventReceived { .. }))
-        .count();
-    assert_eq!(received, 1);
-    // A redelivery whose acknowledgement was lost: taken before.
+    let request = snapshot.to_request().expect("encode the snapshot");
+    assert_eq!(request.gate_watch, Some(expected_gate_watch()));
+    let wire = serde_json::to_value(&request).unwrap();
+    assert_eq!(wire["gate_watch"]["queue"], "mr-review");
+    assert_eq!(wire["gate_watch"]["params"]["mr_url"], MR_URL);
+    let decoded: narsor_protocol::controller::RunnerSnapshotRequest =
+        serde_json::from_value(wire).unwrap();
     assert_eq!(
-        fixture
-            .session
-            .take_event(approval("event-1", &episode, "alice"))
-            .unwrap(),
-        InputVerdict::Taken { first: false }
+        RunnerSnapshot::from_request(decoded).expect("decode the snapshot"),
+        snapshot
     );
-    assert_eq!(fixture.session.event_wait_id().unwrap(), None);
-    assert_eq!(fixture.snapshot().event_wait, None);
 }
 
-/// Two events for one wait in one poll response: the runner takes the
-/// first, and leaves the second for later while the pass it started runs.
-/// It sends no verdict on the second; the control plane makes it obsolete
-/// when the first is acknowledged.
+/// R4: a manual answer still works on a watched gate, and the snapshot after
+/// it has no gate watch.
 #[tokio::test]
-async fn of_two_events_for_one_wait_the_runner_takes_the_first_only() {
+async fn an_answered_watched_gate_reports_no_watch() {
     let root = TempRoot::new();
-    let (mut fixture, episode) = waiting_for_the_approval(&root, &root.dir("storage")).await;
-
-    let first = fixture
-        .session
-        .take_event(approval("event-1", &episode, "alice"))
-        .unwrap();
-    let second = fixture
-        .session
-        .take_event(approval("event-2", &episode, "bob"))
-        .unwrap();
-
-    assert_eq!(first, InputVerdict::Taken { first: true });
-    assert_eq!(second, InputVerdict::Later);
-    fixture.settled().await;
-    assert_eq!(fixture.status(), ExecutionStatus::Completed);
-    let calls = fixture.agent.calls();
-    assert_eq!(calls.len(), 1);
-    assert!(
-        calls[0].prompt.contains("alice approved it"),
-        "{}",
-        calls[0].prompt
-    );
-    // Handed over again after the pass, it no longer fits any wait.
-    assert!(matches!(
-        fixture
-            .session
-            .take_event(approval("event-2", &episode, "bob"))
-            .unwrap(),
-        InputVerdict::Refused(_)
-    ));
-}
-
-/// An event for another wait episode is refused and the step waits on.
-#[tokio::test]
-async fn a_waiting_runner_refuses_an_event_for_another_wait() {
-    let root = TempRoot::new();
-    let (mut fixture, episode) = waiting_for_the_approval(&root, &root.dir("storage")).await;
+    let mut fixture = waiting_at_the_watched_gate(&root, &root.dir("storage"), "pod-1").await;
+    let pending = fixture.session.pending_input_id().unwrap().expect("a gate");
 
     let verdict = fixture
         .session
-        .take_event(approval("event-1", "an-earlier-wait", "alice"))
-        .unwrap();
-
-    assert!(matches!(verdict, InputVerdict::Refused(_)), "{verdict:?}");
+        .take_input(DeliveredInput {
+            input_id: "answer-1".to_string(),
+            pending_input_id: pending,
+            delivery: narsor_protocol::api::HumanInputDeliveryDto {
+                chosen_label: Some("approve".to_string()),
+                ..Default::default()
+            },
+        })
+        .expect("take the answer");
+    assert_eq!(verdict, InputVerdict::Taken { first: true });
     fixture.settled().await;
-    assert_eq!(fixture.status(), ExecutionStatus::WaitingForEvent);
-    assert_eq!(fixture.session.event_wait_id().unwrap(), Some(episode));
-    assert!(fixture.agent.calls().is_empty());
+
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+    let snapshot = fixture.snapshot();
+    assert_eq!(snapshot.gate_watch, None);
+    assert_eq!(snapshot.pending_input, None);
 }
 
-/// A runner relaunched while its task waited restores the same wait.
+/// R17: a runner relaunched while its task waits at the gate reports the
+/// same episode and the same watch; nothing is rendered again.
 #[tokio::test]
-async fn a_relaunched_runner_restores_the_wait_it_was_in() {
+async fn a_relaunched_runner_reports_the_same_watch_for_the_same_episode() {
     let root = TempRoot::new();
     let storage = root.dir("storage");
-    let (_, episode) = waiting_for_the_approval(&root, &storage).await;
+    let mut first = waiting_at_the_watched_gate(&root, &storage, "pod-1").await;
+    let before = first.snapshot();
+    drop(first);
     let path = harness_path(&root, &["claude"]);
     let mut fixture = Fixture::new(
         &root,
         &storage,
         "pod-2",
-        &spec(WAITING, "claude-code"),
-        Agent::new(vec![], Reply::Label("done")),
+        &spec(WATCHED_GATE, "claude-code"),
+        Agent::new(vec![], Reply::Label("exit")),
         Conductor::silent(),
         &path,
     );
@@ -3055,13 +3043,12 @@ async fn a_relaunched_runner_restores_the_wait_it_was_in() {
     assert_eq!(fixture.begin().await, None);
     fixture.settled().await;
 
-    assert_eq!(fixture.status(), ExecutionStatus::WaitingForEvent);
+    assert_eq!(fixture.status(), ExecutionStatus::InputNeeded);
+    let after = fixture.snapshot();
     assert_eq!(
-        fixture.session.event_wait_id().unwrap(),
-        Some(episode.clone())
+        after.pending_input.map(|pending| pending.id),
+        before.pending_input.map(|pending| pending.id)
     );
-    assert_eq!(
-        fixture.snapshot().event_wait.map(|wait| wait.episode_id),
-        Some(episode)
-    );
+    assert_eq!(after.gate_watch, Some(expected_gate_watch()));
+    assert!(fixture.agent.calls().is_empty(), "the work is not redone");
 }

@@ -1153,7 +1153,9 @@ pub enum ActionSchema {
     Agent(AgentActionSchema),
     Script(ScriptActionSchema),
     Human(HumanActionSchema),
-    Wait(WaitActionSchema),
+    /// Removed (R5): never deserializes, so a `type: wait` step fails to
+    /// load with a message that says what replaces it.
+    Wait(RemovedWaitAction),
     /// Unified shape only.
     Decision(DecisionActionSchema),
     /// Unified shape only.
@@ -1169,6 +1171,77 @@ pub struct DecisionActionSchema {
 
     /// What the decider is asked; templated like an agent prompt.
     pub message: PromptText,
+
+    /// The observer queue the gate puts its wait episode on (`by: human`
+    /// only).
+    #[serde(default)]
+    pub watch: Option<GateWatchSchema>,
+}
+
+/// The `watch` block of a `decision` step (§3.3.D).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateWatchSchema {
+    /// A plain queue name; the validator refuses a template.
+    pub queue: String,
+
+    /// A flat map of names to text, each value a template rendered when the
+    /// gate starts. A number or a boolean is read as its text.
+    #[serde(default, deserialize_with = "flat_params")]
+    pub params: BTreeMap<String, String>,
+}
+
+/// Reads `watch.params`: a flat map whose values are text, a number or a
+/// boolean (read as text). A mapping, a list or a null value is refused.
+fn flat_params<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Option::<BTreeMap<String, serde_yaml::Value>>::deserialize(deserializer)?;
+    values
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, value)| {
+            let text = match value {
+                serde_yaml::Value::String(text) => text,
+                serde_yaml::Value::Number(number) => number.to_string(),
+                serde_yaml::Value::Bool(flag) => flag.to_string(),
+                other => {
+                    let kind = match other {
+                        serde_yaml::Value::Null => "an empty value",
+                        serde_yaml::Value::Sequence(_) => "a list",
+                        serde_yaml::Value::Mapping(_) => "a mapping",
+                        _ => "a tagged value",
+                    };
+                    return Err(de::Error::custom(format!(
+                        "watch.params.{name} must be text, not {kind}: 'params' is a flat map \
+                         of names to text"
+                    )));
+                }
+            };
+            Ok((name, text))
+        })
+        .collect()
+}
+
+/// The removed `wait` step type (R5). Has no value: deserializing it always
+/// fails with the message that names what replaces it.
+#[derive(Debug, Clone)]
+pub enum RemovedWaitAction {}
+
+/// What a workflow with a `type: wait` step is told.
+pub const REMOVED_WAIT_MESSAGE: &str =
+    "the 'wait' step type was removed: put a 'watch' block with a queue on a 'decision' step \
+     with 'by: human' instead (docs/dev/workflow-schema.md §3.3.D); 'event_type', 'filter' and \
+     'context.event' were removed with it";
+
+impl<'de> Deserialize<'de> for RemovedWaitAction {
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Err(de::Error::custom(REMOVED_WAIT_MESSAGE))
+    }
 }
 
 /// `type: agent` (§3.3.A).
@@ -1373,34 +1446,6 @@ pub struct HumanInputSchema {
 pub enum HumanInputTypeSchema {
     Text,
     Select,
-}
-
-/// `type: wait` (§3.3.D).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WaitActionSchema {
-    /// The domain calls this field `event`.
-    pub event_type: String,
-
-    #[serde(default)]
-    pub filter: Option<serde_json::Value>,
-
-    #[serde(default)]
-    pub timeout: Option<DurationSecs>,
-
-    #[serde(default)]
-    pub watch: Option<WaitWatchSchema>,
-}
-
-/// The `watch` block of a `wait` step (§3.3.D).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WaitWatchSchema {
-    pub observer: String,
-
-    pub object: String,
-
-    pub event_types: Vec<String>,
 }
 
 /// Decision provider configuration (§3.4).

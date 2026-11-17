@@ -1634,3 +1634,166 @@ fn a_global_set_value_is_checked_for_workspace_references_too() {
         describe(&errors)
     );
 }
+
+// ---------------------------------------------------------------------------
+// The `watch` block of a decision (R1-R3) and what the `wait` step left (R5)
+// ---------------------------------------------------------------------------
+
+/// The errors of a unified workflow whose one step is a decision by `by`
+/// with `watch` (the body of `watch:`, indented for it).
+fn watch_errors(by: &str, watch: &str) -> Vec<ValidationError> {
+    unified_errors(&format!(
+        "  ask:\n    action:\n      type: decision\n      by: {by}\n      message: m\n      \
+         watch:\n{watch}\n    choices:\n      go: {{ next: done }}"
+    ))
+}
+
+fn gate_watch_reasons(errors: &[ValidationError]) -> Vec<String> {
+    errors
+        .iter()
+        .filter_map(|error| match error {
+            ValidationError::InvalidGateWatch { state, reason } if state == "ask" => {
+                Some(reason.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_human_gate_with_a_queue_and_templated_params_passes() {
+    let errors = unified_errors(
+        "  work:\n    action: { type: agent, prompt: p }\n    variables:\n      - { name: mr_url }\n    \
+         exit: { next: ask }\n  ask:\n    action:\n      type: decision\n      by: human\n      \
+         message: m\n      watch:\n        queue: mr-review\n        params:\n          \
+         mr_url: \"{{ context.mr_url }}\"\n          label: \"w CR\"\n    choices:\n      \
+         go: { next: done }",
+    );
+
+    assert!(errors.is_empty(), "got: {}", describe(&errors));
+}
+
+#[test]
+fn a_watch_with_no_params_passes() {
+    let errors = watch_errors("human", "        queue: mr-review");
+
+    assert!(errors.is_empty(), "got: {}", describe(&errors));
+}
+
+#[test]
+fn a_templated_queue_is_refused() {
+    let errors = watch_errors("human", "        queue: \"{{ context.queue }}\"");
+
+    let reasons = gate_watch_reasons(&errors);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("'queue' cannot be templated")),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_blank_or_invalid_queue_is_refused() {
+    let blank = watch_errors("human", "        queue: \"  \"");
+    let invalid = watch_errors("human", "        queue: mr review");
+
+    assert!(
+        gate_watch_reasons(&blank)
+            .iter()
+            .any(|reason| reason.contains("'queue' is required")),
+        "got: {}",
+        describe(&blank)
+    );
+    assert!(
+        gate_watch_reasons(&invalid)
+            .iter()
+            .any(|reason| reason.contains("invalid 'queue'")),
+        "got: {}",
+        describe(&invalid)
+    );
+}
+
+#[test]
+fn a_watch_on_a_conductor_decision_is_refused_with_the_reason() {
+    let errors = watch_errors("conductor", "        queue: mr-review");
+
+    let reasons = gate_watch_reasons(&errors);
+    assert!(
+        reasons.iter().any(|reason| reason.contains("'by: human'")
+            && reason.contains("the conductor decides at once")),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_param_name_with_whitespace_is_refused() {
+    let errors = watch_errors(
+        "human",
+        "        queue: q\n        params: { \"mr url\": x }",
+    );
+
+    assert!(
+        gate_watch_reasons(&errors)
+            .iter()
+            .any(|reason| reason.contains("'mr url'")),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn the_templates_of_params_are_checked_like_other_templates() {
+    let errors = watch_errors(
+        "human",
+        "        queue: q\n        params: { mr: \"{{ inputs.nope }}\" }",
+    );
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::UnknownInputReference { state, field, variable }
+                if state == "ask" && field == "action.watch.params.mr" && variable == "nope"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_reference_to_context_event_is_refused_with_the_removed_feature() {
+    for reference in ["context.event.data.mr", "context.variables.event"] {
+        let errors = unified_errors(&format!(
+            "  merge:\n    action: {{ type: script, command: merge, args: [\"{{{{ {reference} }}}}\"] }}\n    \
+             exit: {{ next: done }}"
+        ));
+
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::RemovedEventReference { state, field, .. }
+                    if state == "merge" && field == "action.args[0]"
+            )),
+            "{reference}: got: {}",
+            describe(&errors)
+        );
+        assert!(
+            describe(&errors).contains("'context.event' was removed"),
+            "{}",
+            describe(&errors)
+        );
+    }
+}
+
+#[test]
+fn a_workflow_that_declares_its_own_event_variable_may_read_it() {
+    let errors = unified_errors(
+        "  work:\n    action: { type: agent, prompt: p }\n    variables:\n      - { name: event }\n    \
+         exit: { next: merge }\n  merge:\n    action: { type: script, command: merge, \
+         args: [\"{{ context.event }}\"] }\n    exit: { next: done }",
+    );
+
+    assert!(errors.is_empty(), "got: {}", describe(&errors));
+}

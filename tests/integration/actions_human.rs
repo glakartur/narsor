@@ -316,6 +316,7 @@ fn permission_wait_survives_reload_and_rejects_ordinary_input() {
                 reason: Some("This command requires approval.".to_string()),
             }],
         }),
+        gate_watch: None,
     };
     let pending = PendingHumanInput::for_permission(
         execution.id.clone(),
@@ -437,6 +438,7 @@ fn a_decision_without_an_index_grants_every_denial_or_none() {
         agent_session_id: Some("session".to_string()),
         prefilled_answer: None,
         permission: Some(PermissionRequestDetails { denials }),
+        gate_watch: None,
     };
     let allow_all = PermissionDecision {
         denial_index: None,
@@ -500,6 +502,7 @@ fn a_typed_pattern_grants_one_rule_but_never_lifts_a_policy_block() {
         agent_session_id: Some("session".to_string()),
         prefilled_answer: None,
         permission: Some(PermissionRequestDetails { denials }),
+        gate_watch: None,
     };
     let typed = |pattern: Option<&str>| PermissionDecision {
         denial_index: None,
@@ -571,6 +574,7 @@ fn denying_an_ungrantable_command_tells_the_agent_how_to_ask_again() {
                 reason: None,
             }],
         }),
+        gate_watch: None,
     };
     let pending = PendingHumanInput::for_permission(
         execution.id.clone(),
@@ -1161,6 +1165,7 @@ fn raise_problem(store: &ExecutionStore, execution: &mut WorkflowExecution) -> P
         agent_session_id: None,
         prefilled_answer: None,
         permission: None,
+        gate_watch: None,
     };
     let problem = OutputProblem {
         reason: "no output label".to_string(),

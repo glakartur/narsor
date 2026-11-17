@@ -4,9 +4,9 @@
 //! verbatim from `docs/dev/workflow-schema.md` §4.
 
 use narsor_engine::domain::{
-    ActionConfig, DecisionMaker, ExecutionStatus, HumanInputType, ParamType, SchemaVersion, State,
-    StepWorkspace, TerminalStatus, VariableScope, VariableSource, VariableType, WorkflowDefinition,
-    WorkspaceAccess, WorkspaceSpec, EXIT_LABEL,
+    ActionConfig, DecisionActionConfig, DecisionMaker, ExecutionStatus, HumanInputType, ParamType,
+    SchemaVersion, State, StepWorkspace, TerminalStatus, VariableScope, VariableSource,
+    VariableType, WorkflowDefinition, WorkspaceAccess, WorkspaceSpec, EXIT_LABEL,
 };
 use narsor_engine::engine::terminal_status;
 use narsor_engine::workflow::{
@@ -672,43 +672,170 @@ terminal_states: [done]
     assert!(state(&definition, "only").retry_policy.is_none());
 }
 
+/// A unified workflow whose `review` step is a decision with `action`
+/// as given (indented as the body of `action:`).
+fn gate_with(action: &str) -> String {
+    format!(
+        "schema: v2\nname: watched\nversion: 1\nstates:\n  review:\n    action:\n{action}\n    \
+         choices:\n      approve: {{ next: done }}\n  done:\n    description: end\n\
+         terminal_states:\n  done: completed\n"
+    )
+}
+
+fn decision_of(definition: &WorkflowDefinition) -> &DecisionActionConfig {
+    match state(definition, "review").action.as_ref().unwrap() {
+        ActionConfig::Decision(decision) => decision,
+        other => panic!("expected a decision, got {other:?}"),
+    }
+}
+
 #[test]
-fn wait_action_keeps_event_type_filter_and_timeout() {
+fn a_human_gate_with_a_queue_and_two_params_loads() {
+    let yaml = gate_with(
+        "      type: decision\n      by: human\n      message: Review it.\n      watch:\n        \
+         queue: mr-review\n        params:\n          \
+         mr_url: \"{{ context.workspace.code.pr_url }}\"\n          label: \"w CR\"",
+    );
+
+    let definition = load_from_str(&yaml).unwrap();
+    let watch = decision_of(&definition)
+        .watch
+        .as_ref()
+        .expect("the gate has a watch");
+
+    assert_eq!(watch.queue, "mr-review");
+    // Kept as templates: rendered when the gate starts.
+    assert_eq!(
+        watch.params,
+        [
+            ("label", "w CR"),
+            ("mr_url", "{{ context.workspace.code.pr_url }}"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+    );
+}
+
+#[test]
+fn a_watch_without_params_loads_with_none() {
+    let yaml = gate_with(
+        "      type: decision\n      by: human\n      message: m\n      watch: { queue: mr-review }",
+    );
+
+    let definition = load_from_str(&yaml).unwrap();
+
+    let watch = decision_of(&definition).watch.as_ref().unwrap();
+    assert_eq!(watch.queue, "mr-review");
+    assert!(watch.params.is_empty());
+}
+
+#[test]
+fn a_decision_without_a_watch_has_none() {
+    let yaml = gate_with("      type: decision\n      by: human\n      message: m");
+
+    let definition = load_from_str(&yaml).unwrap();
+
+    assert_eq!(decision_of(&definition).watch, None);
+}
+
+#[test]
+fn a_number_or_a_boolean_param_is_read_as_its_text() {
+    let yaml = gate_with(
+        "      type: decision\n      by: human\n      message: m\n      watch:\n        \
+         queue: q\n        params: { iid: 17, draft: false }",
+    );
+
+    let definition = load_from_str(&yaml).unwrap();
+
+    let params = &decision_of(&definition).watch.as_ref().unwrap().params;
+    assert_eq!(params["iid"], "17");
+    assert_eq!(params["draft"], "false");
+}
+
+#[test]
+fn params_that_are_not_flat_fail_to_load() {
+    for (value, kind) in [
+        ("{ host: x }", "a mapping"),
+        ("[a, b]", "a list"),
+        ("~", "an empty value"),
+    ] {
+        let yaml = gate_with(&format!(
+            "      type: decision\n      by: human\n      message: m\n      watch:\n        \
+             queue: q\n        params: {{ mr: {value} }}"
+        ));
+
+        let error = load_from_str(&yaml).expect_err("params are a flat map of text");
+
+        assert!(
+            error.to_string().contains("watch.params.mr must be text")
+                && error.to_string().contains(kind),
+            "{value}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_watch_without_a_queue_fails_to_load() {
+    let yaml = gate_with(
+        "      type: decision\n      by: human\n      message: m\n      watch:\n        \
+         params: { mr: x }",
+    );
+
+    let error = load_from_str(&yaml).expect_err("queue is required");
+
+    assert!(
+        error.to_string().contains("missing field `queue`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_removed_watch_fields_of_a_wait_step_fail_to_load() {
+    for field in ["object: x", "event_types: [review.approved]", "observer: o"] {
+        let yaml = gate_with(&format!(
+            "      type: decision\n      by: human\n      message: m\n      watch:\n        \
+             queue: q\n        {field}"
+        ));
+
+        let error = load_from_str(&yaml).expect_err("only queue and params remain");
+
+        assert!(
+            error.to_string().contains("unknown field"),
+            "{field}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_wait_step_fails_to_load_with_a_message_that_names_the_replacement() {
     let yaml = r#"
+schema: v2
 name: waiting
 version: 1
 states:
-  wait_for_review:
+  await_review:
     action:
       type: wait
-      event_type: github.pull_request.reviewed
+      event_type: review.approved
       filter:
-        pr_number: "{{ context.pr_number }}"
-      timeout: 24h
-    choices: [received, timeout]
-    transitions:
-      received: done
-      timeout: done
+        mr: "17"
+    choices:
+      received: { next: done }
   done:
     description: end
-terminal_states: [done]
+terminal_states:
+  done: completed
 "#;
 
-    let definition = load_from_str(yaml).unwrap();
-    let wait = match state(&definition, "wait_for_review")
-        .action
-        .as_ref()
-        .unwrap()
-    {
-        ActionConfig::Wait(wait) => wait,
-        other => panic!("expected a wait action, got {other:?}"),
-    };
+    let error = load_from_str(yaml).expect_err("the wait step type was removed");
+    let message = error.to_string();
 
-    assert_eq!(wait.event, "github.pull_request.reviewed");
-    assert_eq!(wait.timeout_secs, Some(86_400));
-    assert_eq!(
-        wait.filter.as_ref().unwrap()["pr_number"],
-        serde_json::json!("{{ context.pr_number }}")
+    assert!(
+        message.contains("'wait' step type was removed")
+            && message.contains("'watch' block")
+            && message.contains("by: human"),
+        "{message}"
     );
 }
 

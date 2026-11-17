@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::api::{ExecutionStatusDto, Timeline};
 use crate::controller::{
-    AttentionItem, CommandActor, ConversationAvailability, EventWait, ExecutionCursor,
+    AttentionItem, CommandActor, ConversationAvailability, EventWait, ExecutionCursor, GateWatch,
     HarnessUnavailable, OwnerCommand, RunnerDirective, RunnerProblem, RunnerState,
     TaskDefaultHarness,
 };
@@ -34,6 +34,10 @@ pub struct RunnerSnapshotRequest {
     pub event_cursor: u64,
     #[serde(default)]
     pub pending_input: Option<PendingInputRefView>,
+    /// The rendered `watch` block of the `decision` gate the pending input
+    /// belongs to, when the gate has one. Its episode is `pending_input.id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_watch: Option<GateWatch>,
     /// The external event the execution's `wait` step waits for, while it
     /// waits.
     #[serde(default, skip_serializing_if = "Option::is_none")]

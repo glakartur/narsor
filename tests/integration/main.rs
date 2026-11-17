@@ -20,7 +20,6 @@ mod task_app_support;
 mod actions_agent;
 mod actions_human;
 mod actions_script;
-mod actions_wait;
 mod agent_harness_selection;
 mod backend_contract;
 mod branches;

@@ -17,27 +17,30 @@
 //! `{{ inputs.x }}` must name a declared input and `{{ artifacts.x }}` an
 //! artifact some step defines; `{{ context.* }}` and anything
 //! with filters or other expression syntax is passed through untouched and
-//! resolved at runtime (U4).
+//! resolved at runtime (U4). The one exception is `context.event`, which
+//! only the removed `wait` step set: it is refused unless the workflow
+//! declares a variable `event` of its own.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use crate::config::{effort_rank, tier_rank, EFFORT_SCALE, MODEL_TIERS};
 use crate::domain::is_usable_directory_name;
-use crate::domain::observer_name::observer_name_problem;
+use crate::domain::observer_name::queue_name_problem;
 use crate::domain::{
-    ActionConfig, AgentActionConfig, DecisionConfig, DefinitionShape, ImageSpec, OutputLabel,
-    ProfileActionConfig, PromptPart, PromptText, RepositoryDefinition, RepositorySource,
-    SchemaVersion, State, StateId, ValidationError, VariableDefinition, VariableScope,
-    VariableSource, VariableType, WaitWatchConfig, WorkflowDefinition, WorkspaceField,
-    LOCAL_VARIABLE_PREFIX, TIMEOUT_LABEL, WORKSPACE_ROOT,
+    ActionConfig, AgentActionConfig, DecisionConfig, DecisionMaker, DefinitionShape,
+    GateWatchConfig, ImageSpec, OutputLabel, ProfileActionConfig, PromptPart, PromptText,
+    RepositoryDefinition, RepositorySource, SchemaVersion, State, StateId, ValidationError,
+    VariableDefinition, VariableScope, VariableSource, VariableType, WorkflowDefinition,
+    WorkspaceField, LOCAL_VARIABLE_PREFIX, TIMEOUT_LABEL, WORKSPACE_ROOT,
 };
 
 use super::loader::{compile, LoadError};
 use super::schema::WorkflowFile;
 use super::template::{
-    artifact_references, step_label_references, step_reply_references, step_stream_references,
-    unsupported_step_references, workspace_reference_problems, DeclaredNames,
+    artifact_references, context_references, step_label_references, step_reply_references,
+    step_stream_references, unsupported_step_references, workspace_reference_problems,
+    DeclaredNames,
 };
 
 impl WorkflowDefinition {
@@ -524,18 +527,12 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
                 errors.push(missing_field(state, "human", "message"));
             }
         }
-        ActionConfig::Wait(wait) => {
-            if wait.event.trim().is_empty() {
-                errors.push(missing_field(state, "wait", "event_type"));
-            }
-            if wait.timeout_secs.is_some() {
-                errors.push(ValidationError::WaitTimeoutNotAllowed {
-                    state: state.id.clone(),
-                });
-            }
-            if let Some(watch) = &wait.watch {
-                validate_wait_watch(state, &wait.event, watch, errors);
-            }
+        // The loader never builds one (R5); a definition put together in
+        // code still gets the same answer as the YAML.
+        ActionConfig::Wait(_) => {
+            errors.push(ValidationError::RemovedWaitStep {
+                state: state.id.clone(),
+            });
         }
         ActionConfig::Decision(decision) => {
             if decision.message.is_blank() {
@@ -547,51 +544,52 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
                     action_type: "decision",
                 });
             }
+            if let Some(watch) = &decision.watch {
+                validate_gate_watch(state, decision.by, watch, errors);
+            }
         }
     }
 }
 
-/// A `wait` step's `watch` block (§3.3.D): an observer named explicitly
-/// (a plain observer name, no template), an object, and event types that
-/// include the step's own `event_type`. Whether the observer exists and
-/// accepts the object is the control plane's check, when the step waits.
-fn validate_wait_watch(
+/// A `decision` step's `watch` block (§3.3.D, R1-R3): only on a decision
+/// a person takes, with a plain queue name and flat, named params. Whether
+/// the queue has observers is the control plane's check, when the gate
+/// starts.
+fn validate_gate_watch(
     state: &State,
-    event_type: &str,
-    watch: &WaitWatchConfig,
+    by: DecisionMaker,
+    watch: &GateWatchConfig,
     errors: &mut Vec<ValidationError>,
 ) {
-    let invalid = |reason: String| ValidationError::InvalidWaitWatch {
-        state: state.id.clone(),
-        reason,
+    let mut invalid = |reason: String| {
+        errors.push(ValidationError::InvalidGateWatch {
+            state: state.id.clone(),
+            reason,
+        })
     };
-    if watch.observer.trim().is_empty() {
-        errors.push(missing_field(state, "wait", "watch.observer"));
-    } else if let Some(reason) = observer_name_problem(watch.observer.as_str()) {
-        errors.push(invalid(format!(
-            "'observer' must name an observer explicitly: invalid name: {reason}"
-        )));
+    if by == DecisionMaker::Conductor {
+        invalid(
+            "only a decision with 'by: human' can have a 'watch': the conductor decides at \
+             once, so a queue entry could never matter"
+                .to_string(),
+        );
     }
-    if watch.object.trim().is_empty() {
-        errors.push(missing_field(state, "wait", "watch.object"));
+    let queue = watch.queue.trim();
+    if queue.is_empty() {
+        invalid("'queue' is required".to_string());
+    } else if queue.contains("{{") {
+        invalid(format!(
+            "'queue' cannot be templated ('{queue}'): name the queue explicitly"
+        ));
+    } else if let Some(reason) = queue_name_problem(&watch.queue) {
+        invalid(format!("invalid 'queue': {reason}"));
     }
-    if watch.event_types.is_empty() {
-        errors.push(invalid("'event_types' lists no event type".to_string()));
-        return;
-    }
-    if let Some(blank) = watch
-        .event_types
-        .iter()
-        .find(|event_type| event_type.trim().is_empty() || event_type.contains(char::is_whitespace))
-    {
-        errors.push(invalid(format!(
-            "event type '{blank}' is blank or contains whitespace"
-        )));
-    }
-    if !watch.event_types.iter().any(|listed| listed == event_type) {
-        errors.push(invalid(format!(
-            "'event_types' must include the step's event_type '{event_type}'"
-        )));
+    for name in watch.params.keys() {
+        if name.trim().is_empty() || name.contains(char::is_whitespace) {
+            invalid(format!(
+                "param name '{name}' is blank or contains whitespace"
+            ));
+        }
     }
 }
 
@@ -1079,20 +1077,12 @@ fn validate_state_templates(
                 &decision.message,
                 errors,
             ));
-        }
-        Some(ActionConfig::Wait(wait)) => {
-            templated.push(("action.event_type".to_string(), wait.event.clone()));
-            if let Some(watch) = &wait.watch {
-                templated.push(("action.watch.object".to_string(), watch.object.clone()));
-                for (index, event_type) in watch.event_types.iter().enumerate() {
-                    templated.push((
-                        format!("action.watch.event_types[{index}]"),
-                        event_type.clone(),
-                    ));
-                }
+            for (name, value) in decision.watch.iter().flat_map(|watch| &watch.params) {
+                templated.push((format!("action.watch.params.{name}"), value.clone()));
             }
         }
-        None => {}
+        // Refused as a whole by `validate_action`.
+        Some(ActionConfig::Wait(_)) | None => {}
     }
 
     match &state.decision {
@@ -1195,8 +1185,24 @@ fn validate_state_templates(
             }
         }
         push_workspace_reference_errors(state, &field, text, declared, errors);
+        // The engine set `event` when a `wait` step ended; with the step
+        // type gone, only a workflow's own variable of that name is left.
+        if !declared.declares_variable(REMOVED_EVENT_VARIABLE)
+            && context_references(text)
+                .iter()
+                .any(|name| name == REMOVED_EVENT_VARIABLE)
+        {
+            errors.push(ValidationError::RemovedEventReference {
+                state: state.id.clone(),
+                field: field.clone(),
+                reference: format!("context.{REMOVED_EVENT_VARIABLE}"),
+            });
+        }
     }
 }
+
+/// The context variable the removed `wait` step wrote its event to.
+const REMOVED_EVENT_VARIABLE: &str = "event";
 
 fn push_workspace_reference_errors(
     state: &State,

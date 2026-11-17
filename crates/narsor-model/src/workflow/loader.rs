@@ -35,11 +35,11 @@ use crate::domain::is_usable_directory_name;
 
 use crate::domain::{
     ActionConfig, AgentActionConfig, AgentDecisionConfig, ArtifactDefinition, ChoiceDefinition,
-    DecisionActionConfig, DecisionConfig, DefinitionShape, GlobalsConfig, HumanActionConfig,
-    HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter, ParamType,
-    ProfileActionConfig, RepositoryDefinition, RepositorySource, RetryPolicy, SchemaVersion,
-    ScriptActionConfig, State, StepWorkspace, TerminalStatus, VariableDefinition, WaitActionConfig,
-    WaitWatchConfig, WorkflowDefinition, WorkspaceAccess, EXIT_LABEL,
+    DecisionActionConfig, DecisionConfig, DefinitionShape, GateWatchConfig, GlobalsConfig,
+    HumanActionConfig, HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter,
+    ParamType, ProfileActionConfig, RepositoryDefinition, RepositorySource, RetryPolicy,
+    SchemaVersion, ScriptActionConfig, State, StepWorkspace, TerminalStatus, VariableDefinition,
+    WorkflowDefinition, WorkspaceAccess, EXIT_LABEL,
 };
 
 use super::schema::{
@@ -558,18 +558,12 @@ fn compile_action(action: ActionSchema, without_section: bool) -> ActionConfig {
         ActionSchema::Decision(decision) => ActionConfig::Decision(DecisionActionConfig {
             by: decision.by,
             message: decision.message,
-        }),
-        ActionSchema::Wait(wait) => ActionConfig::Wait(WaitActionConfig {
-            // Name drift: YAML says `event_type`, the domain says `event`.
-            event: wait.event_type,
-            filter: wait.filter,
-            timeout_secs: wait.timeout.map(|d| d.as_secs()),
-            watch: wait.watch.map(|watch| WaitWatchConfig {
-                observer: watch.observer,
-                object: watch.object,
-                event_types: watch.event_types,
+            watch: decision.watch.map(|watch| GateWatchConfig {
+                queue: watch.queue,
+                params: watch.params,
             }),
         }),
+        ActionSchema::Wait(removed) => match removed {},
     }
 }
 

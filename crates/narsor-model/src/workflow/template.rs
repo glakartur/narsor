@@ -2,9 +2,9 @@
 //!
 //! The scope is deliberately minimal (D6): the only things recognised inside
 //! `{{ }}` are a workflow input (`inputs.NAME`), a context variable
-//! (`context.variables.NAME`, or the shorthand `context.NAME` used by
-//! `docs/dev/workflow-schema.md` §3.3.D) and a field of its value when that is
-//! an object (`context.variables.NAME.field`), a value of a workspace
+//! (`context.variables.NAME`, or the shorthand `context.NAME`) and a field
+//! of its value when that is an object (`context.variables.NAME.field`), a
+//! value of a workspace
 //! (`context.workspace.NAME.field`, [`WorkspaceField`]), a named artifact (`artifacts.NAME`, the path
 //! it was last written to, KTD7), selected step fields (`reply`,
 //! `stdout`, `stderr`), the current step's own memory (`local.NAME`, R13)
@@ -34,9 +34,9 @@ use serde_json::{Map, Value};
 
 use crate::domain::{
     ActionConfig, AgentActionConfig, ArtifactReference, Context, DecisionActionConfig,
-    HumanActionConfig, ProfileActionConfig, PromptPart, PromptText, ScriptActionConfig,
-    VariableDefinition, WaitActionConfig, WaitWatchConfig, WorkflowDefinition, WorkspaceField,
-    WorkspacePr, LOCAL_VARIABLE_PREFIX,
+    GateWatchConfig, HumanActionConfig, ProfileActionConfig, PromptPart, PromptText,
+    ScriptActionConfig, VariableDefinition, WaitActionConfig, WaitWatchConfig, WorkflowDefinition,
+    WorkspaceField, WorkspacePr, LOCAL_VARIABLE_PREFIX,
 };
 
 /// Opening delimiter of a template placeholder.
@@ -511,10 +511,31 @@ impl<'a> TemplateScope<'a> {
                 ..config.clone()
             })),
 
-            ActionConfig::Decision(config) => Ok(ActionConfig::Decision(DecisionActionConfig {
-                message: self.render_text(&config.message, &format!("{location}, message"))?,
-                ..config.clone()
-            })),
+            ActionConfig::Decision(config) => {
+                // The queue is a plain name; each param is a template,
+                // rendered when the gate starts.
+                let watch = match &config.watch {
+                    Some(watch) => {
+                        let mut params = BTreeMap::new();
+                        for (name, value) in &watch.params {
+                            params.insert(
+                                name.clone(),
+                                self.render(value, &format!("{location}, watch.params.{name}"))?,
+                            );
+                        }
+                        Some(GateWatchConfig {
+                            queue: watch.queue.clone(),
+                            params,
+                        })
+                    }
+                    None => None,
+                };
+                Ok(ActionConfig::Decision(DecisionActionConfig {
+                    message: self.render_text(&config.message, &format!("{location}, message"))?,
+                    watch,
+                    ..config.clone()
+                }))
+            }
 
             ActionConfig::Wait(config) => {
                 let filter = match &config.filter {
@@ -970,6 +991,9 @@ pub fn action_context_references(action: &ActionConfig) -> Vec<String> {
         ActionConfig::Decision(config) => {
             for piece in config.message.template_pieces() {
                 collect_context_references(&piece, &mut names);
+            }
+            for value in config.watch.iter().flat_map(|watch| watch.params.values()) {
+                collect_context_references(value, &mut names);
             }
         }
         ActionConfig::Wait(config) => {

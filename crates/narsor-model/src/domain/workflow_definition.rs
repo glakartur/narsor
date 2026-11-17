@@ -582,6 +582,25 @@ pub struct DecisionActionConfig {
 
     /// What the decider is asked, still templated.
     pub message: PromptText,
+
+    /// The observer queue the gate puts its wait episode on, for a
+    /// `by: human` decision only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<GateWatchConfig>,
+}
+
+/// The `watch` block of a `decision` step (`by: human`): the queue whose
+/// observers may answer the gate, and the params they get. `queue` is a
+/// plain name; each value of `params` is a template, rendered when the gate
+/// starts. Narsor does not interpret any value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateWatchConfig {
+    /// The name of the queue.
+    pub queue: String,
+
+    /// Names to text, flat.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
 }
 
 /// Who decides a [`DecisionActionConfig`] fork.
@@ -878,7 +897,12 @@ pub struct HumanInputField {
     pub description: Option<String>,
 }
 
-/// Wait action configuration
+/// Wait action configuration.
+///
+/// The workflow schema no longer has the `wait` step type (R5): the loader
+/// never builds this action, and the validator refuses it. It stays only
+/// for the engine's `wait` action, which is removed with the runner's
+/// event protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WaitActionConfig {
     /// Event type to wait for (`event_type` in YAML)
@@ -1508,11 +1532,14 @@ pub enum ValidationError {
     #[error("State '{state}' declares a 'timeout' choice, which only agent and script steps can produce")]
     TimeoutChoiceNotAllowed { state: StateId },
 
-    #[error("State '{state}' sets a 'timeout', but a wait step has no timeout")]
-    WaitTimeoutNotAllowed { state: StateId },
+    #[error(
+        "State '{state}' is a wait step; the 'wait' step type was removed: put a 'watch' \
+         block with a queue on a 'decision' step with 'by: human' instead"
+    )]
+    RemovedWaitStep { state: StateId },
 
     #[error("State '{state}' has an invalid 'watch': {reason}")]
-    InvalidWaitWatch { state: StateId, reason: String },
+    InvalidGateWatch { state: StateId, reason: String },
 
     #[error("Choice '{label}' in state '{state}' has invalid approval/resume behavior: {reason}")]
     InvalidChoiceBehavior {
@@ -1552,6 +1579,17 @@ pub enum ValidationError {
         field: String,
         reference: String,
         reason: String,
+    },
+
+    #[error(
+        "State '{state}' references '{reference}' in field '{field}'; 'context.event' was \
+         removed with the 'wait' step type: an observer answers a 'decision' gate with a \
+         choice and variables instead"
+    )]
+    RemovedEventReference {
+        state: StateId,
+        field: String,
+        reference: String,
     },
 
     #[error("Field '{field}' references unknown input '{variable}'")]

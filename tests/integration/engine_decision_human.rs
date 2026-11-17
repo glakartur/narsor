@@ -10,7 +10,9 @@ use crate::engine_support;
 use std::sync::Arc;
 
 use engine_support::{workflow_file, AgentTurn, Harness, ScriptedAgentExecutor};
-use narsor_engine::domain::{EventData, ExecutionStatus, WorkflowDefinition, WorkflowExecution};
+use narsor_engine::domain::{
+    ActionConfig, EventData, ExecutionStatus, WorkflowDefinition, WorkflowExecution,
+};
 use narsor_engine::engine::actions::human::HumanActionError;
 use narsor_engine::engine::{
     ActionKind, Engine, EngineError, HumanInputDelivery, InputContinuation, PendingHumanInput,
@@ -327,4 +329,224 @@ async fn a_pending_record_written_before_decisions_had_forms_still_loads() {
 
     assert!(!loaded.label_from_menu);
     assert!(loaded.local_values.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// A gate on an observer queue (`watch`, U2)
+// ---------------------------------------------------------------------------
+
+/// `review_work` on the queue `mr-review`: the merge request comes from the
+/// inputs, the label is fixed; `params` is the template of the params.
+fn watched_review(params: &str) -> WorkflowDefinition {
+    narsor_engine::workflow::load_from_str(&format!(
+        r#"
+schema: v2
+name: watched-review
+version: 1
+inputs:
+  - name: mr_url
+    type: string
+    required: true
+states:
+  review_work:
+    action:
+      type: decision
+      by: human
+      message: Review {{{{ inputs.mr_url }}}}.
+      watch:
+        queue: mr-review
+        params: {params}
+    variables:
+      - name: comment
+        type: text
+        description: What to change.
+      - name: severity
+        type: select
+        options: [low, high]
+      - name: stage
+        source: workflow
+    choices:
+      check_feedback:
+        description: Read the review.
+        next: done
+      revise_plan:
+        requires_variables: [comment]
+        next: done
+      abandon:
+        requires_variables: [comment, severity]
+        next: cancelled
+  done:
+    description: Finished.
+  cancelled:
+    description: Dropped.
+terminal_states:
+  done: completed
+  cancelled: cancelled
+"#
+    ))
+    .expect("the workflow loads")
+}
+
+const MR_URL: &str = "https://git.example.com/a/-/merge_requests/17";
+
+/// Runs `definition` until its gate asks; the engine and the pending input.
+async fn at_the_watched_gate(
+    harness: &Harness,
+    definition: &WorkflowDefinition,
+) -> (WorkflowExecution, PendingHumanInput) {
+    let execution = harness
+        .engine()
+        .start_and_run(definition, json!({ "mr_url": MR_URL }), harness.workspace())
+        .await
+        .expect("run");
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    let pending = harness
+        .store()
+        .load_pending_input::<PendingHumanInput>(&execution.id)
+        .expect("read the pending input")
+        .expect("a pending input");
+    (execution, pending)
+}
+
+#[tokio::test]
+async fn entering_a_watched_gate_renders_its_params_and_keeps_them_with_the_request() {
+    let harness = Harness::new();
+    let definition = watched_review(r#"{ mr_url: "{{ inputs.mr_url }}", label: "w CR" }"#);
+
+    let (_, pending) = at_the_watched_gate(&harness, &definition).await;
+
+    let watch = pending.request.gate_watch.expect("the gate has a watch");
+    assert_eq!(watch.step, "review_work");
+    assert_eq!(watch.queue, "mr-review");
+    assert_eq!(watch.params["mr_url"], MR_URL);
+    assert_eq!(watch.params["label"], "w CR");
+    let choices: Vec<(&str, &[String])> = watch
+        .choices
+        .iter()
+        .map(|choice| (choice.name.as_str(), choice.requires_variables.as_slice()))
+        .collect();
+    assert_eq!(
+        choices,
+        [
+            ("check_feedback", &[][..]),
+            ("revise_plan", &["comment".to_string()][..]),
+            (
+                "abandon",
+                &["comment".to_string(), "severity".to_string()][..]
+            ),
+        ]
+    );
+    assert_eq!(
+        watch.choices[0].description.as_deref(),
+        Some("Read the review.")
+    );
+    // The variables an answer may give: not the one the workflow sets.
+    let variables: Vec<(&str, Option<&str>)> = watch
+        .variables
+        .iter()
+        .map(|variable| (variable.name.as_str(), variable.variable_type.as_deref()))
+        .collect();
+    assert_eq!(
+        variables,
+        [("comment", Some("text")), ("severity", Some("select"))]
+    );
+    assert_eq!(watch.variables[1].options, ["low", "high"]);
+    // R4: the gate's own form is unchanged.
+    let labels: Vec<&str> = pending
+        .outputs
+        .iter()
+        .map(|output| output.label.as_str())
+        .collect();
+    assert_eq!(labels, ["check_feedback", "revise_plan", "abandon"]);
+}
+
+#[tokio::test]
+async fn a_gate_without_a_watch_has_none_on_its_request() {
+    let run = Run::until_the_decision(vec![work_done()]).await;
+
+    assert_eq!(run.pending().request.gate_watch, None);
+    let stored = serde_json::to_value(run.pending()).unwrap();
+    assert!(stored.get("gate_watch").is_none(), "{stored}");
+}
+
+#[tokio::test]
+async fn a_param_that_fails_to_render_fails_the_step_like_a_message_that_does() {
+    let failure = |definition: WorkflowDefinition| async move {
+        let harness = Harness::new();
+        let execution = harness
+            .engine()
+            .start_and_run(
+                &definition,
+                json!({ "mr_url": MR_URL }),
+                harness.workspace(),
+            )
+            .await
+            .expect("run");
+        let error = harness
+            .events(&execution.id)
+            .into_iter()
+            .find_map(|event| match event.data {
+                EventData::ActionFailed { error, .. } => Some(error),
+                _ => None,
+            })
+            .expect("the step failed");
+        (execution.status, error)
+    };
+    let in_params = watched_review(r#"{ mr_url: "{{ context.nowhere }}" }"#);
+    let mut in_message = watched_review("{}");
+    if let Some(ActionConfig::Decision(decision)) = &mut in_message
+        .states
+        .get_mut("review_work")
+        .expect("the gate")
+        .action
+    {
+        decision.message = "Review {{ context.nowhere }}.".to_string().into();
+    }
+
+    let (params_status, params_error) = failure(in_params).await;
+    let (message_status, message_error) = failure(in_message).await;
+
+    assert_eq!(params_status, message_status);
+    assert!(
+        params_error.contains("unknown template variable 'context.nowhere'")
+            && params_error.contains("watch.params.mr_url"),
+        "{params_error}"
+    );
+    assert!(
+        message_error.contains("unknown template variable 'context.nowhere'"),
+        "{message_error}"
+    );
+}
+
+#[tokio::test]
+async fn a_watched_gate_is_still_answered_by_hand_with_every_choice() {
+    for (label, values, end) in [
+        ("check_feedback", vec![], ExecutionStatus::Completed),
+        (
+            "revise_plan",
+            vec![("comment", json!("smaller"))],
+            ExecutionStatus::Completed,
+        ),
+        (
+            "abandon",
+            vec![("comment", json!("no")), ("severity", json!("high"))],
+            ExecutionStatus::Cancelled,
+        ),
+    ] {
+        let harness = Harness::new();
+        let definition = watched_review(r#"{ mr_url: "{{ inputs.mr_url }}" }"#);
+        let (execution, pending) = at_the_watched_gate(&harness, &definition).await;
+
+        let execution = harness
+            .engine()
+            .deliver_human_input(
+                &definition,
+                &execution.id,
+                &pick(label, &values).for_episode(pending.episode_key().to_string()),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+
+        assert_eq!(execution.status, end, "{label}");
+    }
 }

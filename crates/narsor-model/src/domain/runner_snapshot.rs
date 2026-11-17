@@ -8,8 +8,8 @@
 use chrono::{DateTime, Utc};
 use narsor_protocol::api::Timeline;
 use narsor_protocol::controller::{
-    AttentionItem, ConversationAvailability, EventWait, ExecutionCursor, HarnessUnavailable,
-    PendingInputRefView, RunnerProblem, RunnerSnapshotRequest,
+    AttentionItem, ConversationAvailability, EventWait, ExecutionCursor, GateWatch,
+    HarnessUnavailable, PendingInputRefView, RunnerProblem, RunnerSnapshotRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +51,11 @@ pub struct RunnerSnapshot {
     /// The input request it waits on.
     #[serde(default)]
     pub pending_input: Option<PendingInputRef>,
+    /// The rendered `watch` block of the `decision` gate the pending input
+    /// belongs to, when the gate has one. Its episode is the id of the
+    /// pending input ([`PendingInputRef::id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_watch: Option<GateWatch>,
     /// The external event its `wait` step waits for, while it waits; the
     /// control plane keeps it as `TaskRecord::event_wait` (`narsor_engine::orchestration`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,6 +131,7 @@ impl RunnerSnapshot {
                     })
                 })
                 .transpose()?,
+            gate_watch: snapshot.gate_watch.clone(),
             event_wait: snapshot.event_wait.clone(),
             conversation: snapshot.conversation.clone(),
             timeline: snapshot.timeline.clone(),
@@ -158,6 +164,7 @@ impl RunnerSnapshot {
                     })
                 })
                 .transpose()?,
+            gate_watch: request.gate_watch,
             event_wait: request.event_wait,
             conversation: request.conversation,
             timeline: request.timeline,

@@ -17,6 +17,7 @@ use super::{
     HumanInputField, OutputLabel, StateId,
 };
 use narsor_protocol::api::RequiredValue;
+use narsor_protocol::controller::GateWatch;
 
 pub use narsor_protocol::api::HumanInputActionDto as HumanInputAction;
 pub use narsor_protocol::api::LocalValue;
@@ -73,6 +74,13 @@ pub struct HumanInputRequest {
     /// pending record so an operator can make a later decision.
     #[serde(default)]
     pub permission: Option<PermissionRequestDetails>,
+
+    /// The `watch` block of a `decision` gate (`by: human`), its `params`
+    /// rendered when the gate started. Set by the engine, never by an
+    /// executor; kept with the request, so a restarted runner reports the
+    /// same values for the same episode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_watch: Option<GateWatch>,
 }
 
 /// Details attached to a permission wait. The tool input is untrusted data;

@@ -672,6 +672,7 @@ impl SimulatedRunner<'_> {
             execution_cursor: Default::default(),
             event_cursor: self.storage.next_event(),
             pending_input: None,
+            gate_watch: None,
             event_wait: None,
             conversation: Default::default(),
             timeline: None,
