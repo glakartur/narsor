@@ -11,8 +11,8 @@ use serde_json::Value;
 
 use super::task_text::age;
 use crate::controller_protocol::{
-    ObserverDetailView, ObserverEffectResponse, ObserverListResponse, ObserverRunErrorView,
-    ObserverScriptView, ObserverView,
+    ObserverDetailView, ObserverEffectResponse, ObserverListResponse, ObserverQueueListResponse,
+    ObserverQueueView, ObserverRunErrorView, ObserverScriptView, ObserverView, QueueEntryView,
 };
 use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
 
@@ -48,6 +48,28 @@ fn script_versions(observer: &ObserverView) -> String {
         }
         (Some(approved), _) => format!("v{approved}"),
     }
+}
+
+/// The newest script version when it is not the approved one (R32): saving
+/// never approves, so the schedule still runs the approved version, or
+/// nothing.
+fn unapproved_version(observer: &ObserverView) -> Option<u32> {
+    match (observer.approved_version, observer.latest_version) {
+        (approved, Some(latest)) if approved != Some(latest) => Some(latest),
+        _ => None,
+    }
+}
+
+/// The line under an observer of `observer list` and `observer queue show`
+/// that marks a newest version that is not approved (R32, AE10).
+fn unapproved_line(observer: &ObserverView) -> Option<String> {
+    unapproved_version(observer).map(|version| {
+        format!(
+            "version {version} not approved: approve it with `narsor-cli observer approve {} \
+             --version {version}`",
+            clean(&observer.name)
+        )
+    })
 }
 
 /// The warning `observer list` and `observer show` give when a due run
@@ -118,6 +140,9 @@ pub fn observer_list_output(listing: &ObserverListResponse, now: DateTime<Utc>) 
         if let Some(note) = &observer.note {
             out.push_str(&format!("  note: {}\n", clean(note)));
         }
+        if let Some(marker) = unapproved_line(observer) {
+            out.push_str(&format!("  script: {marker}\n"));
+        }
     }
     out
 }
@@ -128,6 +153,15 @@ fn schedule_text(observer: &ObserverView) -> String {
         (Some(cron), _) => format!("cron '{}' (UTC)", clean(cron)),
         (None, Some(secs)) => format!("every {secs}s"),
         (None, None) => "-".to_string(),
+    }
+}
+
+/// A run mode with what it means.
+fn mode_text(mode: &str) -> String {
+    match mode {
+        "on_episodes" => "on_episodes (runs for the entries of its queue only)".to_string(),
+        "always" => "always (runs on every tick, with no entry)".to_string(),
+        other => clean(other),
     }
 }
 
@@ -157,12 +191,7 @@ pub fn observer_show_output(detail: &ObserverDetailView, now: DateTime<Utc>) -> 
         None => line("Effect: creates no tasks".to_string()),
     }
     line(format!("Queue: {}", clean(&observer.queue)));
-    let mode = match observer.mode.as_str() {
-        "on_episodes" => "on_episodes (runs for the entries of its queue only)".to_string(),
-        "always" => "always (runs on every tick, with no entry)".to_string(),
-        other => clean(other),
-    };
-    line(format!("Mode: {mode}"));
+    line(format!("Mode: {}", mode_text(&observer.mode)));
     line(format!("Schedule: {}", schedule_text(observer)));
     if let Some(note) = &observer.note {
         line(format!("Note: {}", clean(note)));
@@ -256,11 +285,9 @@ pub fn observer_show_output(detail: &ObserverDetailView, now: DateTime<Utc>) -> 
 fn script_line(observer: &ObserverView) -> String {
     match (observer.approved_version, observer.latest_version) {
         (None, None) => "none yet; save one with `narsor-cli observer script set`".to_string(),
-        (None, Some(latest)) => {
-            format!("no approved version; draft version {latest} (not approved)")
-        }
-        (Some(approved), Some(latest)) if latest > approved => {
-            format!("approved version {approved}; draft version {latest} (not approved)")
+        (None, Some(latest)) => format!("no approved version; version {latest} not approved"),
+        (Some(approved), Some(latest)) if latest != approved => {
+            format!("approved version {approved}; version {latest} not approved")
         }
         (Some(approved), _) => format!("approved version {approved}"),
     }
@@ -324,6 +351,148 @@ pub fn observer_changed_output(what: &str, observer: &ObserverView) -> String {
         clean(&observer.state),
         script_line(observer)
     )
+}
+
+/// The answer to `observer update`: where the observer is now, how it
+/// runs and which script version runs.
+pub fn observer_updated_output(observer: &ObserverView) -> String {
+    format!(
+        "Updated observer '{}': queue {}, mode {}, schedule {}; state {}, {}.\n",
+        clean(&observer.name),
+        clean(&observer.queue),
+        clean(&observer.mode),
+        schedule_text(observer),
+        clean(&observer.state),
+        script_line(observer)
+    )
+}
+
+/// `observer queue list`: one line per queue with its mode and counts.
+pub fn queue_list_output(listing: &ObserverQueueListResponse) -> String {
+    if listing.queues.is_empty() {
+        return "No queues. An observer serves the queue of its --queue; a gate with a \
+                `watch` block adds its wait episodes to the queue it names.\n"
+            .to_string();
+    }
+    let mut out = format!(
+        "{:<24} {:<12} {:>9} {:>7}\n",
+        "QUEUE", "MODE", "OBSERVERS", "ENTRIES"
+    );
+    for queue in &listing.queues {
+        out.push_str(&format!(
+            "{:<24} {:<12} {:>9} {:>7}\n",
+            clean(&queue.queue),
+            queue
+                .mode
+                .as_deref()
+                .map(clean)
+                .unwrap_or_else(|| "-".into()),
+            queue.observers,
+            queue.entries
+        ));
+    }
+    out
+}
+
+/// `observer queue show`: the queue's observers with their state, script
+/// versions, schedule and last run, then its entries with how each
+/// observer processed them (R23, R24).
+pub fn queue_show_output(view: &ObserverQueueView, now: DateTime<Utc>) -> String {
+    let mut out = String::new();
+    let mut line = |text: String| {
+        out.push_str(&text);
+        out.push('\n');
+    };
+    line(format!("Queue: {}", clean(&view.queue)));
+    match &view.mode {
+        Some(mode) => line(format!("Mode: {}", mode_text(mode))),
+        None => line("Mode: - (no observer serves it)".to_string()),
+    }
+    if view.observers.is_empty() {
+        line(format!(
+            "Observers: none; its entries wait for a person. Serve it with `narsor-cli \
+             observer create NAME --source TEXT --queue {}`.",
+            clean(&view.queue)
+        ));
+    } else {
+        line("Observers:".to_string());
+        line(format!(
+            "  {:<24} {:<16} {:<16} {:<24} {}",
+            "NAME", "STATE", "SCRIPT", "SCHEDULE", "LAST RUN"
+        ));
+        for observer in &view.observers {
+            line(format!(
+                "  {:<24} {:<16} {:<16} {:<24} {}",
+                clean(&observer.name),
+                clean(&observer.state),
+                script_versions(observer),
+                schedule_text(observer),
+                last_run(observer, now)
+            ));
+            if let Some(marker) = unapproved_line(observer) {
+                line(format!("    script: {marker}"));
+            }
+        }
+    }
+    if view.entries.is_empty() {
+        line("Entries: none".to_string());
+        return out;
+    }
+    line("Entries (oldest first):".to_string());
+    line(format!(
+        "  {:<24} {:<20} {:<20} {}",
+        "TASK", "STEP", "EPISODE", "WAITING"
+    ));
+    for entry in &view.entries {
+        for text in entry_lines(entry, now) {
+            line(text);
+        }
+    }
+    out
+}
+
+/// One entry of `observer queue show`: its row, its params and one line
+/// per observer that processed it.
+fn entry_lines(entry: &QueueEntryView, now: DateTime<Utc>) -> Vec<String> {
+    let mut lines = vec![format!(
+        "  {:<24} {:<20} {:<20} {}",
+        clean(&entry.task_id),
+        clean(&entry.step),
+        clean(&entry.episode),
+        age(now, entry.started_at)
+    )];
+    if !entry.params.is_empty() {
+        lines.push(format!(
+            "    params: {}",
+            entry
+                .params
+                .iter()
+                .map(|(name, value)| format!("{}={}", clean(name), clean(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    for processed in &entry.observers {
+        let mut text = format!("    {}: ", clean(&processed.observer));
+        text.push_str(&match (processed.running, processed.last_run_at) {
+            (true, _) => "running".to_string(),
+            (false, Some(at)) => format!("last run {} ago", age(now, at)),
+            (false, None) => "no run yet".to_string(),
+        });
+        if let Some(error) = &processed.last_error {
+            text.push_str(&format!(
+                "; last error: {} {} ago",
+                clean(&error.status),
+                age(now, error.finished_at)
+            ));
+            if let Some(code) = error.exit_code {
+                text.push_str(&format!(", exit {code}"));
+            }
+            text.push_str(&format!(": {}", clean(&error.error)));
+        }
+        lines.push(text);
+    }
+    lines
 }
 
 /// The first characters of a queue entry id: enough to tell entries apart

@@ -20,22 +20,24 @@ use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
 use futures::future::BoxFuture;
 use narsor::api::ClientError;
-use narsor::cli::observer::{operate, ObserverApi};
+use narsor::cli::observer::{operate, update_observer_request, ObserverApi, UpdateArgs};
 use narsor::cli::observer_effect::{effect_call, perform, EffectApi};
 use narsor::cli::observer_text::{effect_output, observer_list_output};
 use narsor::cli::{Cli, Command};
 use narsor_engine::controller_protocol::{ProtocolError, ProtocolService, RunOutcome, RunReport};
-use narsor_engine::observers::{ObserverState, RunId};
+use narsor_engine::domain::TaskId;
+use narsor_engine::observers::{ObserverState, QueueEntry, RunId};
 use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef};
 use narsor_engine::persistence::StatePaths;
 use narsor_observer_worker::worker::{
     ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, Worker, WorkerApi, WorkerOptions,
 };
 use narsor_protocol::controller::{
-    ApproveObserverRequest, CreateObserverRequest, ObserverCreateTaskRequest,
-    ObserverDecideRequest, ObserverDetailView, ObserverEffectOutcome, ObserverEffectResponse,
-    ObserverListResponse, ObserverRunReport, ObserverRunResultResponse, ObserverScriptView,
-    ObserverView, ObserverWorkerRun, SetObserverScriptRequest,
+    ApproveObserverRequest, CreateObserverRequest, GateWatch, GateWatchChoice,
+    ObserverCreateTaskRequest, ObserverDecideRequest, ObserverDetailView, ObserverEffectOutcome,
+    ObserverEffectResponse, ObserverListResponse, ObserverQueueListResponse, ObserverQueueView,
+    ObserverRunReport, ObserverRunResultResponse, ObserverScriptView, ObserverView,
+    ObserverWorkerRun, SetObserverScriptRequest, UpdateObserverRequest,
 };
 use serde_json::json;
 
@@ -208,11 +210,33 @@ impl ObserverApi for ServiceApi {
         ready(self.service.observer_detail(&self.owner, observer))
     }
 
+    fn update_observer<'a>(
+        &'a self,
+        observer: &'a str,
+        request: &'a UpdateObserverRequest,
+    ) -> BoxFuture<'a, Result<ObserverView, ClientError>> {
+        ready(
+            self.service
+                .update_observer(&self.owner, observer, request.clone()),
+        )
+    }
+
     fn delete_observer<'a>(
         &'a self,
         observer: &'a str,
     ) -> BoxFuture<'a, Result<ObserverView, ClientError>> {
         ready(self.service.delete_observer(&self.owner, observer))
+    }
+
+    fn observer_queues(&self) -> BoxFuture<'_, Result<ObserverQueueListResponse, ClientError>> {
+        ready(self.service.observer_queues_of(&self.owner))
+    }
+
+    fn observer_queue<'a>(
+        &'a self,
+        queue: &'a str,
+    ) -> BoxFuture<'a, Result<ObserverQueueView, ClientError>> {
+        ready(self.service.observer_queue(&self.owner, queue))
     }
 
     fn set_observer_script<'a>(
@@ -604,11 +628,18 @@ async fn a_script_saved_on_an_active_observer_is_a_draft_beside_the_approved_ver
 
     assert!(saved.contains("Saved version 2"), "{saved}");
     assert!(
-        shown.contains("Script: approved version 1; draft version 2 (not approved)"),
+        shown.contains("Script: approved version 1; version 2 not approved"),
         "{shown}"
     );
     assert!(shown.contains("State: active"), "{shown}");
     assert!(listed.contains("v1 (draft v2)"), "{listed}");
+    assert!(
+        listed.contains(
+            "  script: version 2 not approved: approve it with `narsor-cli observer approve \
+             jira-new --version 2`"
+        ),
+        "{listed}"
+    );
     let record = fx
         .service
         .observers()
@@ -786,19 +817,306 @@ async fn a_cron_with_seconds_is_refused_and_cron_with_interval_does_not_parse() 
             "--mode",
             "sometimes",
         ][..],
-        &[
-            "narsor-cli",
-            "observer",
-            "create",
-            "x",
-            "--source",
-            "s",
-            "--deliver-events",
-        ][..],
     ] {
         assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
     }
     assert!(fx.service.observers().list().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_removed_flag_of_observer_create_fails_with_a_hint_at_its_replacement() {
+    let fx = Fixture::new();
+
+    for (flag, value) in [
+        ("--deliver-events", None),
+        ("--watch-list", None),
+        ("--allow-prefix", Some("https://gitlab.example.com/")),
+        ("--max-object-len", Some("200")),
+    ] {
+        let mut args = vec!["create", "gitlab-mr", "--source", "gitlab", flag];
+        args.extend(value);
+        let (code, message) = fx.cli(&args).await.unwrap_err();
+        assert_eq!(code, 2, "{flag}: {message}");
+        assert!(message.contains(flag), "{message}");
+        assert!(message.contains("removed"), "{message}");
+        assert!(message.contains("--queue QUEUE"), "{message}");
+    }
+    assert!(fx.service.observers().list().unwrap().is_empty());
+}
+
+/// The entry of `episode` of `task` of the test's owner on `queue`, as a
+/// runner's gate with a `watch` block adds it.
+fn add_entry(fx: &Fixture, queue: &str, task: &str, episode: &str) {
+    let gate = GateWatch {
+        step: "review_work".into(),
+        queue: queue.into(),
+        params: [(
+            "mr_url".to_string(),
+            "https://gitlab/a/-/merge_requests/17".to_string(),
+        )]
+        .into(),
+        choices: vec![GateWatchChoice {
+            name: "check_feedback".into(),
+            description: None,
+            requires_variables: Vec::new(),
+        }],
+        variables: Vec::new(),
+    };
+    let entry = QueueEntry::from_gate(
+        owner(),
+        TaskId::parse(task).unwrap(),
+        episode,
+        &gate,
+        fx.clock.now(),
+    );
+    let observers = fx.service.observers();
+    let lock = observers.lock_queue_entries().unwrap();
+    observers.add_queue_entry(&lock, &entry).unwrap();
+}
+
+#[tokio::test]
+async fn an_observer_update_moves_it_to_another_queue_and_schedule() {
+    let fx = Fixture::new();
+    fx.cli(CREATE_REVIEW).await.unwrap();
+
+    let updated = fx
+        .cli(&[
+            "update",
+            "gitlab-mr",
+            "--queue",
+            "mr-merge",
+            "--interval",
+            "120",
+        ])
+        .await
+        .unwrap();
+
+    assert!(
+        updated.contains(
+            "Updated observer 'gitlab-mr': queue mr-merge, mode on_episodes, schedule every 120s; \
+             state draft"
+        ),
+        "{updated}"
+    );
+    let shown = fx.cli(&["show", "gitlab-mr"]).await.unwrap();
+    assert!(shown.contains("Queue: mr-merge"), "{shown}");
+    assert!(shown.contains("Schedule: every 120s"), "{shown}");
+
+    let updated = fx
+        .cli(&["update", "gitlab-mr", "--cron", "0 * * * *"])
+        .await
+        .unwrap();
+    assert!(
+        updated.contains("schedule cron '0 * * * *' (UTC)"),
+        "{updated}"
+    );
+    assert!(
+        updated.contains("queue mr-merge"),
+        "the queue stays: {updated}"
+    );
+}
+
+#[tokio::test]
+async fn an_observer_update_of_another_mode_in_a_queue_is_refused() {
+    // Covers AE8 by `observer update`.
+    let fx = Fixture::new();
+    fx.cli(CREATE_REVIEW).await.unwrap();
+    fx.cli(CREATE_JIRA).await.unwrap();
+
+    let (code, message) = fx
+        .cli(&["update", "jira-new", "--queue", "mr-review"])
+        .await
+        .unwrap_err();
+
+    assert_eq!(code, 1);
+    assert!(
+        message.contains("Could not update the observer"),
+        "{message}"
+    );
+    assert!(message.contains("on_episodes"), "{message}");
+    let shown = fx.cli(&["show", "jira-new"]).await.unwrap();
+    assert!(shown.contains("Queue: jira-new"), "{shown}");
+}
+
+#[tokio::test]
+async fn an_observer_update_without_a_change_or_with_both_schedules_is_a_usage_error() {
+    for argv in [
+        &["narsor-cli", "observer", "update", "gitlab-mr"][..],
+        &[
+            "narsor-cli",
+            "observer",
+            "update",
+            "gitlab-mr",
+            "--cron",
+            "* * * * *",
+            "--interval",
+            "60",
+        ][..],
+        &[
+            "narsor-cli",
+            "observer",
+            "update",
+            "gitlab-mr",
+            "--mode",
+            "sometimes",
+        ][..],
+    ] {
+        let error = Cli::try_parse_from(argv).unwrap_err();
+        assert_eq!(error.exit_code(), 2, "{argv:?}: {error}");
+    }
+
+    // The same checks without the parser, as `operate` makes them.
+    let args = |interval: Option<u64>, cron: Option<&str>| UpdateArgs {
+        observer: "gitlab-mr".into(),
+        queue: None,
+        mode: None,
+        interval,
+        cron: cron.map(str::to_string),
+    };
+    let empty = update_observer_request(&args(None, None)).unwrap_err();
+    assert_eq!(empty.exit_code, 2);
+    assert!(empty.message.contains("Nothing to change"), "{empty:?}");
+    let both = update_observer_request(&args(Some(60), Some("* * * * *"))).unwrap_err();
+    assert_eq!(both.exit_code, 2);
+    assert!(both.message.contains("not both"), "{both:?}");
+}
+
+#[tokio::test]
+async fn queue_list_and_show_give_the_observers_and_entries_of_a_queue() {
+    let fx = Fixture::new();
+    assert!(fx
+        .cli(&["queue", "list"])
+        .await
+        .unwrap()
+        .starts_with("No queues."));
+    fx.cli(CREATE_REVIEW).await.unwrap();
+    fx.cli(CREATE_JIRA).await.unwrap();
+    add_entry(&fx, "mr-review", "task-1", "input-1");
+    add_entry(&fx, "nobody-serves", "task-2", "input-1");
+    fx.advance(Duration::minutes(4));
+
+    let listed = fx.cli(&["queue", "list"]).await.unwrap();
+    let lines: Vec<&str> = listed.lines().collect();
+    assert!(lines[0].starts_with("QUEUE"), "{listed}");
+    let row = |queue: &str| {
+        lines
+            .iter()
+            .find(|line| line.starts_with(&format!("{queue} ")))
+            .map(|line| line.split_whitespace().collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("no {queue}: {listed}"))
+    };
+    assert_eq!(row("mr-review"), ["mr-review", "on_episodes", "1", "1"]);
+    assert_eq!(row("jira-new"), ["jira-new", "always", "1", "0"]);
+    assert_eq!(row("nobody-serves"), ["nobody-serves", "-", "0", "1"]);
+
+    let shown = fx.cli(&["queue", "show", "mr-review"]).await.unwrap();
+    assert!(shown.starts_with("Queue: mr-review\n"), "{shown}");
+    assert!(shown.contains("Mode: on_episodes"), "{shown}");
+    assert!(shown.contains("  gitlab-mr "), "{shown}");
+    assert!(shown.contains("cron '*/5 * * * *' (UTC)"), "{shown}");
+    assert!(shown.contains("Entries (oldest first):"), "{shown}");
+    assert!(shown.contains("  task-1 "), "{shown}");
+    assert!(shown.contains("review_work"), "{shown}");
+    assert!(shown.contains(" 4m\n"), "the entry waits 4m: {shown}");
+    assert!(
+        shown.contains("    params: mr_url=https://gitlab/a/-/merge_requests/17"),
+        "{shown}"
+    );
+    assert!(shown.contains("    gitlab-mr: no run yet"), "{shown}");
+
+    let unserved = fx.cli(&["queue", "show", "nobody-serves"]).await.unwrap();
+    assert!(
+        unserved.contains("Mode: - (no observer serves it)"),
+        "{unserved}"
+    );
+    assert!(
+        unserved.contains("Observers: none; its entries wait for a person"),
+        "{unserved}"
+    );
+    let empty = fx.cli(&["queue", "show", "jira-new"]).await.unwrap();
+    assert!(empty.contains("Entries: none"), "{empty}");
+}
+
+#[tokio::test]
+async fn queue_show_marks_a_newest_version_that_is_not_approved() {
+    // Covers AE10 by the CLI.
+    let fx = Fixture::new();
+    fx.cli(CREATE_REVIEW).await.unwrap();
+    let first = fx.script_file("v1.sh", "true\n");
+    let second = fx.script_file("v2.sh", "echo changed\n");
+    fx.cli(&["script", "set", "gitlab-mr", "--file", &first])
+        .await
+        .unwrap();
+    let draft = fx.cli(&["queue", "show", "mr-review"]).await.unwrap();
+    assert!(
+        draft.contains("    script: version 1 not approved"),
+        "{draft}"
+    );
+
+    fx.cli(&["approve", "gitlab-mr", "--version", "1"])
+        .await
+        .unwrap();
+    let approved = fx.cli(&["queue", "show", "mr-review"]).await.unwrap();
+    assert!(!approved.contains("not approved"), "{approved}");
+
+    fx.cli(&["script", "set", "gitlab-mr", "--file", &second])
+        .await
+        .unwrap();
+    let shown = fx.cli(&["queue", "show", "mr-review"]).await.unwrap();
+    assert!(shown.contains("v1 (draft v2)"), "{shown}");
+    assert!(
+        shown.contains(
+            "    script: version 2 not approved: approve it with `narsor-cli observer approve \
+             gitlab-mr --version 2`"
+        ),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn another_owners_queue_is_not_found() {
+    let fx = Fixture::new();
+    fx.cli(CREATE_REVIEW).await.unwrap();
+    add_entry(&fx, "mr-review", "task-1", "input-1");
+    let stranger = ServiceApi {
+        service: Arc::clone(&fx.service),
+        owner: OwnerRef::new("someone-else"),
+    };
+    let parse = |args: &[&str]| {
+        let mut argv = vec!["narsor-cli", "observer"];
+        argv.extend_from_slice(args);
+        let Command::Observer { command } = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("not an observer command");
+        };
+        command
+    };
+
+    let error = operate(
+        &stranger,
+        parse(&["queue", "show", "mr-review"]),
+        None,
+        Utc::now,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.exit_code, 1);
+    assert_eq!(error.message, "Could not read queue 'mr-review': not found");
+
+    let listed = operate(&stranger, parse(&["queue", "list"]), None, Utc::now)
+        .await
+        .unwrap();
+    assert!(listed.starts_with("No queues."), "{listed}");
+
+    let error = operate(
+        &stranger,
+        parse(&["update", "gitlab-mr", "--queue", "mine"]),
+        None,
+        Utc::now,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.exit_code, 1);
+    assert!(error.message.contains("not found"), "{}", error.message);
 }
 
 #[test]

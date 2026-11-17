@@ -3,6 +3,8 @@
 //! | command | who | what |
 //! | --- | --- | --- |
 //! | `observer create\|list\|show\|delete` | the owner | manages observers |
+//! | `observer update` | the owner | changes an observer's queue, mode and schedule |
+//! | `observer queue list\|show` | the owner | reads the queues: observers and gate entries |
 //! | `observer script set --file` | the owner | saves the next, immutable script version (never approved by saving) |
 //! | `observer approve --version\|pause\|resume` | the owner | decides what runs on schedule |
 //!
@@ -23,15 +25,17 @@ use futures::future::BoxFuture;
 
 use super::commands::{CliError, Result};
 use super::observer_text::{
-    observer_changed_output, observer_list_output, observer_show_output, script_saved_output,
+    observer_changed_output, observer_list_output, observer_show_output, observer_updated_output,
+    queue_list_output, queue_show_output, script_saved_output,
 };
 use super::remote::{failure, parse_workspaces, split_pair};
 use crate::api::{ApiClient, ClientError, ServerTarget};
 use crate::config::Flags;
 use crate::controller_protocol::{
     ApproveObserverRequest, CreateObserverRequest, ObserverDetailView, ObserverEffectRequest,
-    ObserverListResponse, ObserverMode, ObserverScriptView, ObserverSecretRef, ObserverView,
-    SetObserverScriptRequest,
+    ObserverListResponse, ObserverMode, ObserverQueueListResponse, ObserverQueueView,
+    ObserverScriptView, ObserverSecretRef, ObserverView, SetObserverScriptRequest,
+    UpdateObserverRequest,
 };
 use crate::domain::without_unsafe_chars;
 
@@ -41,6 +45,10 @@ pub enum ObserverCommand {
     /// Creates a draft observer. Nothing runs until a script version is
     /// saved and approved.
     Create(Box<CreateArgs>),
+
+    /// Changes an observer's queue, mode or schedule; what is left out
+    /// stays. Every observer of a queue keeps the same mode.
+    Update(UpdateArgs),
 
     /// Lists your observers: state, script versions, last and next run,
     /// the last error, and a warning when no worker claims due runs.
@@ -93,6 +101,62 @@ pub enum ObserverCommand {
         #[arg(value_name = "OBSERVER")]
         observer: String,
     },
+
+    /// Reads your queues: the observers that serve them and the gate
+    /// episodes that wait on them.
+    Queue {
+        /// What to do.
+        #[command(subcommand)]
+        command: QueueCommand,
+    },
+}
+
+/// `narsor-cli observer queue …`.
+#[derive(Debug, Subcommand)]
+pub enum QueueCommand {
+    /// Lists your queues with their mode and how many observers serve them
+    /// and how many gate episodes wait on them.
+    List,
+
+    /// Shows one queue: its observers and its entries (task, step,
+    /// episode, start, params) with how each observer processed them.
+    Show {
+        /// The queue's name.
+        #[arg(value_name = "QUEUE")]
+        queue: String,
+    },
+}
+
+/// `narsor-cli observer update`: at least one change.
+#[derive(Debug, clap::Args)]
+#[command(group(
+    clap::ArgGroup::new("change")
+        .required(true)
+        .multiple(true)
+        .args(["queue", "mode", "interval", "cron"])
+))]
+pub struct UpdateArgs {
+    /// The observer's name or id.
+    #[arg(value_name = "OBSERVER")]
+    pub observer: String,
+
+    /// The queue it serves from now on.
+    #[arg(long, value_name = "QUEUE")]
+    pub queue: Option<String>,
+
+    /// Its run mode from now on: `on_episodes` or `always`. It must be the
+    /// mode of the other observers of the queue it then serves.
+    #[arg(long, value_name = "MODE", value_parser = ["on_episodes", "always"])]
+    pub mode: Option<String>,
+
+    /// A new schedule: seconds between runs (at least 60).
+    #[arg(long, value_name = "SECONDS", conflicts_with = "cron")]
+    pub interval: Option<u64>,
+
+    /// A new schedule: a cron expression of five fields, in UTC, like
+    /// '*/10 * * * *'.
+    #[arg(long, value_name = "EXPRESSION")]
+    pub cron: Option<String>,
 }
 
 /// `narsor-cli observer create`.
@@ -186,6 +250,57 @@ pub struct CreateArgs {
     /// than only remember where to start from.
     #[arg(long)]
     pub import_backlog: bool,
+
+    /// Removed with the watch lists: accepted only to name its replacement.
+    #[arg(long, hide = true)]
+    pub deliver_events: bool,
+
+    /// Removed with the watch lists: accepted only to name its replacement.
+    #[arg(long, hide = true)]
+    pub watch_list: bool,
+
+    /// Removed with the watch lists: accepted only to name its replacement.
+    #[arg(long = "allow-prefix", value_name = "PREFIX", hide = true)]
+    pub allowed_prefixes: Vec<String>,
+
+    /// Removed with the watch lists: accepted only to name its replacement.
+    #[arg(long = "max-object-len", value_name = "N", hide = true)]
+    pub max_object_len: Option<String>,
+}
+
+/// The usage error of a flag of `observer create` that went with the watch
+/// lists, naming what replaces it; `None` when no removed flag is given.
+fn removed_flag(args: &CreateArgs) -> Option<CliError> {
+    let (flag, replacement) = if args.deliver_events {
+        (
+            "--deliver-events",
+            "serve a gate's queue with --queue QUEUE --mode on_episodes; the script answers \
+             the gate with `narsor-cli task decide`",
+        )
+    } else if args.watch_list {
+        (
+            "--watch-list",
+            "use --queue QUEUE --mode on_episodes: the script runs for the gate episodes that \
+             wait on the queue",
+        )
+    } else if !args.allowed_prefixes.is_empty() {
+        (
+            "--allow-prefix",
+            "use --queue QUEUE: the entries of a queue come from gates with a `watch` block, \
+             not from objects you add",
+        )
+    } else if args.max_object_len.is_some() {
+        (
+            "--max-object-len",
+            "use --queue QUEUE: the entries of a queue come from gates with a `watch` block, \
+             not from objects you add",
+        )
+    } else {
+        return None;
+    };
+    Some(CliError::usage(format!(
+        "{flag} was removed with the watch lists — {replacement}."
+    )))
 }
 
 /// `narsor-cli observer script …`.
@@ -214,6 +329,10 @@ pub async fn observer(
     // control plane.
     let create = match &command {
         ObserverCommand::Create(args) => Some(create_observer_request(args)?),
+        ObserverCommand::Update(args) => {
+            update_observer_request(args)?;
+            None
+        }
         _ => None,
     };
     let client = crate::api::connect(target, state, flags)
@@ -242,11 +361,29 @@ pub trait ObserverApi: Send + Sync {
         observer: &'a str,
     ) -> BoxFuture<'a, std::result::Result<ObserverDetailView, ClientError>>;
 
+    /// Changes an observer's queue, mode or schedule.
+    fn update_observer<'a>(
+        &'a self,
+        observer: &'a str,
+        request: &'a UpdateObserverRequest,
+    ) -> BoxFuture<'a, std::result::Result<ObserverView, ClientError>>;
+
     /// Deletes an observer.
     fn delete_observer<'a>(
         &'a self,
         observer: &'a str,
     ) -> BoxFuture<'a, std::result::Result<ObserverView, ClientError>>;
+
+    /// The caller's queues.
+    fn observer_queues(
+        &self,
+    ) -> BoxFuture<'_, std::result::Result<ObserverQueueListResponse, ClientError>>;
+
+    /// One queue of the caller with its observers and entries.
+    fn observer_queue<'a>(
+        &'a self,
+        queue: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<ObserverQueueView, ClientError>>;
 
     /// Saves the next script version.
     fn set_observer_script<'a>(
@@ -294,11 +431,32 @@ impl ObserverApi for ApiClient {
         Box::pin(ApiClient::observer(self, observer))
     }
 
+    fn update_observer<'a>(
+        &'a self,
+        observer: &'a str,
+        request: &'a UpdateObserverRequest,
+    ) -> BoxFuture<'a, std::result::Result<ObserverView, ClientError>> {
+        Box::pin(ApiClient::update_observer(self, observer, request))
+    }
+
     fn delete_observer<'a>(
         &'a self,
         observer: &'a str,
     ) -> BoxFuture<'a, std::result::Result<ObserverView, ClientError>> {
         Box::pin(ApiClient::delete_observer(self, observer))
+    }
+
+    fn observer_queues(
+        &self,
+    ) -> BoxFuture<'_, std::result::Result<ObserverQueueListResponse, ClientError>> {
+        Box::pin(ApiClient::observer_queues(self))
+    }
+
+    fn observer_queue<'a>(
+        &'a self,
+        queue: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<ObserverQueueView, ClientError>> {
+        Box::pin(ApiClient::observer_queue(self, queue))
     }
 
     fn set_observer_script<'a>(
@@ -339,6 +497,9 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 300;
 /// The create request of `observer create`, checked locally: a mapping,
 /// workspace, secret or condition that does not parse is a usage error.
 pub fn create_observer_request(args: &CreateArgs) -> Result<CreateObserverRequest> {
+    if let Some(error) = removed_flag(args) {
+        return Err(error);
+    }
     let effect = match &args.workflow {
         None => None,
         Some(workflow) => {
@@ -363,17 +524,7 @@ pub fn create_observer_request(args: &CreateArgs) -> Result<CreateObserverReques
             })
         }
     };
-    let mode = match args.mode.as_deref() {
-        None => None,
-        Some("on_episodes") => Some(ObserverMode::OnEpisodes),
-        Some("always") => Some(ObserverMode::Always),
-        Some(other) => {
-            return Err(CliError::usage(format!(
-                "Invalid --mode '{}' — expected on_episodes or always.",
-                without_unsafe_chars(other)
-            )))
-        }
-    };
+    let mode = parse_mode(args.mode.as_deref())?;
     // The server needs one of the two; the CLI keeps its default interval.
     let interval_secs = match (&args.interval, &args.cron) {
         (None, None) => Some(DEFAULT_INTERVAL_SECS),
@@ -414,6 +565,41 @@ pub fn create_observer_request(args: &CreateArgs) -> Result<CreateObserverReques
     })
 }
 
+/// The `--mode` of `create` or `update`.
+fn parse_mode(mode: Option<&str>) -> Result<Option<ObserverMode>> {
+    match mode {
+        None => Ok(None),
+        Some("on_episodes") => Ok(Some(ObserverMode::OnEpisodes)),
+        Some("always") => Ok(Some(ObserverMode::Always)),
+        Some(other) => Err(CliError::usage(format!(
+            "Invalid --mode '{}' — expected on_episodes or always.",
+            without_unsafe_chars(other)
+        ))),
+    }
+}
+
+/// The update request of `observer update`, checked locally: no change, a
+/// mode that is not one, or both schedules are usage errors.
+pub fn update_observer_request(args: &UpdateArgs) -> Result<UpdateObserverRequest> {
+    if args.interval.is_some() && args.cron.is_some() {
+        return Err(CliError::usage(
+            "Give --interval or --cron, not both: each one replaces the schedule.",
+        ));
+    }
+    let request = UpdateObserverRequest {
+        queue: args.queue.clone(),
+        mode: parse_mode(args.mode.as_deref())?,
+        interval_secs: args.interval,
+        cron: args.cron.clone(),
+    };
+    if request.is_empty() {
+        return Err(CliError::usage(
+            "Nothing to change — give --queue, --mode, --interval or --cron.",
+        ));
+    }
+    Ok(request)
+}
+
 /// Runs one of the owner's observer commands on `api` and returns what it
 /// prints. `create` is [`create_observer_request`] of a `create` command,
 /// and `now` the clock ages are measured with.
@@ -446,6 +632,34 @@ where
                 without_unsafe_chars(&created.state),
                 name
             ))
+        }
+        ObserverCommand::Update(args) => {
+            let request = update_observer_request(&args)?;
+            let updated = api
+                .update_observer(&args.observer, &request)
+                .await
+                .map_err(|error| failure("Could not update the observer", error))?;
+            Ok(observer_updated_output(&updated))
+        }
+        ObserverCommand::Queue {
+            command: QueueCommand::List,
+        } => {
+            let listing = api
+                .observer_queues()
+                .await
+                .map_err(|error| failure("Could not list the queues", error))?;
+            Ok(queue_list_output(&listing))
+        }
+        ObserverCommand::Queue {
+            command: QueueCommand::Show { queue },
+        } => {
+            let view = api.observer_queue(&queue).await.map_err(|error| {
+                failure(
+                    &format!("Could not read queue '{}'", without_unsafe_chars(&queue)),
+                    error,
+                )
+            })?;
+            Ok(queue_show_output(&view, now()))
         }
         ObserverCommand::List => {
             let listing = api
