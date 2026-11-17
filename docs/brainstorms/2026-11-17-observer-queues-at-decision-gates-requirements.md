@@ -315,8 +315,9 @@ Two more problems of the current design:
 
 ## Key Decisions
 
-- **The schedule belongs to the observer, not to the queue.** The request
-  was a queue schedule. We recommend against it, for these reasons:
+- **The schedule belongs to the observer, not to the queue.** Decided by
+  the person (PR thread Q1). The request was a queue schedule; we argued
+  against it, for these reasons:
   - The observer already has a schedule (`interval_secs`), a script with
     versions, an approval and a failure backoff. A queue schedule would
     need a second place for each of them, or a queue object (against R6).
@@ -330,9 +331,8 @@ Two more problems of the current design:
 
   The view groups observers by queue, so the owner still sees "the queue's
   schedule" as the list of its observers' schedules. If the person still
-  wants one schedule per queue, the cost is a queue object (name, mode,
-  schedule), and R26 then becomes simpler. This is the only change needed
-  in the requirements.
+  wants one schedule per queue later, the cost is a queue object (name,
+  mode, schedule), and R26 then becomes simpler.
 - **The run mode, not the schedule, separates Jira from MR review.** One
   scheduler serves both. `always` runs on each tick. `on_episodes` runs
   only when entries exist. Both use the same cron setting.
@@ -388,7 +388,6 @@ Assumptions:
 - Neither the TUI (`src/tui`) nor the WebUI (`crates/narsor-web/ui`) has an
   observer view today.
 - Safe assumptions taken without asking the person (change them if wrong):
-  - The schedule stays on the observer (Key Decisions).
   - Cron is in UTC, five fields.
   - A queue is required for every observer. Existing observers without a
     queue get one named after the observer.
@@ -406,6 +405,8 @@ Assumptions:
 
 ### Resolved
 
+- Q1: the schedule lives on the observer, not on the queue (decided by the
+  person; Key Decisions).
 - `watch` applies only to `by: human` (R3).
 - `task decide` carries no artifacts in this version (R12).
 - TUI: no run state on the task, at most an icon; a separate queues view
