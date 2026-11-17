@@ -79,7 +79,8 @@ use super::dto::{
 use crate::controller_protocol::ConductorReadResponse;
 use narsor_protocol::controller::{
     ApproveObserverRequest, CreateObserverRequest, ObserverDetailView, ObserverListResponse,
-    ObserverScriptView, ObserverView, SetObserverScriptRequest,
+    ObserverQueueListResponse, ObserverQueueView, ObserverScriptView, ObserverView,
+    SetObserverScriptRequest, UpdateObserverRequest,
 };
 use narsor_protocol::controller::{
     CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
@@ -877,6 +878,32 @@ impl ApiClient {
         self.get_json(&url).await
     }
 
+    /// Changes the queue, mode or schedule of an observer —
+    /// `PATCH /control/v1/observers/{observer}`.
+    pub async fn update_observer(
+        &self,
+        observer: &str,
+        request: &UpdateObserverRequest,
+    ) -> Result<ObserverView, ClientError> {
+        let url = self.observer_url(observer, "")?;
+        self.patch_json(&url, request).await
+    }
+
+    /// The caller's queues with their counts —
+    /// `GET /control/v1/observer-queues`.
+    pub async fn observer_queues(&self) -> Result<ObserverQueueListResponse, ClientError> {
+        let url = format!("{}/control/v1/observer-queues", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// One queue of the caller with its observers and entries —
+    /// `GET /control/v1/observer-queues/{queue}`.
+    pub async fn observer_queue(&self, queue: &str) -> Result<ObserverQueueView, ClientError> {
+        let queue = path_segment("queue", queue)?;
+        let url = format!("{}/control/v1/observer-queues/{queue}", self.base_url);
+        self.get_json(&url).await
+    }
+
     /// Deletes an observer with every file of it.
     pub async fn delete_observer(&self, observer: &str) -> Result<ObserverView, ClientError> {
         let url = self.observer_url(observer, "")?;
@@ -1155,6 +1182,20 @@ impl ApiClient {
         let response = self
             .send(&self.http, |http, token| {
                 http.put(url).bearer_auth(token).json(body)
+            })
+            .await?;
+        handle_json_response(response).await
+    }
+
+    /// `PATCH url` with a JSON body, decoding the response as `T`.
+    async fn patch_json<B: Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<T, ClientError> {
+        let response = self
+            .send(&self.http, |http, token| {
+                http.patch(url).bearer_auth(token).json(body)
             })
             .await?;
         handle_json_response(response).await

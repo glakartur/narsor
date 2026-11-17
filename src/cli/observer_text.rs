@@ -194,10 +194,10 @@ pub fn observer_show_output(detail: &ObserverDetailView, now: DateTime<Utc>) -> 
     if let Some(warning) = worker_warning(observer, now) {
         line(format!("Warning: {warning}"));
     }
-    if !detail.mapping.is_empty() {
+    if !observer.mapping.is_empty() {
         line(format!(
             "Mapping: {}",
-            detail
+            observer
                 .mapping
                 .iter()
                 .map(|(input, field)| format!("{} <- {}", clean(input), clean(field)))
@@ -205,10 +205,10 @@ pub fn observer_show_output(detail: &ObserverDetailView, now: DateTime<Utc>) -> 
                 .join(", ")
         ));
     }
-    if !detail.secrets.is_empty() {
+    if !observer.secrets.is_empty() {
         line(format!(
             "Secrets: {}",
-            detail
+            observer
                 .secrets
                 .iter()
                 .map(|secret| format!("{} (file {})", clean(&secret.env), clean(&secret.name)))

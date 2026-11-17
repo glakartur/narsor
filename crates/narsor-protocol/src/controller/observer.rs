@@ -5,7 +5,8 @@
 //! * the worker routes `narsor-observer-worker` calls with the key the
 //!   server gave it (`/observer/v1/worker/…`): claim a run, report its
 //!   result;
-//! * the owner routes of the observers themselves (`/control/v1/observers`).
+//! * the owner routes of the observers themselves (`/control/v1/observers`)
+//!   and of their queues (`/control/v1/observer-queues`).
 
 use std::collections::BTreeMap;
 
@@ -357,10 +358,20 @@ pub struct ObserverView {
     pub cron: Option<String>,
     /// Most tasks one run may create.
     pub task_limit_per_run: u32,
+    /// The secret references handed to the script (never values). Read
+    /// only in the queues view: the owner sets them in the CLI (R34).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<ObserverSecretRef>,
+    /// Workflow input name → effect data field, for a "create a task"
+    /// observer. Read only in the queues view, as `secrets` (R34).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mapping: BTreeMap<String, String>,
     /// The only version the schedule runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_version: Option<u32>,
-    /// The newest script version, approved or not.
+    /// The newest script version, approved or not. The schedule never runs
+    /// it before the owner approves it: a view marks the observer while it
+    /// differs from `approved_version` (R32, AE10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_version: Option<u32>,
     /// When the next scheduled run is due.
@@ -446,17 +457,11 @@ pub struct ObserverRunErrorView {
 /// `GET /control/v1/observers/{observer}`: one observer in detail.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ObserverDetailView {
-    /// What `observer list` shows.
+    /// What `observer list` shows, with the secret references and the
+    /// mapping.
     pub observer: ObserverView,
     /// Parameters handed to the script.
     pub condition: Value,
-    /// Workflow input name → effect data field, for a "create a task"
-    /// observer.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub mapping: BTreeMap<String, String>,
-    /// The secret references (never values).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub secrets: Vec<ObserverSecretRef>,
     /// Every script version, oldest first.
     #[serde(default)]
     pub scripts: Vec<ObserverScriptView>,
@@ -480,4 +485,142 @@ pub struct SetObserverScriptRequest {
 pub struct ApproveObserverRequest {
     /// The script version the schedule runs from now on.
     pub version: u32,
+}
+
+/// `PATCH /control/v1/observers/{observer}`: a new queue, mode or schedule
+/// of an observer (R31, R35). A field left out stays as it is; at least one
+/// must be given. `interval_secs` and `cron` replace the schedule, so at
+/// most one of them may be given.
+///
+/// The observer must keep the mode of the queue it then serves (R26): the
+/// owner moves or deletes the other observers of a queue first to change
+/// the queue's mode.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateObserverRequest {
+    /// The queue it serves from now on, in the owner's namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
+    /// Its run mode from now on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ObserverMode>,
+    /// A new interval schedule, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
+    /// A new cron schedule: five fields, evaluated in UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+}
+
+impl UpdateObserverRequest {
+    /// Whether the request changes nothing.
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_none()
+            && self.mode.is_none()
+            && self.interval_secs.is_none()
+            && self.cron.is_none()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The owner's queues (`/control/v1/observer-queues`)
+// ---------------------------------------------------------------------------
+
+/// One queue of the caller, as `observer queue list` shows it. A queue is a
+/// name, not an object (R6): the caller's observers that serve it and the
+/// entries of the caller's gates that name it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserverQueueSummary {
+    /// The queue's name.
+    pub queue: String,
+    /// The mode of its observers (`on_episodes` or `always`); absent when
+    /// no observer serves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// How many observers serve it.
+    pub observers: u32,
+    /// How many gate episodes wait on it.
+    pub entries: u32,
+}
+
+/// `GET /control/v1/observer-queues`: the caller's queues, by name.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserverQueueListResponse {
+    /// By name.
+    pub queues: Vec<ObserverQueueSummary>,
+}
+
+/// The newest error of one observer's runs for one queue entry (R23). A
+/// newer error of the same entry replaces it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueueEntryErrorView {
+    /// The run (`{observer}.{sequence}`).
+    pub run_id: String,
+    /// Why it ended so (`failed`, `timed_out`, `invalid_output`,
+    /// `worker_error`, `lost`).
+    pub status: String,
+    /// When it ended, or was found lost.
+    pub finished_at: DateTime<Utc>,
+    /// The script's exit code, when it exited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// What went wrong.
+    pub error: String,
+}
+
+/// How one observer of the queue processed one entry, as far as the
+/// control plane knows it (R23).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueueEntryObserverView {
+    /// The observer's name.
+    pub observer: String,
+    /// A run of the observer checks the entry now.
+    #[serde(default)]
+    pub running: bool,
+    /// When a run of the observer for the entry last ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<DateTime<Utc>>,
+    /// The newest error of the observer's runs for the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<QueueEntryErrorView>,
+}
+
+/// One entry of a queue: one wait episode of a `decision` gate with a
+/// `watch` block.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueueEntryView {
+    /// The entry's id, as a run error names it.
+    pub entry_id: String,
+    /// The task waiting at the gate.
+    pub task_id: String,
+    /// The workflow state of the gate.
+    pub step: String,
+    /// The wait episode.
+    pub episode: String,
+    /// When the episode began, as the control plane saw it.
+    pub started_at: DateTime<Utc>,
+    /// The gate's rendered params.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
+    /// Per observer of the queue, by name: how it processed the entry.
+    #[serde(default)]
+    pub observers: Vec<QueueEntryObserverView>,
+}
+
+/// `GET /control/v1/observer-queues/{queue}`: one queue of the caller, with
+/// its observers and its entries. Another owner's queue of the same name
+/// is not found (R7).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserverQueueView {
+    /// The queue's name.
+    pub queue: String,
+    /// The mode of its observers; absent when no observer serves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Its observers, by name.
+    #[serde(default)]
+    pub observers: Vec<ObserverView>,
+    /// Its entries, oldest first.
+    #[serde(default)]
+    pub entries: Vec<QueueEntryView>,
 }

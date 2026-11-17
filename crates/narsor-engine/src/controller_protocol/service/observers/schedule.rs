@@ -31,6 +31,8 @@
 //!                 anything else                         → error file (it replaces the
 //!                                                         entry's older error), the entry
 //!                                                         stays; no backoff
+//!                 either way                            → the entry's last run time
+//!                                                         (the queues view, R23)
 //! ```
 //!
 //! The next due time counts from the tick, never from the end of a run
@@ -543,6 +545,9 @@ impl ProtocolService {
             )?;
         }
         record.active_run = None;
+        if let Some(entry) = &active.entry {
+            record.entry_last_runs.insert(entry.entry_id.clone(), now);
+        }
         let last_run = LastRun {
             sequence: active.sequence,
             status,
@@ -607,6 +612,10 @@ impl ProtocolService {
                 self.restore_queue_entries(&record.owner, &record.config.queue);
             let (remaining, removed) = self.prune_entries(&record)?;
             pass.entries_removed += removed;
+            // The last runs of entries that left the queue are of no use.
+            record
+                .entry_last_runs
+                .retain(|entry_id, _| remaining.iter().any(|entry| &entry.entry_id == entry_id));
             if remaining.is_empty() {
                 self.observers.save(&lock, &mut record, now)?;
                 pass.skipped.push(observer_id.clone());
@@ -691,6 +700,9 @@ impl ProtocolService {
             },
         )?;
         record.active_run = None;
+        if let Some(entry) = &active.entry {
+            record.entry_last_runs.insert(entry.entry_id.clone(), now);
+        }
         record.last_run = Some(LastRun {
             sequence: active.sequence,
             status: RunStatus::Lost,

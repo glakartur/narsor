@@ -71,9 +71,11 @@ pub use narsor_protocol::controller::{
 pub use narsor_protocol::controller::{
     ApproveObserverRequest, CreateObserverRequest, ObserverClaimResponse, ObserverDetailView,
     ObserverEffectRequest, ObserverLastRunView, ObserverListResponse, ObserverMode,
-    ObserverRunErrorView, ObserverRunOutcome, ObserverRunReport, ObserverRunResultResponse,
-    ObserverScriptView, ObserverSecretRef, ObserverView, ObserverWorkerRun,
-    SetObserverScriptRequest, OBSERVER_WORKER_KEY_ENV,
+    ObserverQueueListResponse, ObserverQueueSummary, ObserverQueueView, ObserverRunErrorView,
+    ObserverRunOutcome, ObserverRunReport, ObserverRunResultResponse, ObserverScriptView,
+    ObserverSecretRef, ObserverView, ObserverWorkerRun, QueueEntryErrorView,
+    QueueEntryObserverView, QueueEntryView, SetObserverScriptRequest, UpdateObserverRequest,
+    OBSERVER_WORKER_KEY_ENV,
 };
 pub use narsor_protocol::controller::{
     TaskDefaultHarness, WORKSTATION_RISK, WORKSTATION_RISK_NOT_ACCEPTED,

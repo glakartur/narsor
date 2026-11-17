@@ -1217,3 +1217,454 @@ fn the_runner_channel_keeps_the_queue_entry_in_step_with_the_gate() {
     let record = fx.service.control_plane().task(&task).unwrap();
     assert_eq!(record.watched_gate, None);
 }
+
+// -- the owner's update and queues (R23, R24, R26, R31–R35) ----------------
+
+fn update(
+    queue: Option<&str>,
+    mode: Option<ObserverMode>,
+    interval_secs: Option<u64>,
+    cron: Option<&str>,
+) -> crate::controller_protocol::wire::UpdateObserverRequest {
+    crate::controller_protocol::wire::UpdateObserverRequest {
+        queue: queue.map(str::to_string),
+        mode,
+        interval_secs,
+        cron: cron.map(str::to_string),
+    }
+}
+
+/// The code and message of a refusal.
+fn refusal(error: ProtocolError) -> (&'static str, String) {
+    match error {
+        ProtocolError::BadRequest { code, message } | ProtocolError::Conflict { code, message } => {
+            (code, message)
+        }
+        other => panic!("not a coded refusal: {other:?}"),
+    }
+}
+
+#[test]
+fn the_queue_list_counts_entries_and_the_queue_shows_observers_and_entries() {
+    // R23, R24: the owner's queues with counts; a queue's observers and
+    // entries, and per entry and observer the last run and newest error.
+    let fx = Fixture::new();
+    let gitlab = fx.active_of(owner(), "gitlab-mr", "mr-review", ObserverMode::OnEpisodes);
+    let github = fx.active_of(owner(), "github-pr", "mr-review", ObserverMode::OnEpisodes);
+    fx.active_of(owner(), "jira-new", "jira-intake", ObserverMode::Always);
+    let task = fx.task("task-1");
+    let entry = fx.entry("mr-review", &task, "input-1");
+
+    let listed = fx.service.observer_queues_of(&owner()).unwrap();
+    let summary: Vec<_> = listed
+        .queues
+        .iter()
+        .map(|queue| {
+            (
+                queue.queue.as_str(),
+                queue.mode.as_deref(),
+                queue.observers,
+                queue.entries,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("jira-intake", Some("always"), 1, 0),
+            ("mr-review", Some("on_episodes"), 2, 1),
+        ]
+    );
+
+    // The pass hands the entry to both observers: GitLab's run fails, the
+    // GitHub one's is still running.
+    fx.service.observer_pass();
+    let mut claims = Vec::new();
+    while let Some(claimed) = fx.claim() {
+        claims.push(claimed);
+    }
+    let gitlab_run = claims
+        .iter()
+        .find(|claimed| claimed.run_id.observer_id == gitlab)
+        .unwrap();
+    assert!(claims
+        .iter()
+        .any(|claimed| claimed.run_id.observer_id == github));
+    fx.advance(30);
+    fx.finish(gitlab_run, exited(2, ""));
+
+    let shown = fx.service.observer_queue(&owner(), "mr-review").unwrap();
+    assert_eq!(shown.queue, "mr-review");
+    assert_eq!(shown.mode.as_deref(), Some("on_episodes"));
+    let names: Vec<_> = shown.observers.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(names, vec!["github-pr", "gitlab-mr"]);
+    assert_eq!(shown.entries.len(), 1);
+    let view = &shown.entries[0];
+    assert_eq!(view.entry_id, entry.entry_id);
+    assert_eq!(view.task_id, "task-1");
+    assert_eq!(view.step, "review_work");
+    assert_eq!(view.episode, "input-1");
+    assert_eq!(view.started_at, entry.created_at);
+    assert_eq!(view.params["mr_url"], "https://x/task-1");
+    let processing: Vec<_> = view
+        .observers
+        .iter()
+        .map(|state| {
+            (
+                state.observer.as_str(),
+                state.running,
+                state.last_run_at,
+                state
+                    .last_error
+                    .as_ref()
+                    .map(|error| (error.status.as_str(), error.exit_code)),
+            )
+        })
+        .collect();
+    assert_eq!(
+        processing,
+        vec![
+            ("github-pr", true, None, None),
+            (
+                "gitlab-mr",
+                false,
+                Some(fx.now()),
+                Some(("failed", Some(2)))
+            ),
+        ]
+    );
+    let gitlab_view = shown
+        .observers
+        .iter()
+        .find(|observer| observer.name == "gitlab-mr")
+        .unwrap();
+    assert_eq!(
+        gitlab_view.last_run.as_ref().unwrap().finished_at,
+        fx.now(),
+        "the observer's last run"
+    );
+}
+
+#[test]
+fn a_queue_view_shows_the_read_only_settings_of_its_observers() {
+    // R34: secret references, the task limit and the mapping are shown.
+    let fx = Fixture::new();
+    fx.active_of(owner(), "jira-new", "jira-intake", ObserverMode::Always);
+
+    let shown = fx.service.observer_queue(&owner(), "jira-intake").unwrap();
+
+    let observer = &shown.observers[0];
+    assert_eq!(observer.secrets.len(), 1);
+    assert_eq!(observer.secrets[0].name, "jira-token");
+    assert_eq!(observer.secrets[0].env, "JIRA_TOKEN");
+    assert_eq!(observer.mapping["ticket"], "key");
+    assert_eq!(observer.workflow_id.as_deref(), Some("triage"));
+    assert!(observer.task_limit_per_run > 0);
+    assert!(shown.entries.is_empty());
+    // The detail shows the same, once.
+    let detail = fx.service.observer_detail(&owner(), "jira-new").unwrap();
+    assert_eq!(detail.observer.secrets, observer.secrets);
+    assert_eq!(detail.observer.mapping, observer.mapping);
+}
+
+#[test]
+fn another_owners_queue_is_not_found_and_not_listed() {
+    // R7: a queue name is the owner's; another owner's queue of the same
+    // name, or a name nothing of the caller's names, is not found.
+    let fx = Fixture::new();
+    fx.active_of(owner(), "gitlab-mr", "mr-review", ObserverMode::OnEpisodes);
+    let task = fx.task("task-1");
+    fx.entry("mr-review", &task, "input-1");
+    let stranger = OwnerRef::new("someone-else");
+    fx.active_of(
+        stranger.clone(),
+        "foreign-jira",
+        "jira-intake",
+        ObserverMode::Always,
+    );
+
+    for queue in ["mr-review", "nothing-here"] {
+        assert!(
+            matches!(
+                fx.service.observer_queue(&stranger, queue),
+                Err(ProtocolError::NotFound)
+            ),
+            "{queue}"
+        );
+    }
+    assert!(matches!(
+        fx.service.observer_queue(&owner(), "jira-intake"),
+        Err(ProtocolError::NotFound)
+    ));
+    let theirs = fx.service.observer_queues_of(&stranger).unwrap();
+    let names: Vec<_> = theirs.queues.iter().map(|q| q.queue.as_str()).collect();
+    assert_eq!(names, vec!["jira-intake"]);
+    assert_eq!(theirs.queues[0].entries, 0);
+    assert!(matches!(
+        fx.service
+            .update_observer(&stranger, "gitlab-mr", update(Some("x"), None, None, None)),
+        Err(ProtocolError::NotFound)
+    ));
+}
+
+#[test]
+fn a_queue_with_entries_and_no_observer_is_listed_without_a_mode() {
+    // The gate names a queue no observer serves (R9): the owner still sees
+    // the waiting episode.
+    let fx = Fixture::new();
+    let task = fx.task("task-1");
+    fx.entry("orphan", &task, "input-1");
+
+    let listed = fx.service.observer_queues_of(&owner()).unwrap();
+    assert_eq!(listed.queues.len(), 1);
+    assert_eq!(listed.queues[0].queue, "orphan");
+    assert_eq!(listed.queues[0].mode, None);
+    assert_eq!(listed.queues[0].observers, 0);
+    assert_eq!(listed.queues[0].entries, 1);
+    let shown = fx.service.observer_queue(&owner(), "orphan").unwrap();
+    assert!(shown.observers.is_empty());
+    assert!(shown.entries[0].observers.is_empty());
+}
+
+#[test]
+fn an_update_changes_queue_mode_and_schedule_and_keeps_the_rest() {
+    // R31, R35: queue, mode and schedule change; state, scripts and
+    // approval stay. The effect is not checked against the catalogue
+    // again: this service has none.
+    let fx = Fixture::new();
+    let id = fx.active("jira-new", ObserverMode::Always);
+    let before = fx.record(&id);
+    fx.advance(5);
+
+    let updated = fx
+        .service
+        .update_observer(
+            &owner(),
+            "jira-new",
+            update(Some("jira-intake"), None, None, Some("*/10 * * * *")),
+        )
+        .unwrap();
+
+    assert_eq!(updated.queue, "jira-intake");
+    assert_eq!(updated.mode, "always");
+    assert_eq!(updated.cron.as_deref(), Some("*/10 * * * *"));
+    assert_eq!(updated.interval_secs, None);
+    assert_eq!(updated.state, "active");
+    assert_eq!(updated.approved_version, Some(1));
+    let record = fx.record(&id);
+    assert_eq!(record.scripts, before.scripts);
+    assert_eq!(record.config.effect, before.config.effect);
+    // A new schedule counts its next tick from the update.
+    assert_eq!(
+        record.next_run_at,
+        Some(Utc.with_ymd_and_hms(2026, 11, 13, 12, 10, 0).unwrap())
+    );
+
+    // The only observer of its queue may change the queue's mode, and by
+    // id as well as by name.
+    let moved = fx
+        .service
+        .update_observer(
+            &owner(),
+            id.as_str(),
+            update(None, Some(ObserverMode::OnEpisodes), Some(600), None),
+        )
+        .unwrap();
+    assert_eq!(moved.mode, "on_episodes");
+    assert_eq!(moved.interval_secs, Some(600));
+    assert_eq!(moved.cron, None);
+}
+
+#[test]
+fn an_update_that_mixes_modes_or_has_a_bad_schedule_is_refused() {
+    // Covers AE8, AE9: the refusal names the queue's mode; a cron with a
+    // seconds field, an alias, a too short interval and two schedules are
+    // refused; nothing changes.
+    let fx = Fixture::new();
+    fx.active_of(owner(), "gitlab-mr", "mr-review", ObserverMode::OnEpisodes);
+    fx.active_of(owner(), "github-pr", "mr-review", ObserverMode::OnEpisodes);
+    let jira = fx.active_of(owner(), "jira-new", "jira-intake", ObserverMode::Always);
+    let before = fx.record(&jira);
+
+    let mixed = fx
+        .service
+        .update_observer(
+            &owner(),
+            "jira-new",
+            update(Some("mr-review"), None, None, None),
+        )
+        .unwrap_err();
+    let (code, message) = refusal(mixed);
+    assert_eq!(code, "queue_mode_mismatch");
+    assert!(message.contains("on_episodes"), "{message}");
+    let mixed = fx
+        .service
+        .update_observer(
+            &owner(),
+            "gitlab-mr",
+            update(None, Some(ObserverMode::Always), None, None),
+        )
+        .unwrap_err();
+    assert_eq!(refusal(mixed).0, "queue_mode_mismatch");
+
+    for (interval, cron) in [
+        (None, Some("* * * * * *")),
+        (None, Some("*/30 * * * * *")),
+        (None, Some("@hourly")),
+        (Some(10), None),
+        (Some(300), Some("*/5 * * * *")),
+    ] {
+        let refused = fx
+            .service
+            .update_observer(&owner(), "jira-new", update(None, None, interval, cron))
+            .unwrap_err();
+        assert_eq!(
+            refusal(refused).0,
+            "invalid_observer",
+            "{interval:?} {cron:?}"
+        );
+    }
+    let refused = fx
+        .service
+        .update_observer(
+            &owner(),
+            "jira-new",
+            update(Some("Not A Queue!"), None, None, None),
+        )
+        .unwrap_err();
+    assert_eq!(refusal(refused).0, "invalid_observer");
+    let empty = fx
+        .service
+        .update_observer(&owner(), "jira-new", update(None, None, None, None))
+        .unwrap_err();
+    assert_eq!(refusal(empty).0, "invalid_request");
+    assert_eq!(fx.record(&jira), before);
+
+    // AE9: a five-field expression is accepted.
+    let accepted = fx
+        .service
+        .update_observer(
+            &owner(),
+            "jira-new",
+            update(None, None, None, Some("* * * * *")),
+        )
+        .unwrap();
+    assert_eq!(accepted.cron.as_deref(), Some("* * * * *"));
+}
+
+#[test]
+fn the_view_reports_the_approved_and_the_newest_version() {
+    // Covers AE10: version 3 saved, version 2 approved; the schedule runs 2.
+    let fx = Fixture::new();
+    let id = fx.active("mr-review", ObserverMode::OnEpisodes);
+    for version in 2..=3 {
+        fx.service
+            .add_observer_script(&owner(), "mr-review", &format!("echo {version}\n"))
+            .unwrap();
+    }
+    fx.service
+        .approve_observer_version_for(&owner(), "mr-review", 2)
+        .unwrap();
+
+    let listed = fx.service.observers_of(&owner()).unwrap();
+    assert_eq!(listed.observers[0].approved_version, Some(2));
+    assert_eq!(listed.observers[0].latest_version, Some(3));
+    let shown = fx.service.observer_queue(&owner(), "mr-review").unwrap();
+    assert_eq!(shown.observers[0].approved_version, Some(2));
+    assert_eq!(shown.observers[0].latest_version, Some(3));
+
+    let task = fx.task("task-1");
+    fx.entry("mr-review", &task, "input-1");
+    fx.advance(INTERVAL as i64);
+    fx.service.observer_pass();
+    let claimed = fx.claim().unwrap();
+    assert_eq!(claimed.run_id.observer_id, id);
+    assert_eq!(claimed.script_version, 2);
+}
+
+#[test]
+fn deleting_the_last_observer_of_a_queue_removes_its_scripts_errors_and_entries() {
+    // R33: the observer's files go at once; the queue's entries go with
+    // the queue's last observer, and come back with a new one.
+    let fx = Fixture::new();
+    let gitlab = fx.active_of(owner(), "gitlab-mr", "mr-review", ObserverMode::OnEpisodes);
+    fx.active_of(owner(), "github-pr", "mr-review", ObserverMode::OnEpisodes);
+    let task = fx.task("task-1");
+    let entry = fx.entry("mr-review", &task, "input-1");
+    fx.service.observer_pass();
+    while let Some(claimed) = fx.claim() {
+        fx.finish(&claimed, exited(2, ""));
+    }
+    assert_eq!(fx.failures(&gitlab).len(), 1);
+    let gitlab_dir = fx.service.observers().paths().observer_dir(gitlab.as_str());
+
+    fx.service.delete_observer(&owner(), "gitlab-mr").unwrap();
+    assert!(!gitlab_dir.exists(), "scripts and errors are gone");
+    assert!(
+        fx.service
+            .observers()
+            .queue_entry(&entry.entry_id)
+            .unwrap()
+            .is_some(),
+        "github-pr still serves the queue"
+    );
+
+    fx.service.delete_observer(&owner(), "github-pr").unwrap();
+    assert!(fx
+        .service
+        .observers()
+        .queue_entries(&owner(), "mr-review")
+        .unwrap()
+        .is_empty());
+    assert!(fx
+        .service
+        .observer_queues_of(&owner())
+        .unwrap()
+        .queues
+        .is_empty());
+    assert!(matches!(
+        fx.service.observer_queue(&owner(), "mr-review"),
+        Err(ProtocolError::NotFound)
+    ));
+
+    // The task still waits at its gate: a new observer's tick adds its
+    // entry back.
+    fx.active_of(
+        owner(),
+        "gitlab-mr-2",
+        "mr-review",
+        ObserverMode::OnEpisodes,
+    );
+    let pass = fx.service.observer_pass();
+    assert_eq!(pass.entries_restored, 1);
+    assert!(fx
+        .service
+        .observers()
+        .queue_entry(&entry.entry_id)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn a_new_round_forgets_the_last_runs_of_entries_that_left_the_queue() {
+    let fx = Fixture::new();
+    let id = fx.active("mr-review", ObserverMode::OnEpisodes);
+    let first = fx.task("task-1");
+    let second = fx.task("task-2");
+    let gone = fx.entry("mr-review", &first, "input-1");
+    let kept = fx.entry("mr-review", &second, "input-1");
+    fx.service.observer_pass();
+    while let Some(claimed) = fx.claim() {
+        fx.finish(&claimed, exited(0, ""));
+    }
+    assert_eq!(fx.record(&id).entry_last_runs.len(), 2);
+
+    // The first task's gate exits: its entry leaves the queue.
+    fx.report_gate(&first, None);
+    fx.advance(INTERVAL as i64);
+    fx.service.observer_pass();
+
+    let runs = fx.record(&id).entry_last_runs;
+    assert!(!runs.contains_key(&gone.entry_id));
+    assert!(runs.contains_key(&kept.entry_id));
+}

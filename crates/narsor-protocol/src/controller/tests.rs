@@ -857,3 +857,178 @@ fn an_observers_answer_names_its_entry_and_refuses_artifacts() {
         queued
     );
 }
+
+#[test]
+fn an_observer_update_names_only_what_changes_and_refuses_other_fields() {
+    let request: super::UpdateObserverRequest =
+        serde_json::from_value(serde_json::json!({"queue": "mr-review", "mode": "on_episodes"}))
+            .unwrap();
+    assert_eq!(request.queue.as_deref(), Some("mr-review"));
+    assert_eq!(request.mode, Some(super::ObserverMode::OnEpisodes));
+    assert!(!request.is_empty());
+    let value = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"queue": "mr-review", "mode": "on_episodes"})
+    );
+    assert_eq!(
+        serde_json::from_value::<super::UpdateObserverRequest>(value).unwrap(),
+        request
+    );
+
+    let schedule = super::UpdateObserverRequest {
+        cron: Some("*/5 * * * *".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        serde_json::to_value(&schedule).unwrap(),
+        serde_json::json!({"cron": "*/5 * * * *"})
+    );
+    assert!(super::UpdateObserverRequest::default().is_empty());
+
+    // The name, the source and the effect are not changed by an update.
+    for refused in [
+        serde_json::json!({"name": "other"}),
+        serde_json::json!({"mode": "sometimes"}),
+        serde_json::json!({"secrets": []}),
+    ] {
+        assert!(
+            serde_json::from_value::<super::UpdateObserverRequest>(refused.clone()).is_err(),
+            "{refused}"
+        );
+    }
+}
+
+fn observer_view_for_queue() -> super::ObserverView {
+    super::ObserverView {
+        observer_id: "obs-1".into(),
+        name: "gitlab-mr".into(),
+        source: "gitlab".into(),
+        state: "active".into(),
+        effect: "none".into(),
+        workflow_id: None,
+        queue: "mr-review".into(),
+        mode: "on_episodes".into(),
+        interval_secs: None,
+        cron: Some("*/5 * * * *".into()),
+        task_limit_per_run: 10,
+        secrets: Vec::new(),
+        mapping: Default::default(),
+        approved_version: Some(2),
+        latest_version: Some(3),
+        next_run_at: None,
+        waiting_for_claim_since: None,
+        worker_missing: false,
+        last_claim_at: None,
+        active_run: None,
+        last_run: None,
+        consecutive_failures: 0,
+        note: None,
+        created_at: Utc::now(),
+    }
+}
+
+#[test]
+fn an_observer_view_shows_its_secrets_and_mapping_only_when_it_has_them() {
+    // R34: read-only settings ride on the view; none, no field.
+    let plain = observer_view_for_queue();
+    let value = serde_json::to_value(&plain).unwrap();
+    assert!(value.get("secrets").is_none());
+    assert!(value.get("mapping").is_none());
+    // Covers AE10: both versions are on the wire.
+    assert_eq!(value["approved_version"], 2);
+    assert_eq!(value["latest_version"], 3);
+    assert_eq!(
+        serde_json::from_value::<super::ObserverView>(value).unwrap(),
+        plain
+    );
+
+    let mut source = observer_view_for_queue();
+    source.secrets = vec![super::ObserverSecretRef {
+        name: "jira-token".into(),
+        env: "JIRA_TOKEN".into(),
+    }];
+    source.mapping = [("ticket".to_string(), "key".to_string())].into();
+    let value = serde_json::to_value(&source).unwrap();
+    assert_eq!(
+        value["secrets"],
+        serde_json::json!([{"name": "jira-token", "env": "JIRA_TOKEN"}])
+    );
+    assert_eq!(value["mapping"], serde_json::json!({"ticket": "key"}));
+    assert_eq!(
+        serde_json::from_value::<super::ObserverView>(value).unwrap(),
+        source
+    );
+}
+
+#[test]
+fn queue_views_round_trip_with_entries_and_their_processing_state() {
+    let list = super::ObserverQueueListResponse {
+        queues: vec![
+            super::ObserverQueueSummary {
+                queue: "mr-review".into(),
+                mode: Some("on_episodes".into()),
+                observers: 2,
+                entries: 1,
+            },
+            super::ObserverQueueSummary {
+                queue: "orphan".into(),
+                mode: None,
+                observers: 0,
+                entries: 3,
+            },
+        ],
+    };
+    let value = serde_json::to_value(&list).unwrap();
+    assert_eq!(value["queues"][0]["entries"], 1);
+    assert!(value["queues"][1].get("mode").is_none());
+    assert_eq!(
+        serde_json::from_value::<super::ObserverQueueListResponse>(value).unwrap(),
+        list
+    );
+
+    let now = Utc::now();
+    let queue = super::ObserverQueueView {
+        queue: "mr-review".into(),
+        mode: Some("on_episodes".into()),
+        observers: vec![observer_view_for_queue()],
+        entries: vec![super::QueueEntryView {
+            entry_id: "a".repeat(64),
+            task_id: "task-1".into(),
+            step: "review_work".into(),
+            episode: "input-1".into(),
+            started_at: now,
+            params: [("mr_url".to_string(), "https://x/1".to_string())].into(),
+            observers: vec![
+                super::QueueEntryObserverView {
+                    observer: "gitlab-mr".into(),
+                    running: false,
+                    last_run_at: Some(now),
+                    last_error: Some(super::QueueEntryErrorView {
+                        run_id: "obs-1.4".into(),
+                        status: "failed".into(),
+                        finished_at: now,
+                        exit_code: Some(2),
+                        error: "the script exited with code 2".into(),
+                    }),
+                },
+                super::QueueEntryObserverView {
+                    observer: "github-pr".into(),
+                    running: true,
+                    last_run_at: None,
+                    last_error: None,
+                },
+            ],
+        }],
+    };
+    let value = serde_json::to_value(&queue).unwrap();
+    let entry = &value["entries"][0];
+    assert_eq!(entry["params"]["mr_url"], "https://x/1");
+    assert_eq!(entry["observers"][0]["last_error"]["exit_code"], 2);
+    assert!(entry["observers"][1].get("last_run_at").is_none());
+    assert!(entry["observers"][1].get("last_error").is_none());
+    assert_eq!(
+        serde_json::from_value::<super::ObserverQueueView>(value).unwrap(),
+        queue
+    );
+}

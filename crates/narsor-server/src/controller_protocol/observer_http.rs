@@ -35,11 +35,18 @@
 //! | `GET /control/v1/observers` | none | [`ObserverListResponse`] |
 //! | `POST /control/v1/observers` | [`CreateObserverRequest`] | `201` [`ObserverView`] |
 //! | `GET /control/v1/observers/{observer}` | none | [`ObserverDetailView`] |
+//! | `PATCH /control/v1/observers/{observer}` | [`UpdateObserverRequest`] | [`ObserverView`] |
 //! | `DELETE /control/v1/observers/{observer}` | none | [`ObserverView`] |
 //! | `POST /control/v1/observers/{observer}/scripts` | [`SetObserverScriptRequest`] | `201` [`ObserverScriptView`] |
 //! | `POST /control/v1/observers/{observer}/approve` | [`ApproveObserverRequest`] | [`ObserverView`] |
 //! | `POST /control/v1/observers/{observer}/pause` | none | [`ObserverView`] |
 //! | `POST /control/v1/observers/{observer}/resume` | none | [`ObserverView`] |
+//! | `GET /control/v1/observer-queues` | none | [`ObserverQueueListResponse`] |
+//! | `GET /control/v1/observer-queues/{queue}` | none | [`ObserverQueueView`] |
+//!
+//! A queue is a name in the owner's namespace (R7): another owner's queue
+//! of the same name is a bare `404`, as is a name nothing of the caller's
+//! names.
 //!
 //! They need the owner gate's [`OwnerRef`] and [`Operator`]: anyone else
 //! gets a bare `403`.
@@ -66,8 +73,9 @@ use narsor_engine::controller_protocol::service::{
 use narsor_engine::controller_protocol::wire::{
     ApproveObserverRequest, CreateObserverRequest, ObserverClaimResponse,
     ObserverCreateTaskRequest, ObserverDecideRequest, ObserverDetailView, ObserverEffectResponse,
-    ObserverListResponse, ObserverRunReport, ObserverRunResultResponse, ObserverScriptView,
-    ObserverView, SetObserverScriptRequest,
+    ObserverListResponse, ObserverQueueListResponse, ObserverQueueView, ObserverRunReport,
+    ObserverRunResultResponse, ObserverScriptView, ObserverView, SetObserverScriptRequest,
+    UpdateObserverRequest,
 };
 use narsor_engine::observers::MAX_SCRIPT_BYTES;
 use narsor_engine::observers::{RunId, MAX_SCRIPT_OUTPUT_BYTES};
@@ -126,7 +134,9 @@ where
         )
         .route(
             "/control/v1/observers/{observer}",
-            get(get_observer).delete(delete_observer),
+            get(get_observer)
+                .patch(patch_observer)
+                .delete(delete_observer),
         )
         .route(
             "/control/v1/observers/{observer}/scripts",
@@ -138,6 +148,8 @@ where
         )
         .route("/control/v1/observers/{observer}/pause", post(post_pause))
         .route("/control/v1/observers/{observer}/resume", post(post_resume))
+        .route("/control/v1/observer-queues", get(list_queues))
+        .route("/control/v1/observer-queues/{queue}", get(get_queue))
         .layer(DefaultBodyLimit::max(MAX_OWNER_BODY))
         .with_state(service)
 }
@@ -292,6 +304,46 @@ async fn get_observer(
     let owner = require_owner_operator(owner, operator)?;
     Ok(Json(
         blocking(&service, move |s| s.observer_detail(&owner, &observer)).await?,
+    ))
+}
+
+async fn patch_observer(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path(observer): Path<String>,
+    body: Bytes,
+) -> ProtocolResult<Json<ObserverView>> {
+    let owner = require_owner_operator(owner, operator)?;
+    let request: UpdateObserverRequest = parse_json(&body, "observer update")?;
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.update_observer(&owner, &observer, request)
+        })
+        .await?,
+    ))
+}
+
+async fn list_queues(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+) -> ProtocolResult<Json<ObserverQueueListResponse>> {
+    let owner = require_owner_operator(owner, operator)?;
+    Ok(Json(
+        blocking(&service, move |s| s.observer_queues_of(&owner)).await?,
+    ))
+}
+
+async fn get_queue(
+    State(service): State<Service>,
+    owner: Option<Extension<OwnerRef>>,
+    operator: Option<Extension<Operator>>,
+    Path(queue): Path<String>,
+) -> ProtocolResult<Json<ObserverQueueView>> {
+    let owner = require_owner_operator(owner, operator)?;
+    Ok(Json(
+        blocking(&service, move |s| s.observer_queue(&owner, &queue)).await?,
     ))
 }
 
@@ -1214,6 +1266,104 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_owner_updates_an_observer_and_reads_its_queues() {
+        // R24, R35: the update route and the two queue routes.
+        let fx = Fixture::new();
+        fx.observer("gitlab-mr", ObserverEffect::None, ObserverMode::OnEpisodes);
+        fx.observer("jira-new", ObserverEffect::None, ObserverMode::Always);
+
+        let moved = fx
+            .send(
+                "PATCH",
+                "/control/v1/observers/gitlab-mr",
+                OWNER_TOKEN,
+                json!({"queue": "mr-review", "cron": "*/5 * * * *"}),
+            )
+            .await;
+        assert_eq!(moved.status(), StatusCode::OK);
+        let moved = json_body(moved).await;
+        assert_eq!(moved["queue"], "mr-review");
+        assert_eq!(moved["cron"], "*/5 * * * *");
+        assert!(moved.get("interval_secs").is_none());
+        assert_eq!(moved["state"], "active");
+
+        // Covers AE8: the refusal names the queue's mode.
+        let mixed = fx
+            .send(
+                "PATCH",
+                "/control/v1/observers/jira-new",
+                OWNER_TOKEN,
+                json!({"queue": "mr-review"}),
+            )
+            .await;
+        assert_eq!(mixed.status(), StatusCode::CONFLICT);
+        let mixed = json_body(mixed).await;
+        assert_eq!(mixed["code"], "queue_mode_mismatch");
+        assert!(
+            mixed["message"].as_str().unwrap().contains("on_episodes"),
+            "{mixed}"
+        );
+        // Covers AE9.
+        let seconds = fx
+            .send(
+                "PATCH",
+                "/control/v1/observers/jira-new",
+                OWNER_TOKEN,
+                json!({"cron": "*/30 * * * * *"}),
+            )
+            .await;
+        assert_eq!(seconds.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(seconds).await["code"], "invalid_observer");
+        for body in [json!({"name": "renamed"}), json!({})] {
+            let refused = fx
+                .send("PATCH", "/control/v1/observers/jira-new", OWNER_TOKEN, body)
+                .await;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(json_body(refused).await["code"], "invalid_request");
+        }
+
+        let listed = fx
+            .send(
+                "GET",
+                "/control/v1/observer-queues",
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(listed).await,
+            json!({"queues": [
+                {"queue": "jira-new", "mode": "always", "observers": 1, "entries": 0},
+                {"queue": "mr-review", "mode": "on_episodes", "observers": 1, "entries": 0},
+            ]})
+        );
+        let shown = fx
+            .send(
+                "GET",
+                "/control/v1/observer-queues/mr-review",
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(shown.status(), StatusCode::OK);
+        let shown = json_body(shown).await;
+        assert_eq!(shown["mode"], "on_episodes");
+        assert_eq!(shown["observers"][0]["name"], "gitlab-mr");
+        assert_eq!(shown["entries"], json!([]));
+        let unknown = fx
+            .send(
+                "GET",
+                "/control/v1/observer-queues/gitlab-mr",
+                OWNER_TOKEN,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert!(json_body_is_empty(unknown).await);
+    }
+
     /// A router whose gate let `owner` through, as the owner (`operator`)
     /// or not: what the network gate hands on for a signed-in user.
     fn router_for(fx: &Fixture, owner: &str, operator: bool) -> Router {
@@ -1259,8 +1409,26 @@ mod tests {
         .await;
         assert_eq!(create.status(), StatusCode::FORBIDDEN);
         assert!(json_body_is_empty(create).await);
-        let list = call(stranger, "GET", "/control/v1/observers", Value::Null).await;
+        let list = call(
+            stranger.clone(),
+            "GET",
+            "/control/v1/observers",
+            Value::Null,
+        )
+        .await;
         assert_eq!(list.status(), StatusCode::FORBIDDEN);
+        for (method, uri, body) in [
+            (
+                "PATCH",
+                "/control/v1/observers/mr-review",
+                json!({"cron": "*/5 * * * *"}),
+            ),
+            ("GET", "/control/v1/observer-queues", Value::Null),
+            ("GET", "/control/v1/observer-queues/mr-review", Value::Null),
+        ] {
+            let refused = call(stranger.clone(), method, uri, body).await;
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
 
         let other_owner = router_for(&fx, "someone-else", true);
         let listed = call(
@@ -1274,8 +1442,22 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+        let queues = call(
+            other_owner.clone(),
+            "GET",
+            "/control/v1/observer-queues",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(json_body(queues).await, json!({"queues": []}));
         for (method, uri, body) in [
             ("GET", "/control/v1/observers/mr-review", Value::Null),
+            (
+                "PATCH",
+                "/control/v1/observers/mr-review",
+                json!({"cron": "*/5 * * * *"}),
+            ),
+            ("GET", "/control/v1/observer-queues/mr-review", Value::Null),
             (
                 "POST",
                 "/control/v1/observers/mr-review/approve",

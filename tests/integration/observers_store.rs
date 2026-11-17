@@ -554,6 +554,77 @@ fn an_update_may_not_mix_modes_but_may_move_an_observer_to_another_queue() {
 }
 
 #[test]
+fn an_update_checks_a_changed_effect_only_and_moves_the_next_tick_of_a_new_schedule() {
+    // The catalogue may have moved on: an unchanged "create a task" effect
+    // needs no workflow to update the queue or the schedule.
+    let root = TempRoot::new();
+    let store = root.store();
+    let jira = create(&store, owner(), source_config("jira-new", "jira-intake"));
+    {
+        let lock = store.lock(&jira.observer_id).unwrap();
+        let mut record = store.load(&jira.observer_id).unwrap();
+        record.next_run_at = Some(now());
+        record.entry_last_runs = [("0".repeat(64), now())].into();
+        store.save(&lock, &mut record, now()).unwrap();
+    }
+
+    let mut config = jira.config.clone();
+    config.schedule = ScheduleConfig::from_parts(None, Some("0 8 * * *".to_string())).unwrap();
+    let later = now() + Duration::seconds(30);
+    let updated = store
+        .update_config(&jira.observer_id, config, None, later)
+        .unwrap();
+    assert_eq!(
+        updated.next_run_at,
+        Some(Utc.with_ymd_and_hms(2026, 11, 14, 8, 0, 0).unwrap()),
+        "a new schedule counts from the update"
+    );
+    assert_eq!(updated.entry_last_runs.len(), 1, "same queue, same mode");
+
+    // The same schedule keeps the next tick; a new queue forgets the last
+    // runs of the old queue's entries.
+    let mut moved = updated.config.clone();
+    moved.queue = "jira-other".into();
+    let moved = store
+        .update_config(
+            &jira.observer_id,
+            moved,
+            None,
+            later + Duration::seconds(30),
+        )
+        .unwrap();
+    assert_eq!(moved.next_run_at, updated.next_run_at);
+    assert!(moved.entry_last_runs.is_empty());
+
+    // A changed effect is checked against the catalogue's workflow.
+    let mut other = moved.config.clone();
+    let ObserverEffect::CreateTask(effect) = &mut other.effect else {
+        panic!("a create-task observer");
+    };
+    effect.mapping.insert("summary".into(), "title".into());
+    assert!(matches!(
+        store.update_config(&jira.observer_id, other.clone(), None, later),
+        Err(ObserverError::WorkflowNotFound(_))
+    ));
+    let changed = store
+        .update_config(&jira.observer_id, other, Some(&triage_workflow()), later)
+        .unwrap();
+    let ObserverEffect::CreateTask(effect) = changed.config.effect else {
+        panic!("a create-task observer");
+    };
+    assert_eq!(effect.mapping["summary"], "title");
+
+    // A draft has no next tick to move.
+    let draft = create(&store, owner(), review_config("gitlab-mr", "mr-review"));
+    let mut config = draft.config.clone();
+    config.schedule = ScheduleConfig::from_parts(Some(600), None).unwrap();
+    let draft = store
+        .update_config(&draft.observer_id, config, None, later)
+        .unwrap();
+    assert_eq!(draft.next_run_at, None);
+}
+
+#[test]
 fn a_queue_name_must_be_a_plain_name() {
     let root = TempRoot::new();
     let store = root.store();

@@ -261,8 +261,13 @@ impl ObserverStore {
     /// Replaces the configuration of an observer (its queue, mode or
     /// schedule, say), checked as [`Self::create`] checks a new one: valid,
     /// a unique name, and the mode of the queue it then serves (R26, KTD-7).
+    /// A "create a task" effect is checked against `workflow` only when it
+    /// changes: the catalogue may have a newer version of the workflow the
+    /// observer was made for.
+    ///
     /// The rest of the record (state, scripts, runs) is kept; a new queue
-    /// or mode ends the current round of entries.
+    /// or mode ends the current round of entries, and a new schedule of a
+    /// scheduled observer counts its next tick from `now`.
     pub fn update_config(
         &self,
         observer_id: &ObserverId,
@@ -271,7 +276,6 @@ impl ObserverStore {
         now: DateTime<Utc>,
     ) -> Result<ObserverRecord> {
         config.validate()?;
-        config.validate_workflow(workflow)?;
         let _create = self.lock_creation()?;
         let lock = self.lock(observer_id)?;
         let records = self.list()?;
@@ -282,10 +286,17 @@ impl ObserverStore {
             return Err(ObserverError::NameTaken(config.name));
         }
         let mut record = self.load(observer_id)?;
+        if record.config.effect != config.effect {
+            config.validate_workflow(workflow)?;
+        }
         check_queue_mode(&records, &record.owner, &config, Some(observer_id))?;
         if record.config.queue != config.queue || record.config.mode != config.mode {
             // The round holds entries of the old queue, or none is due.
             record.entry_round.clear();
+            record.entry_last_runs.clear();
+        }
+        if record.config.schedule != config.schedule && record.next_run_at.is_some() {
+            record.next_run_at = Some(config.schedule.next_after(now));
         }
         record.config = config;
         self.save(&lock, &mut record, now)?;

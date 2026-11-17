@@ -458,7 +458,13 @@ pub fn cors_layer(policy: &CorsPolicy) -> Option<CorsLayer> {
     Some(
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(origins))
-            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+            ])
             .allow_headers([
                 header::AUTHORIZATION,
                 header::CONTENT_TYPE,

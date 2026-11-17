@@ -963,6 +963,12 @@ pub struct ObserverRecord {
     /// The latest finished run.
     #[serde(default)]
     pub last_run: Option<LastRun>,
+    /// When a run of this observer for each queue entry (by id) last
+    /// ended, whatever its outcome: what the queues view shows of an entry
+    /// next to its newest error (R23). Holds the entries of the current
+    /// round only: a new round, queue or mode drops the others.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub entry_last_runs: BTreeMap<String, DateTime<Utc>>,
     /// Failed runs in a row since the last success or owner resume.
     #[serde(default)]
     pub consecutive_failures: u32,
@@ -1000,6 +1006,7 @@ impl ObserverRecord {
             last_claim_at: None,
             last_run_sequence: 0,
             last_run: None,
+            entry_last_runs: BTreeMap::new(),
             consecutive_failures: 0,
             note: None,
         }
