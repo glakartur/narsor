@@ -375,3 +375,127 @@ export function tasksWord(count) {
   const last = count % 10;
   return last >= 2 && last <= 4 && !(lastTwo >= 12 && lastTwo <= 14) ? 'zadania' : 'zadań';
 }
+
+// ---------------------------------------------------------------------------
+// Observer queues (R21, R23, R31–R34)
+
+/** The glyph of a task whose current wait episode is on an observer queue. */
+export const QUEUE_ENTRY_GLYPH = '◎';
+
+/**
+ * The one mark of a task whose current episode has a queue entry (R21):
+ * the control plane knows it from its own entries, so it says nothing about
+ * observer runs. `null` when the task has no entry.
+ */
+export function queueEntryMark(task) {
+  const entry = task?.queue_entry;
+  if (!entry?.queue) return null;
+  return { glyph: QUEUE_ENTRY_GLYPH, queue: entry.queue, text: `kolejka ${entry.queue} · ${entry.step}` };
+}
+
+/**
+ * The newest script version when it is not the approved one (R32, AE10):
+ * saving never approves, so the schedule still runs the approved version,
+ * or nothing. `null` when they are the same or no script is saved.
+ */
+export function unapprovedVersion(observer) {
+  const latest = observer?.latest_version ?? null;
+  if (latest === null) return null;
+  return observer.approved_version === latest ? null : latest;
+}
+
+/** The run modes of an observer, by their wire names (R25). */
+export const OBSERVER_MODES = ['on_episodes', 'always'];
+
+/** The default interval of a new observer, in seconds. */
+export const DEFAULT_INTERVAL_SECS = 300;
+
+/**
+ * The values of the observer form: of `observer` for the edit form, empty
+ * for a new one (with `defaults`, say the queue it is created from).
+ */
+export function observerForm(observer = null, defaults = {}) {
+  return {
+    name: observer?.name ?? '',
+    source: observer?.source ?? '',
+    queue: observer?.queue ?? defaults.queue ?? '',
+    mode: observer?.mode ?? defaults.mode ?? 'on_episodes',
+    schedule: observer?.cron ? 'cron' : 'interval',
+    interval: observer
+      ? (observer.interval_secs !== undefined && observer.interval_secs !== null ? String(observer.interval_secs) : '')
+      : String(DEFAULT_INTERVAL_SECS),
+    cron: observer?.cron ?? '',
+    script: '',
+  };
+}
+
+/** The schedule of the form as request fields; adds what is wrong to `problems`. */
+function scheduleFields(form, problems) {
+  if (form.schedule === 'cron') {
+    const cron = form.cron.trim();
+    if (!cron) problems.cron = 'Podaj wyrażenie cron (pięć pól, UTC).';
+    return { cron };
+  }
+  const text = form.interval.trim();
+  if (!/^\d+$/.test(text) || Number(text) < 1) {
+    problems.interval = 'Podaj liczbę sekund (całkowitą, większą od zera).';
+    return {};
+  }
+  return { interval_secs: Number(text) };
+}
+
+function modeProblem(form, problems) {
+  if (!OBSERVER_MODES.includes(form.mode)) problems.mode = `Wybierz tryb: ${OBSERVER_MODES.join(' albo ')}.`;
+}
+
+/**
+ * The `POST /control/v1/observers` request of the create form, and what is
+ * wrong with the form (by field). The script is saved after the create, as
+ * its first version; the server checks the rest and gives its reason.
+ */
+export function createRequest(form) {
+  const problems = {};
+  const name = form.name.trim();
+  const source = form.source.trim();
+  if (!name) problems.name = 'Nazwa jest wymagana.';
+  if (!source) problems.source = 'Źródło jest wymagane.';
+  modeProblem(form, problems);
+  const body = { name, source, mode: form.mode, ...scheduleFields(form, problems) };
+  const queue = form.queue.trim();
+  if (queue) body.queue = queue;
+  return { body, problems };
+}
+
+/**
+ * The `PATCH /control/v1/observers/{observer}` request of the edit form:
+ * only the fields that changed, since a field left out stays as it is.
+ * `problems.form` says that nothing changed.
+ */
+export function updateRequest(form, observer) {
+  const problems = {};
+  const body = {};
+  const queue = form.queue.trim();
+  if (!queue) problems.queue = 'Kolejka jest wymagana.';
+  else if (queue !== observer.queue) body.queue = queue;
+  modeProblem(form, problems);
+  if (!problems.mode && form.mode !== observer.mode) body.mode = form.mode;
+  const schedule = scheduleFields(form, problems);
+  if (schedule.cron !== undefined && schedule.cron !== (observer.cron ?? null)) body.cron = schedule.cron;
+  if (schedule.interval_secs !== undefined && (observer.cron || schedule.interval_secs !== observer.interval_secs)) {
+    body.interval_secs = schedule.interval_secs;
+  }
+  if (!Object.keys(problems).length && !Object.keys(body).length) problems.form = 'Nic się nie zmieniło.';
+  return { body, problems };
+}
+
+/**
+ * The schedule commands the owner may give an observer in `state`, as the
+ * server allows them: pause an active one, resume a paused one, either for
+ * one that waits for its owner. None for a draft (approve it first).
+ */
+export function scheduleCommands(state) {
+  if (state === 'active') return ['pause'];
+  if (state === 'paused') return ['resume'];
+  if (state === 'needs_attention' || state === 'error') return ['resume', 'pause'];
+  return [];
+}

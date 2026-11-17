@@ -3,7 +3,7 @@ import { counters, slots } from '../model.js';
 import { connectionText, staleLabel } from '../store.js';
 import { harnessText, usageGroups } from '../text.js';
 
-export function Header({ state, now, onHelp, onSignOut, onDialog }) {
+export function Header({ state, now, onHelp, onSignOut, onDialog, onQueues }) {
   const { connection, tasks } = state;
   const conn = connectionText(connection, now);
   const age = staleLabel(connection, now);
@@ -27,6 +27,8 @@ export function Header({ state, now, onHelp, onSignOut, onDialog }) {
         ${slot && html`<button class="chip" title="Limit zadań (L)" onClick=${() => onDialog('limit')}>sloty ${slot.used}${slot.limit !== null ? `/${slot.limit}` : ''}</button>`}
         <span class=${`chip counter ${questions ? 'role-attention' : 'role-done'}`} title="Czekają na odpowiedź">? ${questions}</span>
         <span class=${`chip counter ${problems ? 'role-problem' : 'role-done'}`} title="Mają problem">! ${problems}</span>
+        <button class=${`small${state.page === 'queues' ? ' active' : ''}`} title="Kolejki obserwatorów (Q)" aria-pressed=${state.page === 'queues'}
+          onClick=${onQueues}>Kolejki</button>
         <button class="small" title="Historia (H)" onClick=${() => onDialog('history')}>Historia</button>
         <button class="small" title="Repozytoria (R)" onClick=${() => onDialog('repositories')}>Repozytoria</button>
         <button class="icon" title="Skróty klawiszowe (?)" aria-label="Skróty klawiszowe" onClick=${onHelp}>⌨</button>

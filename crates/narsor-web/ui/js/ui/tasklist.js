@@ -1,6 +1,6 @@
 import { html, useEffect, useRef } from '../lib.js';
 import {
-  activityAge, activitySince, currentStep, isDone, needsOperator, queuePositions, secondsBetween,
+  activityAge, activitySince, currentStep, isDone, needsOperator, queueEntryMark, queuePositions, secondsBetween,
   shortIdentifier, stateIcon, titleOf,
 } from '../model.js';
 
@@ -22,6 +22,7 @@ function Row({ task, places, selected, stale, now, canMoveUp, canMoveDown, onSel
   const age = since ? activityAge(secondsBetween(since, now)) : null;
   const tag = label(task, places);
   const loud = needsOperator(icon);
+  const mark = queueEntryMark(task);
   const ref = useRef(null);
   useEffect(() => {
     if (selected) ref.current?.scrollIntoView({ block: 'nearest' });
@@ -39,6 +40,7 @@ function Row({ task, places, selected, stale, now, canMoveUp, canMoveDown, onSel
           ${tag && html`<span class=${`role-${tag.role}`}>${tag.text}</span>`}
           ${tag && age && html`<span class="muted"> · </span>`}
           ${age && html`<span class="muted">${age}</span>`}
+          ${mark && html`<span class="queue-mark" title=${mark.text} aria-label=${mark.text}> ${mark.glyph}</span>`}
           <span class="sr-only">, ${icon.word}</span>
         </div>
       </div>

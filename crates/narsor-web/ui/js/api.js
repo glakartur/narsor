@@ -220,6 +220,22 @@ export class Api {
   removeRepository(id) { return this.request('DELETE', `/control/v1/repositories/${path(id)}`); }
   branches(id) { return this.get(`/control/v1/repositories/${path(id)}/branches`); }
 
+  // Observers and their queues (R23, R31): the owner routes the CLI and the
+  // TUI call. `observer` is a name or an id.
+  observerQueues() { return this.get('/control/v1/observer-queues'); }
+  observerQueue(queue) { return this.get(`/control/v1/observer-queues/${path(queue)}`); }
+  observer(observer) { return this.get(`/control/v1/observers/${path(observer)}`); }
+  createObserver(request) { return this.post('/control/v1/observers', request); }
+  updateObserver(observer, request) { return this.request('PATCH', `/control/v1/observers/${path(observer)}`, { body: request }); }
+  deleteObserver(observer) { return this.request('DELETE', `/control/v1/observers/${path(observer)}`); }
+  /** One script version with its text (`ObserverScriptTextView`). */
+  observerScript(observer, version) { return this.get(`/control/v1/observers/${path(observer)}/scripts/${path(String(version))}`); }
+  /** Saves the next script version; saving never approves it. */
+  saveObserverScript(observer, script) { return this.post(`/control/v1/observers/${path(observer)}/scripts`, { script }); }
+  approveObserver(observer, version) { return this.post(`/control/v1/observers/${path(observer)}/approve`, { version }); }
+  pauseObserver(observer) { return this.post(`/control/v1/observers/${path(observer)}/pause`); }
+  resumeObserver(observer) { return this.post(`/control/v1/observers/${path(observer)}/resume`); }
+
   /**
    * The event stream from `cursor`: an async generator of envelopes
    * `{cursor, event}`. It ends when the server ends the stream; it throws

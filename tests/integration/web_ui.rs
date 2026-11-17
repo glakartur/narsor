@@ -222,3 +222,157 @@ async fn the_passthrough_mode_sends_the_browsers_token_unchanged() {
     assert_eq!(owner.status(), StatusCode::OK);
     server.shutdown().await;
 }
+
+/// The text of a file of the interface, as `narsor-web` serves it.
+async fn served(base: &str, path: &str) -> String {
+    let answer = http().get(format!("{base}{path}")).send().await.unwrap();
+    assert_eq!(answer.status(), StatusCode::OK, "{path}");
+    answer.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn the_queues_view_is_served_with_its_route_and_texts() {
+    let root = TempRoot::new();
+    let server = server(&root).await;
+    let base = format!("http://{}", web(&server, TokenMode::Server).await);
+
+    // The page module, reached from the shell and its address (`#/queues`).
+    let app = served(&base, "/ui/js/ui/app.js").await;
+    assert!(app.contains("from './queues.js'"), "app.js imports the queues view");
+    let store = served(&base, "/ui/js/store.js").await;
+    assert!(store.contains("#/queues"), "store.js knows the queues route");
+
+    let queues = served(&base, "/ui/js/ui/queues.js").await;
+    for text in [
+        "Kolejki obserwatorów",
+        "+ Nowy obserwator",
+        "Zapisz nową wersję",
+        "Usunąć obserwatora",
+        "ustawienia z CLI (tylko do odczytu)",
+        "narsor-cli observer create",
+    ] {
+        assert!(queues.contains(text), "queues.js lacks {text:?}");
+    }
+    // AE10: the marker of a newest version the schedule does not run.
+    let texts = served(&base, "/ui/js/text.js").await;
+    assert!(texts.contains("nie zatwierdzona"), "text.js lacks the marker");
+    // R21: the one icon of a task on a queue.
+    let list = served(&base, "/ui/js/ui/tasklist.js").await;
+    assert!(list.contains("queueEntryMark"), "the task list shows the queue icon");
+
+    let api = served(&base, "/ui/js/api.js").await;
+    for route in [
+        "/control/v1/observer-queues",
+        "'PATCH', `/control/v1/observers/",
+        "/scripts/",
+        "/approve`",
+    ] {
+        assert!(api.contains(route), "api.js lacks {route:?}");
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_observer_routes_go_through_and_a_refusal_keeps_the_servers_reason() {
+    let root = TempRoot::new();
+    let server = server(&root).await;
+    let base = format!("http://{}", web(&server, TokenMode::Server).await);
+    let control = |path: &str| format!("{base}/control/v1/{path}");
+
+    let empty: serde_json::Value = http()
+        .get(control("observer-queues"))
+        .bearer_auth(SESSION)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(empty["queues"], serde_json::json!([]));
+
+    let created = http()
+        .post(control("observers"))
+        .bearer_auth(SESSION)
+        .json(&serde_json::json!({
+            "name": "gitlab-mr", "source": "gitlab", "queue": "mr-review",
+            "mode": "on_episodes", "interval_secs": 300
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let saved = http()
+        .post(control("observers/gitlab-mr/scripts"))
+        .bearer_auth(SESSION)
+        .json(&serde_json::json!({ "script": "echo '{}'\n" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::CREATED);
+
+    // The approve dialog reads the text before the owner confirms (R32).
+    let text: serde_json::Value = http()
+        .get(control("observers/gitlab-mr/scripts/1"))
+        .bearer_auth(SESSION)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(text["script"], "echo '{}'\n");
+
+    // AE10: saved, not approved; the queue page sees both versions.
+    let queue: serde_json::Value = http()
+        .get(control("observer-queues/mr-review"))
+        .bearer_auth(SESSION)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue["observers"][0]["latest_version"], 1);
+    assert!(queue["observers"][0].get("approved_version").is_none());
+
+    // A refused create and a refused edit reach the form with the server's
+    // code and reason (AE8, AE9); PATCH goes through the proxy.
+    let mixed = http()
+        .post(control("observers"))
+        .bearer_auth(SESSION)
+        .json(&serde_json::json!({
+            "name": "jira-new", "source": "jira", "queue": "mr-review",
+            "mode": "always", "interval_secs": 300
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mixed.status(), StatusCode::CONFLICT);
+    let reason: serde_json::Value = mixed.json().await.unwrap();
+    assert_eq!(reason["code"], "queue_mode_mismatch");
+    assert!(
+        reason["message"].as_str().unwrap().contains("on_episodes"),
+        "{reason}"
+    );
+
+    let bad_cron = http()
+        .patch(control("observers/gitlab-mr"))
+        .bearer_auth(SESSION)
+        .json(&serde_json::json!({ "cron": "* * * * * *" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_cron.status(), StatusCode::BAD_REQUEST);
+    let reason: serde_json::Value = bad_cron.json().await.unwrap();
+    assert_eq!(reason["code"], "invalid_observer");
+    assert!(!reason["message"].as_str().unwrap().is_empty());
+
+    let deleted = http()
+        .delete(control("observers/gitlab-mr"))
+        .bearer_auth(SESSION)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+    server.shutdown().await;
+}
