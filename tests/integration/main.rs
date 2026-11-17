@@ -72,6 +72,7 @@ mod tui_background;
 mod tui_conversation;
 mod tui_form;
 mod tui_panel;
+mod tui_queues;
 mod tui_render;
 mod tui_state;
 mod tui_terminal_restore;

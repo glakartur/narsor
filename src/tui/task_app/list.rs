@@ -375,6 +375,9 @@ pub struct RowText {
     pub since: Option<DateTime<Utc>>,
     /// The step or the place in the queue, third line.
     pub label: String,
+    /// The observer queue the task's current wait episode is on, when it
+    /// has an entry (R21): the row shows one mark for it.
+    pub queue_entry: Option<String>,
 }
 
 /// The header counters: how many tasks ask a question, how many have a
@@ -547,6 +550,7 @@ impl PendingRow {
             title: one_line(&self.title),
             since: None,
             label: label.to_string(),
+            queue_entry: None,
         }
     }
 }
@@ -801,6 +805,10 @@ impl TaskList {
             title: title_of(task),
             since: activity_since(task),
             label: label_of(task, positions.get(&index).copied()),
+            queue_entry: task
+                .queue_entry
+                .as_ref()
+                .map(|entry| one_line(&entry.queue)),
         }
     }
 
@@ -1580,6 +1588,11 @@ fn replace_reported_attention(
 /// The columns before the text under the icon: the icon, two spaces.
 const ROW_PREFIX: usize = 3;
 
+/// The mark after the identifier of a task whose current wait episode is on
+/// an observer queue (R21). One mark, whatever the observers do: their runs
+/// report nothing to the task.
+pub const QUEUE_ENTRY_MARK: &str = "◎";
+
 /// The third line of a row: `label · time`, the time alone, or the label
 /// alone. On a narrow list the label is cut first and the time stays.
 fn third_line(row: &RowText, text_width: usize, now: DateTime<Utc>) -> String {
@@ -1634,14 +1647,22 @@ pub(super) fn row_text(
     let title_style = paint(Role::Calm);
     let third = third_line(row, text_width, now);
 
-    let first = Line::from(vec![
+    // The queue mark takes its two cells from the identifier.
+    let mark = row.queue_entry.is_some() && text_width > 4;
+    let identifier_width = if mark { text_width - 2 } else { text_width };
+    let mut first = vec![
         Span::styled(row.icon.glyph().to_string(), icon_style),
         Span::raw("  "),
         Span::styled(
-            fit_cells(identifier, text_width),
+            fit_cells(identifier, identifier_width),
             styles.of(grey(Role::Calm)),
         ),
-    ]);
+    ];
+    if mark {
+        first.push(Span::raw(" "));
+        first.push(Span::styled(QUEUE_ENTRY_MARK, styles.of(grey(Role::Live))));
+    }
+    let first = Line::from(first);
     let second = Line::from(vec![
         Span::raw(" ".repeat(ROW_PREFIX.min(width))),
         Span::styled(fit_cells(&row.title, text_width), title_style),

@@ -50,6 +50,7 @@ fn row_of(task: &TaskSummary) -> RowText {
         title: title_of(task),
         since: None,
         label: "archiwum".to_string(),
+        queue_entry: None,
     }
 }
 

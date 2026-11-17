@@ -104,6 +104,7 @@ pub mod list;
 pub mod new_task;
 pub mod notify;
 pub mod panel;
+pub mod queues;
 pub mod repositories;
 pub mod tabs;
 pub mod usage;
@@ -348,6 +349,8 @@ pub enum View {
     History(Box<History>),
     /// The registered repositories, over the details.
     Repositories(Box<Repositories>),
+    /// The owner's observer queues, over the details (`O`).
+    Queues(Box<super::queues::Queues>),
     /// A view whose read has not come back: the details area shows the
     /// loading marker, `Esc` gives the list back and the answer opens the view.
     Opening(OpeningKind),
@@ -364,6 +367,8 @@ pub enum ViewKind {
     History,
     /// The repositories.
     Repositories,
+    /// The observer queues.
+    Queues,
     /// A view that waits for its read.
     Opening(OpeningKind),
 }
@@ -379,6 +384,10 @@ pub enum Request {
     OpenHistory,
     /// `R`: read the registry and open the repositories.
     OpenRepositories,
+    /// `O`: read the owner's observer queues and open them.
+    OpenQueues,
+    /// A write of the queues view.
+    QueueWrite(Box<super::queues::QueueWrite>),
     /// Send the task being created under this id (the first attempt, or by
     /// hand once it was not sent).
     SendTask(String),
@@ -494,6 +503,9 @@ pub struct TaskApp {
     /// When the next read of the usage limits is due: at once, then a period
     /// after the previous read finished ([`usage::USAGE_PERIOD`]).
     next_usage_at: Instant,
+    /// The editor a script is edited in (`$VISUAL` / `$EDITOR`); a paste
+    /// field when none.
+    editor: Option<String>,
 }
 
 /// What a read of the list must tell after work was sent to a task without a
@@ -551,6 +563,7 @@ impl TaskApp {
             branch_source,
             harness_usage: None,
             next_usage_at: Instant::now(),
+            editor: None,
         }
     }
 
@@ -664,6 +677,7 @@ impl TaskApp {
             View::NewTask(_) => ViewKind::NewTask,
             View::History(_) => ViewKind::History,
             View::Repositories(_) => ViewKind::Repositories,
+            View::Queues(_) => ViewKind::Queues,
             View::Opening(kind) => ViewKind::Opening(kind),
         }
     }
@@ -680,6 +694,7 @@ impl TaskApp {
                 View::Repositories(open) => open
                     .form()
                     .is_some_and(super::chooser::Chooser::is_confirming),
+                View::Queues(_) => self.queues_confirming(),
                 _ => false,
             };
         in_view || self.panel_confirming() || self.conductor_confirming()
@@ -698,6 +713,7 @@ impl TaskApp {
             if let Some(context) = self
                 .new_task_context()
                 .or_else(|| self.repositories_context())
+                .or_else(|| self.queues_context())
             {
                 return context.into();
             }
@@ -800,6 +816,7 @@ impl TaskApp {
             View::Repositories(_) if self.focus == Focus::Details => {
                 self.on_repositories_paste(pasted)
             }
+            View::Queues(_) if self.focus == Focus::Details => self.on_queues_paste(pasted),
             View::Tasks if self.panel_typing() => self.on_panel_paste(pasted),
             View::Tasks if self.conductor_typing() => self.on_conductor_paste(pasted),
             _ => {}
@@ -847,7 +864,8 @@ impl TaskApp {
             View::Repositories(_) if self.focus == Focus::Details => {
                 return self.on_repositories_key(key)
             }
-            View::NewTask(_) | View::Repositories(_) => {}
+            View::Queues(_) if self.focus == Focus::Details => return self.on_queues_key(key),
+            View::NewTask(_) | View::Repositories(_) | View::Queues(_) => {}
         }
         if self.panel_focused() {
             return self.on_panel_key(key);
@@ -875,6 +893,7 @@ impl TaskApp {
             Action::NewTask
             | Action::History
             | Action::Repositories
+            | Action::Queues
             | Action::ChooseHarness
             | Action::ChooseLimit
                 if !matches!(&self.view, View::Tasks) =>
@@ -935,6 +954,7 @@ impl TaskApp {
             Action::NewTask => return Request::OpenNewTask,
             Action::History => return Request::OpenHistory,
             Action::Repositories => return Request::OpenRepositories,
+            Action::Queues => return Request::OpenQueues,
             Action::ChooseHarness => return Request::OpenHarness,
             Action::ChooseLimit => return Request::OpenLimit,
             Action::RetrySend => return self.retry_selected(),
@@ -1153,6 +1173,8 @@ impl TaskApp {
             Request::OpenNewTask => self.start_opening(OpeningKind::NewTask),
             Request::OpenHistory => self.start_opening(OpeningKind::History),
             Request::OpenRepositories => self.start_opening(OpeningKind::Repositories),
+            Request::OpenQueues => self.start_opening(OpeningKind::Queues),
+            Request::QueueWrite(write) => self.queue_write(*write).await,
             Request::SendTask(id) => self.send_task(&id).await,
             Request::ValidatePath(path) => self.validate_path(&path).await,
             Request::AddRepository(request) => self.add_repository(&request).await,
@@ -1190,6 +1212,7 @@ impl TaskApp {
                 (View::Repositories(_), OpeningKind::Repositories) => {
                     self.reload_repositories(None)
                 }
+                (View::Queues(_), OpeningKind::Queues) => self.reload_queues(),
                 _ => {}
             }
             return;
@@ -1241,6 +1264,7 @@ impl TaskApp {
                 self.on_new_task_read(workflows, repositories);
             }
             OpeningRead::Harness(snapshot) => self.on_harness_read(snapshot),
+            OpeningRead::Queues(listing) => self.on_queues_read(listing),
         }
     }
 
@@ -1319,6 +1343,9 @@ impl TaskApp {
     /// capabilities. Does nothing while one runs: the answer of that one is
     /// the newest there will be.
     pub fn start_refresh(&mut self) {
+        // The open queues view follows the same period: its entries come and
+        // go with the tasks.
+        self.reload_queues();
         let client = self.client.clone();
         let want_capabilities = self.capabilities.is_none();
         self.background.start(JobKey::Refresh, async move {
