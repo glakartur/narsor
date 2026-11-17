@@ -17,7 +17,8 @@ use super::error::{OrchestrationError, Result};
 use super::model::{
     EventWatch, ExternalEvent, ExternalEventOutcome, GateChange, InputOutcome, InputRequest,
     InputStatus, InputUpdate, QueuedEventInput, QueuedInput, RunnerObservation,
-    RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind, TaskRecord, WatchedGate,
+    RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind, TaskProvenance, TaskRecord,
+    WatchedGate,
 };
 use crate::domain::display::bounded_detail;
 use crate::domain::{one_line_label, without_unsafe_chars, TaskId, GENERATED_TITLE_MAX_CHARS};
@@ -203,9 +204,22 @@ impl ControlPlane {
     /// Refused — without touching the record, let alone the runner — when
     /// the task cannot take input in its runner state, when the last runner
     /// snapshot waits on another request (or none), or when another answer
-    /// to the same request is already queued. A retry with the same key and
+    /// to the same request is already queued or was taken by the runner
+    /// (the first answer of an episode wins). A retry with the same key and
     /// answer returns the original input.
     pub fn queue_input(&self, task_id: &TaskId, request: InputRequest) -> Result<InputOutcome> {
+        self.queue_input_from(task_id, request, None)
+    }
+
+    /// [`Self::queue_input`] for the answer of `observer`'s run (`task
+    /// decide`, R15), or of the owner with `None`. The input and its
+    /// [`TaskEventKind::InputQueued`] name the observer.
+    pub fn queue_input_from(
+        &self,
+        task_id: &TaskId,
+        request: InputRequest,
+        observer: Option<TaskProvenance>,
+    ) -> Result<InputOutcome> {
         // The answer is bound to the request it names, so the runner's
         // engine refuses it too should it ever land on a newer request.
         let mut delivery = request.delivery.clone();
@@ -254,8 +268,11 @@ impl ControlPlane {
                     pending,
                 });
             }
+            // An answer the runner took already ended the episode; its next
+            // snapshot says so (R16).
             if let Some(open) = record.inputs.iter().find(|input| {
-                input.pending_input_id == request.pending_input_id && !input.status.is_settled()
+                input.pending_input_id == request.pending_input_id
+                    && (!input.status.is_settled() || input.status == InputStatus::Consumed)
             }) {
                 return Err(OrchestrationError::InputAlreadyQueued {
                     task_id: record.task_id.clone(),
@@ -273,12 +290,14 @@ impl ControlPlane {
                 submitted_at: now,
                 updated_at: now,
                 detail: None,
+                observer: observer.clone(),
             };
             record.inputs.push(input.clone());
             Ok(Mutation::Changed(
                 TaskEventKind::InputQueued {
                     input_id: input.input_id.clone(),
                     pending_input_id: input.pending_input_id.clone(),
+                    observer: observer.clone(),
                 },
                 (input, false),
             ))

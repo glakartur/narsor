@@ -17,7 +17,7 @@ use super::{
     HumanInputField, OutputLabel, StateId,
 };
 use narsor_protocol::api::RequiredValue;
-use narsor_protocol::controller::GateWatch;
+use narsor_protocol::controller::{GateWatch, TaskProvenance};
 
 pub use narsor_protocol::api::HumanInputActionDto as HumanInputAction;
 pub use narsor_protocol::api::LocalValue;
@@ -624,6 +624,13 @@ pub struct HumanInputDelivery {
     /// the operator, and only in-process callers answer as the conductor.
     #[serde(skip)]
     pub answered_by: AnsweredBy,
+
+    /// The observer and its run, when an observer's script is answering
+    /// (`answered_by: observer`, R15). Never read from the wire either: the
+    /// runner takes it from the control plane's delivery, never from an
+    /// owner's.
+    #[serde(skip)]
+    pub observer: Option<TaskProvenance>,
 }
 
 pub const APPROVE_OUTPUT_LABEL: &str = "__approve_output";

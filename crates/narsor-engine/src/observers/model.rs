@@ -360,6 +360,26 @@ impl ScheduleConfig {
         }
     }
 
+    /// The schedule's next tick after the tick `tick` that is also after
+    /// `now` (KTD-3): the next due time counts from the last tick, not from
+    /// the end of a run, and ticks that passed meanwhile are skipped, never
+    /// owed. An interval adds whole intervals to `tick`, so a late tick does
+    /// not shift the ones after it; a cron expression fires at its own
+    /// times.
+    pub fn next_tick_after(&self, tick: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+        match self {
+            Self::Interval { secs } => {
+                let secs = (*secs).max(1);
+                let behind = u64::try_from((now - tick).num_seconds()).unwrap_or(0);
+                let periods = (behind / secs).saturating_add(1);
+                after_secs(tick, secs.saturating_mul(periods))
+            }
+            Self::Cron(cron) => cron
+                .next_after(tick.max(now))
+                .unwrap_or(DateTime::<Utc>::MAX_UTC),
+        }
+    }
+
     /// The first fire at or after `delay_secs` from `now`, and never before
     /// [`Self::next_after`]: an interval schedule waits exactly
     /// `delay_secs`, a cron schedule waits for its first fire time from

@@ -14,7 +14,14 @@
 //! owner's archive  the entry of the task's episode removed (R19)
 //! schedule         an entry whose task no longer waits in its episode, or ended,
 //!                  was archived or is gone      → removed, never run (R18, R19)
+//!                  a task of the queue that waits in its watched episode with
+//!                  no entry                     → entry added back, no warning
 //! ```
+//!
+//! The task's record and the entry are two writes: a control plane that
+//! stops between them leaves a waiting task without its entry, and no later
+//! snapshot adds it (the episode is known). The tick of an `on_episodes`
+//! observer of the queue adds it back ([`ProtocolService::restore_queue_entries`]).
 //!
 //! The warning is written once per episode: only the snapshot that begins
 //! the episode adds the entry, and an entry id is the task's and the
@@ -23,6 +30,7 @@
 //! episode finds the episode known and changes nothing.
 
 use crate::controller_protocol::service::ProtocolService;
+use crate::domain::TaskId;
 use crate::observers::{
     queue_entry_id, EntryWrite, ObserverError, ObserverMode, ObserverState, QueueEntry,
 };
@@ -118,13 +126,7 @@ impl ProtocolService {
     pub(super) fn entry_wait(&self, entry: &QueueEntry) -> EntryWait {
         match self.control.task(&entry.task_id) {
             Ok(task) => {
-                let waits = !task_ended(&task)
-                    && task.owner == entry.owner
-                    && task
-                        .watched_gate
-                        .as_ref()
-                        .is_some_and(|gate| gate.episode == entry.episode);
-                if waits {
+                if waits_in(&task, &entry.owner, &entry.episode) {
                     EntryWait::Waits
                 } else {
                     EntryWait::Gone
@@ -136,6 +138,85 @@ impl ProtocolService {
                 EntryWait::Unknown
             }
         }
+    }
+
+    /// Adds back the entries of `owner`'s queue `queue` that a task waiting
+    /// in its watched episode has none of; returns how many. Called at the
+    /// tick of an `on_episodes` observer of the queue, so its cost (one read
+    /// of the task records) comes at most once per tick.
+    ///
+    /// Each entry is added under the lock of the queue entries after the
+    /// task is read again, so it never comes back for an episode a snapshot
+    /// ended meanwhile. No warning: the snapshot that began the episode
+    /// wrote the one there is. Failures are logged; the next tick tries
+    /// again.
+    pub(super) fn restore_queue_entries(&self, owner: &OwnerRef, queue: &str) -> usize {
+        let tasks = match self.control.list_tasks() {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                tracing::warn!(%error, "observers: cannot list the tasks for the queue entries");
+                return 0;
+            }
+        };
+        let missing: Vec<TaskRecord> = tasks
+            .into_iter()
+            .filter(|task| {
+                task.watched_gate.as_ref().is_some_and(|gate| {
+                    gate.watch.queue == queue && waits_in(task, owner, &gate.episode)
+                })
+            })
+            .filter(|task| self.task_queue_entry(task).is_none())
+            .collect();
+        let mut restored = 0;
+        for task in missing {
+            match self.restore_queue_entry(&task.task_id) {
+                Ok(true) => restored += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(task = %task.task_id, %error, "observers: cannot add back a queue entry");
+                }
+            }
+        }
+        restored
+    }
+
+    /// Adds the entry of the episode `task_id` waits in now, if it has
+    /// none; `true` when it was added.
+    fn restore_queue_entry(&self, task_id: &TaskId) -> Result<bool, ObserverError> {
+        let lock = self.observers.lock_queue_entries()?;
+        let task = match self.control.task(task_id) {
+            Ok(task) => task,
+            Err(OrchestrationError::TaskNotFound(_)) => return Ok(false),
+            Err(error) => {
+                tracing::warn!(task = %task_id, %error, "observers: cannot read a task for its queue entry");
+                return Ok(false);
+            }
+        };
+        let Some(gate) = task
+            .watched_gate
+            .as_ref()
+            .filter(|gate| waits_in(&task, &task.owner, &gate.episode))
+        else {
+            return Ok(false);
+        };
+        let entry = QueueEntry::from_gate(
+            task.owner.clone(),
+            task.task_id.clone(),
+            gate.episode.clone(),
+            &gate.watch,
+            self.control.now(),
+        );
+        if entry.validate().is_err() {
+            return Ok(false);
+        }
+        let added = matches!(
+            self.observers.add_queue_entry(&lock, &entry)?,
+            EntryWrite::Created
+        );
+        if added {
+            tracing::info!(task = %task.task_id, queue = %gate.watch.queue, episode = %gate.episode, "observers: a waiting task had no queue entry; it is added back");
+        }
+        Ok(added)
     }
 
     /// The removal and the addition of [`Self::follow_gate_episode`];
@@ -210,6 +291,17 @@ impl ProtocolService {
         };
         Ok(Some(reason))
     }
+}
+
+/// Whether `task` of `owner` still waits at its watched gate in `episode`:
+/// not ended, and the episode is the one its last runner snapshot shows.
+pub(super) fn waits_in(task: &TaskRecord, owner: &OwnerRef, episode: &str) -> bool {
+    !task_ended(task)
+        && &task.owner == owner
+        && task
+            .watched_gate
+            .as_ref()
+            .is_some_and(|gate| gate.episode == episode)
 }
 
 /// Whether `task` can take no more answers: finished, archived (or being

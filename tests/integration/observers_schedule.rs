@@ -373,3 +373,283 @@ fn an_entry_run_gets_the_whole_gate_in_contract_version_two() {
         })
     );
 }
+
+// ---------------------------------------------------------------------------
+// Run modes and ticks (U8, KTD-3)
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// 12:MM:SS of the fixture's day.
+    fn at(&self, minute: u32, second: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 13, 12, minute, second)
+            .unwrap()
+    }
+
+    fn set(&self, to: DateTime<Utc>) {
+        *self.clock.0.lock().unwrap() = to;
+    }
+
+    /// Reports `exit_code` for `run`; exit 0 with a valid output document.
+    fn finish(&self, run: &narsor_engine::controller_protocol::ClaimedObserverRun, exit_code: i32) {
+        self.service
+            .finish_observer_run(
+                &run.run_id,
+                RunReport {
+                    outcome: RunOutcome::Exited { exit_code },
+                    stdout: "{\"state\": {}}".into(),
+                    stderr: String::new(),
+                },
+            )
+            .unwrap();
+    }
+
+    fn claim(&self) -> Option<narsor_engine::controller_protocol::ClaimedObserverRun> {
+        self.service.claim_observer_run().unwrap()
+    }
+}
+
+#[test]
+fn an_on_episodes_observer_runs_only_at_a_tick_with_an_entry() {
+    // Covers AE7: cron `*/5`; at the first tick the queue is empty, no run
+    // and no error; at the next tick one entry, one run for it.
+    let fx = Fixture::new();
+    let cron = ScheduleConfig::from_parts(None, Some("*/5 * * * *".into())).unwrap();
+    let id = fx.active("gitlab-mr", ObserverMode::OnEpisodes, cron);
+
+    let empty = fx.service.observer_pass();
+    assert_eq!(empty.skipped, vec![id.clone()]);
+    assert!(fx.claim().is_none());
+    let record = fx.service.observers().load(&id).unwrap();
+    assert_eq!(record.last_run, None);
+    assert_eq!(record.next_run_at, Some(fx.at(5, 0)));
+
+    fx.set(fx.at(2, 0));
+    let task = fx.task("task-1");
+    fx.entry("gitlab-mr", &task, "input-1");
+    run_periodic_pass(&fx.service);
+    assert!(fx.claim().is_none(), "no tick yet");
+
+    fx.set(fx.at(5, 0));
+    run_periodic_pass(&fx.service);
+    let run = fx.claim().expect("one run at the tick");
+    assert_eq!(run.input.entry.as_ref().unwrap().task_id, task);
+    assert!(fx.claim().is_none());
+}
+
+#[test]
+fn an_always_observer_runs_once_at_every_tick_with_no_entry() {
+    // Covers AE6: no task exists; every tick runs the script once, with no
+    // entry in its input.
+    let fx = Fixture::new();
+    let cron = ScheduleConfig::from_parts(None, Some("*/10 * * * *".into())).unwrap();
+    fx.active("jira-new", ObserverMode::Always, cron);
+
+    let mut runs = 0;
+    for minute in [0, 3, 10, 10, 15, 20] {
+        fx.set(fx.at(minute, 0));
+        run_periodic_pass(&fx.service);
+        while let Some(run) = fx.claim() {
+            assert!(run.input.entry.is_none());
+            runs += 1;
+            fx.finish(&run, 0);
+        }
+    }
+
+    assert_eq!(runs, 3, "12:00, 12:10 and 12:20");
+}
+
+#[test]
+fn the_next_tick_counts_from_the_last_tick_not_from_the_end_of_the_run() {
+    let fx = Fixture::new();
+    let id = fx.active("jira-new", ObserverMode::Always, ScheduleConfig::default());
+    run_periodic_pass(&fx.service);
+    let run = fx.claim().expect("the approval's tick");
+
+    fx.set(fx.at(3, 0));
+    fx.finish(&run, 0);
+
+    let record = fx.service.observers().load(&id).unwrap();
+    assert_eq!(record.next_run_at, Some(fx.at(5, 0)));
+}
+
+#[test]
+fn a_tick_while_the_run_is_active_starts_nothing_and_is_not_owed() {
+    // R29: one run at a time; the tick is skipped, not queued.
+    let fx = Fixture::new();
+    let id = fx.active("jira-new", ObserverMode::Always, ScheduleConfig::default());
+    run_periodic_pass(&fx.service);
+    let run = fx.claim().expect("the approval's tick");
+
+    fx.set(fx.at(5, 0));
+    let pass = fx.service.observer_pass();
+    assert_eq!(pass.busy, vec![id.clone()]);
+    assert!(pass.due.is_empty());
+    assert!(fx.claim().is_none());
+    assert_eq!(
+        fx.service.observers().load(&id).unwrap().next_run_at,
+        Some(fx.at(10, 0))
+    );
+
+    // Within the run's deadline (the script's limit and a minute).
+    fx.set(fx.at(5, 40));
+    fx.finish(&run, 0);
+    run_periodic_pass(&fx.service);
+    assert!(fx.claim().is_none(), "the 12:05 tick is not owed");
+
+    fx.set(fx.at(10, 0));
+    run_periodic_pass(&fx.service);
+    assert!(fx.claim().is_some());
+}
+
+#[test]
+fn a_tick_the_run_outlasted_without_a_pass_is_not_owed_either() {
+    let fx = Fixture::new();
+    let id = fx.active("jira-new", ObserverMode::Always, ScheduleConfig::default());
+    run_periodic_pass(&fx.service);
+    let run = fx.claim().expect("the approval's tick");
+
+    fx.set(fx.at(5, 30));
+    fx.finish(&run, 0);
+    run_periodic_pass(&fx.service);
+
+    assert!(fx.claim().is_none());
+    assert_eq!(
+        fx.service.observers().load(&id).unwrap().next_run_at,
+        Some(fx.at(10, 0))
+    );
+}
+
+#[test]
+fn a_tick_during_the_backoff_starts_nothing_and_keeps_the_backoff() {
+    // R29: a failed `always` run waits `interval × 2^failures`; the tick in
+    // between neither runs nor moves the backoff.
+    let fx = Fixture::new();
+    let id = fx.active("jira-new", ObserverMode::Always, ScheduleConfig::default());
+    run_periodic_pass(&fx.service);
+    let run = fx.claim().expect("the approval's tick");
+    fx.finish(&run, 1);
+    let record = fx.service.observers().load(&id).unwrap();
+    assert_eq!(record.consecutive_failures, 1);
+    assert_eq!(record.next_run_at, Some(fx.at(10, 0)));
+
+    fx.set(fx.at(5, 0));
+    let pass = fx.service.observer_pass();
+
+    assert!(pass.due.is_empty() && pass.busy.is_empty());
+    assert!(fx.claim().is_none());
+    let record = fx.service.observers().load(&id).unwrap();
+    assert_eq!(record.next_run_at, Some(fx.at(10, 0)));
+    assert_eq!(record.consecutive_failures, 1);
+
+    fx.set(fx.at(10, 0));
+    run_periodic_pass(&fx.service);
+    assert!(fx.claim().is_some());
+}
+
+#[test]
+fn three_entries_at_one_tick_run_one_per_run_over_the_round() {
+    // R30: one entry per run, never three at once; a tick while the round
+    // goes on is skipped.
+    let fx = Fixture::new();
+    let id = fx.active_on_episodes("mr-review");
+    for (task, episode) in [
+        ("task-1", "input-1"),
+        ("task-2", "input-2"),
+        ("task-3", "input-3"),
+    ] {
+        let task = fx.task(task);
+        fx.entry("mr-review", &task, episode);
+    }
+    run_periodic_pass(&fx.service);
+
+    let first = fx.claim().expect("the round's first entry");
+    assert!(fx.claim().is_none(), "one run at a time");
+    fx.finish(&first, 0);
+    let second = fx.claim().expect("the round's second entry");
+    fx.set(fx.at(5, 0));
+    let pass = fx.service.observer_pass();
+    assert_eq!(pass.busy, vec![id.clone()]);
+    fx.finish(&second, 0);
+    let third = fx.claim().expect("the round's third entry");
+    fx.finish(&third, 0);
+    assert!(
+        fx.claim().is_none(),
+        "the round is over; the 12:05 tick is not owed"
+    );
+
+    let mut episodes: Vec<String> = [&first, &second, &third]
+        .iter()
+        .map(|run| run.input.entry.as_ref().unwrap().episode.clone())
+        .collect();
+    episodes.sort();
+    assert_eq!(episodes, vec!["input-1", "input-2", "input-3"]);
+    assert_eq!(
+        fx.service.observers().load(&id).unwrap().next_run_at,
+        Some(fx.at(10, 0))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// An entry the control plane lost (U4's gap)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_tick_adds_back_the_entry_of_a_waiting_task_once_and_warns_nothing() {
+    // A crash between the task's record and its entry: the task waits in
+    // its watched episode with no entry.
+    let fx = Fixture::new();
+    fx.active_on_episodes("mr-review");
+    let task = fx.task("task-1");
+    fx.entry("mr-review", &task, "input-1");
+    let entry_id = queue_entry_id(&task, "input-1");
+    let store = fx.service.observers();
+    let lock = store.lock_queue_entries().unwrap();
+    assert!(store.remove_queue_entry(&lock, &entry_id).unwrap());
+    drop(lock);
+    let events_before = fx
+        .service
+        .control_plane()
+        .events_since(&task, 0)
+        .unwrap()
+        .len();
+
+    let pass = fx.service.observer_pass();
+
+    assert_eq!(pass.entries_restored, 1);
+    assert!(store.queue_entry(&entry_id).unwrap().is_some());
+    let run = fx.claim().expect("a run for the entry");
+    assert_eq!(run.input.entry.as_ref().unwrap().episode, "input-1");
+    fx.finish(&run, 0);
+    assert_eq!(
+        fx.service
+            .control_plane()
+            .events_since(&task, 0)
+            .unwrap()
+            .len(),
+        events_before,
+        "no warning, nothing in the task's history"
+    );
+
+    fx.advance(Duration::seconds(300));
+    let again = fx.service.observer_pass();
+    assert_eq!(again.entries_restored, 0);
+}
+
+#[test]
+fn no_entry_comes_back_for_an_episode_that_ended() {
+    let fx = Fixture::new();
+    fx.active_on_episodes("mr-review");
+    let task = fx.task("task-1");
+    fx.entry("mr-review", &task, "input-1");
+    crate::gate_support::past_gates(&fx.service, &task);
+
+    let pass = fx.service.observer_pass();
+
+    assert_eq!(pass.entries_restored, 0);
+    assert!(fx
+        .service
+        .observers()
+        .queue_entries(&OwnerRef::new("owner"), "mr-review")
+        .unwrap()
+        .is_empty());
+}

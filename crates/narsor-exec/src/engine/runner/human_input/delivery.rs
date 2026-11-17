@@ -212,7 +212,7 @@ impl Engine {
             let outcome = DecisionOutcome {
                 label: resumed.result.output_label.clone(),
                 provider: match delivery.answered_by {
-                    AnsweredBy::Operator => DecisionProviderType::Human,
+                    AnsweredBy::Operator | AnsweredBy::Observer => DecisionProviderType::Human,
                     AnsweredBy::Conductor => DecisionProviderType::Conductor,
                 },
                 reasoning: delivery

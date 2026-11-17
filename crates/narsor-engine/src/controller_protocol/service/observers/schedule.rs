@@ -1,12 +1,21 @@
-//! The observers' schedule (R6, R7, R14, R16, R17): which observer is due,
-//! the worker's claim of a run, and what the run's result changes.
+//! The observers' schedule (R6, R7, R14, R16, R17, R25, R29, R30): which
+//! observer is due, the worker's claim of a run, and what the run's result
+//! changes.
 //!
 //! ```text
-//! observer_pass   next_run_at <= now, active, approved  → run_due_since = now
-//!                 on_episodes without entries           → next_run_at = next fire, no run
-//!                 on_episodes with entries              → entry_round = the entries
-//!                 an entry whose task no longer waits   → removed (R18, R19)
-//!                 in its episode, ended or is gone
+//! observer_pass   a tick (next_run_at <= now), active,  → next_run_at = the next tick
+//!                 approved, idle                          after this one (KTD-3)
+//!                   always                              → run_due_since = now: one run,
+//!                                                         no entry
+//!                   on_episodes without entries         → no run, no error
+//!                   on_episodes with entries            → run_due_since = now,
+//!                                                         entry_round = the entries
+//!                   a task of the queue that waits in   → its entry added back
+//!                   its episode with no entry
+//!                   an entry whose task no longer waits → removed (R18, R19)
+//!                   in its episode, ended or is gone
+//!                 a tick while a run is active or a     → skipped, not queued:
+//!                 round goes on                           next_run_at = the next tick
 //!                 run past its deadline                 → lost: error file, token spent
 //! claim           a run past its deadline               → lost (as in the pass)
 //!                 the oldest due                        → active_run + token (once);
@@ -24,14 +33,23 @@
 //!                                                         stays; no backoff
 //! ```
 //!
+//! The next due time counts from the tick, never from the end of a run
+//! (KTD-3): the pass sets it when the tick comes. A tick that finds the
+//! observer's run still active, or its round still going, is skipped, so an
+//! observer owes no run for it (R29). The backoff after failed runs moves
+//! `next_run_at` past the ticks it covers, so a tick in the backoff never
+//! comes; a success or a lost run leaves the next tick as the tick set it,
+//! past any tick the run outlasted.
+//!
 //! An `on_episodes` observer checks one entry of its queue per run (R30).
-//! A round holds the entries that were there when the run became due; while
-//! entries are left in it, the observer stays due, so the next entry is
-//! claimed as soon as the run before has its result. The next round comes
-//! at the schedule's next fire after the last run. An entry stays on its
-//! queue until its gate exits, so it is checked again in every round until
-//! then. The entries are the queue's, in the owner's namespace (R7): every
-//! observer of the queue checks them on its own schedule (R8).
+//! A round holds the entries that were there at the tick; while entries are
+//! left in it, the observer stays due, so the next entry is claimed as soon
+//! as the run before has its result. The next round comes at the first tick
+//! after the round ends. An entry stays on its queue until its gate exits,
+//! so it is checked again in every round until then. The entries are the
+//! queue's, in the owner's namespace (R7): every observer of the queue
+//! checks them on its own schedule (R8). An `always` observer runs once per
+//! tick, with no entry (R25).
 //!
 //! The pass only flags; the run appears at the claim, as the record's
 //! `active_run`. The flag is one value, not a queue, so a control plane that
@@ -113,14 +131,22 @@ pub struct ObserverPass {
     /// Observers whose scheduled run became due.
     pub due: Vec<ObserverId>,
     /// `on_episodes` observers that were due with no queue entry: no run,
-    /// the next deadline moved to the schedule's next fire (R30).
+    /// the next deadline moved to the schedule's next tick (R30).
     pub skipped: Vec<ObserverId>,
+    /// Observers whose tick came while their run was active or their round
+    /// went on: no run for that tick, the next deadline moved to the
+    /// schedule's next tick (R29).
+    pub busy: Vec<ObserverId>,
     /// Runs that passed their deadline without a result.
     pub lost: Vec<RunId>,
     /// Queue entries removed because their task no longer waits in their
     /// episode: the gate exited, or the task ended, was archived or is gone
     /// (R18, R19).
     pub entries_removed: usize,
+    /// Queue entries added back for tasks that wait in a watched episode
+    /// with none: the control plane stopped between the task's record and
+    /// the entry.
+    pub entries_restored: usize,
 }
 
 /// A run handed to a worker. The token is in no record: this is the only
@@ -202,6 +228,22 @@ fn scheduled_run_due(record: &ObserverRecord, now: DateTime<Utc>) -> bool {
         && record.active_run.is_none()
         && record.run_due_since.is_none()
         && record.next_run_at.is_none_or(|at| at <= now)
+}
+
+/// Whether the observer's tick came while its run is active or its round
+/// goes on: the tick is skipped, not queued (R29).
+fn tick_while_busy(record: &ObserverRecord, now: DateTime<Utc>) -> bool {
+    record.state == ObserverState::Active
+        && (record.active_run.is_some() || record.run_due_since.is_some())
+        && record.next_run_at.is_some_and(|at| at <= now)
+}
+
+/// Moves a tick that passed by `now` to the schedule's next tick after it
+/// (KTD-3); a tick still to come stays.
+fn skip_passed_tick(record: &mut ObserverRecord, now: DateTime<Utc>) {
+    if let Some(at) = record.next_run_at.filter(|at| *at <= now) {
+        record.next_run_at = Some(record.config.schedule.next_tick_after(at, now));
+    }
 }
 
 /// `now` plus `secs` seconds, the latest instant when that is too far.
@@ -345,13 +387,15 @@ impl ProtocolService {
         let now = self.control.now();
         let mut pass = ObserverPass::default();
         for record in &records {
-            let result = if let Some(active) = &record.active_run {
-                if active.is_past_deadline(now) {
-                    self.expire_run_if_lost(&record.observer_id, now)
-                        .map(|lost| pass.lost.extend(lost))
-                } else {
-                    Ok(())
-                }
+            let lost = record
+                .active_run
+                .as_ref()
+                .is_some_and(|active| active.is_past_deadline(now));
+            let result = if lost {
+                self.expire_run_if_lost(&record.observer_id, now)
+                    .map(|lost| pass.lost.extend(lost))
+            } else if tick_while_busy(record, now) {
+                self.skip_busy_tick(&record.observer_id, now, &mut pass)
             } else if scheduled_run_due(record, now) {
                 self.mark_run_due(&record.observer_id, now, &mut pass)
             } else {
@@ -448,7 +492,9 @@ impl ProtocolService {
                 format!("run {run_id} passed its deadline and was recorded as lost"),
             ));
         }
-        let next_fire = record.config.schedule.next_after(now);
+        // The next tick was set when this run's tick came; one the run
+        // outlasted is skipped, not owed (KTD-3, R29).
+        skip_passed_tick(&mut record, now);
         let (status, exit_code, error) = match &active.entry {
             Some(_) => {
                 let verdict = judge_entry_run(&report);
@@ -457,7 +503,6 @@ impl ProtocolService {
                 }
                 // A failed entry is checked again in the next round: no
                 // backoff, no count towards the error state (R14).
-                record.next_run_at = Some(next_fire);
                 // The round's next entry waits for a claim from now, not
                 // from this run's claim.
                 if record.run_due_since.is_some() {
@@ -472,7 +517,6 @@ impl ProtocolService {
                         record.script_state = Some(output.state);
                         record.first_run_done = true;
                         record.consecutive_failures = 0;
-                        record.next_run_at = Some(next_fire);
                     }
                     None => count_failure(&mut record, now),
                 }
@@ -539,9 +583,12 @@ impl ProtocolService {
         valid.then_some(run_id)
     }
 
-    /// Flags the observer's scheduled run due, unless it is `on_episodes`
-    /// and its queue is empty once the entries of ended tasks are gone (R19,
-    /// R30). An `on_episodes` observer's round is the entries left.
+    /// Takes the observer's tick: the next tick counts from this one
+    /// (KTD-3). Flags the scheduled run due, unless the observer is
+    /// `on_episodes` and its queue is empty once the entries of ended tasks
+    /// are gone and missing ones are back (R19, R30). An `on_episodes`
+    /// observer's round is the entries left; an `always` observer's run has
+    /// no entry (R25).
     fn mark_run_due(
         &self,
         observer_id: &ObserverId,
@@ -553,11 +600,14 @@ impl ProtocolService {
         if !scheduled_run_due(&record, now) {
             return Ok(());
         }
+        let tick = record.next_run_at.unwrap_or(now);
+        record.next_run_at = Some(record.config.schedule.next_tick_after(tick, now));
         if record.config.mode == ObserverMode::OnEpisodes {
+            pass.entries_restored +=
+                self.restore_queue_entries(&record.owner, &record.config.queue);
             let (remaining, removed) = self.prune_entries(&record)?;
             pass.entries_removed += removed;
             if remaining.is_empty() {
-                record.next_run_at = Some(record.config.schedule.next_after(now));
                 self.observers.save(&lock, &mut record, now)?;
                 pass.skipped.push(observer_id.clone());
                 return Ok(());
@@ -567,6 +617,26 @@ impl ProtocolService {
         record.run_due_since = Some(now);
         self.observers.save(&lock, &mut record, now)?;
         pass.due.push(observer_id.clone());
+        Ok(())
+    }
+
+    /// Skips the tick of an observer whose run is active or whose round goes
+    /// on (R29): no run for it, the next tick counts from it.
+    fn skip_busy_tick(
+        &self,
+        observer_id: &ObserverId,
+        now: DateTime<Utc>,
+        pass: &mut ObserverPass,
+    ) -> Result<(), ObserverError> {
+        let lock = self.observers.lock(observer_id)?;
+        let mut record = self.observers.load(observer_id)?;
+        if !tick_while_busy(&record, now) {
+            return Ok(());
+        }
+        skip_passed_tick(&mut record, now);
+        self.observers.save(&lock, &mut record, now)?;
+        tracing::debug!(observer = %observer_id, "observers: a tick came while a run was active; skipped");
+        pass.busy.push(observer_id.clone());
         Ok(())
     }
 
@@ -595,7 +665,7 @@ impl ProtocolService {
     /// Ends the run `active` as lost: its error file is written, its token
     /// stops working, the observer's state and failure count stay as they
     /// are (the cause is the infrastructure, not the script), and a
-    /// scheduled run is next due at the schedule's next fire.
+    /// scheduled run is next due at the next tick the run did not outlast.
     fn lose_run(
         &self,
         lock: &ObserverLock,
@@ -627,7 +697,7 @@ impl ProtocolService {
             finished_at: now,
             error: Some(LOST_MESSAGE.to_string()),
         });
-        record.next_run_at = Some(record.config.schedule.next_after(now));
+        skip_passed_tick(record, now);
         // The round's next entry waits for a claim from now (R30).
         if record.run_due_since.is_some() {
             record.run_due_since = Some(now);
@@ -656,9 +726,9 @@ impl ProtocolService {
                 Some(entry) => Some(entry),
                 None => {
                     // The round's entries went between the pass and this
-                    // claim (R30).
+                    // claim (R30); the next round comes at the next tick.
                     record.run_due_since = None;
-                    record.next_run_at = Some(record.config.schedule.next_after(now));
+                    skip_passed_tick(&mut record, now);
                     self.observers.save(&lock, &mut record, now)?;
                     return Ok(None);
                 }

@@ -844,6 +844,8 @@ fn each_run_checks_one_entry_of_the_queue_with_its_episode() {
     // R30: one entry per run; the round takes the entries in order.
     let fx = Fixture::new();
     let id = fx.active("mr-review", ObserverMode::OnEpisodes);
+    // The approval's tick: the next one counts from it (KTD-3).
+    let tick = fx.now();
     let first_task = fx.task("task-first");
     let second_task = fx.task("task-second");
     fx.entry("mr-review", &first_task, "input-3");
@@ -885,7 +887,7 @@ fn each_run_checks_one_entry_of_the_queue_with_its_episode() {
     );
     assert_eq!(
         fx.record(&id).next_run_at,
-        Some(fx.now() + Duration::seconds(INTERVAL as i64))
+        Some(tick + Duration::seconds(INTERVAL as i64))
     );
 }
 

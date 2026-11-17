@@ -293,9 +293,14 @@ pub enum EventData {
         /// The step's `variables`, when the answer resolved a problem.
         #[serde(default)]
         variables: Option<serde_json::Value>,
-        /// A free-text remark that came with the answer.
+        /// A free-text remark that came with the answer: for an observer's
+        /// answer, the reason its script gave (R22).
         #[serde(default)]
         comment: Option<String>,
+        /// The observer and its run, when an observer's script answered
+        /// (`answered_by: observer`, R15).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observer: Option<crate::controller::TaskProvenance>,
     },
     HumanTransitionSelected {
         from_state: String,
@@ -474,6 +479,25 @@ pub enum AnsweredBy {
     Operator,
     /// The conductor, acting on its own or on a confirmed proposal.
     Conductor,
+    /// An observer's script, through `narsor-cli task decide` (R15); the
+    /// event names the observer and its run.
+    Observer,
+}
+
+/// Who answered an input, as a history line names them: `operator`,
+/// `conductor`, or `observer NAME (run RUN)` when an observer's script
+/// answered (R15, R22).
+pub fn answer_author(
+    answered_by: Option<AnsweredBy>,
+    observer: Option<&crate::controller::TaskProvenance>,
+) -> String {
+    match observer {
+        Some(observer) => format!(
+            "observer {} (run {})",
+            observer.observer_name, observer.run_id
+        ),
+        None => answered_by.unwrap_or_default().name().to_string(),
+    }
 }
 
 impl AnsweredBy {
@@ -482,6 +506,7 @@ impl AnsweredBy {
         match self {
             Self::Operator => "operator",
             Self::Conductor => "conductor",
+            Self::Observer => "observer",
         }
     }
 }
@@ -746,6 +771,7 @@ impl EventData {
             artifacts: None,
             variables: None,
             comment: None,
+            observer: None,
         }
     }
 }
@@ -857,9 +883,10 @@ impl Event {
                 answered_by,
                 close_reason,
                 output_label,
+                observer,
                 ..
             } => {
-                let by = answered_by.unwrap_or_default().name();
+                let by = answer_author(*answered_by, observer.as_ref());
                 match close_reason {
                     Some(reason) if *reason != InputCloseReason::Answered => {
                         format!("Human input closed by {} ({by})", reason.name())

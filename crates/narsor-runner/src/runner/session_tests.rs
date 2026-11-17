@@ -558,6 +558,7 @@ impl Fixture {
                     chosen_label: Some("ok".to_string()),
                     ..Default::default()
                 },
+                observer: None,
             })
             .expect("take the answer")
     }
@@ -3002,6 +3003,7 @@ async fn an_answered_watched_gate_reports_no_watch() {
                 chosen_label: Some("approve".to_string()),
                 ..Default::default()
             },
+            observer: None,
         })
         .expect("take the answer");
     assert_eq!(verdict, InputVerdict::Taken { first: true });
@@ -3011,6 +3013,62 @@ async fn an_answered_watched_gate_reports_no_watch() {
     let snapshot = fixture.snapshot();
     assert_eq!(snapshot.gate_watch, None);
     assert_eq!(snapshot.pending_input, None);
+}
+
+/// R15, R22: an answer the control plane hands over for an observer's
+/// script is recorded as the observer's, with its run and its reason.
+#[tokio::test]
+async fn an_observers_answer_is_recorded_with_its_run_and_reason() {
+    let root = TempRoot::new();
+    let mut fixture = waiting_at_the_watched_gate(&root, &root.dir("storage"), "pod-1").await;
+    let pending = fixture.session.pending_input_id().unwrap().expect("a gate");
+    let observer = narsor_protocol::controller::TaskProvenance {
+        observer_id: "obs-1".to_string(),
+        observer_name: "gitlab-mr".to_string(),
+        run_id: "obs-1.3".to_string(),
+    };
+
+    let verdict = fixture
+        .session
+        .take_input(DeliveredInput {
+            input_id: "answer-1".to_string(),
+            pending_input_id: pending.clone(),
+            delivery: narsor_protocol::api::HumanInputDeliveryDto {
+                chosen_label: Some("approve".to_string()),
+                comment: Some("label removed".to_string()),
+                episode: Some(pending),
+                ..Default::default()
+            },
+            observer: Some(observer.clone()),
+        })
+        .expect("take the answer");
+    assert_eq!(verdict, InputVerdict::Taken { first: true });
+    fixture.settled().await;
+
+    let answer = fixture
+        .events()
+        .into_iter()
+        .find_map(|event| match event {
+            EventData::HumanInputReceived {
+                answered_by,
+                output_label,
+                comment,
+                observer,
+                ..
+            } => Some((answered_by, output_label, comment, observer)),
+            _ => None,
+        })
+        .expect("the answer is in the log");
+    assert_eq!(
+        answer,
+        (
+            Some(AnsweredBy::Observer),
+            Some("approve".to_string()),
+            Some("label removed".to_string()),
+            Some(observer)
+        )
+    );
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
 }
 
 /// R17: a runner relaunched while its task waits at the gate reports the

@@ -71,6 +71,11 @@ pub struct DeliveredInput {
     pub input_id: String,
     pub pending_input_id: String,
     pub delivery: HumanInputDeliveryDto,
+    /// The observer and its run, when an observer's script gave the answer
+    /// (`task decide`, R15); `None` for a person's. Only the control plane
+    /// sets it: the owner's routes never read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer: Option<crate::controller::TaskProvenance>,
 }
 
 /// An operator command handed to the runner.

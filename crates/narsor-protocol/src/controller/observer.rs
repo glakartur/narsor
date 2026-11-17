@@ -26,13 +26,40 @@ pub struct ObserverCreateTaskRequest {
     pub data: Value,
 }
 
+/// `POST /observer/v1/runs/{run}/decide`: answer the gate of the run's queue
+/// entry, as a person answers it (R12, R13).
+///
+/// The task and the episode must be those of the entry the run was started
+/// for; a run of an `always` observer has none and answers no gate. The
+/// choice must be one of the gate's, every variable it requires must have a
+/// value, and every variable must be one the gate declares. No artifacts in
+/// this version.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ObserverDecideRequest {
+    /// The task waiting at the gate.
+    pub task_id: String,
+    /// The wait episode the answer is for: the entry's episode.
+    pub episode: String,
+    /// The choice, by its name.
+    pub choice: String,
+    /// Why the script chose it; the task's history shows it (R22).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The values of the gate's variables, by name.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub variables: serde_json::Map<String, Value>,
+}
+
 /// What an effect route did.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObserverEffectOutcome {
     /// A task was created.
     Created,
-    /// The answer was queued for the task's waiting step.
+    /// The answer was queued for the task's waiting gate. The runner
+    /// applies it; the gate exits with it unless another answer for the
+    /// same episode came first.
     Delivered,
     /// The task's history recorded it; nothing was queued.
     Recorded,

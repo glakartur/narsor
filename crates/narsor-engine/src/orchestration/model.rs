@@ -892,6 +892,11 @@ pub struct QueuedInput {
     pub updated_at: DateTime<Utc>,
     /// The runner's reason, when it rejected the input.
     pub detail: Option<String>,
+    /// The observer and its run, when an observer's script gave the answer
+    /// (`task decide`, R15); `None` for the owner's. The runner records it
+    /// in the answer's event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer: Option<TaskProvenance>,
 }
 
 /// An owner input as submitted.

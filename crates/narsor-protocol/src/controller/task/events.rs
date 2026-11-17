@@ -33,6 +33,10 @@ pub enum TaskEventKind {
     InputQueued {
         input_id: String,
         pending_input_id: String,
+        /// The observer and its run, when an observer's script gave the
+        /// answer (`task decide`, R15); `None` for the owner's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observer: Option<TaskProvenance>,
     },
     /// The owner commented on a paused task; the comment waits for the
     /// runner of the next launch.
@@ -162,7 +166,8 @@ pub enum TaskEventKind {
     Unrecognized,
 }
 
-/// Where a task or an event came from when an observer caused it (R19).
+/// Where a task, an event or an answer came from when an observer caused it
+/// (R15, R19).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskProvenance {
     /// The observer's id, never reused.

@@ -86,7 +86,7 @@ use narsor_protocol::controller::{
     ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest,
     CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery,
     ExecutionEventsResponse, HarnessUsageResponse, ObserverClaimResponse,
-    ObserverCreateTaskRequest, ObserverEffectResponse, ObserverRunReport,
+    ObserverCreateTaskRequest, ObserverDecideRequest, ObserverEffectResponse, ObserverRunReport,
     ObserverRunResultResponse, ObserverWorkerRun, OwnerCommandRequest, RepositoryBranchesResponse,
     RepositoryListResponse, RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest,
     SubmitInputRequest, SubmitOperatorCommandRequest, ValidateWorkflowRequest,
@@ -924,6 +924,18 @@ impl ApiClient {
     ) -> Result<ObserverEffectResponse, ClientError> {
         let run_id = path_segment("run", run_id)?;
         let url = format!("{}/observer/v1/runs/{run_id}/tasks", self.base_url);
+        self.post_json(&url, request).await
+    }
+
+    /// Answers the gate of the run's queue entry, for a client holding a
+    /// run token — `POST /observer/v1/runs/{run}/decide`.
+    pub async fn observer_decide(
+        &self,
+        run_id: &str,
+        request: &ObserverDecideRequest,
+    ) -> Result<ObserverEffectResponse, ClientError> {
+        let run_id = path_segment("run", run_id)?;
+        let url = format!("{}/observer/v1/runs/{run_id}/decide", self.base_url);
         self.post_json(&url, request).await
     }
 

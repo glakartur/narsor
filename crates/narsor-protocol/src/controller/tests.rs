@@ -821,3 +821,39 @@ fn usage_windows_outside_the_pattern_have_no_length() {
         assert_eq!(usage_window_length(window), None, "{window:?}");
     }
 }
+
+#[test]
+fn an_observers_answer_names_its_entry_and_refuses_artifacts() {
+    let request: super::ObserverDecideRequest = serde_json::from_value(serde_json::json!({
+        "task_id": "task-1",
+        "episode": "input-1",
+        "choice": "check_feedback",
+        "reason": "label removed",
+    }))
+    .unwrap();
+    assert!(request.variables.is_empty());
+    let value = serde_json::to_value(&request).unwrap();
+    assert!(value.get("variables").is_none());
+    assert_eq!(value["reason"], "label removed");
+
+    let refused = serde_json::json!({
+        "task_id": "task-1",
+        "episode": "input-1",
+        "choice": "check_feedback",
+        "artifacts": {"report": "out.md"},
+    });
+    assert!(serde_json::from_value::<super::ObserverDecideRequest>(refused).is_err());
+
+    // The input of an observer's answer names it; an owner's has nothing.
+    let queued = super::TaskEventKind::InputQueued {
+        input_id: "input-1".into(),
+        pending_input_id: "episode-1".into(),
+        observer: None,
+    };
+    let value = serde_json::to_value(&queued).unwrap();
+    assert!(value.get("observer").is_none());
+    assert_eq!(
+        serde_json::from_value::<super::TaskEventKind>(value).unwrap(),
+        queued
+    );
+}

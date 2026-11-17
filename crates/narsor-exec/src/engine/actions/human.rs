@@ -620,29 +620,15 @@ fn resume_inner(
 
     // Checked on the same read the answer is applied to (KTD9): nothing
     // between here and the writes below can bring the request back.
-    if let Some(delivered) = &delivery.episode {
-        if delivered != pending.episode_key() {
-            return Err(HumanActionError::StaleEpisode {
-                execution_id: execution_id.to_string(),
-                delivered: delivered.clone(),
-                current: pending.episode_key().to_string(),
-            });
-        }
-    }
+    require_episode(&pending, delivery, execution_id)?;
 
     // Validation first, and before any write: a rejected delivery must leave
     // the execution exactly as paused as it was.
-    let optional_resume_fields: Vec<&str> = intended_label(&pending, delivery)
-        .map(|label| {
-            pending
-                .outputs
-                .iter()
-                .filter(|output| output.label != label)
-                .filter_map(|output| output.resume_comment_field.as_deref())
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut values = validate_values(pending.fields(), &delivery.values, &optional_resume_fields)?;
+    let mut values = validate_values(
+        pending.fields(),
+        &delivery.values,
+        &optional_resume_fields(&pending, delivery),
+    )?;
     let agent_message = delivery
         .agent_message
         .as_deref()
@@ -673,15 +659,7 @@ fn resume_inner(
     validate_agent_answer(&pending, &values)?;
     let (label, data, variables) = match pending.continuation {
         InputContinuation::CompleteStep => {
-            reject_step_values(delivery)?;
-            let label = resolve_label(&pending, delivery, &values)?;
-            require_resume_comment(&pending, &label, &values)?;
-            let answered = if pending.label_from_menu {
-                require_label_variables(&pending, &label, &values)?;
-                values.clone()
-            } else {
-                with_blank_optional_text(pending.fields(), &values)
-            };
+            let (label, answered) = complete_step(&pending, delivery, &values)?;
             (label, Value::Object(answered.clone()), answered)
         }
         // This label is internal only. The engine observes `continuation` and
@@ -805,6 +783,7 @@ fn resume_inner(
                 .map(str::trim)
                 .filter(|comment| !comment.is_empty())
                 .map(ToString::to_string),
+            observer: delivery.observer.clone(),
         },
     )?;
 
@@ -901,6 +880,7 @@ pub fn closing_event(
         artifacts: None,
         variables: None,
         comment: None,
+        observer: None,
     }
 }
 
@@ -935,6 +915,94 @@ pub(crate) const ENTRY_LIMIT_RESET_LABEL: &str = "__entry_limit_reset__";
 pub use narsor_protocol::api::{
     ENTRY_LIMIT_CONTINUE, ENTRY_LIMIT_DECISION_FIELD, ENTRY_LIMIT_RESET_COUNTER,
 };
+
+/// Checks an answer to a gate that completes its step
+/// ([`InputContinuation::CompleteStep`]) as [`resume`] checks it, without
+/// the store: the request it names, the declared fields, the label and what
+/// the label needs. Returns the label it chooses.
+///
+/// For the control plane, which answers for an observer's script (R13) and
+/// must refuse a wrong answer at once rather than when the runner applies
+/// it. [`resume`] still checks everything again on its own read.
+pub fn check_gate_answer(
+    pending: &PendingHumanInput,
+    delivery: &HumanInputDelivery,
+) -> Result<OutputLabel, HumanActionError> {
+    if pending.continuation != InputContinuation::CompleteStep {
+        return Err(HumanActionError::InvalidContinuation {
+            reason: "the request does not wait for a gate's choice".to_string(),
+        });
+    }
+    require_episode(pending, delivery, &pending.execution_id)?;
+    let values = validate_values(
+        pending.fields(),
+        &delivery.values,
+        &optional_resume_fields(pending, delivery),
+    )?;
+    let agent_message = delivery
+        .agent_message
+        .as_deref()
+        .is_some_and(|message| !message.trim().is_empty());
+    if agent_message {
+        return Err(HumanActionError::UnexpectedStepValues);
+    }
+    complete_step(pending, delivery, &values).map(|(label, _)| label)
+}
+
+/// Refuses a delivery that names another request than `pending` (KTD9).
+fn require_episode(
+    pending: &PendingHumanInput,
+    delivery: &HumanInputDelivery,
+    execution_id: &str,
+) -> Result<(), HumanActionError> {
+    match &delivery.episode {
+        Some(delivered) if delivered != pending.episode_key() => {
+            Err(HumanActionError::StaleEpisode {
+                execution_id: execution_id.to_string(),
+                delivered: delivered.clone(),
+                current: pending.episode_key().to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The resume-comment fields of the labels the delivery does not choose:
+/// optional for this answer, whatever the form says.
+fn optional_resume_fields<'a>(
+    pending: &'a PendingHumanInput,
+    delivery: &HumanInputDelivery,
+) -> Vec<&'a str> {
+    intended_label(pending, delivery)
+        .map(|label| {
+            pending
+                .outputs
+                .iter()
+                .filter(|output| output.label != label)
+                .filter_map(|output| output.resume_comment_field.as_deref())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The label and the recorded values of an answer that completes its step,
+/// from the delivery and its checked `values`.
+fn complete_step(
+    pending: &PendingHumanInput,
+    delivery: &HumanInputDelivery,
+    values: &Map<String, Value>,
+) -> Result<(OutputLabel, Map<String, Value>), HumanActionError> {
+    reject_step_values(delivery)?;
+    let label = resolve_label(pending, delivery, values)?;
+    require_resume_comment(pending, &label, values)?;
+    let answered = if pending.label_from_menu {
+        require_label_variables(pending, &label, values)?;
+        values.clone()
+    } else {
+        with_blank_optional_text(pending.fields(), values)
+    };
+    Ok((label, answered))
+}
 
 /// Refuses `artifacts`/`variables` on a request that is not a problem:
 /// nothing would read them, and silently dropping an operator's values is

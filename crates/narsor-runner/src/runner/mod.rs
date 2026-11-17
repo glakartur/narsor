@@ -1750,7 +1750,14 @@ impl Session {
             action: input.delivery.action,
             episode: input.delivery.episode,
             permission_decision: permission_decision.clone(),
-            answered_by: AnsweredBy::Operator,
+            // The control plane names the observer whose script answered
+            // (R15); any other answer is a person's.
+            answered_by: if input.observer.is_some() {
+                AnsweredBy::Observer
+            } else {
+                AnsweredBy::Operator
+            },
+            observer: input.observer,
         };
         let started = if let Some(decision) = permission_decision {
             episode

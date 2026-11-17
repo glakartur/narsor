@@ -149,6 +149,7 @@ impl ProtocolService {
                             delivery: protocol_delivery(&delivery),
                             input_id: input.input_id,
                             pending_input_id: input.pending_input_id,
+                            observer: input.observer,
                         })
                     })
                     .collect(),

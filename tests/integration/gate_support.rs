@@ -204,7 +204,7 @@ pub fn snapshot(
         .as_ref()
         .map_or(1, |runner| runner.snapshot.event_cursor + 1);
     let (pending_input, gate_watch) = match waiting {
-        Some((episode, gate)) => (Some(pending_input(episode)), gate.cloned()),
+        Some((episode, gate)) => (Some(pending_input(episode, gate)), gate.cloned()),
         None => (None, None),
     };
     RunnerSnapshot {
@@ -236,15 +236,45 @@ pub fn snapshot(
     }
 }
 
-/// The pending input request of a gate in `episode`.
-fn pending_input(episode: &str) -> PendingInputRef {
+/// The pending input request of a gate in `episode`: the form a `decision`
+/// gate raises, its choices and variables those of `gate` (none without
+/// one).
+fn pending_input(episode: &str, gate: Option<&GateWatch>) -> PendingInputRef {
+    let outputs: Vec<_> = gate
+        .map(|gate| gate.choices.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|choice| {
+            json!({
+                "label": choice.name,
+                "description": choice.description,
+                "requires_variables": choice.requires_variables,
+            })
+        })
+        .collect();
+    let fields: Vec<_> = gate
+        .map(|gate| gate.variables.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|variable| {
+            json!({
+                "name": variable.name,
+                "type": if variable.options.is_empty() { "text" } else { "select" },
+                "options": variable.options,
+                "required": false,
+                "description": variable.description,
+            })
+        })
+        .collect();
     let form = serde_json::from_value(json!({
         "execution_id": "exec-1",
         "state_id": "review_work",
         "action_execution_id": "act-1",
         "instruction": "Review the merge request",
-        "fields": [],
-        "outputs": [],
+        "fields": fields,
+        "outputs": outputs,
+        "continuation": "complete_step",
+        "label_from_menu": true,
         "episode": episode,
         "requested_at": "2026-11-17T12:00:00Z",
     }))

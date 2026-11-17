@@ -7,8 +7,10 @@
 //! | route | body | answer |
 //! | --- | --- | --- |
 //! | `POST /observer/v1/runs/{run}/tasks` | [`ObserverCreateTaskRequest`] | `201` created |
+//! | `POST /observer/v1/runs/{run}/decide` | [`ObserverDecideRequest`] | `200` delivered |
 //!
-//! It answers an [`ObserverEffectResponse`]. They are merged outside the
+//! Each answers an [`ObserverEffectResponse`]. `decide` answers the gate of
+//! the queue entry the run was started for, and no other (KTD-6). They are merged outside the
 //! owner gate, which never accepts a run token; the run gate in turn
 //! accepts nothing but the token of a run in progress before its deadline,
 //! and only for that run's own path. Refusals of the gate are a bare `401`;
@@ -63,9 +65,9 @@ use narsor_engine::controller_protocol::service::{
 };
 use narsor_engine::controller_protocol::wire::{
     ApproveObserverRequest, CreateObserverRequest, ObserverClaimResponse,
-    ObserverCreateTaskRequest, ObserverDetailView, ObserverEffectResponse, ObserverListResponse,
-    ObserverRunReport, ObserverRunResultResponse, ObserverScriptView, ObserverView,
-    SetObserverScriptRequest,
+    ObserverCreateTaskRequest, ObserverDecideRequest, ObserverDetailView, ObserverEffectResponse,
+    ObserverListResponse, ObserverRunReport, ObserverRunResultResponse, ObserverScriptView,
+    ObserverView, SetObserverScriptRequest,
 };
 use narsor_engine::observers::MAX_SCRIPT_BYTES;
 use narsor_engine::observers::{RunId, MAX_SCRIPT_OUTPUT_BYTES};
@@ -147,6 +149,7 @@ where
 {
     Router::new()
         .route("/observer/v1/runs/{run}/tasks", post(post_task))
+        .route("/observer/v1/runs/{run}/decide", post(post_decide))
         .layer(DefaultBodyLimit::max(MAX_EFFECT_BODY))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&service),
@@ -185,6 +188,18 @@ async fn post_task(
     let request: ObserverCreateTaskRequest = parse_json(&body, "effect request")?;
     let response = blocking(&service, move |s| s.observer_create_task(&run_id, request)).await?;
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn post_decide(
+    State(service): State<Service>,
+    Extension(principal): Extension<Principal>,
+    Path(run): Path<String>,
+    body: Bytes,
+) -> ProtocolResult<Json<ObserverEffectResponse>> {
+    let run_id = token_run(&principal, &run)?;
+    let request: ObserverDecideRequest = parse_json(&body, "answer")?;
+    let response = blocking(&service, move |s| s.observer_decide(&run_id, request)).await?;
+    Ok(Json(response))
 }
 
 /// The worker gate's principal (a bare `401` for any other, which the gate
@@ -597,6 +612,32 @@ mod tests {
             .await
             .unwrap()
             .is_empty()
+    }
+
+    #[tokio::test]
+    async fn the_decide_route_is_the_runs_and_refuses_a_run_with_no_entry() {
+        let fx = Fixture::new();
+        let run = fx.effect_run();
+        let uri = format!("/observer/v1/runs/{}/decide", run.run_id);
+        let answer = json!({
+            "task_id": "task-1",
+            "episode": "input-1",
+            "choice": "check_feedback",
+            "reason": "label removed",
+        });
+
+        let owner = fx.send("POST", &uri, OWNER_TOKEN, answer.clone()).await;
+        assert_eq!(owner.status(), StatusCode::UNAUTHORIZED);
+        let no_entry = fx
+            .send("POST", &uri, run.token.expose(), answer.clone())
+            .await;
+        assert_eq!(no_entry.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(no_entry).await["code"], "no_queue_entry");
+        let mut artifacts = answer;
+        artifacts["artifacts"] = json!({"report": "out.md"});
+        let refused = fx.send("POST", &uri, run.token.expose(), artifacts).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(refused).await["code"], "invalid_request");
     }
 
     #[tokio::test]

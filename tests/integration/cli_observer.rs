@@ -32,10 +32,10 @@ use narsor_observer_worker::worker::{
     ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, Worker, WorkerApi, WorkerOptions,
 };
 use narsor_protocol::controller::{
-    ApproveObserverRequest, CreateObserverRequest, ObserverCreateTaskRequest, ObserverDetailView,
-    ObserverEffectOutcome, ObserverEffectResponse, ObserverListResponse, ObserverRunReport,
-    ObserverRunResultResponse, ObserverScriptView, ObserverView, ObserverWorkerRun,
-    SetObserverScriptRequest,
+    ApproveObserverRequest, CreateObserverRequest, ObserverCreateTaskRequest,
+    ObserverDecideRequest, ObserverDetailView, ObserverEffectOutcome, ObserverEffectResponse,
+    ObserverListResponse, ObserverRunReport, ObserverRunResultResponse, ObserverScriptView,
+    ObserverView, ObserverWorkerRun, SetObserverScriptRequest,
 };
 use serde_json::json;
 
@@ -307,6 +307,17 @@ impl EffectApi for TokenEffects {
         ready(
             self.gate(run_id)
                 .and_then(|run| self.service.observer_create_task(&run, request.clone())),
+        )
+    }
+
+    fn decide<'a>(
+        &'a self,
+        run_id: &'a str,
+        request: &'a ObserverDecideRequest,
+    ) -> BoxFuture<'a, Result<ObserverEffectResponse, ClientError>> {
+        ready(
+            self.gate(run_id)
+                .and_then(|run| self.service.observer_decide(&run, request.clone())),
         )
     }
 }
@@ -864,4 +875,173 @@ async fn a_forged_token_or_the_path_of_another_run_is_refused() {
     let wrong_run = script_cli(&fx.service, &create_line("ABC-1"), Some(&elsewhere), &token).await;
     assert_eq!(wrong_run.unwrap_err().0, 1);
     assert_eq!(fx.tasks(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// `task decide` (U6)
+// ---------------------------------------------------------------------------
+
+/// `task decide task-1 --episode input-1 ARGS…` as a script's line.
+fn decide_line(args: &[&str]) -> Vec<String> {
+    let mut line: Vec<String> = ["task", "decide", "task-1", "--episode", "input-1"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    line.extend(args.iter().map(|arg| arg.to_string()));
+    line
+}
+
+/// An approved `on_episodes` observer of `mr-review` made through the CLI,
+/// a task waiting at its gate in `input-1`, and the run claimed for the
+/// entry; returns the run's id and token.
+async fn claimed_review_run(fx: &Fixture) -> (String, String) {
+    fx.cli(CREATE_REVIEW).await.unwrap();
+    let file = fx.script_file("review.sh", "true\n");
+    fx.cli(&["script", "set", "gitlab-mr", "--file", &file])
+        .await
+        .unwrap();
+    fx.cli(&["approve", "gitlab-mr", "--version", "1"])
+        .await
+        .unwrap();
+    let task = crate::gate_support::queued_task(&fx.service, "task-1", &owner());
+    crate::gate_support::running(&fx.service, &task);
+    crate::gate_support::wait_at(
+        &fx.service,
+        &task,
+        "input-1",
+        &crate::gate_support::review_gate("mr-review"),
+    );
+    fx.service.observer_pass();
+    let run = fx.service.claim_observer_run().unwrap().unwrap();
+    assert!(run.input.entry.is_some());
+    (run.run_id.to_string(), run.token.expose().to_string())
+}
+
+#[tokio::test]
+async fn a_script_answers_its_gate_with_task_decide_and_a_refusal_exits_1() {
+    let fx = Fixture::new();
+    let (run, token) = claimed_review_run(&fx).await;
+    let note = fx.script_file("note.txt", "split the change\n");
+
+    let unknown = script_cli(
+        &fx.service,
+        &decide_line(&["--choice", "merge"]),
+        Some(&run),
+        &token,
+    )
+    .await;
+    let decided = script_cli(
+        &fx.service,
+        &decide_line(&[
+            "--choice",
+            "revise_plan",
+            "--reason",
+            "the reviewer asked",
+            "--var-file",
+            &format!("note={note}"),
+        ]),
+        Some(&run),
+        &token,
+    )
+    .await;
+    let second = script_cli(
+        &fx.service,
+        &decide_line(&["--data", r#"{"choice": "check_feedback"}"#]),
+        Some(&run),
+        &token,
+    )
+    .await;
+
+    let (code, message) = unknown.unwrap_err();
+    assert_eq!(code, 1);
+    assert!(message.starts_with("The answer was refused"), "{message}");
+    assert!(message.contains("invalid_answer"), "{message}");
+    let decided = decided.unwrap();
+    assert!(
+        decided.starts_with("answered review_work of task task-1 with revise_plan"),
+        "{decided}"
+    );
+    let (code, message) = second.unwrap_err();
+    assert_eq!(code, 1);
+    assert!(message.contains("idempotency_key_reused"), "{message}");
+    let task = fx
+        .service
+        .control_plane()
+        .task(&narsor_engine::domain::TaskId::parse("task-1").unwrap())
+        .unwrap();
+    let delivery = task.inputs[0].delivery.as_ref().unwrap();
+    assert_eq!(delivery.values["note"], json!("split the change\n"));
+    assert_eq!(delivery.comment.as_deref(), Some("the reviewer asked"));
+}
+
+#[tokio::test]
+async fn task_decide_takes_the_answer_as_data() {
+    let fx = Fixture::new();
+    let (run, token) = claimed_review_run(&fx).await;
+
+    let decided = script_cli(
+        &fx.service,
+        &decide_line(&[
+            "--data",
+            r#"{"choice": "revise_plan", "reason": "label removed", "variables": {"note": "x"}}"#,
+        ]),
+        Some(&run),
+        &token,
+    )
+    .await;
+
+    assert!(decided.unwrap().contains("with revise_plan"));
+}
+
+#[tokio::test]
+async fn task_decide_usage_errors_exit_2_and_send_nothing() {
+    let fx = Fixture::new();
+    let (run, token) = claimed_review_run(&fx).await;
+
+    let cases: Vec<(Vec<String>, Option<&str>, &str)> = vec![
+        (
+            decide_line(&["--choice", "check_feedback"]),
+            None,
+            "NARSOR_OBSERVER_RUN is not set",
+        ),
+        (
+            decide_line(&["--choice", "check_feedback", "--data", "{}"]),
+            Some(&run),
+            "not both",
+        ),
+        (decide_line(&[]), Some(&run), "needs --choice"),
+        (
+            decide_line(&["--data", r#"{"choice": "x", "artifacts": {}}"#]),
+            Some(&run),
+            "Invalid --data",
+        ),
+        (
+            decide_line(&["--choice", "revise_plan", "--var", "note"]),
+            Some(&run),
+            "name=value",
+        ),
+        (
+            decide_line(&[
+                "--choice",
+                "revise_plan",
+                "--var-file",
+                "note=/no/such/file",
+            ]),
+            Some(&run),
+            "Cannot read --var-file",
+        ),
+    ];
+    for (line, observer_run, expected) in cases {
+        let (code, message) = script_cli(&fx.service, &line, observer_run, &token)
+            .await
+            .unwrap_err();
+        assert_eq!(code, 2, "{line:?}: {message}");
+        assert!(message.contains(expected), "{line:?}: {message}");
+    }
+    let task = fx
+        .service
+        .control_plane()
+        .task(&narsor_engine::domain::TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert!(task.inputs.is_empty());
 }

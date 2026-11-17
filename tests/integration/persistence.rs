@@ -302,11 +302,12 @@ fn an_old_format_human_input_received_event_deserializes_as_a_plain_answer() {
             artifacts,
             variables,
             comment,
+            observer,
         } => {
             assert_eq!(input, &serde_json::json!({"approval_status": "approved"}));
             assert!(answered_by.is_none() && close_reason.is_none() && episode.is_none());
             assert!(output_label.is_none() && artifacts.is_none() && variables.is_none());
-            assert!(comment.is_none());
+            assert!(comment.is_none() && observer.is_none());
         }
         other => panic!("unexpected event data: {other:?}"),
     }

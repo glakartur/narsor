@@ -272,6 +272,36 @@ pub enum TaskCommand {
         #[arg(long, value_name = "JSON")]
         data: Option<String>,
     },
+    /// In an observer's script only (`NARSOR_OBSERVER_RUN` set): answers
+    /// the gate of the queue entry the run was started for, as a person
+    /// answers it. Give `--choice` with its options, or `--data`. The first
+    /// answer of an episode wins; a refused answer exits 1.
+    Decide {
+        /// The task waiting at the gate: the entry's `task_id`.
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+        /// The wait episode: the entry's `episode`.
+        #[arg(long, value_name = "EPISODE")]
+        episode: String,
+        /// The choice, by its name.
+        #[arg(long, value_name = "CHOICE")]
+        choice: Option<String>,
+        /// Why the script chose it; the task's history shows it.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+        /// A variable of the gate, `name=value` (repeatable); the value is
+        /// text.
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        vars: Vec<String>,
+        /// A variable of the gate whose value is the text of a file,
+        /// `name=path` (repeatable).
+        #[arg(long = "var-file", value_name = "NAME=PATH")]
+        var_files: Vec<String>,
+        /// The whole answer as JSON, `{"choice", "reason", "variables"}`,
+        /// instead of `--choice`, `--reason`, `--var` and `--var-file`.
+        #[arg(long, value_name = "JSON")]
+        data: Option<String>,
+    },
     /// Lists your tasks with backend, runner state and queue state, the
     /// attention mark (`?` asks, `!` is wrong) and the title.
     List {
@@ -977,6 +1007,11 @@ pub async fn task(
     let client = client(target, state, flags).await?;
 
     match command {
+        // Answered by `effect_call` above, a run or a usage error.
+        TaskCommand::Decide { .. } => Err(CliError::usage(format!(
+            "narsor-cli task decide is for the script of an observer run only: {} is not set",
+            super::observer_effect::OBSERVER_RUN_ENV
+        ))),
         TaskCommand::Create {
             file: Some(file),
             inputs,

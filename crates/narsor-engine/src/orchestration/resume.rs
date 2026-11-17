@@ -90,6 +90,14 @@ pub fn observer_event_key(run_id: &str) -> String {
     )
 }
 
+/// The idempotency key of the answer the observer run `run_id` gives to the
+/// gate episode `episode` (`task decide`): one per run and episode, so a
+/// retry of the same answer by the same run returns the input it queued,
+/// and another answer of that run for the episode is refused.
+pub fn observer_decide_key(run_id: &str, episode: &str) -> String {
+    format!("{OBSERVER_KEY_PREFIX}{run_id}:decide:{episode}")
+}
+
 /// The idempotency key prefixes only a policy may use, each with what it is
 /// reserved for: an owner's command, answer or operator command may not
 /// carry one.

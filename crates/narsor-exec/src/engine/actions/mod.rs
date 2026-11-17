@@ -61,9 +61,9 @@ pub use harness::{
     HarnessRequest, HarnessRun, OpenCodeAdapter,
 };
 pub use human::{
-    ConductorAnalysis, HumanActionError, HumanExecutor, HumanInputDelivery, HumanInputRequest,
-    InputContinuation, OutputProblem, OutputRequirement, PendingHumanInput, PermissionDecision,
-    PermissionDecisionKind, PermissionDenialDetails, PermissionGrantScope,
+    check_gate_answer, ConductorAnalysis, HumanActionError, HumanExecutor, HumanInputDelivery,
+    HumanInputRequest, InputContinuation, OutputProblem, OutputRequirement, PendingHumanInput,
+    PermissionDecision, PermissionDecisionKind, PermissionDenialDetails, PermissionGrantScope,
     PermissionRequestDetails, RejectedAnswer, ResumedHumanAction,
 };
 pub use profile::ProfileExecutor;
