@@ -1,14 +1,12 @@
 //! The request `narsor task create` builds from its arguments, and what
-//! `task create --data` and `task event` ask for in an observer's
-//! script (`NARSOR_OBSERVER_RUN`, passed in rather than set).
+//! `task create --data` asks for in an observer's script
+//! (`NARSOR_OBSERVER_RUN`, passed in rather than set).
 
 use clap::Parser;
 use narsor::cli::observer_effect::{effect_call, EffectCall};
 use narsor::cli::remote::{create_request, TaskCommand};
 use narsor::cli::{Cli, Command};
-use narsor_protocol::controller::{
-    CreateTaskRequest, ObserverCreateTaskRequest, ObserverEventRequest,
-};
+use narsor_protocol::controller::{CreateTaskRequest, ObserverCreateTaskRequest};
 use serde_json::json;
 
 fn parse(arguments: &[&str]) -> Result<Cli, clap::Error> {
@@ -128,13 +126,9 @@ fn usage_error(arguments: &[&str], observer_run: Option<&str>) -> String {
 }
 
 #[test]
-fn data_or_a_task_event_outside_an_observer_run_is_a_usage_error() {
+fn data_outside_an_observer_run_is_a_usage_error() {
     let message = usage_error(&["create", "--data", "{}"], None);
     assert!(message.contains("--data"), "{message}");
-    assert!(message.contains("NARSOR_OBSERVER_RUN"), "{message}");
-
-    let message = usage_error(&["event", "task-1", "--type", "approved"], None);
-    assert!(message.contains("task event"), "{message}");
     assert!(message.contains("NARSOR_OBSERVER_RUN"), "{message}");
 
     // An empty variable is no run either.
@@ -194,28 +188,14 @@ fn in_an_observer_run_task_create_needs_json_data() {
 }
 
 #[test]
-fn in_an_observer_run_task_event_builds_the_event() {
-    let call = effect_call(
-        &task_command(&[
-            "event",
-            "task-1",
-            "--type",
-            "approved",
-            "--data",
-            r#"{"mr": 17}"#,
-        ]),
-        Some(RUN),
-    )
-    .unwrap();
-
-    assert_eq!(
-        call,
-        Some(EffectCall::Event {
-            task_id: "task-1".into(),
-            request: ObserverEventRequest {
-                event_type: "approved".into(),
-                data: json!({"mr": 17}),
-            },
-        })
-    );
+fn task_event_is_gone_with_the_wait_step() {
+    let argv = [
+        "narsor-cli",
+        "task",
+        "event",
+        "task-1",
+        "--type",
+        "approved",
+    ];
+    assert!(Cli::try_parse_from(argv).is_err());
 }

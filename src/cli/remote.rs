@@ -272,20 +272,6 @@ pub enum TaskCommand {
         #[arg(long, value_name = "JSON")]
         data: Option<String>,
     },
-    /// In an observer's script only (`NARSOR_OBSERVER_RUN` set): delivers
-    /// an event to a task on the observer's watch list. It goes to the
-    /// task's history, and to its waiting `wait` step when it matches.
-    Event {
-        /// The task id.
-        #[arg(value_name = "TASK_ID")]
-        task_id: String,
-        /// The event type (`approved`, say).
-        #[arg(long = "type", value_name = "TYPE")]
-        event_type: String,
-        /// The event's data, as JSON.
-        #[arg(long, value_name = "JSON")]
-        data: Option<String>,
-    },
     /// Lists your tasks with backend, runner state and queue state, the
     /// attention mark (`?` asks, `!` is wrong) and the title.
     List {
@@ -991,11 +977,6 @@ pub async fn task(
     let client = client(target, state, flags).await?;
 
     match command {
-        // Answered by `effect_call` above, a run or a usage error.
-        TaskCommand::Event { .. } => Err(CliError::usage(format!(
-            "narsor-cli task event is for the script of an observer run only: {} is not set",
-            super::observer_effect::OBSERVER_RUN_ENV
-        ))),
         TaskCommand::Create {
             file: Some(file),
             inputs,

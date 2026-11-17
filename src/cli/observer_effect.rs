@@ -1,27 +1,25 @@
 //! The effect commands of an observer's script: `narsor-cli task create
-//! --data JSON` and `narsor-cli task event TASK --type T [--data JSON]`
-//! (R3, R4, PO1).
+//! --data JSON` (R3, PO1).
 //!
 //! The worker runs a script with `NARSOR_OBSERVER_RUN` (the run's id),
 //! `NARSOR_SERVER` and `NARSOR_TOKEN` (the run's token) set. With
-//! `NARSOR_OBSERVER_RUN` set, both commands go to the effect routes of
-//! that run (`/observer/v1/runs/{run}/…`) and nowhere else:
+//! `NARSOR_OBSERVER_RUN` set, the command goes to the effect routes of that
+//! run (`/observer/v1/runs/{run}/…`) and nowhere else:
 //!
 //! ```text
 //!                          NARSOR_OBSERVER_RUN set          not set
 //! task create --data       effect route                     usage error
 //! task create WORKFLOW …   usage error (the record decides)  the owner's create
-//! task event               effect route                     usage error
 //! ```
 //!
-//! The server does not deduplicate: every call creates a task or records an
-//! event. The script keeps track in its state of what it already reported.
+//! The server does not deduplicate: every call creates a task. The script
+//! keeps track in its state of what it already reported.
 //!
 //! What the script sees:
 //!
 //! | answer | prints | exit code |
 //! | --- | --- | --- |
-//! | created, delivered, recorded | the server's line | 0 |
+//! | created | the server's line | 0 |
 //! | task limit reached, refused data, token not valid | the reason, on stderr | 1 |
 //! | usage error | the reason, on stderr | 2 |
 
@@ -32,9 +30,7 @@ use super::commands::{CliError, Result};
 use super::observer_text::effect_output;
 use super::remote::{failure, TaskCommand};
 use crate::api::{ApiClient, ClientError, ServerTarget, TokenSource};
-use crate::controller_protocol::{
-    ObserverCreateTaskRequest, ObserverEffectResponse, ObserverEventRequest,
-};
+use crate::controller_protocol::{ObserverCreateTaskRequest, ObserverEffectResponse};
 
 /// The environment variable naming the observer run a script belongs to.
 pub const OBSERVER_RUN_ENV: &str = "NARSOR_OBSERVER_RUN";
@@ -44,13 +40,6 @@ pub const OBSERVER_RUN_ENV: &str = "NARSOR_OBSERVER_RUN";
 pub enum EffectCall {
     /// `task create --data JSON`.
     CreateTask(ObserverCreateTaskRequest),
-    /// `task event TASK --type T [--data JSON]`.
-    Event {
-        /// The task on the observer's watch list.
-        task_id: String,
-        /// The event.
-        request: ObserverEventRequest,
-    },
 }
 
 /// What `command` asks for given the observer run of the environment
@@ -68,10 +57,6 @@ pub fn effect_call(
                 "--data is for the script of an observer run only: {OBSERVER_RUN_ENV} is not set"
             )))
         }
-        (TaskCommand::Event { .. }, None) => Err(CliError::usage(format!(
-            "narsor-cli task event is for the script of an observer run only: \
-             {OBSERVER_RUN_ENV} is not set"
-        ))),
         (
             TaskCommand::Create {
                 workflow,
@@ -117,20 +102,6 @@ pub fn effect_call(
                 data: parse_data(data.as_deref())?,
             })))
         }
-        (
-            TaskCommand::Event {
-                task_id,
-                event_type,
-                data,
-            },
-            Some(_),
-        ) => Ok(Some(EffectCall::Event {
-            task_id: task_id.clone(),
-            request: ObserverEventRequest {
-                event_type: event_type.clone(),
-                data: parse_data(data.as_deref())?,
-            },
-        })),
         _ => Ok(None),
     }
 }
@@ -153,14 +124,6 @@ pub trait EffectApi: Send + Sync {
         run_id: &'a str,
         request: &'a ObserverCreateTaskRequest,
     ) -> BoxFuture<'a, std::result::Result<ObserverEffectResponse, ClientError>>;
-
-    /// `POST /observer/v1/runs/{run}/tasks/{task_id}/events`.
-    fn deliver_event<'a>(
-        &'a self,
-        run_id: &'a str,
-        task_id: &'a str,
-        request: &'a ObserverEventRequest,
-    ) -> BoxFuture<'a, std::result::Result<ObserverEffectResponse, ClientError>>;
 }
 
 impl EffectApi for ApiClient {
@@ -170,15 +133,6 @@ impl EffectApi for ApiClient {
         request: &'a ObserverCreateTaskRequest,
     ) -> BoxFuture<'a, std::result::Result<ObserverEffectResponse, ClientError>> {
         Box::pin(self.observer_create_task(run_id, request))
-    }
-
-    fn deliver_event<'a>(
-        &'a self,
-        run_id: &'a str,
-        task_id: &'a str,
-        request: &'a ObserverEventRequest,
-    ) -> BoxFuture<'a, std::result::Result<ObserverEffectResponse, ClientError>> {
-        Box::pin(self.observer_deliver_event(run_id, task_id, request))
     }
 }
 
@@ -196,10 +150,6 @@ pub async fn perform<A: EffectApi + ?Sized>(
             .create_task(run_id, request)
             .await
             .map_err(|error| failure("The task was not created", error))?,
-        EffectCall::Event { task_id, request } => api
-            .deliver_event(run_id, task_id, request)
-            .await
-            .map_err(|error| failure("The event was not delivered", error))?,
     };
     Ok(effect_output(&response))
 }

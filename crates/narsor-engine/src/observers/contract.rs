@@ -4,17 +4,20 @@
 //! ```text
 //! stdin   one JSON document, ScriptInput
 //!
-//! an observer that creates tasks (watch mode `all`):
+//! an observer in mode `always`:
 //!   stdout  one JSON document, ScriptOutput: {"state": …}
 //!   exit 0 + a document parse_script_output accepts → the state is saved
 //!   anything else                                   → error, state kept
 //!
-//! an observer with a watch list: one run checks one watch entry
+//! an observer in mode `on_episodes`: one run checks one queue entry
 //!   stdout  not read
-//!   exit 0 (WATCH_DONE_EXIT_CODE)    → done: the entry is removed
-//!   exit 1 (WATCH_PENDING_EXIT_CODE) → check the entry again in the next run
-//!   any other result                 → error, the entry is checked again
+//!   exit 0 (ENTRY_DONE_EXIT_CODE)    → the run is done
+//!   exit 1 (ENTRY_PENDING_EXIT_CODE) → the run is done (as for exit 0)
+//!   any other result                 → error, recorded for the entry
 //! ```
+//!
+//! No exit code removes an entry: the entry goes when its gate exits
+//! (R14, R16), and is checked again in the next round until then.
 //!
 //! For an observer that creates tasks, exit code 0 with a valid document is
 //! the only result that changes the remembered state (R14). The output is
@@ -25,6 +28,7 @@
 use super::model::{ObserverId, ObserverName};
 use crate::domain::TaskId;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// Version of the contract a [`ScriptInput`] follows.
@@ -33,11 +37,12 @@ pub const SCRIPT_CONTRACT_VERSION: u32 = 1;
 /// Largest stdout document a script may print (1 MiB).
 pub const MAX_SCRIPT_OUTPUT_BYTES: usize = 1024 * 1024;
 
-/// The exit code of a watch run whose entry is done: the engine removes it.
-pub const WATCH_DONE_EXIT_CODE: i32 = 0;
+/// The exit code of a run that checked its queue entry.
+pub const ENTRY_DONE_EXIT_CODE: i32 = 0;
 
-/// The exit code of a watch run whose entry must be checked again.
-pub const WATCH_PENDING_EXIT_CODE: i32 = 1;
+/// The exit code a script for a watch list gave when its object had to be
+/// checked again; a run for a queue entry may still give it.
+pub const ENTRY_PENDING_EXIT_CODE: i32 = 1;
 
 /// The observer, as its script sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,20 +55,18 @@ pub struct ScriptObserver {
     pub source: String,
 }
 
-/// One watch entry, as its script sees it.
+/// One queue entry, as its script sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScriptWatch {
-    /// The watched object (a PR/MR URL, say).
-    pub object: String,
-    /// The task its events go to.
+pub struct ScriptEntry {
+    /// The task waiting at the gate.
     pub task_id: TaskId,
-    /// The event types to catch.
+    /// The wait episode: an answer names it.
+    pub episode: String,
+    /// The workflow state of the gate.
+    pub step: String,
+    /// The gate's rendered params.
     #[serde(default)]
-    pub event_types: Vec<String>,
-    /// The id of the `wait` episode the task is in, `None` when the task is
-    /// not waiting: the script sends an event only to a waiting task.
-    #[serde(default)]
-    pub wait_episode: Option<String>,
+    pub params: BTreeMap<String, String>,
 }
 
 /// What the script reads on stdin.
@@ -78,10 +81,10 @@ pub struct ScriptInput {
     /// The state the last successful run returned; `None` before the first.
     #[serde(default)]
     pub state: Option<serde_json::Value>,
-    /// The one watch entry this run checks, for a `watch_list` observer;
-    /// `None` for an observer that creates tasks.
+    /// The one queue entry this run checks, for an `on_episodes` observer;
+    /// `None` for an `always` observer.
     #[serde(default)]
-    pub watch: Option<ScriptWatch>,
+    pub entry: Option<ScriptEntry>,
     /// No run of this observer has succeeded yet.
     #[serde(default)]
     pub first_run: bool,

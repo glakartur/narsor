@@ -1,21 +1,25 @@
-//! Integration tests of the observers' model and file store (U1).
+//! Integration tests of the observers' model and file store: records, run
+//! modes and queues, schedules, script versions, run errors, queue entries
+//! and the reading of records of an older version.
 //!
 //! Every test runs against a real temporary directory: the value of the
 //! store lies in real file operations, locks and exclusive creates.
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_engine::domain::{TaskId, WorkflowDefinition};
+use narsor_engine::observers::migrate::DELIVER_EVENT_REMOVED_NOTE;
 use narsor_engine::observers::{
-    parse_script_output, ActiveRun, ContractError, CreateTaskEffect, ObserverConfig,
-    ObserverEffect, ObserverError, ObserverName, ObserverRecord, ObserverState, ObserverStore,
-    RunFailure, RunId, RunStatus, ScheduleConfig, ScriptInput, ScriptObserver, ScriptWatch,
-    SecretRef, WatchEntry, WatchMode, WatchObjectPolicy, WatchOrigin, WatchWrite,
+    parse_script_output, queue_entry_id, ActiveRun, ContractError, CreateTaskEffect, EntryWrite,
+    ObserverConfig, ObserverEffect, ObserverError, ObserverId, ObserverMode, ObserverName,
+    ObserverRecord, ObserverState, ObserverStore, QueueEntry, RunEntry, RunFailure, RunId,
+    RunStatus, ScheduleConfig, ScriptEntry, ScriptInput, ScriptObserver, SecretRef,
     DEFAULT_INTERVAL_SECS, KEPT_RUN_FAILURES, MAX_SCRIPT_OUTPUT_BYTES, OBSERVER_RECORD_VERSION,
     RUN_FAILURE_VERSION, SCRIPT_CONTRACT_VERSION,
 };
 use narsor_engine::orchestration::OwnerRef;
 use narsor_engine::persistence::paths::temp_path_for;
 use narsor_engine::persistence::StatePaths;
+use narsor_protocol::controller::{GateWatch, GateWatchChoice, GateWatchVariable};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,7 +91,12 @@ fn create_task_effect() -> ObserverEffect {
 }
 
 fn jira_config(observer: &str) -> ObserverConfig {
-    let mut config = ObserverConfig::new(name(observer), "jira", create_task_effect());
+    let mut config = ObserverConfig::new(
+        name(observer),
+        "jira",
+        create_task_effect(),
+        ObserverMode::Always,
+    );
     config.condition = json!({"jql": "project = ABC AND labels = narsor"});
     config.secrets = vec![SecretRef {
         name: "jira-token".into(),
@@ -96,14 +105,29 @@ fn jira_config(observer: &str) -> ObserverConfig {
     config
 }
 
-fn review_config(observer: &str) -> ObserverConfig {
-    let mut config = ObserverConfig::new(name(observer), "gitlab", ObserverEffect::DeliverEvent);
-    config.watch_mode = WatchMode::WatchList;
-    config.watch_objects = WatchObjectPolicy {
-        allowed_prefixes: vec!["https://gitlab.example.com/".into()],
-        ..WatchObjectPolicy::default()
-    };
+/// An `on_episodes` observer of the queue `queue` that creates no tasks.
+fn review_config(observer: &str, queue: &str) -> ObserverConfig {
+    let mut config = ObserverConfig::new(
+        name(observer),
+        "gitlab",
+        ObserverEffect::None,
+        ObserverMode::OnEpisodes,
+    );
+    config.queue = queue.into();
     config
+}
+
+/// A `jira-intake`-like `always` observer of the queue `queue`.
+fn source_config(observer: &str, queue: &str) -> ObserverConfig {
+    let mut config = jira_config(observer);
+    config.queue = queue.into();
+    config
+}
+
+fn create(store: &ObserverStore, owner: OwnerRef, config: ObserverConfig) -> ObserverRecord {
+    store
+        .create(owner, config, Some(&triage_workflow()), now())
+        .expect("create observer")
 }
 
 fn create_jira(store: &ObserverStore, observer: &str) -> ObserverRecord {
@@ -127,11 +151,11 @@ fn script_input(record: &ObserverRecord) -> ScriptInput {
         },
         condition: record.config.condition.clone(),
         state: Some(json!({"cursor": 4})),
-        watch: Some(ScriptWatch {
-            object: "https://gitlab.example.com/a/-/merge_requests/17".into(),
+        entry: Some(ScriptEntry {
             task_id: TaskId::parse("task-1").unwrap(),
-            event_types: vec!["approved".into()],
-            wait_episode: Some("episode-1".into()),
+            episode: "input-1".into(),
+            step: "review_work".into(),
+            params: [("mr_url".to_string(), "https://gitlab/1".to_string())].into(),
         }),
         first_run: true,
         import_backlog: false,
@@ -146,7 +170,7 @@ fn active_run(sequence: u64) -> ActiveRun {
         deadline: now() + Duration::seconds(360),
         token_digest: "sha256:abc".into(),
         tasks_created: 2,
-        watch: None,
+        entry: None,
     }
 }
 
@@ -163,19 +187,62 @@ fn failure(record: &ObserverRecord, sequence: u64) -> RunFailure {
         error: "the script exited with code 1".into(),
         stdout: Some(String::new()),
         stderr: Some("boom".into()),
-        watch_object: None,
+        entry_id: None,
     }
 }
 
-fn watch(task: &str, step: Option<&str>, object: &str) -> WatchEntry {
-    WatchEntry::new(
+/// The gate `review_work` with its `watch` on `queue`.
+fn gate(queue: &str) -> GateWatch {
+    GateWatch {
+        step: "review_work".into(),
+        queue: queue.into(),
+        params: [
+            (
+                "mr_url".to_string(),
+                "https://gitlab/a/-/merge_requests/17".to_string(),
+            ),
+            ("label".to_string(), "w CR".to_string()),
+        ]
+        .into(),
+        choices: vec![
+            GateWatchChoice {
+                name: "check_feedback".into(),
+                description: Some("Read the review".into()),
+                requires_variables: Vec::new(),
+            },
+            GateWatchChoice {
+                name: "revise_plan".into(),
+                description: None,
+                requires_variables: vec!["note".into()],
+            },
+        ],
+        variables: vec![GateWatchVariable {
+            name: "note".into(),
+            variable_type: Some("text".into()),
+            description: None,
+            options: Vec::new(),
+        }],
+    }
+}
+
+/// The entry of `episode` of `task` of `owner` on `queue`.
+fn entry(owner: OwnerRef, queue: &str, task: &str, episode: &str) -> QueueEntry {
+    QueueEntry::from_gate(
+        owner,
         TaskId::parse(task).unwrap(),
-        step.map(str::to_string),
-        object,
-        vec!["approved".into()],
-        WatchOrigin::Workflow,
+        episode,
+        &gate(queue),
         now(),
     )
+}
+
+/// Writes `value` as the record of a new observer `observer_id`, as an
+/// older build left it.
+fn write_raw_record(root: &TempRoot, observer_id: &str, value: serde_json::Value) -> ObserverId {
+    let path = root.paths().observer_record_file(observer_id);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    ObserverId::parse(observer_id).unwrap()
 }
 
 fn invalid_reason(error: ObserverError) -> String {
@@ -198,7 +265,12 @@ fn a_new_observer_is_a_draft_without_an_approved_version() {
 
     assert_eq!(record.state, ObserverState::Draft);
     assert_eq!(record.approved_version, None);
-    assert_eq!(record.config.schedule.interval_secs, DEFAULT_INTERVAL_SECS);
+    assert_eq!(
+        record.config.schedule.interval_secs(),
+        Some(DEFAULT_INTERVAL_SECS)
+    );
+    assert_eq!(record.config.queue, "jira-abc");
+    assert_eq!(record.config.mode, ObserverMode::Always);
     assert_eq!(record.config.task_limit_per_run, 10);
     assert_eq!(record.owner, owner());
     assert_eq!(record.record_version, OBSERVER_RECORD_VERSION);
@@ -220,7 +292,7 @@ fn an_interval_under_sixty_seconds_is_refused() {
     let root = TempRoot::new();
     let store = root.store();
     let mut config = jira_config("jira-abc");
-    config.schedule = ScheduleConfig { interval_secs: 30 };
+    config.schedule = ScheduleConfig::Interval { secs: 30 };
 
     let error = store
         .create(owner(), config, Some(&triage_workflow()), now())
@@ -278,32 +350,216 @@ fn concurrent_creations_of_one_name_give_one_observer() {
     assert_eq!(store.list().unwrap().len(), 1);
 }
 
+// ---------------------------------------------------------------------------
+// Queues and run modes
+// ---------------------------------------------------------------------------
+
 #[test]
-fn deliver_event_with_watch_mode_all_is_refused() {
+fn two_observers_of_one_queue_with_the_same_mode_are_created() {
     let root = TempRoot::new();
     let store = root.store();
-    let mut config = review_config("gitlab-review");
-    config.watch_mode = WatchMode::All;
 
-    let reason = invalid_reason(store.create(owner(), config, None, now()).unwrap_err());
+    let gitlab = create(&store, owner(), review_config("gitlab-mr", "mr-review"));
+    let github = create(&store, owner(), review_config("github-pr", "mr-review"));
 
-    assert!(reason.contains("watch_list"), "{reason}");
+    let observers = store.queue_observers(&owner(), "mr-review").unwrap();
+    assert_eq!(observers, vec![github, gitlab]);
+    assert!(store.queue_observers(&owner(), "other").unwrap().is_empty());
+}
+
+#[test]
+fn an_observer_of_another_mode_in_a_queue_is_refused_and_names_the_queues_mode() {
+    // Covers AE8.
+    let root = TempRoot::new();
+    let store = root.store();
+    create(&store, owner(), review_config("gitlab-mr", "mr-review"));
+
+    let error = store
+        .create(
+            owner(),
+            source_config("jira-new", "mr-review"),
+            Some(&triage_workflow()),
+            now(),
+        )
+        .unwrap_err();
+
+    match &error {
+        ObserverError::QueueModeMismatch { queue, mode, .. } => {
+            assert_eq!(queue, "mr-review");
+            assert_eq!(*mode, ObserverMode::OnEpisodes);
+        }
+        other => panic!("expected a mode mismatch, got {other:?}"),
+    }
+    let message = error.to_string();
+    assert!(message.contains("'mr-review'"), "{message}");
+    assert!(message.contains("on_episodes"), "{message}");
+    assert_eq!(store.list().unwrap().len(), 1);
+}
+
+#[test]
+fn queues_of_two_owners_with_one_name_are_two_queues() {
+    // R7: the mode check and the entries are per owner.
+    let root = TempRoot::new();
+    let store = root.store();
+    let other = OwnerRef::new("someone-else");
+    create(&store, owner(), review_config("gitlab-mr", "mr-review"));
+    create(
+        &store,
+        other.clone(),
+        source_config("their-jira", "mr-review"),
+    );
+
+    let lock = store.lock_queue_entries().unwrap();
+    let mine = entry(owner(), "mr-review", "task-1", "input-1");
+    let theirs = entry(other.clone(), "mr-review", "task-2", "input-1");
+    store.add_queue_entry(&lock, &mine).unwrap();
+    store.add_queue_entry(&lock, &theirs).unwrap();
+    drop(lock);
+
+    assert_eq!(
+        store.queue_entries(&owner(), "mr-review").unwrap(),
+        vec![mine]
+    );
+    assert_eq!(
+        store.queue_entries(&other, "mr-review").unwrap(),
+        vec![theirs]
+    );
+    assert_eq!(store.queue_observers(&other, "mr-review").unwrap().len(), 1);
+}
+
+#[test]
+fn concurrent_creations_of_two_modes_in_one_queue_leave_one_mode() {
+    // KTD-7: the check runs under the creation lock.
+    for _ in 0..4 {
+        let root = TempRoot::new();
+        let store = root.store();
+        let results: Vec<(ObserverMode, bool)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|index| {
+                    let store = store.clone();
+                    scope.spawn(move || {
+                        let config = if index % 2 == 0 {
+                            review_config(&format!("review-{index}"), "shared")
+                        } else {
+                            source_config(&format!("source-{index}"), "shared")
+                        };
+                        let mode = config.mode;
+                        let created = store
+                            .create(owner(), config, Some(&triage_workflow()), now())
+                            .is_ok();
+                        (mode, created)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let modes: std::collections::BTreeSet<&str> = results
+            .iter()
+            .filter(|(_, created)| *created)
+            .map(|(mode, _)| mode.as_str())
+            .collect();
+        assert_eq!(modes.len(), 1, "{results:?}");
+        let stored = store.queue_observers(&owner(), "shared").unwrap();
+        assert!(!stored.is_empty());
+        assert!(stored
+            .iter()
+            .all(|record| record.config.mode.as_str() == *modes.first().unwrap()));
+    }
+}
+
+#[test]
+fn an_update_may_not_mix_modes_but_may_move_an_observer_to_another_queue() {
+    let root = TempRoot::new();
+    let store = root.store();
+    create(&store, owner(), review_config("gitlab-mr", "mr-review"));
+    let jira = create(&store, owner(), source_config("jira-new", "jira-intake"));
+
+    let mut into_review = jira.config.clone();
+    into_review.queue = "mr-review".into();
+    let error = store
+        .update_config(
+            &jira.observer_id,
+            into_review,
+            Some(&triage_workflow()),
+            now(),
+        )
+        .unwrap_err();
+    assert!(matches!(error, ObserverError::QueueModeMismatch { .. }));
+    assert_eq!(
+        store.load(&jira.observer_id).unwrap().config.queue,
+        "jira-intake"
+    );
+
+    // The only observer of its queue may change the queue's mode; the
+    // round of the old mode ends.
+    {
+        let lock = store.lock(&jira.observer_id).unwrap();
+        let mut record = store.load(&jira.observer_id).unwrap();
+        record.entry_round = vec!["0".repeat(64)];
+        store.save(&lock, &mut record, now()).unwrap();
+    }
+    let jira = store.load(&jira.observer_id).unwrap();
+    let mut on_episodes = jira.config.clone();
+    on_episodes.mode = ObserverMode::OnEpisodes;
+    on_episodes.schedule =
+        ScheduleConfig::from_parts(None, Some("*/5 * * * *".to_string())).unwrap();
+    let updated = store
+        .update_config(
+            &jira.observer_id,
+            on_episodes,
+            Some(&triage_workflow()),
+            now() + Duration::seconds(1),
+        )
+        .unwrap();
+    assert_eq!(updated.config.mode, ObserverMode::OnEpisodes);
+    assert!(updated.entry_round.is_empty());
+    assert_eq!(updated.revision, jira.revision + 1);
+    assert_eq!(updated.state, jira.state);
+    assert_eq!(store.load(&jira.observer_id).unwrap(), updated);
+
+    let mut renamed = updated.config.clone();
+    renamed.name = name("gitlab-mr");
+    assert!(matches!(
+        store.update_config(&jira.observer_id, renamed, Some(&triage_workflow()), now()),
+        Err(ObserverError::NameTaken(_))
+    ));
+}
+
+#[test]
+fn a_queue_name_must_be_a_plain_name() {
+    let root = TempRoot::new();
+    let store = root.store();
+    for queue in ["", "a b", "../x", "{{ queue }}"] {
+        let reason = invalid_reason(
+            store
+                .create(owner(), review_config("gitlab-mr", queue), None, now())
+                .unwrap_err(),
+        );
+        assert!(reason.starts_with("queue:"), "{queue}: {reason}");
+    }
     assert!(store.list().unwrap().is_empty());
 }
 
 #[test]
-fn a_watch_list_observer_needs_an_allowed_object_prefix() {
+fn a_cron_schedule_is_stored_as_its_text() {
     let root = TempRoot::new();
     let store = root.store();
-    let mut config = review_config("gitlab-review");
-    config.watch_objects.allowed_prefixes.clear();
+    let mut config = jira_config("jira-new");
+    config.schedule = ScheduleConfig::from_parts(None, Some("0 8 * * 1-5".into())).unwrap();
 
-    let reason = invalid_reason(store.create(owner(), config, None, now()).unwrap_err());
+    let record = create(&store, owner(), config);
 
-    assert!(reason.contains("allowed object prefix"), "{reason}");
-    assert!(store
-        .create(owner(), review_config("gitlab-review"), None, now())
-        .is_ok());
+    let raw: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            root.paths()
+                .observer_record_file(record.observer_id.as_str()),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw["config"]["schedule"], json!({"cron": "0 8 * * 1-5"}));
+    assert_eq!(store.load(&record.observer_id).unwrap(), record);
 }
 
 #[test]
@@ -384,14 +640,12 @@ fn invalid_secrets_and_conditions_are_refused() {
 fn an_older_record_without_the_newer_fields_loads_with_defaults() {
     let root = TempRoot::new();
     let store = root.store();
-    let observer_id = "obs-0123456789abcdef";
-    let path = root.paths().observer_record_file(observer_id);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(
-        &path,
-        serde_json::to_vec(&json!({
+    let id = write_raw_record(
+        &root,
+        "obs-0123456789abcdef",
+        json!({
             "record_version": 1,
-            "observer_id": observer_id,
+            "observer_id": "obs-0123456789abcdef",
             "owner": "owner",
             "created_at": "2026-11-01T00:00:00Z",
             "config": {
@@ -399,26 +653,143 @@ fn an_older_record_without_the_newer_fields_loads_with_defaults() {
                 "source": "jira",
                 "effect": {"kind": "create_task", "workflow_id": "triage", "workflow_version": 1},
             },
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+        }),
+    );
 
-    let record = store
-        .load(&narsor_engine::observers::ObserverId::parse(observer_id).unwrap())
-        .unwrap();
+    let record = store.load(&id).unwrap();
 
     assert_eq!(record.state, ObserverState::Draft);
-    assert_eq!(record.config.schedule.interval_secs, DEFAULT_INTERVAL_SECS);
+    assert_eq!(
+        record.config.schedule.interval_secs(),
+        Some(DEFAULT_INTERVAL_SECS)
+    );
     assert_eq!(record.config.task_limit_per_run, 10);
-    assert_eq!(record.config.watch_mode, WatchMode::All);
+    assert_eq!(record.config.queue, "legacy");
+    assert_eq!(record.config.mode, ObserverMode::Always);
     assert_eq!(record.config.condition, json!({}));
-    assert_eq!(record.config.watch_objects.max_len, 512);
     assert_eq!(record.approved_version, None);
     assert_eq!(record.consecutive_failures, 0);
     assert!(!record.first_run_done);
     assert!(record.scripts.is_empty());
     assert_eq!(store.list().unwrap().len(), 1);
+}
+
+#[test]
+fn a_version_one_record_loads_with_its_name_as_queue_and_its_mode_and_interval() {
+    // KTD-8: watch_mode all → always, watch_list → on_episodes; the
+    // interval is kept; the next save writes version 2.
+    let root = TempRoot::new();
+    let store = root.store();
+    let jira = write_raw_record(
+        &root,
+        "obs-0000000000000001",
+        json!({
+            "record_version": 1,
+            "observer_id": "obs-0000000000000001",
+            "owner": "owner",
+            "created_at": "2026-11-01T00:00:00Z",
+            "state": "active",
+            "approved_version": 1,
+            "next_run_at": "2026-11-13T12:05:00Z",
+            "config": {
+                "name": "jira-new",
+                "source": "jira",
+                "schedule": {"interval_secs": 900},
+                "effect": {"kind": "create_task", "workflow_id": "triage", "workflow_version": 1},
+                "watch_mode": "all",
+                "watch_objects": {"allowed_prefixes": [], "max_len": 512},
+            },
+        }),
+    );
+    let review = write_raw_record(
+        &root,
+        "obs-0000000000000002",
+        json!({
+            "record_version": 1,
+            "observer_id": "obs-0000000000000002",
+            "owner": "owner",
+            "created_at": "2026-11-01T00:00:00Z",
+            "state": "active",
+            "config": {
+                "name": "mr-watch",
+                "source": "gitlab",
+                "effect": {"kind": "create_task", "workflow_id": "triage", "workflow_version": 1},
+                "watch_mode": "watch_list",
+                "watch_objects": {"allowed_prefixes": ["https://gitlab/"], "max_len": 512},
+            },
+        }),
+    );
+
+    let jira_record = store.load(&jira).unwrap();
+    assert_eq!(jira_record.record_version, OBSERVER_RECORD_VERSION);
+    assert_eq!(jira_record.config.queue, "jira-new");
+    assert_eq!(jira_record.config.mode, ObserverMode::Always);
+    assert_eq!(
+        jira_record.config.schedule,
+        ScheduleConfig::Interval { secs: 900 }
+    );
+    assert_eq!(jira_record.state, ObserverState::Active);
+    assert_eq!(jira_record.note, None);
+    let review_record = store.load(&review).unwrap();
+    assert_eq!(review_record.config.queue, "mr-watch");
+    assert_eq!(review_record.config.mode, ObserverMode::OnEpisodes);
+    assert_eq!(store.list_readable().unwrap().len(), 2);
+
+    let lock = store.lock(&jira).unwrap();
+    let mut saved = jira_record.clone();
+    store.save(&lock, &mut saved, now()).unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.paths().observer_record_file(jira.as_str())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw["record_version"], json!(OBSERVER_RECORD_VERSION));
+    assert_eq!(raw["config"]["queue"], "jira-new");
+    assert_eq!(raw["config"]["mode"], "always");
+    assert_eq!(raw["config"]["schedule"], json!({"interval_secs": 900}));
+    assert!(raw["config"].get("watch_mode").is_none());
+    assert!(raw["config"].get("watch_objects").is_none());
+}
+
+#[test]
+fn a_version_one_deliver_event_observer_is_paused_with_a_note_and_kept() {
+    // KTD-8, U13: not deleted, not run.
+    let root = TempRoot::new();
+    let store = root.store();
+    let id = write_raw_record(
+        &root,
+        "obs-0000000000000003",
+        json!({
+            "record_version": 1,
+            "observer_id": "obs-0000000000000003",
+            "owner": "owner",
+            "created_at": "2026-11-01T00:00:00Z",
+            "state": "active",
+            "approved_version": 1,
+            "scripts": [{"version": 1, "created_at": "2026-11-01T00:00:00Z", "sha256": "sha256:x"}],
+            "run_due_since": "2026-11-13T11:59:00Z",
+            "watch_round": ["0000000000000000000000000000000000000000000000000000000000000000"],
+            "config": {
+                "name": "gitlab-review",
+                "source": "gitlab",
+                "effect": {"kind": "deliver_event"},
+                "watch_mode": "watch_list",
+                "watch_objects": {"allowed_prefixes": ["https://gitlab/"], "max_len": 512},
+            },
+        }),
+    );
+
+    let record = store.load(&id).unwrap();
+
+    assert_eq!(record.state, ObserverState::Paused);
+    assert_eq!(record.note.as_deref(), Some(DELIVER_EVENT_REMOVED_NOTE));
+    assert_eq!(record.config.effect, ObserverEffect::None);
+    assert_eq!(record.config.mode, ObserverMode::OnEpisodes);
+    assert_eq!(record.config.queue, "gitlab-review");
+    assert_eq!(record.run_due_since, None);
+    assert!(record.entry_round.is_empty());
+    assert_eq!(record.approved_version, Some(1));
+    assert_eq!(record.scripts.len(), 1);
+    assert_eq!(store.list().unwrap(), vec![record]);
 }
 
 #[test]
@@ -705,77 +1076,150 @@ fn the_lenient_listing_skips_unreadable_records_and_the_strict_one_refuses_them(
 }
 
 // ---------------------------------------------------------------------------
-// Watch entries
+// Queue entries
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_watch_entry_exists_once_per_task_step_and_object() {
+fn a_queue_entry_exists_once_per_task_and_episode() {
+    // KTD-4, AE3, R17: the same episode reported again keeps its entry; a
+    // new episode of the same gate is a new entry.
     let root = TempRoot::new();
     let store = root.store();
-    let record = store
-        .create(owner(), review_config("gitlab-review"), None, now())
-        .unwrap();
-    let lock = store.lock(&record.observer_id).unwrap();
-    let object = "https://gitlab.example.com/a/-/merge_requests/17";
-    record.config.watch_objects.check(object).unwrap();
-    assert!(record
-        .config
-        .watch_objects
-        .check("https://gitlab.example.com.evil.org/x")
-        .is_err());
+    let lock = store.lock_queue_entries().unwrap();
 
-    let entry = watch("task-1", Some("await_review"), object);
+    let first = entry(owner(), "mr-review", "task-1", "input-1");
     assert_eq!(
-        store.create_watch(&lock, &entry).unwrap(),
-        WatchWrite::Created
+        first.entry_id,
+        queue_entry_id(&TaskId::parse("task-1").unwrap(), "input-1")
     );
-    // The review loop suspends the same step again.
-    let mut again = watch("task-1", Some("await_review"), object);
+    assert_eq!(
+        store.add_queue_entry(&lock, &first).unwrap(),
+        EntryWrite::Created
+    );
+    let mut again = entry(owner(), "mr-review", "task-1", "input-1");
     again.created_at = now() + Duration::seconds(60);
+    assert_eq!(again.entry_id, first.entry_id);
     assert_eq!(
-        store.create_watch(&lock, &again).unwrap(),
-        WatchWrite::Exists(entry.clone())
+        store.add_queue_entry(&lock, &again).unwrap(),
+        EntryWrite::Exists(first.clone())
     );
-    let owners_entry = WatchEntry::new(
-        TaskId::parse("task-1").unwrap(),
-        None,
-        object,
-        vec!["approved".into()],
-        WatchOrigin::Operator,
-        now(),
-    );
+    let mut next = entry(owner(), "mr-review", "task-1", "input-2");
+    next.created_at = now() + Duration::seconds(120);
+    assert_ne!(next.entry_id, first.entry_id);
     assert_eq!(
-        store.create_watch(&lock, &owners_entry).unwrap(),
-        WatchWrite::Created
+        store.add_queue_entry(&lock, &next).unwrap(),
+        EntryWrite::Created
     );
-    assert_eq!(store.list_watches(&record.observer_id).unwrap().len(), 2);
 
-    assert!(store.remove_watch(&lock, &entry.entry_id).unwrap());
-    assert!(!store.remove_watch(&lock, &entry.entry_id).unwrap());
-    assert!(store.remove_watch(&lock, "../observer").is_err());
     assert_eq!(
-        store.list_watches(&record.observer_id).unwrap(),
-        vec![owners_entry]
+        store.queue_entries(&owner(), "mr-review").unwrap(),
+        vec![first.clone(), next.clone()]
+    );
+    assert_eq!(
+        store.queue_entry(&first.entry_id).unwrap(),
+        Some(first.clone())
+    );
+    assert!(store.remove_queue_entry(&lock, &first.entry_id).unwrap());
+    assert!(!store.remove_queue_entry(&lock, &first.entry_id).unwrap());
+    assert!(store.remove_queue_entry(&lock, "../observer").is_err());
+    assert_eq!(store.queue_entry(&first.entry_id).unwrap(), None);
+    assert_eq!(store.queue_entry("../observer").unwrap(), None);
+    assert_eq!(store.list_queue_entries().unwrap(), vec![next]);
+}
+
+#[test]
+fn a_queue_entry_keeps_the_gates_params_choices_and_variables() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let lock = store.lock_queue_entries().unwrap();
+    let added = entry(owner(), "mr-review", "task-1", "input-1");
+    store.add_queue_entry(&lock, &added).unwrap();
+
+    let raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.paths().queue_entry_file(&added.entry_id)).unwrap())
+            .unwrap();
+
+    assert_eq!(raw["owner"], "owner");
+    assert_eq!(raw["queue"], "mr-review");
+    assert_eq!(raw["task_id"], "task-1");
+    assert_eq!(raw["episode"], "input-1");
+    assert_eq!(raw["step"], "review_work");
+    assert_eq!(raw["params"]["label"], "w CR");
+    assert_eq!(raw["choices"][1]["requires_variables"], json!(["note"]));
+    assert_eq!(raw["variables"][0]["type"], "text");
+    assert_eq!(store.queue_entry(&added.entry_id).unwrap(), Some(added));
+}
+
+#[test]
+fn a_queue_entry_with_a_forged_id_or_a_bad_queue_is_refused() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let lock = store.lock_queue_entries().unwrap();
+
+    let mut forged = entry(owner(), "mr-review", "task-1", "input-1");
+    forged.entry_id = "0".repeat(64);
+    assert!(store.add_queue_entry(&lock, &forged).is_err());
+    let bad_queue = entry(owner(), "no spaces allowed", "task-1", "input-1");
+    assert!(store.add_queue_entry(&lock, &bad_queue).is_err());
+    let no_episode = entry(owner(), "mr-review", "task-1", "");
+    assert!(store.add_queue_entry(&lock, &no_episode).is_err());
+    assert!(store.list_queue_entries().unwrap().is_empty());
+}
+
+#[test]
+fn only_the_newest_error_of_an_entry_is_kept() {
+    // R23.
+    let root = TempRoot::new();
+    let store = root.store();
+    let record = create(&store, owner(), review_config("gitlab-mr", "mr-review"));
+    let lock = store.lock(&record.observer_id).unwrap();
+    let with_entry = |sequence, entry_id: &str| RunFailure {
+        entry_id: Some(entry_id.to_string()),
+        ..failure(&record, sequence)
+    };
+
+    store.record_failure(&lock, &with_entry(1, "a")).unwrap();
+    store.record_failure(&lock, &with_entry(2, "b")).unwrap();
+    store.record_failure(&lock, &failure(&record, 3)).unwrap();
+    store.record_failure(&lock, &with_entry(4, "a")).unwrap();
+
+    let kept: Vec<(u64, Option<String>)> = store
+        .list_failures(&record.observer_id)
+        .unwrap()
+        .into_iter()
+        .map(|failure| (failure.sequence, failure.entry_id))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![
+            (4, Some("a".to_string())),
+            (3, None),
+            (2, Some("b".to_string()))
+        ]
     );
 }
 
 #[test]
-fn a_watch_entry_without_event_types_or_with_a_forged_id_is_refused() {
+fn the_run_of_an_entry_names_its_task_and_episode() {
     let root = TempRoot::new();
     let store = root.store();
-    let record = store
-        .create(owner(), review_config("gitlab-review"), None, now())
-        .unwrap();
+    let mut record = create(&store, owner(), review_config("gitlab-mr", "mr-review"));
     let lock = store.lock(&record.observer_id).unwrap();
+    let checked = entry(owner(), "mr-review", "task-1", "input-1");
+    let mut run = active_run(1);
+    run.entry = Some(RunEntry {
+        entry_id: checked.entry_id.clone(),
+        task_id: checked.task_id.clone(),
+        episode: checked.episode.clone(),
+    });
+    record.active_run = Some(run.clone());
+    record.entry_round = vec![checked.entry_id.clone()];
 
-    let mut entry = watch("task-1", None, "https://gitlab.example.com/a/1");
-    entry.event_types.clear();
-    assert!(store.create_watch(&lock, &entry).is_err());
+    store.save(&lock, &mut record, now()).unwrap();
 
-    let mut entry = watch("task-1", None, "https://gitlab.example.com/a/1");
-    entry.entry_id = "0".repeat(64);
-    assert!(store.create_watch(&lock, &entry).is_err());
-    assert!(store.list_watches(&record.observer_id).unwrap().is_empty());
+    let loaded = store.load(&record.observer_id).unwrap();
+    assert_eq!(loaded.active_run, Some(run));
+    assert_eq!(loaded.entry_round, vec![checked.entry_id]);
 }
 
 // ---------------------------------------------------------------------------
@@ -810,7 +1254,7 @@ fn script_output_over_the_limit_or_not_json_breaks_the_contract() {
 }
 
 #[test]
-fn the_script_input_is_one_json_document_with_the_watch_episode() {
+fn the_script_input_is_one_json_document_with_the_queue_entry() {
     let root = TempRoot::new();
     let store = root.store();
     let record = create_jira(&store, "jira-abc");
@@ -821,7 +1265,13 @@ fn the_script_input_is_one_json_document_with_the_watch_episode() {
     assert_eq!(value["contract_version"], json!(1));
     assert_eq!(value["observer"]["name"], json!("jira-abc"));
     assert_eq!(value["state"], json!({"cursor": 4}));
-    assert_eq!(value["watch"]["wait_episode"], json!("episode-1"));
+    assert_eq!(value["entry"]["episode"], json!("input-1"));
+    assert_eq!(value["entry"]["task_id"], json!("task-1"));
+    assert_eq!(value["entry"]["step"], json!("review_work"));
+    assert_eq!(
+        value["entry"]["params"]["mr_url"],
+        json!("https://gitlab/1")
+    );
     assert_eq!(value["first_run"], json!(true));
 }
 
@@ -830,7 +1280,7 @@ fn the_script_input_is_one_json_document_with_the_watch_episode() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn records_scripts_errors_and_watches_survive_a_restart() {
+fn records_scripts_errors_and_entries_survive_a_restart() {
     let root = TempRoot::new();
     let (jira, review, error, entry) = {
         let store = root.store();
@@ -839,7 +1289,12 @@ fn records_scripts_errors_and_watches_survive_a_restart() {
             .add_script(&jira.observer_id, "echo one\n", now())
             .unwrap();
         let review = store
-            .create(owner(), review_config("gitlab-review"), None, now())
+            .create(
+                owner(),
+                review_config("gitlab-review", "mr-review"),
+                None,
+                now(),
+            )
             .unwrap();
         let lock = store.lock(&jira.observer_id).unwrap();
         let mut active = store.load(&jira.observer_id).unwrap();
@@ -848,19 +1303,24 @@ fn records_scripts_errors_and_watches_survive_a_restart() {
         let error = failure(&jira, 1);
         store.record_failure(&lock, &error).unwrap();
         drop(lock);
-        let lock = store.lock(&review.observer_id).unwrap();
-        let entry = watch("task-1", Some("await"), "https://gitlab.example.com/a/1");
-        store.create_watch(&lock, &entry).unwrap();
+        let lock = store.lock_queue_entries().unwrap();
+        let entry = self::entry(owner(), "mr-review", "task-1", "input-1");
+        store.add_queue_entry(&lock, &entry).unwrap();
         let jira = store.load(&jira.observer_id).unwrap();
         (jira, review, error, entry)
     };
     // Interrupted writes leave temporary files; a fresh store sweeps them.
     let stray = temp_path_for(&root.paths().observer_record_file(jira.observer_id.as_str()));
     fs::write(&stray, b"{").unwrap();
+    let stray_entry = temp_path_for(&root.paths().queue_entry_file(&entry.entry_id));
+    fs::write(&stray_entry, b"{").unwrap();
 
     let store = root.store();
 
-    assert_eq!(store.cleanup_orphaned_temp_files().unwrap(), vec![stray]);
+    assert_eq!(
+        store.cleanup_orphaned_temp_files().unwrap(),
+        vec![stray, stray_entry]
+    );
     assert_eq!(store.list().unwrap(), vec![review.clone(), jira.clone()]);
     assert_eq!(
         store.load_script(&jira.observer_id, 1).unwrap(),
@@ -869,7 +1329,7 @@ fn records_scripts_errors_and_watches_survive_a_restart() {
     assert_eq!(store.list_failures(&jira.observer_id).unwrap(), vec![error]);
     assert_eq!(jira.active_run, Some(active_run(2)));
     assert_eq!(
-        store.list_watches(&review.observer_id).unwrap(),
+        store.queue_entries(&owner(), "mr-review").unwrap(),
         vec![entry]
     );
 }

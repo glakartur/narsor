@@ -78,16 +78,15 @@ use super::dto::{
 };
 use crate::controller_protocol::ConductorReadResponse;
 use narsor_protocol::controller::{
-    AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest, ObserverDetailView,
-    ObserverListResponse, ObserverScriptView, ObserverView, ObserverWatchListResponse,
-    ObserverWatchView, SetObserverScriptRequest,
+    ApproveObserverRequest, CreateObserverRequest, ObserverDetailView, ObserverListResponse,
+    ObserverScriptView, ObserverView, SetObserverScriptRequest,
 };
 use narsor_protocol::controller::{
     CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
     ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest,
     CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery,
     ExecutionEventsResponse, HarnessUsageResponse, ObserverClaimResponse,
-    ObserverCreateTaskRequest, ObserverEffectResponse, ObserverEventRequest, ObserverRunReport,
+    ObserverCreateTaskRequest, ObserverEffectResponse, ObserverRunReport,
     ObserverRunResultResponse, ObserverWorkerRun, OwnerCommandRequest, RepositoryBranchesResponse,
     RepositoryListResponse, RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest,
     SubmitInputRequest, SubmitOperatorCommandRequest, ValidateWorkflowRequest,
@@ -916,36 +915,6 @@ impl ApiClient {
         self.post_empty(&url).await
     }
 
-    /// The observer's watch entries.
-    pub async fn observer_watches(
-        &self,
-        observer: &str,
-    ) -> Result<ObserverWatchListResponse, ClientError> {
-        let url = self.observer_url(observer, "/watches")?;
-        self.get_json(&url).await
-    }
-
-    /// Adds a watch entry for one of the caller's tasks.
-    pub async fn add_observer_watch(
-        &self,
-        observer: &str,
-        request: &AddObserverWatchRequest,
-    ) -> Result<ObserverWatchView, ClientError> {
-        let url = self.observer_url(observer, "/watches")?;
-        self.post_json(&url, request).await
-    }
-
-    /// Removes a watch entry.
-    pub async fn remove_observer_watch(
-        &self,
-        observer: &str,
-        entry_id: &str,
-    ) -> Result<ObserverWatchView, ClientError> {
-        let entry_id = path_segment("watch entry", entry_id)?;
-        let url = self.observer_url(observer, &format!("/watches/{entry_id}"))?;
-        self.delete_json(&url).await
-    }
-
     /// Creates a task from effect data, for a client holding a run token
     /// — `POST /observer/v1/runs/{run}/tasks`.
     pub async fn observer_create_task(
@@ -955,23 +924,6 @@ impl ApiClient {
     ) -> Result<ObserverEffectResponse, ClientError> {
         let run_id = path_segment("run", run_id)?;
         let url = format!("{}/observer/v1/runs/{run_id}/tasks", self.base_url);
-        self.post_json(&url, request).await
-    }
-
-    /// Delivers an event to a task, for a client holding a run token —
-    /// `POST /observer/v1/runs/{run}/tasks/{task_id}/events`.
-    pub async fn observer_deliver_event(
-        &self,
-        run_id: &str,
-        task_id: &str,
-        request: &ObserverEventRequest,
-    ) -> Result<ObserverEffectResponse, ClientError> {
-        let run_id = path_segment("run", run_id)?;
-        let task_id = path_segment("task", task_id)?;
-        let url = format!(
-            "{}/observer/v1/runs/{run_id}/tasks/{task_id}/events",
-            self.base_url
-        );
         self.post_json(&url, request).await
     }
 

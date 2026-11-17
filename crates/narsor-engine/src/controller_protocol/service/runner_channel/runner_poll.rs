@@ -50,16 +50,6 @@ impl ProtocolService {
         self.credentials
             .touch_runner(identity, None)?
             .ok_or(ProtocolError::Unauthorized)?;
-        // A `wait` step that began to wait with a `watch` block asks for
-        // its watch entry once per episode: an entry the script closed is
-        // not added back while the task still waits in the same episode.
-        if let Some(watch) = outcome
-            .began_wait
-            .as_ref()
-            .and_then(|wait| wait.watch.as_ref())
-        {
-            self.register_wait_watch(&identity.task_id, &outcome.task.owner, watch);
-        }
         let mut task = outcome.task;
         if outcome.applied {
             self.notify(&identity.task_id);

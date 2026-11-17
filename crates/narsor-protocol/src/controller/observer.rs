@@ -26,28 +26,15 @@ pub struct ObserverCreateTaskRequest {
     pub data: Value,
 }
 
-/// `POST /observer/v1/runs/{run}/tasks/{task_id}/events`: deliver an event
-/// to the task of one of the observer's watch entries.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ObserverEventRequest {
-    /// The event type (`review.approved`, say).
-    pub event_type: String,
-    /// The event's data, any JSON value of bounded size.
-    #[serde(default)]
-    pub data: Value,
-}
-
 /// What an effect route did.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObserverEffectOutcome {
     /// A task was created.
     Created,
-    /// The event matched the task's waiting `wait` step and was queued for
-    /// it; it is in the task's history too.
+    /// The answer was queued for the task's waiting step.
     Delivered,
-    /// The task does not wait for this event: it went to the history only.
+    /// The task's history recorded it; nothing was queued.
     Recorded,
     /// An outcome from a newer server.
     #[serde(other)]
@@ -62,7 +49,7 @@ pub struct ObserverEffectResponse {
     /// The task created or addressed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
-    /// The input queued for the waiting step, for a delivered event.
+    /// The input queued for the waiting step, for a delivered answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_id: Option<String>,
     /// One line for the script's log ("created task …", say).
@@ -204,8 +191,7 @@ pub struct ObserverRunResultResponse {
 // The owner's observer routes (`/control/v1/observers`)
 // ---------------------------------------------------------------------------
 
-/// What every task of a "create a task" observer runs, or that the
-/// observer delivers events to the tasks of its watch entries.
+/// What every task of a "create a task" observer runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObserverEffectRequest {
@@ -230,8 +216,34 @@ pub enum ObserverEffectRequest {
         #[serde(default)]
         mapping: BTreeMap<String, String>,
     },
-    /// Deliver events to the tasks of the observer's watch entries.
-    DeliverEvent,
+}
+
+/// When an observer's script runs (R25). Every observer of one queue has
+/// the same mode (R26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObserverMode {
+    /// Only for the entries of its queue, one entry per run: no entry, no
+    /// run.
+    OnEpisodes,
+    /// On every tick of its schedule, with no entry.
+    Always,
+}
+
+impl ObserverMode {
+    /// The wire name (`on_episodes`, `always`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OnEpisodes => "on_episodes",
+            Self::Always => "always",
+        }
+    }
+}
+
+impl std::fmt::Display for ObserverMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// `POST /control/v1/observers`: a new draft observer. Nothing runs until
@@ -246,27 +258,30 @@ pub struct CreateObserverRequest {
     /// Parameters handed to the script as they are; a JSON object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<Value>,
-    /// Seconds between runs; the server's default when absent.
+    /// The queue it serves, in the owner's namespace; the observer's name
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
+    /// When its script runs; `on_episodes` when absent, `always` for an
+    /// observer that creates tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ObserverMode>,
+    /// Seconds between runs. Exactly one of `interval_secs` and `cron`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_secs: Option<u64>,
-    /// What its script may do.
-    pub effect: ObserverEffectRequest,
-    /// Whether the script looks only at the objects of its watch entries
-    /// (required for [`ObserverEffectRequest::DeliverEvent`]).
-    #[serde(default)]
-    pub watch_list: bool,
+    /// A five-field cron expression, evaluated in UTC. Exactly one of
+    /// `interval_secs` and `cron`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// The tasks its script may create; none when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<ObserverEffectRequest>,
     /// Secrets handed to the script.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<ObserverSecretRef>,
     /// Most tasks one run may create; the server's default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_limit_per_run: Option<u32>,
-    /// A watch entry's object must start with one of these.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_object_prefixes: Vec<String>,
-    /// Longest object of a watch entry; the server's default when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_object_len: Option<usize>,
     /// Whether the first run imports what already matches the condition.
     #[serde(default)]
     pub import_backlog: bool,
@@ -298,15 +313,21 @@ pub struct ObserverView {
     pub source: String,
     /// `draft`, `active`, `paused`, `needs_attention` or `error`.
     pub state: String,
-    /// `create_task` or `deliver_event`.
+    /// `create_task` or `none`.
     pub effect: String,
     /// The workflow of a "create a task" observer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
-    /// Whether it watches only the objects of its watch entries.
-    pub watch_list: bool,
-    /// Seconds between runs.
-    pub interval_secs: u64,
+    /// The queue it serves.
+    pub queue: String,
+    /// `on_episodes` or `always`.
+    pub mode: String,
+    /// Seconds between runs, for an interval schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
+    /// The cron expression (UTC), for a cron schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
     /// Most tasks one run may create.
     pub task_limit_per_run: u32,
     /// The only version the schedule runs.
@@ -335,6 +356,10 @@ pub struct ObserverView {
     pub last_run: Option<ObserverLastRunView>,
     /// Failed runs in a row.
     pub consecutive_failures: u32,
+    /// What the server wants the owner to know (why an update paused it,
+    /// say).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     /// When it was created.
     pub created_at: DateTime<Utc>,
 }
@@ -385,9 +410,10 @@ pub struct ObserverRunErrorView {
     /// The script's stderr (masked, bounded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
-    /// The watched object the run checked, for a watch run.
+    /// The queue entry the run checked, for an `on_episodes` run. A newer
+    /// error of the same entry replaces this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub watch_object: Option<String>,
+    pub entry_id: Option<String>,
 }
 
 /// `GET /control/v1/observers/{observer}`: one observer in detail.
@@ -404,9 +430,6 @@ pub struct ObserverDetailView {
     /// The secret references (never values).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<ObserverSecretRef>,
-    /// A watch entry's object must start with one of these.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_object_prefixes: Vec<String>,
     /// Every script version, oldest first.
     #[serde(default)]
     pub scripts: Vec<ObserverScriptView>,
@@ -430,44 +453,4 @@ pub struct SetObserverScriptRequest {
 pub struct ApproveObserverRequest {
     /// The script version the schedule runs from now on.
     pub version: u32,
-}
-
-/// `POST /control/v1/observers/{observer}/watches`: watch an object for a
-/// task of the caller.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AddObserverWatchRequest {
-    /// The task its events go to.
-    pub task_id: String,
-    /// The watched object (a PR/MR URL, say).
-    pub object: String,
-    /// The event types to catch.
-    pub event_types: Vec<String>,
-}
-
-/// One watch entry.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObserverWatchView {
-    /// The entry's id.
-    pub entry_id: String,
-    /// The task its events go to.
-    pub task_id: String,
-    /// The workflow step that added it; absent for an owner's entry.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub step: Option<String>,
-    /// The watched object.
-    pub object: String,
-    /// The event types it catches.
-    pub event_types: Vec<String>,
-    /// `workflow` or `operator`.
-    pub origin: String,
-    /// When it was added.
-    pub created_at: DateTime<Utc>,
-}
-
-/// `GET /control/v1/observers/{observer}/watches`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObserverWatchListResponse {
-    /// Oldest first.
-    pub watches: Vec<ObserverWatchView>,
 }

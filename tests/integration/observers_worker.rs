@@ -23,8 +23,8 @@ use narsor_engine::controller_protocol::service::MAX_STORED_LOG_BYTES;
 use narsor_engine::controller_protocol::ProtocolService;
 use narsor_engine::domain::WorkflowDefinition;
 use narsor_engine::observers::{
-    CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverId, ObserverName, RunId, RunStatus,
-    SecretRef, WatchMode, MAX_SCRIPT_OUTPUT_BYTES,
+    CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverId, ObserverMode, ObserverName,
+    RunId, RunStatus, SecretRef, MAX_SCRIPT_OUTPUT_BYTES,
 };
 use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef};
 use narsor_engine::persistence::StatePaths;
@@ -125,8 +125,8 @@ impl Fixture {
                 profile: None,
                 mapping: [("ticket".to_string(), "key".to_string())].into(),
             }),
+            ObserverMode::Always,
         );
-        config.watch_mode = WatchMode::All;
         config.secrets = secrets
             .iter()
             .map(|(name, env)| SecretRef {

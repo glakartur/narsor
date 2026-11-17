@@ -6,8 +6,10 @@
 //! {state}/observers/{id}/observer.lock              per-observer mutation lock
 //! {state}/observers/{id}/scripts/{n}.sh             script version n (exclusive create, immutable)
 //! {state}/observers/{id}/errors/{seq:08}.json       RunFailure of a failed or lost run (atomic
-//!                                                   replace; the newest 20 kept)
-//! {state}/observers/{id}/watches/{entry}.json       WatchEntry (exclusive create)
+//!                                                   replace; the newest 20 kept, the
+//!                                                   newest one per queue entry)
+//! {state}/observer-queues/entries.lock              additions and removals of queue entries
+//! {state}/observer-queues/entries/{entry}.json      QueueEntry (exclusive create, never changed)
 //! ```
 //!
 //! # Locks and commit protocol
@@ -17,8 +19,24 @@
 //! the holder dies, and every file is replaced atomically (temp + fsync +
 //! rename) or created exclusively (hard link, `EEXIST` instead of
 //! clobbering). Methods that mutate an observer's files take the
-//! [`ObserverLock`] as proof that the caller holds it. `create.lock` is
-//! always taken before an observer's lock, never after.
+//! [`ObserverLock`] as proof that the caller holds it, and methods that add
+//! or remove queue entries take the [`QueueEntriesLock`]. The order is
+//! fixed: `create.lock`, then an observer's lock, then `entries.lock`; never
+//! the other way round.
+//!
+//! # Queues
+//!
+//! A queue is a name in the namespace of an owner (R6, R7), not a file: the
+//! observers whose configuration names it and the entries that name it. All
+//! observers of one owner's queue have the same mode (R26). The check runs
+//! under `create.lock` in [`ObserverStore::create`] and
+//! [`ObserverStore::update_config`], the only writes that set a queue or a
+//! mode, so two concurrent writes cannot mix the modes of one queue (KTD-7).
+//!
+//! # Records of an older version
+//!
+//! A version 1 record (watch lists) is read as version 2 (queues), see
+//! [`super::migrate`]; the next save writes version 2.
 //!
 //! The record is the commit point of a script version: the script file is
 //! written first and listed in the record second, so a crash in between
@@ -30,9 +48,10 @@
 //! a file only when it fails or is lost; a successful run changes the
 //! record and nothing else.
 
+use super::migrate::migrate_v1_record;
 use super::model::{
-    sha256_hex, ObserverConfig, ObserverId, ObserverRecord, RunFailure, WatchEntry,
-    MAX_SCRIPT_BYTES, OBSERVER_RECORD_VERSION, RUN_FAILURE_VERSION, WATCH_ENTRY_VERSION,
+    sha256_hex, ObserverConfig, ObserverId, ObserverRecord, QueueEntry, RunFailure,
+    MAX_SCRIPT_BYTES, OBSERVER_RECORD_VERSION, QUEUE_ENTRY_VERSION, RUN_FAILURE_VERSION,
 };
 use super::{ObserverError, Result};
 use crate::domain::WorkflowDefinition;
@@ -77,13 +96,20 @@ impl ObserverLock {
     }
 }
 
-/// What an exclusive write of a watch entry found.
+/// Proof that the caller holds the lock of the queue entries. Released when
+/// dropped.
+#[derive(Debug)]
+pub struct QueueEntriesLock {
+    _lock: FileLock,
+}
+
+/// What an exclusive write of a queue entry found.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WatchWrite {
+pub enum EntryWrite {
     /// The entry is new.
     Created,
     /// The entry already existed and was left untouched.
-    Exists(WatchEntry),
+    Exists(QueueEntry),
 }
 
 /// The observers' file store. Holds no state beyond paths, so any number of
@@ -119,9 +145,23 @@ impl ObserverStore {
         if !path.exists() {
             return Err(ObserverError::NotFound(observer_id.clone()));
         }
-        let record: ObserverRecord = read_json(&path)?;
-        check_version(&path, record.record_version, OBSERVER_RECORD_VERSION)?;
-        Ok(record)
+        let mut value: serde_json::Value = read_json(&path)?;
+        let version = value
+            .get("record_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .unwrap_or(0);
+        check_version(&path, version, OBSERVER_RECORD_VERSION)?;
+        if version < OBSERVER_RECORD_VERSION {
+            migrate_v1_record(&mut value);
+        }
+        serde_json::from_value(value).map_err(|source| {
+            PersistenceError::Deserialize {
+                path: path.clone(),
+                source,
+            }
+            .into()
+        })
     }
 
     /// Every observer, sorted by name.
@@ -163,6 +203,16 @@ impl ObserverStore {
         Ok(records)
     }
 
+    /// The observers of `owner`'s queue `queue`, sorted by name (R7). An
+    /// unreadable record is skipped, as in [`Self::list_readable`].
+    pub fn queue_observers(&self, owner: &OwnerRef, queue: &str) -> Result<Vec<ObserverRecord>> {
+        Ok(self
+            .list_readable()?
+            .into_iter()
+            .filter(|record| &record.owner == owner && record.config.queue == queue)
+            .collect())
+    }
+
     /// The observer named `name`, if any.
     pub fn find_by_name(&self, name: &str) -> Result<Option<ObserverRecord>> {
         Ok(self
@@ -175,8 +225,9 @@ impl ObserverStore {
     ///
     /// `workflow` is the catalogue's definition of the workflow a "create a
     /// task" effect names (`None`: not found); it is ignored for any other
-    /// effect. The configuration is validated first, and the name is checked
-    /// for uniqueness under `create.lock`.
+    /// effect. The configuration is validated first; the name is checked for
+    /// uniqueness and the mode against the other observers of the owner's
+    /// queue (R26) under `create.lock`.
     pub fn create(
         &self,
         owner: OwnerRef,
@@ -187,13 +238,14 @@ impl ObserverStore {
         config.validate()?;
         config.validate_workflow(workflow)?;
         let _create = self.lock_creation()?;
-        if self
-            .list()?
+        let records = self.list()?;
+        if records
             .iter()
             .any(|record| record.config.name == config.name)
         {
             return Err(ObserverError::NameTaken(config.name));
         }
+        check_queue_mode(&records, &owner, &config, None)?;
         let mut record = ObserverRecord::new(ObserverId::generate(), owner, config, now);
         // A random id that is already taken is all but impossible; draw
         // again rather than reuse anything.
@@ -203,6 +255,40 @@ impl ObserverStore {
         )? {
             record.observer_id = ObserverId::generate();
         }
+        Ok(record)
+    }
+
+    /// Replaces the configuration of an observer (its queue, mode or
+    /// schedule, say), checked as [`Self::create`] checks a new one: valid,
+    /// a unique name, and the mode of the queue it then serves (R26, KTD-7).
+    /// The rest of the record (state, scripts, runs) is kept; a new queue
+    /// or mode ends the current round of entries.
+    pub fn update_config(
+        &self,
+        observer_id: &ObserverId,
+        config: ObserverConfig,
+        workflow: Option<&WorkflowDefinition>,
+        now: DateTime<Utc>,
+    ) -> Result<ObserverRecord> {
+        config.validate()?;
+        config.validate_workflow(workflow)?;
+        let _create = self.lock_creation()?;
+        let lock = self.lock(observer_id)?;
+        let records = self.list()?;
+        if records
+            .iter()
+            .any(|record| &record.observer_id != observer_id && record.config.name == config.name)
+        {
+            return Err(ObserverError::NameTaken(config.name));
+        }
+        let mut record = self.load(observer_id)?;
+        check_queue_mode(&records, &record.owner, &config, Some(observer_id))?;
+        if record.config.queue != config.queue || record.config.mode != config.mode {
+            // The round holds entries of the old queue, or none is due.
+            record.entry_round.clear();
+        }
+        record.config = config;
+        self.save(&lock, &mut record, now)?;
         Ok(record)
     }
 
@@ -329,8 +415,8 @@ impl ObserverStore {
     // -- run failures -------------------------------------------------------
 
     /// Writes the execution error of a failed or lost run, then deletes the
-    /// older errors of the same watched object (a new error replaces the
-    /// old one, D18) and the oldest errors beyond [`KEPT_RUN_FAILURES`].
+    /// older errors of the same queue entry (a new error replaces the old
+    /// one, R23) and the oldest errors beyond [`KEPT_RUN_FAILURES`].
     /// Writing the same run's error again replaces it.
     pub fn record_failure(&self, lock: &ObserverLock, failure: &RunFailure) -> Result<()> {
         lock.require(&failure.observer_id)?;
@@ -339,10 +425,9 @@ impl ObserverStore {
             &self.paths.observer_error_file(id, failure.sequence),
             failure,
         )?;
-        if failure.watch_object.is_some() {
+        if failure.entry_id.is_some() {
             for older in self.list_failures(&failure.observer_id)? {
-                if older.sequence != failure.sequence && older.watch_object == failure.watch_object
-                {
+                if older.sequence != failure.sequence && older.entry_id == failure.entry_id {
                     remove_file_if_exists(&self.paths.observer_error_file(id, older.sequence))?;
                 }
             }
@@ -387,38 +472,67 @@ impl ObserverStore {
         Ok(sequences)
     }
 
-    // -- watches ------------------------------------------------------------
+    // -- queue entries ------------------------------------------------------
 
-    /// Adds a watch entry, idempotently by task, step and object: an entry
-    /// already there is answered as it is and left untouched.
-    ///
-    /// Checks the entry itself, not the observer's object policy: the
-    /// caller applies [`super::WatchObjectPolicy::check`] before.
-    pub fn create_watch(&self, lock: &ObserverLock, entry: &WatchEntry) -> Result<WatchWrite> {
-        entry.validate()?;
-        let path = self
-            .paths
-            .observer_watch_file(lock.observer_id().as_str(), &entry.entry_id);
-        if write_json_atomic_exclusive(&path, entry)? {
-            return Ok(WatchWrite::Created);
-        }
-        Ok(WatchWrite::Exists(read_watch(&path)?))
+    /// Takes the lock of the queue entries: every addition and removal of
+    /// an entry holds it. Taken after an observer's lock, never before.
+    pub fn lock_queue_entries(&self) -> Result<QueueEntriesLock> {
+        let lock = FileLock::acquire(self.paths.queue_entries_lock_file()).map_err(lock_error)?;
+        Ok(QueueEntriesLock { _lock: lock })
     }
 
-    /// Every watch entry of an observer, oldest first.
-    pub fn list_watches(&self, observer_id: &ObserverId) -> Result<Vec<WatchEntry>> {
-        let dir = self.paths.observer_watches_dir(observer_id.as_str());
+    /// Adds a queue entry, idempotently by task and episode: an entry
+    /// already there is answered as it is and left untouched (a runner that
+    /// reports the same episode again, R17).
+    pub fn add_queue_entry(
+        &self,
+        _lock: &QueueEntriesLock,
+        entry: &QueueEntry,
+    ) -> Result<EntryWrite> {
+        entry.validate()?;
+        let path = self.paths.queue_entry_file(&entry.entry_id);
+        if write_json_atomic_exclusive(&path, entry)? {
+            return Ok(EntryWrite::Created);
+        }
+        Ok(EntryWrite::Exists(read_entry(&path)?))
+    }
+
+    /// Removes a queue entry. `Ok(false)` when there was none.
+    pub fn remove_queue_entry(&self, _lock: &QueueEntriesLock, entry_id: &str) -> Result<bool> {
+        if !is_entry_id(entry_id) {
+            return Err(ObserverError::invalid(
+                "queue entry id",
+                format!("'{entry_id}' is not a queue entry id"),
+            ));
+        }
+        Ok(remove_file_if_exists(
+            &self.paths.queue_entry_file(entry_id),
+        )?)
+    }
+
+    /// The queue entry `entry_id`, if it exists.
+    pub fn queue_entry(&self, entry_id: &str) -> Result<Option<QueueEntry>> {
+        if !is_entry_id(entry_id) {
+            return Ok(None);
+        }
+        match read_entry(&self.paths.queue_entry_file(entry_id)) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(ObserverError::Persistence(PersistenceError::Io { source, .. }))
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Every queue entry of every owner, oldest first.
+    pub fn list_queue_entries(&self) -> Result<Vec<QueueEntry>> {
+        let dir = self.paths.queue_entries_dir();
         let mut entries = Vec::new();
         for stem in json_file_stems(&dir)? {
-            if !is_entry_id(&stem) {
-                continue;
-            }
-            match read_watch(&dir.join(format!("{stem}.json"))) {
-                Ok(entry) => entries.push(entry),
-                // Removed between the listing and the read.
-                Err(ObserverError::Persistence(PersistenceError::Io { source, .. }))
-                    if source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+            if let Some(entry) = self.queue_entry(&stem)? {
+                entries.push(entry);
             }
         }
         entries.sort_by(|left, right| {
@@ -429,18 +543,14 @@ impl ObserverStore {
         Ok(entries)
     }
 
-    /// Removes a watch entry. `Ok(false)` when there was none.
-    pub fn remove_watch(&self, lock: &ObserverLock, entry_id: &str) -> Result<bool> {
-        if !is_entry_id(entry_id) {
-            return Err(ObserverError::invalid(
-                "watch entry id",
-                format!("'{entry_id}' is not a watch entry id"),
-            ));
-        }
-        Ok(remove_file_if_exists(&self.paths.observer_watch_file(
-            lock.observer_id().as_str(),
-            entry_id,
-        ))?)
+    /// The entries of `owner`'s queue `queue`, oldest first (R7): an entry
+    /// of another owner's queue of the same name is not among them.
+    pub fn queue_entries(&self, owner: &OwnerRef, queue: &str) -> Result<Vec<QueueEntry>> {
+        Ok(self
+            .list_queue_entries()?
+            .into_iter()
+            .filter(|entry| entry.is_in(owner, queue))
+            .collect())
     }
 
     // -- housekeeping -------------------------------------------------------
@@ -455,11 +565,13 @@ impl ObserverStore {
                 self.paths.observer_dir(id),
                 self.paths.observer_scripts_dir(id),
                 self.paths.observer_errors_dir(id),
-                self.paths.observer_watches_dir(id),
             ] {
                 removed.extend(cleanup_orphaned_temp_files(&dir)?);
             }
         }
+        removed.extend(cleanup_orphaned_temp_files(
+            &self.paths.queue_entries_dir(),
+        )?);
         Ok(removed)
     }
 
@@ -518,13 +630,37 @@ fn check_version(path: &Path, version: u32, current: u32) -> Result<()> {
     Ok(())
 }
 
-fn read_watch(path: &Path) -> Result<WatchEntry> {
-    let entry: WatchEntry = read_json(path)?;
-    check_version(path, entry.record_version, WATCH_ENTRY_VERSION)?;
+fn read_entry(path: &Path) -> Result<QueueEntry> {
+    let entry: QueueEntry = read_json(path)?;
+    check_version(path, entry.record_version, QUEUE_ENTRY_VERSION)?;
     Ok(entry)
 }
 
-/// A watch entry id is a hex SHA-256: anything else is not a file name this
+/// Refuses `config` when another observer of `owner`'s queue (`except`
+/// aside) runs in another mode (R26): the refusal names the queue's mode.
+fn check_queue_mode(
+    records: &[ObserverRecord],
+    owner: &OwnerRef,
+    config: &ObserverConfig,
+    except: Option<&ObserverId>,
+) -> Result<()> {
+    let other = records.iter().find(|record| {
+        Some(&record.observer_id) != except
+            && &record.owner == owner
+            && record.config.queue == config.queue
+            && record.config.mode != config.mode
+    });
+    match other {
+        Some(other) => Err(ObserverError::QueueModeMismatch {
+            queue: config.queue.clone(),
+            mode: other.config.mode,
+            observer: other.config.name.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// A queue entry id is a hex SHA-256: anything else is not a file name this
 /// store wrote, and is never joined into a path.
 fn is_entry_id(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())

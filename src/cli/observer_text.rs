@@ -12,7 +12,7 @@ use serde_json::Value;
 use super::task_text::age;
 use crate::controller_protocol::{
     ObserverDetailView, ObserverEffectResponse, ObserverListResponse, ObserverRunErrorView,
-    ObserverScriptView, ObserverView, ObserverWatchListResponse, ObserverWatchView,
+    ObserverScriptView, ObserverView,
 };
 use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
 
@@ -115,8 +115,20 @@ pub fn observer_list_output(listing: &ObserverListResponse, now: DateTime<Utc>) 
         if let Some(warning) = worker_warning(observer, now) {
             out.push_str(&format!("  warning: {warning}\n"));
         }
+        if let Some(note) = &observer.note {
+            out.push_str(&format!("  note: {}\n", clean(note)));
+        }
     }
     out
+}
+
+/// `every 300s` or `cron '*/10 * * * *' (UTC)`.
+fn schedule_text(observer: &ObserverView) -> String {
+    match (&observer.cron, observer.interval_secs) {
+        (Some(cron), _) => format!("cron '{}' (UTC)", clean(cron)),
+        (None, Some(secs)) => format!("every {secs}s"),
+        (None, None) => "-".to_string(),
+    }
 }
 
 /// `observer show`: everything about one observer the owner may need,
@@ -142,22 +154,19 @@ pub fn observer_show_output(detail: &ObserverDetailView, now: DateTime<Utc>) -> 
             clean(workflow),
             observer.task_limit_per_run
         )),
-        None => line("Effect: delivers events to the tasks on its watch list".to_string()),
+        None => line("Effect: creates no tasks".to_string()),
     }
-    if observer.watch_list {
-        line(format!(
-            "Watches: its watch list (objects under {})",
-            detail
-                .allowed_object_prefixes
-                .iter()
-                .map(|prefix| clean(prefix))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    } else {
-        line("Watches: everything its condition selects".to_string());
+    line(format!("Queue: {}", clean(&observer.queue)));
+    let mode = match observer.mode.as_str() {
+        "on_episodes" => "on_episodes (runs for the entries of its queue only)".to_string(),
+        "always" => "always (runs on every tick, with no entry)".to_string(),
+        other => clean(other),
+    };
+    line(format!("Mode: {mode}"));
+    line(format!("Schedule: {}", schedule_text(observer)));
+    if let Some(note) = &observer.note {
+        line(format!("Note: {}", clean(note)));
     }
-    line(format!("Interval: {}s", observer.interval_secs));
     line(format!("Script: {}", script_line(observer)));
     line(format!("Next run: {}", next_run(observer, now)));
     match &observer.last_run {
@@ -269,8 +278,8 @@ fn error_line(error: &ObserverRunErrorView, now: DateTime<Utc>) -> String {
     if let Some(code) = error.exit_code {
         text.push_str(&format!(", exit {code}"));
     }
-    if let Some(object) = &error.watch_object {
-        text.push_str(&format!(", {}", clean(object)));
+    if let Some(entry) = &error.entry_id {
+        text.push_str(&format!(", entry {}", short_entry(entry)));
     }
     text.push_str(&format!(": {}", clean(&error.error)));
     text
@@ -317,66 +326,13 @@ pub fn observer_changed_output(what: &str, observer: &ObserverView) -> String {
     )
 }
 
-/// `observer watch list`.
-pub fn watch_list_output(listing: &ObserverWatchListResponse, now: DateTime<Utc>) -> String {
-    if listing.watches.is_empty() {
-        return "No watch entries.\n".to_string();
-    }
-    let mut out = format!(
-        "{:<16} {:<28} {:<20} {:<9} {}\n",
-        "ENTRY", "TASK", "EVENTS", "ORIGIN", "OBJECT"
-    );
-    for entry in &listing.watches {
-        out.push_str(&format!(
-            "{:<16} {:<28} {:<20} {:<9} {}  (added {} ago)\n",
-            short_entry(&entry.entry_id),
-            clean(&entry.task_id),
-            event_types(entry),
-            clean(&entry.origin),
-            clean(&entry.object),
-            age(now, entry.created_at)
-        ));
-    }
-    out
-}
-
-/// The answer to `observer watch add`.
-pub fn watch_added_output(entry: &ObserverWatchView) -> String {
-    format!(
-        "Watching {} for task {} ({}); entry {}.\n",
-        clean(&entry.object),
-        clean(&entry.task_id),
-        event_types(entry),
-        clean(&entry.entry_id)
-    )
-}
-
-/// The answer to `observer watch remove`.
-pub fn watch_removed_output(entry: &ObserverWatchView) -> String {
-    format!(
-        "Removed watch entry {}: {} for task {}.\n",
-        clean(&entry.entry_id),
-        clean(&entry.object),
-        clean(&entry.task_id)
-    )
-}
-
-fn event_types(entry: &ObserverWatchView) -> String {
-    entry
-        .event_types
-        .iter()
-        .map(|event| clean(event))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// The first characters of an entry id: enough to tell entries apart in a
-/// listing. `watch remove` takes the full id or this prefix.
+/// The first characters of a queue entry id: enough to tell entries apart
+/// in a listing.
 fn short_entry(entry_id: &str) -> String {
     clean(entry_id).chars().take(12).collect()
 }
 
-/// What `task create --data` and `task event` print for the script's log:
+/// What `task create --data` prints for the script's log:
 /// the server's line, cleaned.
 pub fn effect_output(response: &ObserverEffectResponse) -> String {
     format!("{}\n", clean(&response.message))

@@ -7,9 +7,8 @@
 //! | route | body | answer |
 //! | --- | --- | --- |
 //! | `POST /observer/v1/runs/{run}/tasks` | [`ObserverCreateTaskRequest`] | `201` created |
-//! | `POST /observer/v1/runs/{run}/tasks/{task_id}/events` | [`ObserverEventRequest`] | `200` |
 //!
-//! Both answer an [`ObserverEffectResponse`]. They are merged outside the
+//! It answers an [`ObserverEffectResponse`]. They are merged outside the
 //! owner gate, which never accepts a run token; the run gate in turn
 //! accepts nothing but the token of a run in progress before its deadline,
 //! and only for that run's own path. Refusals of the gate are a bare `401`;
@@ -39,9 +38,6 @@
 //! | `POST /control/v1/observers/{observer}/approve` | [`ApproveObserverRequest`] | [`ObserverView`] |
 //! | `POST /control/v1/observers/{observer}/pause` | none | [`ObserverView`] |
 //! | `POST /control/v1/observers/{observer}/resume` | none | [`ObserverView`] |
-//! | `GET /control/v1/observers/{observer}/watches` | none | [`ObserverWatchListResponse`] |
-//! | `POST /control/v1/observers/{observer}/watches` | [`AddObserverWatchRequest`] | `201` new, `200` existing [`ObserverWatchView`] |
-//! | `DELETE /control/v1/observers/{observer}/watches/{entry_id}` | none | [`ObserverWatchView`] |
 //!
 //! They need the owner gate's [`OwnerRef`] and [`Operator`]: anyone else
 //! gets a bare `403`.
@@ -55,7 +51,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::de::DeserializeOwned;
 
@@ -66,10 +62,10 @@ use narsor_engine::controller_protocol::service::{
     ProtocolService, MAX_EFFECT_DATA_BYTES, MAX_STORED_LOG_BYTES,
 };
 use narsor_engine::controller_protocol::wire::{
-    AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest, ObserverClaimResponse,
-    ObserverCreateTaskRequest, ObserverDetailView, ObserverEffectResponse, ObserverEventRequest,
-    ObserverListResponse, ObserverRunReport, ObserverRunResultResponse, ObserverScriptView,
-    ObserverView, ObserverWatchListResponse, ObserverWatchView, SetObserverScriptRequest,
+    ApproveObserverRequest, CreateObserverRequest, ObserverClaimResponse,
+    ObserverCreateTaskRequest, ObserverDetailView, ObserverEffectResponse, ObserverListResponse,
+    ObserverRunReport, ObserverRunResultResponse, ObserverScriptView, ObserverView,
+    SetObserverScriptRequest,
 };
 use narsor_engine::observers::MAX_SCRIPT_BYTES;
 use narsor_engine::observers::{RunId, MAX_SCRIPT_OUTPUT_BYTES};
@@ -140,14 +136,6 @@ where
         )
         .route("/control/v1/observers/{observer}/pause", post(post_pause))
         .route("/control/v1/observers/{observer}/resume", post(post_resume))
-        .route(
-            "/control/v1/observers/{observer}/watches",
-            get(list_watches).post(post_watch),
-        )
-        .route(
-            "/control/v1/observers/{observer}/watches/{entry_id}",
-            delete(delete_watch),
-        )
         .layer(DefaultBodyLimit::max(MAX_OWNER_BODY))
         .with_state(service)
 }
@@ -159,10 +147,6 @@ where
 {
     Router::new()
         .route("/observer/v1/runs/{run}/tasks", post(post_task))
-        .route(
-            "/observer/v1/runs/{run}/tasks/{task_id}/events",
-            post(post_event),
-        )
         .layer(DefaultBodyLimit::max(MAX_EFFECT_BODY))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&service),
@@ -201,22 +185,6 @@ async fn post_task(
     let request: ObserverCreateTaskRequest = parse_json(&body, "effect request")?;
     let response = blocking(&service, move |s| s.observer_create_task(&run_id, request)).await?;
     Ok((StatusCode::CREATED, Json(response)))
-}
-
-async fn post_event(
-    State(service): State<Service>,
-    Extension(principal): Extension<Principal>,
-    Path((run, task_id)): Path<(String, String)>,
-    body: Bytes,
-) -> ProtocolResult<Json<ObserverEffectResponse>> {
-    let run_id = token_run(&principal, &run)?;
-    let request: ObserverEventRequest = parse_json(&body, "effect request")?;
-    Ok(Json(
-        blocking(&service, move |s| {
-            s.observer_deliver_event(&run_id, &task_id, request)
-        })
-        .await?,
-    ))
 }
 
 /// The worker gate's principal (a bare `401` for any other, which the gate
@@ -381,54 +349,6 @@ async fn post_resume(
     ))
 }
 
-async fn list_watches(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-    Path(observer): Path<String>,
-) -> ProtocolResult<Json<ObserverWatchListResponse>> {
-    let owner = require_owner_operator(owner, operator)?;
-    Ok(Json(
-        blocking(&service, move |s| s.observer_watches(&owner, &observer)).await?,
-    ))
-}
-
-async fn post_watch(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-    Path(observer): Path<String>,
-    body: Bytes,
-) -> ProtocolResult<(StatusCode, Json<ObserverWatchView>)> {
-    let owner = require_owner_operator(owner, operator)?;
-    let request: AddObserverWatchRequest = parse_json(&body, "observer request")?;
-    let (entry, created) = blocking(&service, move |s| {
-        s.add_observer_watch(&owner, &observer, request)
-    })
-    .await?;
-    let status = if created {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    Ok((status, Json(entry)))
-}
-
-async fn delete_watch(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-    Path((observer, entry_id)): Path<(String, String)>,
-) -> ProtocolResult<Json<ObserverWatchView>> {
-    let owner = require_owner_operator(owner, operator)?;
-    Ok(Json(
-        blocking(&service, move |s| {
-            s.remove_observer_watch(&owner, &observer, &entry_id)
-        })
-        .await?,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -440,19 +360,15 @@ mod tests {
     use axum::response::Response;
     use chrono::{DateTime, Duration, TimeZone, Utc};
     use narsor_engine::controller_protocol::{ClaimedObserverRun, RunOutcome, RunReport};
-    use narsor_engine::domain::{
-        BackendId, GitIdentity, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec,
-        TaskRepository, TaskRepositorySource, TaskWorkspace, WorkflowDefinition,
-    };
+    use narsor_engine::domain::{BackendId, WorkflowDefinition};
     use narsor_engine::environment::{
         BackendRecord, LaunchError, LaunchIntent, LaunchResolver, ResolvedLaunch,
         SlotReleaseTimings,
     };
     use narsor_engine::observers::{
-        CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverId, ObserverName, WatchEntry,
-        WatchMode, WatchObjectPolicy, WatchOrigin,
+        CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverId, ObserverMode, ObserverName,
     };
-    use narsor_engine::orchestration::{Clock, ControlPlane, NewTask, OwnerRef, TaskEventKind};
+    use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef};
     use narsor_engine::persistence::StatePaths;
     use serde_json::{json, Value};
     use tower::ServiceExt;
@@ -462,7 +378,6 @@ mod tests {
     use crate::controller_protocol::http::owner_routes;
 
     const OWNER_TOKEN: &str = "owner-token";
-    const PREFIX: &str = "https://git.example.com/";
 
     #[derive(Debug)]
     struct ManualClock(Mutex<DateTime<Utc>>);
@@ -473,7 +388,8 @@ mod tests {
         }
     }
 
-    /// Launches nothing: these routes are tested on events and refusals.
+    /// Launches nothing: these routes are tested on their gates and
+    /// refusals.
     struct NoLaunches;
 
     impl LaunchResolver for NoLaunches {
@@ -584,7 +500,7 @@ mod tests {
         }
 
         /// An active observer of `effect`, approved and due.
-        fn observer(&self, name: &str, effect: ObserverEffect, mode: WatchMode) -> ObserverId {
+        fn observer(&self, name: &str, effect: ObserverEffect, mode: ObserverMode) -> ObserverId {
             self.observer_of(owner(), name, effect, mode)
         }
 
@@ -594,15 +510,10 @@ mod tests {
             owner: OwnerRef,
             name: &str,
             effect: ObserverEffect,
-            mode: WatchMode,
+            mode: ObserverMode,
         ) -> ObserverId {
-            let mut config =
-                ObserverConfig::new(ObserverName::parse(name).unwrap(), "gitlab", effect);
-            config.watch_mode = mode;
-            config.watch_objects = WatchObjectPolicy {
-                allowed_prefixes: vec![PREFIX.into()],
-                ..WatchObjectPolicy::default()
-            };
+            let config =
+                ObserverConfig::new(ObserverName::parse(name).unwrap(), "gitlab", effect, mode);
             let workflow = triage();
             let store = self.service.observers();
             let id = store
@@ -616,63 +527,11 @@ mod tests {
             id
         }
 
-        /// A watch-list observer's run and the task on its list.
-        fn event_run(&self) -> (ClaimedObserverRun, TaskId) {
-            let id = self.observer(
-                "mr-review",
-                ObserverEffect::DeliverEvent,
-                WatchMode::WatchList,
-            );
-            let task = self.task("task-1");
-            let entry = WatchEntry::new(
-                task.clone(),
-                None,
-                format!("{PREFIX}a/-/merge_requests/17"),
-                vec!["approved".into()],
-                WatchOrigin::Operator,
-                self.now(),
-            );
-            let lock = self.service.observers().lock(&id).unwrap();
-            self.service
-                .observers()
-                .create_watch(&lock, &entry)
-                .unwrap();
-            drop(lock);
+        /// The claimed run of an active "create a task" observer.
+        fn effect_run(&self) -> ClaimedObserverRun {
+            jira_observer(self);
             self.service.observer_pass();
-            (self.service.claim_observer_run().unwrap().unwrap(), task)
-        }
-
-        fn task(&self, id: &str) -> TaskId {
-            let workspace = TaskWorkspace::single(TaskRepository::new(
-                "narsor",
-                TaskRepositorySource::Git(Box::new(GitIdentity {
-                    repository: Some("narsor".to_string()),
-                    remote_url: "https://example.com/narsor.git".to_string(),
-                    commit: "614c3a8".repeat(5) + "abcde",
-                    git_ref: None,
-                    ref_origin: None,
-                    credential: None,
-                })),
-            ));
-            let spec = TaskLaunchSpec::new(
-                "steps",
-                1,
-                json!({}),
-                workspace,
-                ResolvedEnvironment::harness_only("claude-code"),
-                ResourceProfile::new(1000, 2048),
-            );
-            let task_id = TaskId::parse(id).unwrap();
-            self.service
-                .control_plane()
-                .create_task(NewTask::new(
-                    task_id.clone(),
-                    owner(),
-                    BackendId::parse("k8s").unwrap(),
-                    spec,
-                ))
-                .unwrap();
-            task_id
+            self.service.claim_observer_run().unwrap().unwrap()
         }
 
         async fn send(&self, method: &str, uri: &str, token: &str, body: Value) -> Response {
@@ -694,66 +553,40 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
-    fn events_uri(run: &ClaimedObserverRun, task: &TaskId) -> String {
-        format!("/observer/v1/runs/{}/tasks/{task}/events", run.run_id)
+    fn tasks_uri(run: &ClaimedObserverRun) -> String {
+        format!("/observer/v1/runs/{}/tasks", run.run_id)
     }
 
-    fn event() -> Value {
-        json!({"event_type": "approved", "data": {"mr": 17}})
-    }
-
-    #[tokio::test]
-    async fn an_event_goes_to_the_history_of_the_watched_task() {
-        let fx = Fixture::new();
-        let (run, task) = fx.event_run();
-
-        let response = fx
-            .send(
-                "POST",
-                &events_uri(&run, &task),
-                run.token.expose(),
-                event(),
-            )
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = json_body(response).await;
-        assert_eq!(body["outcome"], "recorded");
-        assert_eq!(body["task_id"], "task-1");
-        let events = fx.service.control_plane().events_since(&task, 0).unwrap();
-        let external = events
-            .iter()
-            .filter(|event| matches!(event.kind, TaskEventKind::ExternalEventReceived { .. }))
-            .count();
-        assert_eq!(external, 1);
+    fn effect() -> Value {
+        json!({"data": {"key": "ABC-1"}})
     }
 
     #[tokio::test]
     async fn the_gate_refuses_no_token_a_wrong_one_and_another_runs_path() {
         let fx = Fixture::new();
-        let (run, task) = fx.event_run();
-        let uri = events_uri(&run, &task);
+        let run = fx.effect_run();
+        let uri = tasks_uri(&run);
 
         let request = Request::post(&uri)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(event().to_string()))
+            .body(Body::from(effect().to_string()))
             .unwrap();
         let no_token = fx.router().oneshot(request).await.unwrap();
         assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
 
         let forged = format!("{}x", run.token.expose());
-        let wrong = fx.send("POST", &uri, &forged, event()).await;
+        let wrong = fx.send("POST", &uri, &forged, effect()).await;
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
-        let owner = fx.send("POST", &uri, OWNER_TOKEN, event()).await;
+        let owner = fx.send("POST", &uri, OWNER_TOKEN, effect()).await;
         assert_eq!(owner.status(), StatusCode::UNAUTHORIZED);
 
         let other_run = format!(
-            "/observer/v1/runs/{}.{}/tasks/{task}/events",
+            "/observer/v1/runs/{}.{}/tasks",
             run.run_id.observer_id,
             run.run_id.sequence + 1
         );
         let elsewhere = fx
-            .send("POST", &other_run, run.token.expose(), event())
+            .send("POST", &other_run, run.token.expose(), effect())
             .await;
         assert_eq!(elsewhere.status(), StatusCode::UNAUTHORIZED);
         assert!(json_body_is_empty(elsewhere).await);
@@ -769,7 +602,7 @@ mod tests {
     #[tokio::test]
     async fn a_run_token_opens_no_owner_route() {
         let fx = Fixture::new();
-        let (run, _task) = fx.event_run();
+        let run = fx.effect_run();
 
         let list = fx
             .send("GET", "/control/v1/tasks", run.token.expose(), Value::Null)
@@ -785,25 +618,19 @@ mod tests {
     #[tokio::test]
     async fn a_token_stops_working_at_the_result_and_at_the_deadline() {
         let fx = Fixture::new();
-        let (run, task) = fx.event_run();
-        // Exit code 1: the entry stays, so a next run checks it (D18).
+        let run = fx.effect_run();
         fx.service
             .finish_observer_run(
                 &run.run_id,
                 RunReport {
-                    outcome: RunOutcome::Exited { exit_code: 1 },
-                    stdout: String::new(),
+                    outcome: RunOutcome::Exited { exit_code: 0 },
+                    stdout: "{\"state\": {}}".to_string(),
                     stderr: String::new(),
                 },
             )
             .unwrap();
         let ended = fx
-            .send(
-                "POST",
-                &events_uri(&run, &task),
-                run.token.expose(),
-                event(),
-            )
+            .send("POST", &tasks_uri(&run), run.token.expose(), effect())
             .await;
         assert_eq!(ended.status(), StatusCode::UNAUTHORIZED);
 
@@ -814,23 +641,10 @@ mod tests {
         *fx.clock.0.lock().unwrap() +=
             Duration::seconds(i64::try_from(next.timeout_secs).unwrap() + 3600);
         let late = fx
-            .send(
-                "POST",
-                &events_uri(&next, &task),
-                next.token.expose(),
-                event(),
-            )
+            .send("POST", &tasks_uri(&next), next.token.expose(), effect())
             .await;
         assert_eq!(late.status(), StatusCode::UNAUTHORIZED);
-        let external = fx
-            .service
-            .control_plane()
-            .events_since(&task, 0)
-            .unwrap()
-            .iter()
-            .filter(|event| matches!(event.kind, TaskEventKind::ExternalEventReceived { .. }))
-            .count();
-        assert_eq!(external, 0);
+        assert!(fx.service.control_plane().list_tasks().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -846,7 +660,7 @@ mod tests {
                 profile: None,
                 mapping: [("ticket".to_string(), "key".to_string())].into(),
             }),
-            WatchMode::All,
+            ObserverMode::Always,
         );
         assert!(fx.service.observer_pass().due.contains(&id));
         let run = fx.service.claim_observer_run().unwrap().unwrap();
@@ -870,14 +684,11 @@ mod tests {
     #[tokio::test]
     async fn an_oversized_effect_body_is_refused_before_it_is_read() {
         let fx = Fixture::new();
-        let (run, task) = fx.event_run();
-        let body = json!({
-            "event_type": "approved",
-            "data": {"text": "x".repeat(MAX_EFFECT_BODY)},
-        });
+        let run = fx.effect_run();
+        let body = json!({"data": {"key": "x".repeat(MAX_EFFECT_BODY)}});
 
         let refused = fx
-            .send("POST", &events_uri(&run, &task), run.token.expose(), body)
+            .send("POST", &tasks_uri(&run), run.token.expose(), body)
             .await;
 
         assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -895,7 +706,7 @@ mod tests {
                 profile: None,
                 mapping: [("ticket".to_string(), "key".to_string())].into(),
             }),
-            WatchMode::All,
+            ObserverMode::Always,
         )
     }
 
@@ -1012,21 +823,21 @@ mod tests {
     async fn each_credential_opens_only_its_own_routes() {
         let fx = Fixture::new();
         let credential = worker_key(&fx);
-        let (run, task) = fx.event_run();
+        let run = fx.effect_run();
 
         for (method, uri) in [
             ("GET", "/control/v1/tasks"),
             ("GET", "/control/v1/observers"),
             ("POST", "/control/v1/observers"),
-            ("POST", "/control/v1/observers/mr-review/approve"),
+            ("POST", "/control/v1/observers/jira-all/approve"),
         ] {
             let refused = fx.send(method, uri, &credential, json!({})).await;
             assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
-        let effect = fx
-            .send("POST", &events_uri(&run, &task), &credential, event())
+        let refused = fx
+            .send("POST", &tasks_uri(&run), &credential, effect())
             .await;
-        assert_eq!(effect.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
 
         let result_uri = format!("/observer/v1/worker/runs/{}/result", run.run_id);
         for token in [run.token.expose(), OWNER_TOKEN, "nsw.server.forged"] {
@@ -1102,7 +913,7 @@ mod tests {
                 profile: None,
                 mapping: Default::default(),
             }),
-            WatchMode::All,
+            ObserverMode::Always,
         );
         fx.service.observer_pass();
 
@@ -1153,14 +964,14 @@ mod tests {
 
     // -- the owner's observer routes ----------------------------------------
 
-    /// The body of a "deliver events" observer named `name`.
-    fn event_observer_body(name: &str) -> Value {
+    /// The body of an observer named `name` that answers the gates of the
+    /// `mr-review` queue.
+    fn queue_observer_body(name: &str) -> Value {
         json!({
             "name": name,
             "source": "gitlab",
-            "effect": {"kind": "deliver_event"},
-            "watch_list": true,
-            "allowed_object_prefixes": [PREFIX],
+            "queue": "mr-review",
+            "cron": "*/5 * * * *",
         })
     }
 
@@ -1173,13 +984,17 @@ mod tests {
                 "POST",
                 "/control/v1/observers",
                 OWNER_TOKEN,
-                event_observer_body("mr-review"),
+                queue_observer_body("mr-review"),
             )
             .await;
         assert_eq!(created.status(), StatusCode::CREATED);
         let created = json_body(created).await;
         assert_eq!(created["state"], "draft");
-        assert_eq!(created["effect"], "deliver_event");
+        assert_eq!(created["effect"], "none");
+        assert_eq!(created["queue"], "mr-review");
+        assert_eq!(created["mode"], "on_episodes");
+        assert_eq!(created["cron"], "*/5 * * * *");
+        assert!(created.get("interval_secs").is_none());
 
         let script = fx
             .send(
@@ -1276,6 +1091,7 @@ mod tests {
             json!({
                 "name": "jira-new",
                 "source": "jira",
+                "interval_secs": 300,
                 "effect": {"kind": "create_task", "workflow_id": workflow, "mapping": {"ticket": "key"}},
             })
         };
@@ -1309,60 +1125,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_owner_adds_lists_and_removes_a_watch_entry() {
+    async fn a_create_request_refuses_a_bad_schedule_and_a_mode_mixed_into_a_queue() {
+        // Covers AE8, AE9.
         let fx = Fixture::new();
-        fx.observer(
-            "mr-review",
-            ObserverEffect::DeliverEvent,
-            WatchMode::WatchList,
+        let create = |body: Value| fx.send("POST", "/control/v1/observers", OWNER_TOKEN, body);
+
+        for (field, value) in [
+            ("cron", json!("*/30 * * * * *")),
+            ("cron", json!("@daily")),
+            ("interval_secs", json!(10)),
+        ] {
+            let mut body = queue_observer_body("gitlab-mr");
+            body.as_object_mut().unwrap().remove("cron");
+            body[field] = value;
+            let refused = create(body).await;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{field}");
+            assert_eq!(json_body(refused).await["code"], "invalid_observer");
+        }
+        let mut both = queue_observer_body("gitlab-mr");
+        both["interval_secs"] = json!(300);
+        let both = create(both).await;
+        assert_eq!(json_body(both).await["code"], "invalid_observer");
+        let mut neither = queue_observer_body("gitlab-mr");
+        neither.as_object_mut().unwrap().remove("cron");
+        let neither = create(neither).await;
+        assert_eq!(json_body(neither).await["code"], "invalid_observer");
+        let removed = create(json!({
+            "name": "old", "source": "gitlab", "interval_secs": 300,
+            "watch_list": true, "allowed_object_prefixes": ["https://x/"],
+        }))
+        .await;
+        assert_eq!(json_body(removed).await["code"], "invalid_request");
+
+        assert_eq!(
+            create(queue_observer_body("gitlab-mr")).await.status(),
+            StatusCode::CREATED
         );
-        let task = fx.task("task-1");
-        let body = |object: &str| json!({"task_id": task.to_string(), "object": object, "event_types": ["approved"]});
-        let uri = "/control/v1/observers/mr-review/watches";
-        let object = format!("{PREFIX}a/-/merge_requests/17");
-
-        let added = fx.send("POST", uri, OWNER_TOKEN, body(&object)).await;
-        assert_eq!(added.status(), StatusCode::CREATED);
-        let entry = json_body(added).await;
-        assert_eq!(entry["origin"], "operator");
-        let again = fx.send("POST", uri, OWNER_TOKEN, body(&object)).await;
-        assert_eq!(again.status(), StatusCode::OK);
-
-        let foreign = fx
-            .send("POST", uri, OWNER_TOKEN, body("https://evil.example.org/x"))
-            .await;
-        assert_eq!(foreign.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(json_body(foreign).await["code"], "invalid_watch_entry");
-        let unknown_task = fx
-            .send(
-                "POST",
-                uri,
-                OWNER_TOKEN,
-                json!({"task_id": "task-9", "object": object, "event_types": ["approved"]}),
-            )
-            .await;
-        assert_eq!(json_body(unknown_task).await["code"], "unknown_task");
-
-        let listed = fx.send("GET", uri, OWNER_TOKEN, Value::Null).await;
-        let listed = json_body(listed).await;
-        assert_eq!(listed["watches"].as_array().unwrap().len(), 1);
-        assert_eq!(listed["watches"][0]["object"], object.as_str());
-
-        let entry_id = entry["entry_id"].as_str().unwrap();
-        let removed = fx
-            .send(
-                "DELETE",
-                &format!("{uri}/{entry_id}"),
-                OWNER_TOKEN,
-                Value::Null,
-            )
-            .await;
-        assert_eq!(removed.status(), StatusCode::OK);
-        let listed = fx.send("GET", uri, OWNER_TOKEN, Value::Null).await;
-        assert!(json_body(listed).await["watches"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        let mut always = queue_observer_body("jira-intake");
+        always["mode"] = json!("always");
+        let mixed = create(always).await;
+        assert_eq!(mixed.status(), StatusCode::CONFLICT);
+        let mixed = json_body(mixed).await;
+        assert_eq!(mixed["code"], "queue_mode_mismatch");
+        assert!(
+            mixed["message"].as_str().unwrap().contains("on_episodes"),
+            "{mixed}"
+        );
     }
 
     /// A router whose gate let `owner` through, as the owner (`operator`)
@@ -1398,18 +1206,14 @@ mod tests {
         // R21: a user who is not the installation's owner is refused with
         // a bare 403; another owner's observer is not found.
         let fx = Fixture::new();
-        fx.observer(
-            "mr-review",
-            ObserverEffect::DeliverEvent,
-            WatchMode::WatchList,
-        );
+        fx.observer("mr-review", ObserverEffect::None, ObserverMode::OnEpisodes);
 
         let stranger = router_for(&fx, "someone-else", false);
         let create = call(
             stranger.clone(),
             "POST",
             "/control/v1/observers",
-            event_observer_body("mine"),
+            queue_observer_body("mine"),
         )
         .await;
         assert_eq!(create.status(), StatusCode::FORBIDDEN);

@@ -14,8 +14,8 @@ use narsor_engine::controller_protocol::{
 use narsor_engine::domain::{TaskId, WorkflowDefinition};
 use narsor_engine::environment::EnvironmentCatalog;
 use narsor_engine::observers::{
-    CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverId, ObserverName, ObserverState,
-    RunStatus,
+    CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverId, ObserverMode, ObserverName,
+    ObserverState, RunStatus,
 };
 use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef, TaskEventKind};
 use narsor_engine::persistence::StatePaths;
@@ -126,6 +126,7 @@ impl Fixture {
                 ]
                 .into(),
             }),
+            ObserverMode::Always,
         );
         config.task_limit_per_run = limit;
         let store = self.service.observers();

@@ -4,8 +4,8 @@
 //!
 //! The owner's commands run through [`operate`] on the [`ObserverApi`]
 //! seam, implemented here on the service for one owner, as the owner
-//! routes call it. A script's `task create --data` and `task event`
-//! are parsed by the real command line and sent through [`perform`] on the
+//! routes call it. A script's `task create --data` is parsed by the real
+//! command line and sent through [`perform`] on the
 //! [`EffectApi`] seam, which authenticates the run token the way the run
 //! gate does. Where a worker is needed, it is the real worker of U6 with a
 //! script runner that plays the script: it runs `narsor-cli` command lines
@@ -25,26 +25,19 @@ use narsor::cli::observer_effect::{effect_call, perform, EffectApi};
 use narsor::cli::observer_text::{effect_output, observer_list_output};
 use narsor::cli::{Cli, Command};
 use narsor_engine::controller_protocol::{ProtocolError, ProtocolService, RunOutcome, RunReport};
-use narsor_engine::domain::{
-    BackendId, GitIdentity, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec,
-    TaskRepository, TaskRepositorySource, TaskWorkspace,
-};
 use narsor_engine::observers::{ObserverState, RunId};
-use narsor_engine::orchestration::{Clock, ControlPlane, NewTask, OwnerRef, TaskEventKind};
+use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef};
 use narsor_engine::persistence::StatePaths;
 use narsor_observer_worker::worker::{
     ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, Worker, WorkerApi, WorkerOptions,
 };
 use narsor_protocol::controller::{
-    AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest,
-    ObserverCreateTaskRequest, ObserverDetailView, ObserverEffectOutcome, ObserverEffectResponse,
-    ObserverEventRequest, ObserverListResponse, ObserverRunReport, ObserverRunResultResponse,
-    ObserverScriptView, ObserverView, ObserverWatchListResponse, ObserverWatchView,
-    ObserverWorkerRun, SetObserverScriptRequest,
+    ApproveObserverRequest, CreateObserverRequest, ObserverCreateTaskRequest, ObserverDetailView,
+    ObserverEffectOutcome, ObserverEffectResponse, ObserverListResponse, ObserverRunReport,
+    ObserverRunResultResponse, ObserverScriptView, ObserverView, ObserverWorkerRun,
+    SetObserverScriptRequest,
 };
 use serde_json::json;
-
-const PREFIX: &str = "https://git.example.com/";
 
 /// A clock the test moves by hand, starting at the real time: the worker
 /// cuts a script's limit by the run's deadline on the wall clock.
@@ -157,40 +150,6 @@ impl Fixture {
         (Arc::new(worker), script)
     }
 
-    /// A task of the owner.
-    fn task(&self, id: &str) -> TaskId {
-        let workspace = TaskWorkspace::single(TaskRepository::new(
-            "narsor",
-            TaskRepositorySource::Git(Box::new(GitIdentity {
-                repository: Some("narsor".to_string()),
-                remote_url: "https://example.com/narsor.git".to_string(),
-                commit: "614c3a8".repeat(5) + "abcde",
-                git_ref: None,
-                ref_origin: None,
-                credential: None,
-            })),
-        ));
-        let spec = TaskLaunchSpec::new(
-            "steps",
-            1,
-            json!({}),
-            workspace,
-            ResolvedEnvironment::harness_only("claude-code"),
-            ResourceProfile::new(1000, 2048),
-        );
-        let task_id = TaskId::parse(id).unwrap();
-        self.service
-            .control_plane()
-            .create_task(NewTask::new(
-                task_id.clone(),
-                owner(),
-                BackendId::parse("k8s").unwrap(),
-                spec,
-            ))
-            .unwrap();
-        task_id
-    }
-
     fn tasks(&self) -> usize {
         self.service.control_plane().list_tasks().unwrap().len()
     }
@@ -291,36 +250,6 @@ impl ObserverApi for ServiceApi {
     ) -> BoxFuture<'a, Result<ObserverView, ClientError>> {
         ready(self.service.resume_observer_for(&self.owner, observer))
     }
-
-    fn observer_watches<'a>(
-        &'a self,
-        observer: &'a str,
-    ) -> BoxFuture<'a, Result<ObserverWatchListResponse, ClientError>> {
-        ready(self.service.observer_watches(&self.owner, observer))
-    }
-
-    fn add_observer_watch<'a>(
-        &'a self,
-        observer: &'a str,
-        request: &'a AddObserverWatchRequest,
-    ) -> BoxFuture<'a, Result<ObserverWatchView, ClientError>> {
-        ready(
-            self.service
-                .add_observer_watch(&self.owner, observer, request.clone())
-                .map(|(entry, _)| entry),
-        )
-    }
-
-    fn remove_observer_watch<'a>(
-        &'a self,
-        observer: &'a str,
-        entry_id: &'a str,
-    ) -> BoxFuture<'a, Result<ObserverWatchView, ClientError>> {
-        ready(
-            self.service
-                .remove_observer_watch(&self.owner, observer, entry_id),
-        )
-    }
 }
 
 impl WorkerApi for ServiceApi {
@@ -379,18 +308,6 @@ impl EffectApi for TokenEffects {
             self.gate(run_id)
                 .and_then(|run| self.service.observer_create_task(&run, request.clone())),
         )
-    }
-
-    fn deliver_event<'a>(
-        &'a self,
-        run_id: &'a str,
-        task_id: &'a str,
-        request: &'a ObserverEventRequest,
-    ) -> BoxFuture<'a, Result<ObserverEffectResponse, ClientError>> {
-        ready(self.gate(run_id).and_then(|run| {
-            self.service
-                .observer_deliver_event(&run, task_id, request.clone())
-        }))
     }
 }
 
@@ -753,137 +670,135 @@ async fn another_owners_observer_is_not_found() {
 }
 
 // ---------------------------------------------------------------------------
-// Watch entries and events
+// Queues, run modes and schedules
 // ---------------------------------------------------------------------------
 
-/// `observer create mr-review` delivering events, watching under PREFIX.
+/// `observer create gitlab-mr` for the gates of the `mr-review` queue, on
+/// a cron schedule.
 const CREATE_REVIEW: &[&str] = &[
     "create",
-    "mr-review",
+    "gitlab-mr",
     "--source",
     "gitlab",
-    "--deliver-events",
-    "--allow-prefix",
-    PREFIX,
+    "--queue",
+    "mr-review",
+    "--cron",
+    "*/5 * * * *",
 ];
 
 #[tokio::test]
-async fn a_watch_entry_added_by_the_owner_is_in_the_watch_list() {
+async fn an_observer_of_a_queue_shows_its_queue_mode_and_cron() {
     let fx = Fixture::new();
     fx.cli(CREATE_REVIEW).await.unwrap();
-    let task = fx.task("task-1");
-    let object = format!("{PREFIX}a/-/merge_requests/17");
 
-    let added = fx
-        .cli(&[
-            "watch",
-            "add",
-            "mr-review",
-            "--task",
-            task.as_str(),
-            "--object",
-            &object,
-            "--events",
-            "approved,merged",
-        ])
-        .await
-        .unwrap();
-    let listed = fx.cli(&["watch", "list", "mr-review"]).await.unwrap();
+    let shown = fx.cli(&["show", "gitlab-mr"]).await.unwrap();
 
+    assert!(shown.contains("Effect: creates no tasks"), "{shown}");
+    assert!(shown.contains("Queue: mr-review"), "{shown}");
+    assert!(shown.contains("Mode: on_episodes"), "{shown}");
     assert!(
-        added.contains(&format!("Watching {object} for task task-1")),
-        "{added}"
+        shown.contains("Schedule: cron '*/5 * * * *' (UTC)"),
+        "{shown}"
     );
-    assert!(added.contains("approved,merged"), "{added}");
-    let row = listed.lines().nth(1).unwrap();
-    assert!(row.contains("task-1"), "{row}");
-    assert!(row.contains("approved,merged"), "{row}");
-    assert!(row.contains("operator"), "{row}");
-    assert!(row.contains(&object), "{row}");
-
-    let entry = row.split_whitespace().next().unwrap();
-    let removed = fx
-        .cli(&["watch", "remove", "mr-review", entry])
-        .await
-        .unwrap();
-    assert!(removed.starts_with("Removed watch entry"), "{removed}");
-    let empty = fx.cli(&["watch", "list", "mr-review"]).await.unwrap();
-    assert_eq!(empty, "No watch entries.\n");
+    let jira = fx.cli(CREATE_JIRA).await.unwrap();
+    assert!(jira.contains("Created observer 'jira-new'"), "{jira}");
+    let shown = fx.cli(&["show", "jira-new"]).await.unwrap();
+    assert!(shown.contains("Queue: jira-new"), "{shown}");
+    assert!(shown.contains("Mode: always"), "{shown}");
+    assert!(shown.contains("Schedule: every 300s"), "{shown}");
 }
 
 #[tokio::test]
-async fn an_operator_runs_the_review_flow_through_the_cli_alone() {
-    // F3 by the CLI: the event of a watched MR reaches the task's history.
-    // The server does not deduplicate: two calls are two events.
+async fn an_observer_of_another_mode_in_a_queue_is_refused_with_the_queues_mode() {
+    // Covers AE8 by the CLI.
     let fx = Fixture::new();
     fx.cli(CREATE_REVIEW).await.unwrap();
-    let task = fx.task("task-1");
-    let object = format!("{PREFIX}a/-/merge_requests/17");
-    fx.cli(&[
-        "watch",
-        "add",
-        "mr-review",
-        "--task",
-        "task-1",
-        "--object",
-        &object,
-        "--events",
-        "approved",
-    ])
-    .await
-    .unwrap();
-    let file = fx.script_file("mr.sh", "narsor-cli task event ...\n");
-    fx.cli(&["script", "set", "mr-review", "--file", &file])
-        .await
-        .unwrap();
-    fx.cli(&["approve", "mr-review", "--version", "1"])
-        .await
-        .unwrap();
-    let event = [
-        "task",
-        "event",
-        "task-1",
-        "--type",
-        "approved",
-        "--data",
-        r#"{"mr": 17}"#,
-    ];
-    let (worker, script) = fx.worker(&[&event, &event]);
 
-    fx.service.observer_pass();
-    worker.run_once().await.unwrap().expect("a run is due");
+    let (code, message) = fx
+        .cli(&[
+            "create",
+            "jira-new",
+            "--source",
+            "jira",
+            "--queue",
+            "mr-review",
+            "--mode",
+            "always",
+        ])
+        .await
+        .unwrap_err();
 
-    let outputs = script.outputs();
-    let first = outputs[0].as_ref().unwrap();
-    assert!(
-        first.contains("recorded in the history of task task-1"),
-        "{first}"
-    );
-    let second = outputs[1].as_ref().unwrap();
-    assert!(
-        second.contains("recorded in the history of task task-1"),
-        "{second}"
-    );
-    let external = fx
-        .service
-        .control_plane()
-        .events_since(&task, 0)
-        .unwrap()
-        .iter()
-        .filter(|event| matches!(event.kind, TaskEventKind::ExternalEventReceived { .. }))
-        .count();
-    assert_eq!(external, 2);
+    assert_eq!(code, 1);
+    assert!(message.contains("'mr-review'"), "{message}");
+    assert!(message.contains("on_episodes"), "{message}");
+    assert_eq!(fx.service.observers().list().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_cron_with_seconds_is_refused_and_cron_with_interval_does_not_parse() {
+    // Covers AE9 by the CLI.
+    let fx = Fixture::new();
+    let (code, message) = fx
+        .cli(&[
+            "create",
+            "gitlab-mr",
+            "--source",
+            "gitlab",
+            "--cron",
+            "*/30 * * * * *",
+        ])
+        .await
+        .unwrap_err();
+    assert_eq!(code, 1);
+    assert!(message.contains("seconds field"), "{message}");
+
+    for argv in [
+        &[
+            "narsor-cli",
+            "observer",
+            "create",
+            "x",
+            "--source",
+            "s",
+            "--cron",
+            "* * * * *",
+            "--interval",
+            "60",
+        ][..],
+        &[
+            "narsor-cli",
+            "observer",
+            "create",
+            "x",
+            "--source",
+            "s",
+            "--mode",
+            "sometimes",
+        ][..],
+        &[
+            "narsor-cli",
+            "observer",
+            "create",
+            "x",
+            "--source",
+            "s",
+            "--deliver-events",
+        ][..],
+    ] {
+        assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+    }
+    assert!(fx.service.observers().list().unwrap().is_empty());
 }
 
 #[test]
 fn the_text_of_untrusted_answers_has_no_control_characters() {
     let effect = ObserverEffectResponse {
-        outcome: ObserverEffectOutcome::Recorded,
+        outcome: ObserverEffectOutcome::Created,
         task_id: None,
         input_id: None,
-        message: "recorded\u{7} in \u{1b}[31mtask-1".into(),
+        message: "created\u{7} task \u{1b}[31mtask-1".into(),
     };
-    assert_eq!(effect_output(&effect), "recorded in [31mtask-1\n");
+    assert_eq!(effect_output(&effect), "created task [31mtask-1\n");
 
     let listing = ObserverListResponse {
         observers: Vec::new(),

@@ -1,16 +1,16 @@
 //! What the owner does with their observers through `narsor-cli observer`
 //! (R18, R21): create, list, show, save a script version, approve, pause,
-//! resume, delete, and keep the watch list.
+//! resume and delete.
 //!
 //! An observer is named by its name or its id. Every method takes the
 //! caller's [`OwnerRef`]: another owner's observer is answered exactly like
 //! one that does not exist (`404`), so a caller learns nothing of it.
 //!
 //! ```text
-//! create         config checked, "create a task" against the catalogue → draft
+//! create         config checked, "create a task" against the catalogue,
+//!                the mode against the owner's queue (R26)            → draft
 //! script set     next immutable version; never approved by saving (AE6)
 //! approve        the schedule runs that version only (R11)
-//! watch add      watch_list observer, own task, object under an allowed prefix
 //! ```
 
 use chrono::{DateTime, Utc};
@@ -18,20 +18,24 @@ use serde::Serialize;
 
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::tasks::launch_refusal;
-use crate::controller_protocol::service::{parse_identifier, ProtocolService};
+use crate::controller_protocol::service::ProtocolService;
 use crate::controller_protocol::wire::*;
-use crate::domain::{TaskId, WorkflowDefinition};
+use crate::domain::WorkflowDefinition;
 use crate::observers::{
-    CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverError, ObserverId, ObserverName,
-    ObserverRecord, RunFailure, SecretRef, WatchEntry, WatchMode, WatchObjectPolicy, WatchOrigin,
-    WatchWrite,
+    CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverError, ObserverId, ObserverMode,
+    ObserverName, ObserverRecord, RunFailure, ScheduleConfig, SecretRef,
 };
-use crate::orchestration::{OrchestrationError, OwnerRef};
+use crate::orchestration::OwnerRef;
 
 impl ProtocolService {
     /// Creates a draft observer of `owner` (R1, R2, R3). A "create a task"
     /// effect is checked against the catalogue's workflow, whose version
     /// it takes when the request names none.
+    ///
+    /// The queue is the observer's name when the request names none; the
+    /// mode is `always` for an observer that creates tasks and
+    /// `on_episodes` for any other. The schedule must be exactly one of an
+    /// interval and a cron expression (R28).
     pub fn create_observer(
         &self,
         owner: &OwnerRef,
@@ -39,15 +43,18 @@ impl ProtocolService {
     ) -> ProtocolResult<ObserverView> {
         let name = ObserverName::parse(request.name).map_err(ProtocolError::from)?;
         let mut workflow: Option<WorkflowDefinition> = None;
+        let schedule = ScheduleConfig::from_parts(request.interval_secs, request.cron)
+            .map_err(ProtocolError::from)?;
         let effect = match request.effect {
-            ObserverEffectRequest::CreateTask {
+            None => ObserverEffect::None,
+            Some(ObserverEffectRequest::CreateTask {
                 workflow_id,
                 workflow_version,
                 workspaces,
                 backend_id,
                 profile,
                 mapping,
-            } => {
+            }) => {
                 let definition = self
                     .launch
                     .workflow_definition(&workflow_id)
@@ -63,17 +70,18 @@ impl ProtocolService {
                 workflow = Some(definition);
                 ObserverEffect::CreateTask(effect)
             }
-            ObserverEffectRequest::DeliverEvent => ObserverEffect::DeliverEvent,
         };
-        let mut config = ObserverConfig::new(name, request.source, effect);
+        let mode = request.mode.unwrap_or(match effect {
+            ObserverEffect::CreateTask(_) => ObserverMode::Always,
+            ObserverEffect::None => ObserverMode::OnEpisodes,
+        });
+        let mut config = ObserverConfig::new(name, request.source, effect, mode);
+        if let Some(queue) = request.queue {
+            config.queue = queue;
+        }
+        config.schedule = schedule;
         if let Some(condition) = request.condition {
             config.condition = condition;
-        }
-        if let Some(interval_secs) = request.interval_secs {
-            config.schedule.interval_secs = interval_secs;
-        }
-        if request.watch_list {
-            config.watch_mode = WatchMode::WatchList;
         }
         config.secrets = request
             .secrets
@@ -86,12 +94,6 @@ impl ProtocolService {
         if let Some(limit) = request.task_limit_per_run {
             config.task_limit_per_run = limit;
         }
-        config.watch_objects = WatchObjectPolicy {
-            allowed_prefixes: request.allowed_object_prefixes,
-            max_len: request
-                .max_object_len
-                .unwrap_or(WatchObjectPolicy::default().max_len),
-        };
         config.import_backlog = request.import_backlog;
         let record =
             self.observers
@@ -125,7 +127,7 @@ impl ProtocolService {
         let errors = self.observers.list_failures(&record.observer_id)?;
         let mapping = match &record.config.effect {
             ObserverEffect::CreateTask(effect) => effect.mapping.clone(),
-            ObserverEffect::DeliverEvent => Default::default(),
+            ObserverEffect::None => Default::default(),
         };
         Ok(ObserverDetailView {
             observer: observer_view(&record, self.control.now()),
@@ -140,7 +142,6 @@ impl ProtocolService {
                     env: secret.env.clone(),
                 })
                 .collect(),
-            allowed_object_prefixes: record.config.watch_objects.allowed_prefixes.clone(),
             scripts: record.scripts.iter().map(script_view).collect(),
             errors: errors.iter().map(run_error_view).collect(),
         })
@@ -201,9 +202,10 @@ impl ProtocolService {
         Ok(observer_view(&record, self.control.now()))
     }
 
-    /// Deletes an observer of `owner` with every file of it: its scripts,
-    /// run errors and watch entries. A run in progress loses its
-    /// token at once. The tasks it created stay. Its id is never reused.
+    /// Deletes an observer of `owner` with every file of it: its scripts
+    /// and run errors. A run in progress loses its token at once. The tasks
+    /// it created stay, and so do the entries of its queue (they belong to
+    /// the gates). Its id is never reused.
     pub fn delete_observer(
         &self,
         owner: &OwnerRef,
@@ -215,102 +217,6 @@ impl ProtocolService {
         }
         tracing::info!(observer = %record.observer_id, name = %record.config.name, "observers: deleted");
         Ok(observer_view(&record, self.control.now()))
-    }
-
-    /// The watch entries of an observer of `owner`, oldest first.
-    pub fn observer_watches(
-        &self,
-        owner: &OwnerRef,
-        observer: &str,
-    ) -> ProtocolResult<ObserverWatchListResponse> {
-        let record = self.owned_observer(owner, observer)?;
-        let mut entries = self.observers.list_watches(&record.observer_id)?;
-        entries.sort_by(|left, right| {
-            (left.created_at, &left.entry_id).cmp(&(right.created_at, &right.entry_id))
-        });
-        Ok(ObserverWatchListResponse {
-            watches: entries.iter().map(watch_view).collect(),
-        })
-    }
-
-    /// Adds the owner's watch entry for `request.object` and the task
-    /// `request.task_id` (R8), idempotently: an entry for the same task and
-    /// object is answered as it is, with `false`.
-    ///
-    /// The observer must keep a watch list, the task must be the caller's,
-    /// and the object must pass the observer's object policy, so the
-    /// source's token never goes to a host the owner did not allow.
-    pub fn add_observer_watch(
-        &self,
-        owner: &OwnerRef,
-        observer: &str,
-        request: AddObserverWatchRequest,
-    ) -> ProtocolResult<(ObserverWatchView, bool)> {
-        let record = self.owned_observer(owner, observer)?;
-        if record.config.watch_mode != WatchMode::WatchList {
-            return Err(ProtocolError::conflict(
-                "observer_keeps_no_watch_list",
-                format!(
-                    "observer '{}' keeps no watch list (create it with --watch-list)",
-                    record.config.name
-                ),
-            ));
-        }
-        let task_id = parse_identifier(TaskId::parse(request.task_id))?;
-        let unknown_task = || {
-            ProtocolError::bad_request("unknown_task", format!("task '{task_id}' does not exist"))
-        };
-        match self.control.task(&task_id) {
-            Ok(task) if &task.owner == owner => {}
-            // Another owner's task is indistinguishable from none.
-            Ok(_) | Err(OrchestrationError::TaskNotFound(_)) => return Err(unknown_task()),
-            Err(error) => return Err(error.into()),
-        }
-        record
-            .config
-            .watch_objects
-            .check(&request.object)
-            .map_err(watch_refusal)?;
-        let entry = WatchEntry::new(
-            task_id,
-            None,
-            request.object,
-            request.event_types,
-            WatchOrigin::Operator,
-            self.control.now(),
-        );
-        entry.validate().map_err(watch_refusal)?;
-        let lock = self.observers.lock(&record.observer_id)?;
-        match self.observers.create_watch(&lock, &entry)? {
-            WatchWrite::Created => {
-                tracing::info!(observer = %record.observer_id, entry = %entry.entry_id, "observers: the owner added a watch entry");
-                Ok((watch_view(&entry), true))
-            }
-            WatchWrite::Exists(existing) => Ok((watch_view(&existing), false)),
-        }
-    }
-
-    /// Removes the watch entry `entry_id` of an observer of `owner`: its
-    /// object is not looked at for that task any more.
-    pub fn remove_observer_watch(
-        &self,
-        owner: &OwnerRef,
-        observer: &str,
-        entry_id: &str,
-    ) -> ProtocolResult<ObserverWatchView> {
-        let record = self.owned_observer(owner, observer)?;
-        let lock = self.observers.lock(&record.observer_id)?;
-        let entry = self
-            .observers
-            .list_watches(&record.observer_id)?
-            .into_iter()
-            .find(|entry| entry.entry_id == entry_id)
-            .ok_or(ProtocolError::NotFound)?;
-        if !self.observers.remove_watch(&lock, &entry.entry_id)? {
-            return Err(ProtocolError::NotFound);
-        }
-        tracing::info!(observer = %record.observer_id, entry = %entry.entry_id, "observers: the owner removed a watch entry");
-        Ok(watch_view(&entry))
     }
 
     /// The observer `observer` (an id when it has the id's form, else a
@@ -337,16 +243,6 @@ impl ProtocolService {
     }
 }
 
-/// A refused watch object or event type, as the owner reads it.
-fn watch_refusal(error: ObserverError) -> ProtocolError {
-    match error {
-        ObserverError::Invalid { .. } => {
-            ProtocolError::bad_request("invalid_watch_entry", error.to_string())
-        }
-        other => other.into(),
-    }
-}
-
 /// The wire name of a `snake_case` enum value (`needs_attention`, say).
 fn wire_name<T: Serialize>(value: &T) -> String {
     serde_json::to_value(value)
@@ -359,7 +255,7 @@ fn wire_name<T: Serialize>(value: &T) -> String {
 fn observer_view(record: &ObserverRecord, now: DateTime<Utc>) -> ObserverView {
     let (effect, workflow_id) = match &record.config.effect {
         ObserverEffect::CreateTask(effect) => ("create_task", Some(effect.workflow_id.clone())),
-        ObserverEffect::DeliverEvent => ("deliver_event", None),
+        ObserverEffect::None => ("none", None),
     };
     ObserverView {
         observer_id: record.observer_id.to_string(),
@@ -368,8 +264,14 @@ fn observer_view(record: &ObserverRecord, now: DateTime<Utc>) -> ObserverView {
         state: wire_name(&record.state),
         effect: effect.to_string(),
         workflow_id,
-        watch_list: record.config.watch_mode == WatchMode::WatchList,
-        interval_secs: record.config.schedule.interval_secs,
+        queue: record.config.queue.clone(),
+        mode: record.config.mode.to_string(),
+        interval_secs: record.config.schedule.interval_secs(),
+        cron: record
+            .config
+            .schedule
+            .cron()
+            .map(|cron| cron.as_str().to_string()),
         task_limit_per_run: record.config.task_limit_per_run,
         approved_version: record.approved_version,
         latest_version: record.latest_script_version(),
@@ -385,6 +287,7 @@ fn observer_view(record: &ObserverRecord, now: DateTime<Utc>) -> ObserverView {
             error: run.error.clone(),
         }),
         consecutive_failures: record.consecutive_failures,
+        note: record.note.clone(),
         created_at: record.created_at,
     }
 }
@@ -409,18 +312,6 @@ fn run_error_view(failure: &RunFailure) -> ObserverRunErrorView {
         error: failure.error.clone(),
         stdout: failure.stdout.clone(),
         stderr: failure.stderr.clone(),
-        watch_object: failure.watch_object.clone(),
-    }
-}
-
-fn watch_view(entry: &WatchEntry) -> ObserverWatchView {
-    ObserverWatchView {
-        entry_id: entry.entry_id.clone(),
-        task_id: entry.task_id.to_string(),
-        step: entry.step.clone(),
-        object: entry.object.clone(),
-        event_types: entry.event_types.clone(),
-        origin: wire_name(&entry.origin),
-        created_at: entry.created_at,
+        entry_id: failure.entry_id.clone(),
     }
 }
