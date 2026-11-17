@@ -44,7 +44,10 @@ The workflow has:
   only when the agent asked something, and after the code review always, to
   approve the whole code;
 - the whole conversation with the person in open threads of the pull request,
-  and a loop back to the work for each question or note there.
+  and a loop back to the work for each question or note there;
+- a `watch` block on each review gate (queue `mr-review`), so that an
+  observer can answer the gate when the person removes the label
+  `narsor-review` from the pull request.
 
 It needs an agent harness, the `compound-engineering` skills and `gh` or
 `glab`. Run it by its path from a checkout of this repository:
@@ -61,10 +64,13 @@ use `curl` and `jq`:
 
 - `jira-new-issues.sh` creates a task for each new Jira issue that a JQL
   query finds. On the first run it only records where to start.
-- `github-pr-review.sh` and `gitlab-mr-review.sh` deliver `review.approved`,
-  `review.changes_requested`, `merged` and `closed` to the tasks that wait
-  for a pull or merge request on the watch list.
+- `github-pr-review.sh` and `gitlab-mr-review.sh` serve a queue of review
+  gates (a `watch` block on a human `decision`, mode `on_episodes`). When the
+  reviewer removes the gate's `label` from the pull or merge request in
+  `mr_url`, the script answers the gate with `narsor-cli task decide` and the
+  gate's `choice` param (default `check_feedback`). Both can serve one
+  queue: each one exits 0 with no answer for a URL that is not on its host.
 
-The header of each script has the `observer create` command, the condition
-and the secrets. With `FAKE_SOURCE_DIR` set, a script reads its answers from
-files and does not use the network.
+The header of each script has the `observer create` command, the condition,
+the params and the secrets. With `FAKE_SOURCE_DIR` set, a script reads its
+answers from files and does not use the network.

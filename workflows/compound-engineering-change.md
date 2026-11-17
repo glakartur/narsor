@@ -64,6 +64,23 @@ flowchart TD
 | `review_code` | Always, after a clean code review. | Chooses `approve` for the whole code, or writes questions and notes in threads and chooses `feedback`. |
 | `finalize_blocked` | Only when `finalize` could not take the pull request out of Draft. | Fixes the cause and chooses `retry`, or takes it out of Draft and chooses `done`. |
 
+## An observer at the gates
+
+The gates `requirements_questions`, `plan_questions` and `review_code` have a
+`watch` block on the queue `mr-review`, with the params `mr_url` (the pull
+request), `label` (`narsor-review`) and `choice` (`answered`, or `feedback` at
+`review_code`). Before each of these gates the agent puts the label
+`narsor-review` on the pull request. The person removes it when their answers
+or notes are on the pull request.
+
+An `on_episodes` observer of the queue `mr-review` with the script
+[`gitlab-mr-review.sh`](observers/examples/gitlab-mr-review.sh) or
+[`github-pr-review.sh`](observers/examples/github-pr-review.sh) then answers
+the gate with that choice, so the person does not go back to Narsor for it.
+Both scripts can serve the queue at the same time: each one answers only for
+a URL of its own host. Without an observer, the person chooses at the gate as
+before; `approve` and `abandon` are always the person's choices.
+
 Every question and every answer is in an open thread of the pull request. An
 agent question starts with `✨ [NARSOR] [Q<n>]`. The agent resolves a thread only
 after the person answered it, and it leaves the threads of the person's own

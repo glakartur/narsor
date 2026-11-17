@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_engine::controller_protocol::{ProtocolService, RunOutcome, RunReport};
 use narsor_engine::domain::TaskId;
+use narsor_engine::observers::migrate::DELIVER_EVENT_REMOVED_NOTE;
 use narsor_engine::observers::{
     queue_entry_id, ObserverConfig, ObserverEffect, ObserverId, ObserverMode, ObserverName,
     ObserverState, RunStatus, ScheduleConfig,
@@ -256,6 +257,47 @@ fn an_old_record_with_only_an_interval_runs_unchanged() {
     );
     assert_eq!(record.config.queue, "jira-new");
     assert_eq!(record.next_run_at, Some(fx.now() + Duration::seconds(600)));
+}
+
+#[test]
+fn an_old_deliver_event_observer_is_paused_with_its_note_and_not_run() {
+    // KTD-8, U13: an active version 1 observer that delivered events reads
+    // as a paused `on_episodes` observer of the queue of its name. It keeps
+    // its scripts, and a gate entry on its queue starts no run.
+    let fx = Fixture::new();
+    let id = fx.active_on_episodes("mr-review");
+    let path = fx
+        .service
+        .observers()
+        .paths()
+        .observer_record_file(id.as_str());
+    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    raw["record_version"] = json!(1);
+    raw["config"]["effect"] = json!({"kind": "deliver_event"});
+    raw["config"]["watch_mode"] = json!("watch_list");
+    raw["config"]["watch_objects"] =
+        json!({"allowed_prefixes": ["https://gitlab/"], "max_len": 512});
+    raw["config"].as_object_mut().unwrap().remove("queue");
+    raw["config"].as_object_mut().unwrap().remove("mode");
+    fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+    let task = fx.task("task-1");
+    fx.entry("mr-review", &task, "input-1");
+    for _ in 0..3 {
+        run_periodic_pass(&fx.service);
+        assert!(fx.service.claim_observer_run().unwrap().is_none());
+        fx.advance(Duration::seconds(300));
+    }
+
+    let record = fx.service.observers().load(&id).unwrap();
+    assert_eq!(record.state, ObserverState::Paused);
+    assert_eq!(record.note.as_deref(), Some(DELIVER_EVENT_REMOVED_NOTE));
+    assert_eq!(record.config.effect, ObserverEffect::None);
+    assert_eq!(record.config.queue, "mr-review");
+    assert_eq!(record.config.mode, ObserverMode::OnEpisodes);
+    assert_eq!(record.approved_version, Some(1));
+    assert_eq!(record.last_run_sequence, 0);
+    assert_eq!(fx.service.observers().list().unwrap().len(), 1);
 }
 
 #[test]
