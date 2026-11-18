@@ -122,14 +122,15 @@ impl ControlPlane {
                 })
                 .unwrap_or(record.generation);
             let command_id = next_command_id(record);
-            // A transition or a step chosen at a watched gate leaves it:
-            // with exit scripts it waits for them like an answer (R10).
-            if let Some(target) = gate_exit_target(&request.command) {
+            // A transition, a step chosen or a restart at a watched gate
+            // leaves its episode: with exit scripts it waits for them like
+            // an answer (R10, R16).
+            if let Some(choice) = gate_exit_choice(&request.command) {
                 hold_gate_exit(
                     record,
                     None,
                     GateExit {
-                        choice: Some(target.to_string()),
+                        choice: choice.map(str::to_string),
                         author: GateExitAuthor::Operator,
                         run_id: None,
                         held: Some(HeldExitItem::Command {
@@ -375,13 +376,15 @@ fn commands_for(record: &TaskRecord, launch_generation: u64) -> Vec<QueuedOperat
         .collect()
 }
 
-/// The state or step `command` leaves a gate for, when it is a command that
-/// leaves one (a transition, a chosen step).
-fn gate_exit_target(command: &OperatorCommand) -> Option<&str> {
+/// How `command` leaves a gate episode, when it is a command that leaves
+/// one: a transition or a chosen step for its state or step, a restart of
+/// the gate step (a new episode of the same gate, R16) for none.
+fn gate_exit_choice(command: &OperatorCommand) -> Option<Option<&str>> {
     match command {
         OperatorCommand::Transition { target, .. } | OperatorCommand::SelectStep { target, .. } => {
-            Some(target)
+            Some(Some(target))
         }
+        OperatorCommand::RestartStep { .. } => Some(None),
         _ => None,
     }
 }

@@ -49,8 +49,9 @@ impl Engine {
     }
 
     /// The synchronous half of an explicit operator recovery. Recovery is
-    /// deliberately limited to terminal failure or interruption states, so it
-    /// cannot turn daemon startup into an automatic replay.
+    /// deliberately limited to terminal failure or interruption states, and
+    /// to a gate that waits for its answer (the operator restarts the gate
+    /// step), so it cannot turn daemon startup into an automatic replay.
     ///
     /// A recovery naming a step failure's key is refused once the execution
     /// is no longer failed on it (KTD9); the failure record goes in the same
@@ -64,6 +65,10 @@ impl Engine {
         let mut execution = self.store.load_execution(execution_id)?;
         match execution.status {
             ExecutionStatus::Failed | ExecutionStatus::Unknown => {}
+            // A gate that waits for its answer starts again as a new episode
+            // (R16): its request is closed below and the step raises a new one.
+            ExecutionStatus::InputNeeded
+                if recovery.episode.is_none() && self.waits_at_gate(execution_id)? => {}
             _ if recovery.episode.is_some() => {
                 return Err(EngineError::StaleEpisode {
                     execution_id: execution_id.to_string(),
@@ -104,6 +109,15 @@ impl Engine {
         self.store.save_execution(&execution)?;
         self.emit(execution_id, EventData::WorkflowResumed)?;
         Ok(execution)
+    }
+
+    /// Whether the execution waits at a gate a restart may start again
+    /// ([`human::restarts_as_new_episode`]).
+    fn waits_at_gate(&self, execution_id: &str) -> Result<bool, EngineError> {
+        Ok(self
+            .store
+            .load_pending_input::<human::PendingHumanInput>(execution_id)?
+            .is_some_and(|pending| human::restarts_as_new_episode(&pending)))
     }
 
     /// Phase 1 of the two-phase `resume` (U3): claims the execution

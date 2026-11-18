@@ -447,6 +447,17 @@ pub fn pending_input(
     Ok(store.load_pending_input(execution_id)?)
 }
 
+/// Whether a restart of the step may close `pending`: a gate (a form or a
+/// decision that completes its step, R16). The restart closes the request
+/// ([`InputCloseReason::Recover`]) and runs the step again; the request the
+/// step raises then has a new key ([`PendingHumanInput::episode_key`]), so
+/// the old episode ends and a new one begins. An agent's question, a
+/// problem, an approval, a permission or an entry limit is not a gate: the
+/// agent or the person in it waits for that answer.
+pub fn restarts_as_new_episode(pending: &PendingHumanInput) -> bool {
+    pending.continuation == InputContinuation::CompleteStep
+}
+
 /// Delivers an answer, resuming the execution.
 ///
 /// Refuses any execution that is not [`ExecutionStatus::InputNeeded`], and a
