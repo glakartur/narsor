@@ -68,6 +68,16 @@ mr=$(jq -n -c --arg url "$mr_url" --arg host "$host" '
 [ -n "$mr" ] || done_with "'$mr_url' is not a merge request URL on $host; not mine, not fetched"
 
 project=$(printf '%s' "$mr" | jq -r '.project')
+
+# Optional allowlist: the token never reaches a project that is not on it.
+allowed=$(printf "%s" "$input" | jq -c ".condition.gitlab.projects // null")
+if [ "$allowed" != null ]; then
+    printf "%s" "$allowed" | jq -e "type == \"array\" and all(.[]; type == \"string\")" >/dev/null ||
+        fail "condition.gitlab.projects must be a list of project paths"
+    printf "%s" "$allowed" | jq -e --arg p "$project" "any(.[]; ascii_downcase == (\$p | ascii_downcase))" >/dev/null ||
+        done_with "$project is not in condition.gitlab.projects; not mine, not fetched"
+fi
+
 iid=$(printf '%s' "$mr" | jq -r '.iid')
 encoded=$(printf '%s' "$project" | jq -R -r '@uri')
 name=$(printf '%s-%s' "$project" "$iid" | tr '/' '-')
@@ -120,7 +130,7 @@ request() {
 answer=$(request GET "$path") || exit "$ERROR"
 printf '%s' "$answer" | jq -e 'type == "object" and (.labels | type) == "array"' >/dev/null ||
     fail "the answer for $mr_url is not a merge request"
-if printf '%s' "$answer" | jq -e --arg label "$label" 'any(.labels[]; . == $label)' >/dev/null; then
+if printf '%s' "$answer" | jq -e --arg label "$label" 'any(.labels[]; ascii_downcase == ($label | ascii_downcase))' >/dev/null; then
     done_with "$mr_url already has the label $label"
 fi
 

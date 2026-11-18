@@ -67,6 +67,16 @@ pr=$(jq -n -c --arg url "$mr_url" --arg host "$host" '
 
 owner=$(printf '%s' "$pr" | jq -r '.owner')
 repo=$(printf '%s' "$pr" | jq -r '.repo')
+
+# Optional allowlist: the token never reaches a repository that is not on it.
+allowed=$(printf "%s" "$input" | jq -c ".condition.github.repos // null")
+if [ "$allowed" != null ]; then
+    printf "%s" "$allowed" | jq -e "type == \"array\" and all(.[]; type == \"string\")" >/dev/null ||
+        fail "condition.github.repos must be a list of owner/repo names"
+    printf "%s" "$allowed" | jq -e --arg r "$owner/$repo" "any(.[]; ascii_downcase == (\$r | ascii_downcase))" >/dev/null ||
+        done_with "$owner/$repo is not in condition.github.repos; not mine, not fetched"
+fi
+
 number=$(printf '%s' "$pr" | jq -r '.number')
 name="$owner-$repo-$number"
 
@@ -118,7 +128,7 @@ request() {
 answer=$(request GET "repos/$owner/$repo/pulls/$number") || exit "$ERROR"
 printf '%s' "$answer" | jq -e 'type == "object" and (.labels | type) == "array"' >/dev/null ||
     fail "the answer for $mr_url is not a pull request"
-if printf '%s' "$answer" | jq -e --arg label "$label" 'any(.labels[]; .name == $label)' >/dev/null; then
+if printf '%s' "$answer" | jq -e --arg label "$label" 'any(.labels[]; (.name | ascii_downcase) == ($label | ascii_downcase))' >/dev/null; then
     done_with "$mr_url already has the label $label"
 fi
 

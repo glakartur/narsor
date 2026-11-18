@@ -14,5 +14,7 @@ condition:
   label: narsor-review
   gitlab:
     host: gitlab.example.com     # replace with your GitLab host
+    # projects: [group/app]      # recommended: only these projects get the token
   github:
     host: github.com
+    # repos: [acme/app]          # recommended: only these repositories get the token

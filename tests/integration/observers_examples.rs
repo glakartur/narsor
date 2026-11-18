@@ -646,6 +646,37 @@ fn two_example_automations_of_one_queue_handle_only_their_own_urls() {
     }
 }
 
+/// `mr_url` comes from the workflow (an agent can write it), so with an
+/// allowlist in the condition a URL of another project on the same host is
+/// not the automation's entry: no fetch, no write, no answer, in any phase.
+#[test]
+#[ignore = "runs the example scripts with a real sh and jq"]
+fn a_url_outside_the_allowlist_is_not_touched() {
+    let condition = json!({
+        "label": "w CR",
+        "gitlab": {"host": "gitlab.example.com", "projects": ["group/other"]},
+        "github": {"repos": ["acme/other"]},
+    });
+    for (automation, url) in [(GITLAB, GITLAB_MR), (GITHUB, GITHUB_PR)] {
+        let sandbox = Sandbox::new();
+        for phase in HookPhase::ALL {
+            let mut input = review_input(condition.clone(), review_entry(url, &[]));
+            input["phase"] = json!(phase.as_str());
+
+            let run = sandbox.run(automation, phase, &input);
+
+            assert_exit(&run, DONE);
+            assert!(
+                run.calls.is_empty(),
+                "{automation} {phase}: {:?}",
+                run.calls
+            );
+            assert!(run.stderr.contains("not mine"), "{}", run.stderr);
+        }
+        assert!(sandbox.writes().is_empty(), "{:?}", sandbox.writes());
+    }
+}
+
 #[test]
 #[ignore = "runs the example scripts with a real sh and jq"]
 fn no_answer_while_the_label_is_on_or_the_request_is_not_open() {
@@ -675,6 +706,17 @@ fn no_answer_while_the_label_is_on_or_the_request_is_not_open() {
     );
     assert_exit(&github, DONE);
     assert!(github.stderr.contains("is closed"), "{}", github.stderr);
+
+    // GitHub matches label names without case: `W cr` is the label `w CR`,
+    // so it must not look like the reviewer removed it.
+    sandbox.answer("pr-acme-app-17", &pull_request("open", &["W cr"]));
+    let other_case = sandbox.run(
+        GITHUB,
+        HookPhase::Check,
+        &github_input(review_entry(GITHUB_PR, &[])),
+    );
+    assert_exit(&other_case, DONE);
+    assert!(other_case.calls.is_empty(), "{:?}", other_case.calls);
 
     sandbox.answer("mr-group-app-7", &merge_request("merged", &[]));
     let merged = sandbox.run(

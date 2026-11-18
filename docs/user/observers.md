@@ -579,7 +579,13 @@ values are files in the secrets directory of the worker (the setting
 - **Params are not trusted.** The params of an entry come from a workflow.
   A script must check a URL in the params (its host and its form) before it
   sends a token to it. The example scripts do this, and do not fetch a URL
-  that is not theirs.
+  that is not theirs. A host check alone still lets an agent name another
+  project on the same host, so give the label automations an allowlist:
+  `condition.gitlab.projects` (project paths) and `condition.github.repos`
+  (`owner/repo`). A URL outside the list is not the automation's entry, and
+  the token is not sent. Also give the token access only to those projects.
+- **Label names are compared without case**, as GitHub does, so a label
+  that differs only in case still counts as present.
 
 ## 11. Data from the source
 

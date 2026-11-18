@@ -84,6 +84,16 @@ printf '%s' "$entry" | jq -e --arg choice "$choice" 'any(.choices[]; .name == $c
     fail "the gate $(printf '%s' "$entry" | jq -r '.step') has no choice $choice"
 
 project=$(printf '%s' "$mr" | jq -r '.project')
+
+# Optional allowlist: the token never reaches a project that is not on it.
+allowed=$(printf "%s" "$input" | jq -c ".condition.gitlab.projects // null")
+if [ "$allowed" != null ]; then
+    printf "%s" "$allowed" | jq -e "type == \"array\" and all(.[]; type == \"string\")" >/dev/null ||
+        fail "condition.gitlab.projects must be a list of project paths"
+    printf "%s" "$allowed" | jq -e --arg p "$project" "any(.[]; ascii_downcase == (\$p | ascii_downcase))" >/dev/null ||
+        done_with "$project is not in condition.gitlab.projects; not mine, not fetched"
+fi
+
 iid=$(printf '%s' "$mr" | jq -r '.iid')
 encoded=$(printf '%s' "$project" | jq -R -r '@uri')
 name=$(printf '%s-%s' "$project" "$iid" | tr '/' '-')
@@ -127,7 +137,7 @@ printf '%s' "$answer" | jq -e 'type == "object" and (.labels | type) == "array"'
 
 state=$(printf '%s' "$answer" | jq -r '.state')
 [ "$state" = opened ] || done_with "$mr_url is $state; nothing to answer"
-if printf '%s' "$answer" | jq -e --arg label "$label" 'any(.labels[]; . == $label)' >/dev/null; then
+if printf '%s' "$answer" | jq -e --arg label "$label" 'any(.labels[]; ascii_downcase == ($label | ascii_downcase))' >/dev/null; then
     done_with "$mr_url still has the label $label"
 fi
 
