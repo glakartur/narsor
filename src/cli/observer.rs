@@ -26,7 +26,7 @@ use futures::future::BoxFuture;
 use super::commands::{CliError, Result};
 use super::observer_text::{
     observer_changed_output, observer_list_output, observer_show_output, observer_updated_output,
-    queue_list_output, queue_show_output, script_saved_output,
+    queue_list_output, queue_show_output, script_saved_output, script_text_output,
 };
 use super::remote::{failure, parse_workspaces, split_pair};
 use crate::api::{ApiClient, ClientError, ServerTarget};
@@ -34,8 +34,8 @@ use crate::config::Flags;
 use crate::controller_protocol::{
     ApproveObserverRequest, CreateObserverRequest, ObserverDetailView, ObserverEffectRequest,
     ObserverListResponse, ObserverMode, ObserverQueueListResponse, ObserverQueueView,
-    ObserverScriptView, ObserverSecretRef, ObserverView, SetObserverScriptRequest,
-    UpdateObserverRequest,
+    ObserverScriptTextView, ObserverScriptView, ObserverSecretRef, ObserverView,
+    SetObserverScriptRequest, UpdateObserverRequest,
 };
 use crate::domain::without_unsafe_chars;
 
@@ -62,7 +62,7 @@ pub enum ObserverCommand {
         observer: String,
     },
 
-    /// Saves script versions.
+    /// Saves and prints script versions.
     Script {
         /// What to do.
         #[command(subcommand)]
@@ -316,6 +316,17 @@ pub enum ScriptCommand {
         #[arg(long, value_name = "FILE")]
         file: PathBuf,
     },
+
+    /// Prints a script version: a header with the version and whether it
+    /// is approved, then the script text. Read it before you approve it.
+    Show {
+        /// The observer's name or id.
+        #[arg(value_name = "OBSERVER")]
+        observer: String,
+        /// The script version to print; the newest when left out.
+        #[arg(long, value_name = "N")]
+        version: Option<u32>,
+    },
 }
 
 /// Runs one `narsor-cli observer` command.
@@ -392,6 +403,13 @@ pub trait ObserverApi: Send + Sync {
         request: &'a SetObserverScriptRequest,
     ) -> BoxFuture<'a, std::result::Result<ObserverScriptView, ClientError>>;
 
+    /// One script version with its text.
+    fn observer_script<'a>(
+        &'a self,
+        observer: &'a str,
+        version: u32,
+    ) -> BoxFuture<'a, std::result::Result<ObserverScriptTextView, ClientError>>;
+
     /// Approves a script version.
     fn approve_observer<'a>(
         &'a self,
@@ -465,6 +483,14 @@ impl ObserverApi for ApiClient {
         request: &'a SetObserverScriptRequest,
     ) -> BoxFuture<'a, std::result::Result<ObserverScriptView, ClientError>> {
         Box::pin(ApiClient::set_observer_script(self, observer, request))
+    }
+
+    fn observer_script<'a>(
+        &'a self,
+        observer: &'a str,
+        version: u32,
+    ) -> BoxFuture<'a, std::result::Result<ObserverScriptTextView, ClientError>> {
+        Box::pin(ApiClient::observer_script(self, observer, version))
     }
 
     fn approve_observer<'a>(
@@ -685,6 +711,28 @@ where
                 .await
                 .map_err(|error| failure("Could not save the script", error))?;
             Ok(script_saved_output(&observer, &saved))
+        }
+        ObserverCommand::Script {
+            command: ScriptCommand::Show { observer, version },
+        } => {
+            // The observer says which version is the newest and which one
+            // is approved; the version itself is read after it.
+            let detail = api.observer(&observer).await.map_err(|error| {
+                failure(&format!("Could not read observer '{observer}'"), error)
+            })?;
+            let Some(version) = version.or(detail.observer.latest_version) else {
+                return Err(CliError::failure(format!(
+                    "Observer '{}' has no script version yet. Save one with \
+                     `narsor-cli observer script set {} --file SCRIPT`.",
+                    without_unsafe_chars(&observer),
+                    without_unsafe_chars(&observer)
+                )));
+            };
+            let script = api
+                .observer_script(&observer, version)
+                .await
+                .map_err(|error| failure(&format!("Could not read version {version}"), error))?;
+            Ok(script_text_output(&detail.observer, &script))
         }
         ObserverCommand::Approve { observer, version } => {
             let approved = api

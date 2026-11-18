@@ -116,13 +116,6 @@ pub fn schedule_value(view: &ObserverView) -> String {
     }
 }
 
-/// The newest version when it is not the approved one: what the view
-/// marks (R32).
-pub fn unapproved_version(view: &ObserverView) -> Option<u32> {
-    view.latest_version
-        .filter(|latest| view.approved_version != Some(*latest))
-}
-
 /// The approved and the newest version in words.
 pub fn versions_text(view: &ObserverView) -> String {
     let approved = view
@@ -155,7 +148,7 @@ pub fn last_run_text(view: &ObserverView) -> String {
 /// How an observer reads on the list: its name and state, marked when its
 /// newest version is not approved; the rest in the description.
 pub fn observer_item(view: &ObserverView) -> ChooserItem {
-    let unapproved = unapproved_version(view);
+    let unapproved = view.unapproved_version();
     let mark = if unapproved.is_some() {
         format!("{UNAPPROVED_MARK} ")
     } else {

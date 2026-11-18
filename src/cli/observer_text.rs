@@ -12,9 +12,12 @@ use serde_json::Value;
 use super::task_text::age;
 use crate::controller_protocol::{
     ObserverDetailView, ObserverEffectResponse, ObserverListResponse, ObserverQueueListResponse,
-    ObserverQueueView, ObserverRunErrorView, ObserverScriptView, ObserverView, QueueEntryView,
+    ObserverQueueView, ObserverRunErrorView, ObserverScriptTextView, ObserverScriptView,
+    ObserverView, QueueEntryView,
 };
-use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
+use crate::domain::{
+    without_unsafe_chars, without_unsafe_chars_json, without_unsafe_chars_multiline,
+};
 
 /// `text` cleaned of what a terminal would act on.
 fn clean(text: &str) -> String {
@@ -50,20 +53,10 @@ fn script_versions(observer: &ObserverView) -> String {
     }
 }
 
-/// The newest script version when it is not the approved one (R32): saving
-/// never approves, so the schedule still runs the approved version, or
-/// nothing.
-fn unapproved_version(observer: &ObserverView) -> Option<u32> {
-    match (observer.approved_version, observer.latest_version) {
-        (approved, Some(latest)) if approved != Some(latest) => Some(latest),
-        _ => None,
-    }
-}
-
 /// The line under an observer of `observer list` and `observer queue show`
 /// that marks a newest version that is not approved (R32, AE10).
 fn unapproved_line(observer: &ObserverView) -> Option<String> {
-    unapproved_version(observer).map(|version| {
+    observer.unapproved_version().map(|version| {
         format!(
             "version {version} not approved: approve it with `narsor-cli observer approve {} \
              --version {version}`",
@@ -340,6 +333,32 @@ pub fn script_saved_output(name: &str, script: &ObserverScriptView) -> String {
         clean(&script.sha256),
         clean(name),
         script.version
+    )
+}
+
+/// `observer script show`: a header with the version, its digest and
+/// whether the schedule runs it, then the script text. The text is cleaned
+/// of what a terminal would act on (line feeds stay, a tab becomes a
+/// space), so what the owner reads is what the header names.
+pub fn script_text_output(observer: &ObserverView, script: &ObserverScriptTextView) -> String {
+    let name = clean(&observer.name);
+    let status = if observer.approved_version == Some(script.version) {
+        "approved: the schedule runs it".to_string()
+    } else {
+        format!(
+            "not approved: approve it with `narsor-cli observer approve {name} --version {}`",
+            script.version
+        )
+    };
+    let mut text = without_unsafe_chars_multiline(&script.script);
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    format!(
+        "Script version {} of '{name}' ({}), saved {}; {status}.\n---\n{text}",
+        script.version,
+        clean(&script.sha256),
+        script.created_at.format("%Y-%m-%d %H:%M UTC"),
     )
 }
 

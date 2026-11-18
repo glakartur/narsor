@@ -36,8 +36,8 @@ use narsor_protocol::controller::{
     ApproveObserverRequest, CreateObserverRequest, GateWatch, GateWatchChoice,
     ObserverCreateTaskRequest, ObserverDecideRequest, ObserverDetailView, ObserverEffectOutcome,
     ObserverEffectResponse, ObserverListResponse, ObserverQueueListResponse, ObserverQueueView,
-    ObserverRunReport, ObserverRunResultResponse, ObserverScriptView, ObserverView,
-    ObserverWorkerRun, SetObserverScriptRequest, UpdateObserverRequest,
+    ObserverRunReport, ObserverRunResultResponse, ObserverScriptTextView, ObserverScriptView,
+    ObserverView, ObserverWorkerRun, SetObserverScriptRequest, UpdateObserverRequest,
 };
 use serde_json::json;
 
@@ -248,6 +248,14 @@ impl ObserverApi for ServiceApi {
             self.service
                 .add_observer_script(&self.owner, observer, &request.script),
         )
+    }
+
+    fn observer_script<'a>(
+        &'a self,
+        observer: &'a str,
+        version: u32,
+    ) -> BoxFuture<'a, Result<ObserverScriptTextView, ClientError>> {
+        ready(self.service.observer_script(&self.owner, observer, version))
     }
 
     fn approve_observer<'a>(
@@ -647,6 +655,67 @@ async fn a_script_saved_on_an_active_observer_is_a_draft_beside_the_approved_ver
         .unwrap()
         .unwrap();
     assert_eq!(record.approved_version, Some(1));
+}
+
+#[tokio::test]
+async fn script_show_prints_the_newest_version_or_the_one_asked_with_its_approval() {
+    // R32: the owner reads what they approve.
+    let fx = Fixture::new();
+    fx.cli(CREATE_JIRA).await.unwrap();
+    let (code, message) = fx.cli(&["script", "show", "jira-new"]).await.unwrap_err();
+    assert_eq!(code, 1);
+    assert!(message.contains("has no script version yet"), "{message}");
+
+    let first = fx.script_file("v1.sh", "true\n");
+    let second = fx.script_file("v2.sh", "echo changed\n\techo \u{1b}[31mred\n");
+    fx.cli(&["script", "set", "jira-new", "--file", &first])
+        .await
+        .unwrap();
+    fx.cli(&["approve", "jira-new", "--version", "1"])
+        .await
+        .unwrap();
+    fx.cli(&["script", "set", "jira-new", "--file", &second])
+        .await
+        .unwrap();
+
+    let newest = fx.cli(&["script", "show", "jira-new"]).await.unwrap();
+    let approved = fx
+        .cli(&["script", "show", "jira-new", "--version", "1"])
+        .await
+        .unwrap();
+
+    let (header, text) = newest.split_once("\n---\n").expect("a header and the text");
+    assert!(
+        header.starts_with("Script version 2 of 'jira-new' (sha256:"),
+        "{header}"
+    );
+    assert!(
+        header.contains(
+            "not approved: approve it with `narsor-cli observer approve jira-new --version 2`"
+        ),
+        "{header}"
+    );
+    assert_eq!(
+        text, "echo changed\n echo [31mred\n",
+        "escape removed, tab a space"
+    );
+    let (header, text) = approved.split_once("\n---\n").unwrap();
+    assert!(
+        header.starts_with("Script version 1 of 'jira-new'"),
+        "{header}"
+    );
+    assert!(
+        header.contains("approved: the schedule runs it"),
+        "{header}"
+    );
+    assert_eq!(text, "true\n");
+
+    let (code, message) = fx
+        .cli(&["script", "show", "jira-new", "--version", "7"])
+        .await
+        .unwrap_err();
+    assert_eq!(code, 1);
+    assert!(message.contains("Could not read version 7"), "{message}");
 }
 
 #[tokio::test]

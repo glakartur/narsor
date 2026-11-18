@@ -402,6 +402,16 @@ pub struct ObserverView {
     pub created_at: DateTime<Utc>,
 }
 
+impl ObserverView {
+    /// The newest script version when it is not the approved one (R32):
+    /// saving never approves, so the schedule still runs the approved
+    /// version, or nothing. Every front end marks it in its own words.
+    pub fn unapproved_version(&self) -> Option<u32> {
+        self.latest_version
+            .filter(|latest| self.approved_version != Some(*latest))
+    }
+}
+
 /// `GET /control/v1/observers`: the caller's observers, by name.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObserverListResponse {
