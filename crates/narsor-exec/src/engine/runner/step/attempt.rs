@@ -184,10 +184,6 @@ impl Engine {
                 Ok(AttemptOutcome::AwaitingAgentInput(request))
             }
 
-            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingExternalEvent(request))) => {
-                Ok(AttemptOutcome::AwaitingExternalEvent(request))
-            }
-
             Err(error)
                 if resumed_input
                     .as_ref()

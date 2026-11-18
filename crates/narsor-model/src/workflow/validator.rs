@@ -527,13 +527,6 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
                 errors.push(missing_field(state, "human", "message"));
             }
         }
-        // The loader never builds one (R5); a definition put together in
-        // code still gets the same answer as the YAML.
-        ActionConfig::Wait(_) => {
-            errors.push(ValidationError::RemovedWaitStep {
-                state: state.id.clone(),
-            });
-        }
         ActionConfig::Decision(decision) => {
             if decision.message.is_blank() {
                 errors.push(missing_field(state, "decision", "message"));
@@ -1081,8 +1074,7 @@ fn validate_state_templates(
                 templated.push((format!("action.watch.params.{name}"), value.clone()));
             }
         }
-        // Refused as a whole by `validate_action`.
-        Some(ActionConfig::Wait(_)) | None => {}
+        None => {}
     }
 
     match &state.decision {

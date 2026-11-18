@@ -117,7 +117,6 @@ pub(crate) fn workflow_steps(record: &TaskRecord) -> Option<Vec<StepView>> {
                     Some(ActionConfig::Profile(_)) => StepKind::Profile,
                     Some(ActionConfig::Script(_)) => StepKind::Script,
                     Some(ActionConfig::Human(_)) => StepKind::Human,
-                    Some(ActionConfig::Wait(_)) => StepKind::Wait,
                     Some(ActionConfig::Decision(_)) => StepKind::Decision,
                     None => StepKind::Terminal,
                 };

@@ -15,10 +15,9 @@
 use super::control_plane::{refresh_slot_release_due, ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    EventWatch, ExternalEvent, ExternalEventOutcome, GateChange, InputOutcome, InputRequest,
-    InputStatus, InputUpdate, QueuedEventInput, QueuedInput, RunnerObservation,
-    RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind, TaskProvenance, TaskRecord,
-    WatchedGate,
+    GateChange, InputOutcome, InputRequest, InputStatus, InputUpdate, QueuedInput,
+    RunnerObservation, RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind,
+    TaskProvenance, TaskRecord, WatchedGate,
 };
 use crate::domain::display::bounded_detail;
 use crate::domain::{one_line_label, without_unsafe_chars, TaskId, GENERATED_TITLE_MAX_CHARS};
@@ -87,12 +86,6 @@ impl ControlPlane {
         if let Some(reason) = &mut snapshot.conductor_unavailable_reason {
             *reason = without_unsafe_chars(reason);
         }
-        // Observers hand the episode to their scripts, and clients show the
-        // event type.
-        if let Some(wait) = &mut snapshot.event_wait {
-            wait.episode_id = without_unsafe_chars(&wait.episode_id);
-            wait.event_type = without_unsafe_chars(&wait.event_type);
-        }
         // The gate's step and queue reach the task's history and the
         // observers' scripts.
         if let Some(watch) = &mut snapshot.gate_watch {
@@ -109,7 +102,7 @@ impl ControlPlane {
             .generated_title
             .as_deref()
             .and_then(|title| one_line_label(title, GENERATED_TITLE_MAX_CHARS));
-        let (task, (applied, began_wait, gate_change)) = self.mutate(task_id, |record, now| {
+        let (task, (applied, gate_change)) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
             // A report without a title does not take back one already shown.
             if snapshot.generated_title.is_none() {
@@ -123,7 +116,7 @@ impl ControlPlane {
                     && previous.snapshot.snapshot_sequence == snapshot.snapshot_sequence
                 {
                     if previous.snapshot == snapshot {
-                        return Ok(Mutation::Unchanged((false, None, GateChange::default())));
+                        return Ok(Mutation::Unchanged((false, GateChange::default())));
                     }
                     return Err(stale_snapshot(record, previous, &snapshot));
                 }
@@ -140,24 +133,13 @@ impl ControlPlane {
             // follow from it are on the record that event points at.
             obsolete_undelivered(record, pending.as_deref(), now);
             // A runner without an execution yet (it is still starting) says
-            // nothing of a wait; one with an execution says where it waits,
-            // or that it waits for no event, and what was queued for any
-            // other episode can never reach it.
-            let mut began_wait = None;
-            let mut gate_change = GateChange::default();
-            if snapshot.execution_cursor.execution_id.is_some() {
-                gate_change = follow_watched_gate(record, &snapshot);
-                let episode = snapshot
-                    .event_wait
-                    .as_ref()
-                    .map(|wait| wait.episode_id.clone());
-                obsolete_undelivered_events(record, episode.as_deref(), now);
-                let known = record.event_wait.as_ref().map(|wait| &wait.episode_id);
-                if episode.is_some() && episode.as_ref() != known {
-                    began_wait = snapshot.event_wait.clone();
-                }
-                record.event_wait = snapshot.event_wait.clone();
-            }
+            // nothing of a gate; one with an execution says where it waits,
+            // or that it waits at no watched gate.
+            let gate_change = if snapshot.execution_cursor.execution_id.is_some() {
+                follow_watched_gate(record, &snapshot)
+            } else {
+                GateChange::default()
+            };
             let safe_point_generation = if snapshot.safe_point {
                 if record.runner_state == RunnerState::PauseRequested {
                     Some(record.generation)
@@ -186,12 +168,11 @@ impl ControlPlane {
                 safe_point_generation,
             });
             refresh_slot_release_due(record, now, grace);
-            Ok(Mutation::Changed(kind, (true, began_wait, gate_change)))
+            Ok(Mutation::Changed(kind, (true, gate_change)))
         })?;
         Ok(RunnerReportOutcome {
             task,
             applied,
-            began_wait,
             gate_change,
         })
     }
@@ -303,65 +284,6 @@ impl ControlPlane {
             ))
         })?;
         Ok(InputOutcome { input, replayed })
-    }
-
-    /// Records an external event an observer delivers to the task (R4),
-    /// under the task's lock. Every call records a new event: the server
-    /// does not deduplicate events (the script keeps track of what it sent).
-    ///
-    /// The event always goes to the task's history, as one
-    /// [`TaskEventKind::ExternalEventReceived`]. When the task waits in a
-    /// `wait` step ([`TaskRecord::event_wait`]) for this type and the
-    /// filter matches ([`super::EventWait::matches`]), the same mutation
-    /// queues it for the runner as a [`QueuedEventInput`] of that episode;
-    /// otherwise nothing else changes, so an event for a task that does
-    /// not wait never changes its state, and a `wait` that starts later
-    /// never sees it (AE7). An archived task takes no events.
-    pub fn record_external_event(
-        &self,
-        task_id: &TaskId,
-        event: ExternalEvent,
-    ) -> Result<ExternalEventOutcome> {
-        let (task, input) = self.mutate(task_id, |record, now| {
-            if record.runner_state.is_archival() {
-                return Err(OrchestrationError::TaskNotAcceptingInput {
-                    task_id: record.task_id.clone(),
-                    runner_state: record.runner_state,
-                });
-            }
-            let episode = record
-                .event_wait
-                .as_ref()
-                .filter(|wait| wait.matches(&event.event_type, &event.data))
-                .map(|wait| wait.episode_id.clone());
-            let input = episode.map(|episode_id| QueuedEventInput {
-                input_id: format!("event-{}", record.event_inputs.len() + 1),
-                idempotency_key: event.idempotency_key.clone(),
-                episode_id,
-                event_type: event.event_type.clone(),
-                source: event.source.clone(),
-                data: Some(event.data.clone()),
-                provenance: event.provenance.clone(),
-                status: InputStatus::Queued,
-                submitted_at: now,
-                updated_at: now,
-                detail: None,
-            });
-            if let Some(input) = &input {
-                record.event_inputs.push(input.clone());
-            }
-            Ok(Mutation::Changed(
-                TaskEventKind::ExternalEventReceived {
-                    event_type: event.event_type.clone(),
-                    source: event.source.clone(),
-                    provenance: event.provenance.clone(),
-                    data: event.data.clone(),
-                    input_id: input.as_ref().map(|input| input.input_id.clone()),
-                },
-                input,
-            ))
-        })?;
-        Ok(ExternalEventOutcome { task, input })
     }
 
     /// Drops the comment on the pause from the record once the runner says it
@@ -548,148 +470,6 @@ impl ControlPlane {
 }
 
 impl ControlPlane {
-    /// What ends the `wait` step a polling runner waits in
-    /// (`event_wait_id`, its episode): the queued events for that episode (queued, or delivered and not yet acknowledged —
-    /// at-least-once; the runner's engine deduplicates by the episode).
-    /// Queued ones for any other episode become obsolete, as owner answers
-    /// to another request do in [`Self::deliver_inputs`].
-    ///
-    /// Returns them and whether the record changed.
-    pub fn deliver_event_inputs(
-        &self,
-        task_id: &TaskId,
-        incarnation: &str,
-        launch_generation: u64,
-        event_wait_id: Option<&str>,
-    ) -> Result<(Vec<QueuedEventInput>, bool)> {
-        let (_, delivered) = self.mutate(task_id, |record, now| {
-            fence_runner(record, incarnation, launch_generation)?;
-            let mut updates = obsolete_undelivered_events(record, event_wait_id, now);
-            let mut deliverable = Vec::new();
-            for input in record.event_inputs.iter_mut() {
-                if Some(input.episode_id.as_str()) != event_wait_id {
-                    continue;
-                }
-                match input.status {
-                    InputStatus::Queued => {
-                        input.status = InputStatus::Delivered;
-                        input.updated_at = now;
-                        updates.push(InputUpdate {
-                            input_id: input.input_id.clone(),
-                            status: InputStatus::Delivered,
-                        });
-                        deliverable.push(input.clone());
-                    }
-                    InputStatus::Delivered => deliverable.push(input.clone()),
-                    _ => {}
-                }
-            }
-            if updates.is_empty() {
-                Ok(Mutation::Unchanged((deliverable, false)))
-            } else {
-                Ok(Mutation::Changed(
-                    TaskEventKind::InputsUpdated { updates },
-                    (deliverable, true),
-                ))
-            }
-        })?;
-        Ok(delivered)
-    }
-
-    /// The runner's verdict on a delivered event. Repeating the same
-    /// verdict is harmless (`changed: false`); contradicting a settled one
-    /// is refused. An accepted one ended the wait of its episode, so the
-    /// task no longer waits for an event from the same mutation on: nothing
-    /// more is queued for it.
-    pub fn settle_event_input(
-        &self,
-        task_id: &TaskId,
-        incarnation: &str,
-        launch_generation: u64,
-        input_id: &str,
-        accepted: bool,
-        detail: Option<String>,
-    ) -> Result<(QueuedEventInput, bool)> {
-        let detail = detail.map(|detail| bounded_detail(&detail));
-        let (_, settled) = self.mutate(task_id, |record, now| {
-            fence_runner(record, incarnation, launch_generation)?;
-            let target = if accepted {
-                InputStatus::Consumed
-            } else {
-                InputStatus::Rejected
-            };
-            let task_id = record.task_id.clone();
-            let input = record
-                .event_inputs
-                .iter_mut()
-                .find(|input| input.input_id == input_id)
-                .ok_or_else(|| OrchestrationError::InputNotFound {
-                    task_id: task_id.clone(),
-                    input_id: input_id.to_string(),
-                })?;
-            // A refusal of an input that the accepted one of its episode
-            // made obsolete agrees with it: neither ends the wait.
-            let refused_obsolete = !accepted && input.status == InputStatus::Obsolete;
-            if input.status == target || refused_obsolete {
-                return Ok(Mutation::Unchanged((input.clone(), false)));
-            }
-            if input.status != InputStatus::Delivered {
-                return Err(OrchestrationError::InputAlreadySettled {
-                    task_id,
-                    input_id: input_id.to_string(),
-                    status: input.status,
-                });
-            }
-            input.status = target;
-            input.updated_at = now;
-            input.detail = detail.clone();
-            input.data = None;
-            let settled = input.clone();
-            let mut updates = vec![InputUpdate {
-                input_id: settled.input_id.clone(),
-                status: target,
-            }];
-            if accepted {
-                if record
-                    .event_wait
-                    .as_ref()
-                    .is_some_and(|wait| wait.episode_id == settled.episode_id)
-                {
-                    record.event_wait = None;
-                }
-                // The accepted one ended the episode's wait: what else was
-                // handed over for it (two events in one poll, say) will
-                // never be taken, and must not wait for an ack.
-                updates.extend(obsolete_rest_of_episode(record, &settled, now));
-            }
-            Ok(Mutation::Changed(
-                TaskEventKind::InputsUpdated { updates },
-                (settled, true),
-            ))
-        })?;
-        Ok(settled)
-    }
-
-    /// Writes the warning that the `watch` of the task's `wait` step got no
-    /// watch entry (U5) to the task's history. The step keeps waiting; the
-    /// record changes only by the event. What the runner asked for is
-    /// untrusted text, so it is cleaned and bounded first.
-    pub fn record_watch_refused(
-        &self,
-        task_id: &TaskId,
-        watch: &EventWatch,
-        reason: &str,
-    ) -> Result<()> {
-        let kind = TaskEventKind::WatchRefused {
-            step: bounded_name(&watch.step),
-            observer: bounded_name(&watch.observer),
-            object: bounded_name(&watch.object),
-            reason: bounded_detail(reason),
-        };
-        self.mutate(task_id, |_, _| Ok(Mutation::Changed(kind, ())))?;
-        Ok(())
-    }
-
     /// Writes a warning about the queue entry of the watched gate episode
     /// `gate` to the task's history (R9, R27): no observer can answer it,
     /// or it could not be stored. The gate keeps waiting for a person; the
@@ -735,8 +515,8 @@ fn follow_watched_gate(record: &mut TaskRecord, snapshot: &RunnerSnapshot) -> Ga
     }
 }
 
-/// The longest step, observer or object a [`TaskEventKind::WatchRefused`]
-/// warning keeps, in characters.
+/// The longest step, queue or episode a [`TaskEventKind::GateQueueWarning`]
+/// keeps, in characters.
 const MAX_WATCH_WARNING_FIELD_CHARS: usize = 512;
 
 /// One-line `text` without unsafe characters, cut to
@@ -777,54 +557,6 @@ fn obsolete_undelivered(
             input.status = InputStatus::Obsolete;
             input.updated_at = now;
             input.delivery = None;
-            updates.push(InputUpdate {
-                input_id: input.input_id.clone(),
-                status: InputStatus::Obsolete,
-            });
-        }
-    }
-    updates
-}
-
-/// Marks every still-queued event for another wait episode than
-/// `episode` (none: the runner waits for no event) as obsolete and drops
-/// its data. Delivered ones are left to the runner's acknowledgement.
-fn obsolete_undelivered_events(
-    record: &mut TaskRecord,
-    episode: Option<&str>,
-    now: DateTime<Utc>,
-) -> Vec<InputUpdate> {
-    let mut updates = Vec::new();
-    for input in record.event_inputs.iter_mut() {
-        if input.status == InputStatus::Queued && Some(input.episode_id.as_str()) != episode {
-            input.status = InputStatus::Obsolete;
-            input.updated_at = now;
-            input.data = None;
-            updates.push(InputUpdate {
-                input_id: input.input_id.clone(),
-                status: InputStatus::Obsolete,
-            });
-        }
-    }
-    updates
-}
-
-/// Makes every unsettled input of `accepted`'s episode but `accepted`
-/// itself obsolete, dropping its data.
-fn obsolete_rest_of_episode(
-    record: &mut TaskRecord,
-    accepted: &QueuedEventInput,
-    now: DateTime<Utc>,
-) -> Vec<InputUpdate> {
-    let mut updates = Vec::new();
-    for input in record.event_inputs.iter_mut() {
-        if input.episode_id == accepted.episode_id
-            && input.input_id != accepted.input_id
-            && !input.status.is_settled()
-        {
-            input.status = InputStatus::Obsolete;
-            input.updated_at = now;
-            input.data = None;
             updates.push(InputUpdate {
                 input_id: input.input_id.clone(),
                 status: InputStatus::Obsolete,

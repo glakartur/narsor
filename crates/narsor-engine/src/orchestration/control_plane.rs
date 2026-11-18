@@ -209,10 +209,8 @@ impl ControlPlane {
             reader_lease: None,
             resume_message: None,
             resume_message_taken: Vec::new(),
-            event_wait: None,
             watched_gate: None,
             provenance: request.provenance,
-            event_inputs: Vec::new(),
             last_event: TaskEvent {
                 sequence: 1,
                 task_id: request.task_id.clone(),

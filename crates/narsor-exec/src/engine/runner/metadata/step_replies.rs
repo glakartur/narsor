@@ -29,7 +29,7 @@ fn step_templates(action: &ActionConfig) -> Vec<String> {
         ActionConfig::Profile(config) => config.prompt.template_pieces(),
         ActionConfig::Human(config) => vec![config.instruction.clone()],
         ActionConfig::Decision(config) => config.message.template_pieces(),
-        ActionConfig::Script(_) | ActionConfig::Wait(_) => Vec::new(),
+        ActionConfig::Script(_) => Vec::new(),
     }
 }
 

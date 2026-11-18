@@ -416,7 +416,6 @@ fn step_kind_name(kind: StepKind) -> &'static str {
         StepKind::Profile => "profile",
         StepKind::Script => "skrypt",
         StepKind::Human => "człowiek",
-        StepKind::Wait => "oczekiwanie",
         StepKind::Decision => "decyzja",
         StepKind::Terminal => "koniec",
         StepKind::Unrecognized => "nieznany",

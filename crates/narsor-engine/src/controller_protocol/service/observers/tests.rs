@@ -312,7 +312,6 @@ impl Fixture {
             event_cursor: sequence,
             pending_input,
             gate_watch,
-            event_wait: None,
             conversation: Default::default(),
             timeline: None,
             safe_point: false,

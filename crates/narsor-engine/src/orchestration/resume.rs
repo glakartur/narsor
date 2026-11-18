@@ -79,17 +79,6 @@ pub const WORK_RESUME_KEY_PREFIX: &str = "work-resume:";
 /// causes.
 pub const OBSERVER_KEY_PREFIX: &str = "observer:";
 
-/// A new idempotency key for one external event the observer run `run_id`
-/// sends. The server makes one per event (the script gives no key), so the
-/// input queued for the waiting step and the resume it causes each have a
-/// key of their own.
-pub fn observer_event_key(run_id: &str) -> String {
-    format!(
-        "{OBSERVER_KEY_PREFIX}{run_id}:{}",
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
 /// The idempotency key of the answer the observer run `run_id` gives to the
 /// gate episode `episode` (`task decide`): one per run and episode, so a
 /// retry of the same answer by the same run returns the input it queued,

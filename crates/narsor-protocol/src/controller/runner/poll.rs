@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::HumanInputDeliveryDto;
 use crate::controller::{
-    ConductorReadRequest, ConversationPageRequest, DeliveredEvent, ExecutionEventsRequest,
-    InputView, OperatorCommand, OperatorCommandView, RunnerLaunchView, RunnerState,
+    ConductorReadRequest, ConversationPageRequest, ExecutionEventsRequest, InputView,
+    OperatorCommand, OperatorCommandView, RunnerLaunchView, RunnerState,
 };
 
 /// Directive returned to a runner.
@@ -33,12 +33,6 @@ pub struct RunnerPollQuery {
     /// agent: the control plane drops that comment from the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_message_taken: Option<String>,
-    /// The episode of the `wait` step the runner's engine waits in
-    /// ([`crate::controller::EventWait::episode_id`]), while it waits and no
-    /// pass runs: only deliveries for it are handed over, and queued ones
-    /// for any other become obsolete.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub event_wait_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,10 +89,6 @@ pub struct RunnerPollResponse {
     #[serde(alias = "lifecycle")]
     pub runner_state: RunnerState,
     pub inputs: Vec<DeliveredInput>,
-    /// What ends the `wait` step the runner named in
-    /// [`RunnerPollQuery::event_wait_id`]: a matching event.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub events: Vec<DeliveredEvent>,
     #[serde(default)]
     pub commands: Vec<DeliveredOperatorCommand>,
     pub credential_expires_at: DateTime<Utc>,

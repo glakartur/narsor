@@ -35,8 +35,8 @@ use serde_json::{Map, Value};
 use crate::domain::{
     ActionConfig, AgentActionConfig, ArtifactReference, Context, DecisionActionConfig,
     GateWatchConfig, HumanActionConfig, ProfileActionConfig, PromptPart, PromptText,
-    ScriptActionConfig, VariableDefinition, WaitActionConfig, WaitWatchConfig, WorkflowDefinition,
-    WorkspaceField, WorkspacePr, LOCAL_VARIABLE_PREFIX,
+    ScriptActionConfig, VariableDefinition, WorkflowDefinition, WorkspaceField, WorkspacePr,
+    LOCAL_VARIABLE_PREFIX,
 };
 
 /// Opening delimiter of a template placeholder.
@@ -536,46 +536,6 @@ impl<'a> TemplateScope<'a> {
                     ..config.clone()
                 }))
             }
-
-            ActionConfig::Wait(config) => {
-                let filter = match &config.filter {
-                    Some(filter) => {
-                        Some(self.render_value(filter, &format!("{location}, filter"))?)
-                    }
-                    None => None,
-                };
-
-                // The validator checks `event_type` as a template, so it is
-                // rendered like the filter.
-                let event = self.render(&config.event, &format!("{location}, event_type"))?;
-                // The observer is a plain name; the object and the event
-                // types are templates, so they always name the same thing
-                // as the step's own `event_type`.
-                let watch = match &config.watch {
-                    Some(watch) => {
-                        let mut event_types = Vec::with_capacity(watch.event_types.len());
-                        for (index, event_type) in watch.event_types.iter().enumerate() {
-                            event_types.push(self.render(
-                                event_type,
-                                &format!("{location}, watch.event_types[{index}]"),
-                            )?);
-                        }
-                        Some(WaitWatchConfig {
-                            observer: watch.observer.clone(),
-                            object: self
-                                .render(&watch.object, &format!("{location}, watch.object"))?,
-                            event_types,
-                        })
-                    }
-                    None => None,
-                };
-                Ok(ActionConfig::Wait(WaitActionConfig {
-                    event,
-                    filter,
-                    watch,
-                    ..config.clone()
-                }))
-            }
         }
     }
 
@@ -996,11 +956,6 @@ pub fn action_context_references(action: &ActionConfig) -> Vec<String> {
                 collect_context_references(value, &mut names);
             }
         }
-        ActionConfig::Wait(config) => {
-            if let Some(filter) = &config.filter {
-                collect_value_references(filter, &mut names);
-            }
-        }
     }
     names
 }
@@ -1019,24 +974,6 @@ fn collect_context_references(template: &str, names: &mut Vec<String>) {
             }
         }
         rest = &after_open[end + CLOSE.len()..];
-    }
-}
-
-/// [`collect_context_references`] over every string inside a JSON value.
-fn collect_value_references(value: &Value, names: &mut Vec<String>) {
-    match value {
-        Value::String(text) => collect_context_references(text, names),
-        Value::Array(items) => {
-            for item in items {
-                collect_value_references(item, names);
-            }
-        }
-        Value::Object(entries) => {
-            for item in entries.values() {
-                collect_value_references(item, names);
-            }
-        }
-        _ => {}
     }
 }
 

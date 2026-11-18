@@ -498,7 +498,6 @@ pub enum ActionConfig {
     Agent(AgentActionConfig),
     Script(ScriptActionConfig),
     Human(HumanActionConfig),
-    Wait(WaitActionConfig),
     Decision(DecisionActionConfig),
     Profile(ProfileActionConfig),
 }
@@ -510,7 +509,6 @@ impl ActionConfig {
             Self::Agent(_) => "agent",
             Self::Script(_) => "script",
             Self::Human(_) => "human",
-            Self::Wait(_) => "wait",
             Self::Decision(_) => "decision",
             Self::Profile(_) => "profile",
         }
@@ -522,7 +520,7 @@ impl ActionConfig {
         match self {
             Self::Agent(config) => Some(&config.harness_step),
             Self::Profile(config) => Some(&config.harness_step),
-            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+            Self::Script(_) | Self::Human(_) | Self::Decision(_) => None,
         }
     }
 
@@ -531,7 +529,7 @@ impl ActionConfig {
         match self {
             Self::Agent(config) => Some(&mut config.harness_step),
             Self::Profile(config) => Some(&mut config.harness_step),
-            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+            Self::Script(_) | Self::Human(_) | Self::Decision(_) => None,
         }
     }
 
@@ -541,7 +539,7 @@ impl ActionConfig {
         match self {
             Self::Agent(config) => Some(&config.prompt),
             Self::Profile(config) => Some(&config.prompt),
-            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+            Self::Script(_) | Self::Human(_) | Self::Decision(_) => None,
         }
     }
 
@@ -553,7 +551,7 @@ impl ActionConfig {
         match self {
             Self::Agent(config) => Some((&mut config.harness_step, &mut config.prompt)),
             Self::Profile(config) => Some((&mut config.harness_step, &mut config.prompt)),
-            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+            Self::Script(_) | Self::Human(_) | Self::Decision(_) => None,
         }
     }
 
@@ -564,11 +562,7 @@ impl ActionConfig {
     pub fn is_profile_candidate(&self) -> bool {
         match self {
             Self::Agent(config) => !config.harness_step.is_pinned(),
-            Self::Profile(_)
-            | Self::Script(_)
-            | Self::Human(_)
-            | Self::Wait(_)
-            | Self::Decision(_) => false,
+            Self::Profile(_) | Self::Script(_) | Self::Human(_) | Self::Decision(_) => false,
         }
     }
 }
@@ -895,47 +889,6 @@ pub struct HumanInputField {
 
     #[serde(default)]
     pub description: Option<String>,
-}
-
-/// Wait action configuration.
-///
-/// The workflow schema no longer has the `wait` step type (R5): the loader
-/// never builds this action, and the validator refuses it. It stays only
-/// for the engine's `wait` action, which is removed with the runner's
-/// event protocol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WaitActionConfig {
-    /// Event type to wait for (`event_type` in YAML)
-    pub event: String,
-
-    /// Filter criteria (optional)
-    #[serde(default)]
-    pub filter: Option<serde_json::Value>,
-
-    /// Timeout in seconds; the validator rejects it, a wait step has no
-    /// timeout
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-
-    /// The watch entry to register while the step waits (optional)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub watch: Option<WaitWatchConfig>,
-}
-
-/// A `wait` step's `watch` block: which observer is to watch which object
-/// while the step waits (§3.3.D). `object` and `event_types` are
-/// templates, rendered when the step starts; `observer` is a plain name.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WaitWatchConfig {
-    /// Name of the observer
-    pub observer: String,
-
-    /// The object to watch (the URL of a merge request, say)
-    pub object: String,
-
-    /// Event types the observer reports for the object; they include the
-    /// step's own event type
-    pub event_types: Vec<String>,
 }
 
 /// Reference to a workspace
@@ -1531,12 +1484,6 @@ pub enum ValidationError {
 
     #[error("State '{state}' declares a 'timeout' choice, which only agent and script steps can produce")]
     TimeoutChoiceNotAllowed { state: StateId },
-
-    #[error(
-        "State '{state}' is a wait step; the 'wait' step type was removed: put a 'watch' \
-         block with a queue on a 'decision' step with 'by: human' instead"
-    )]
-    RemovedWaitStep { state: StateId },
 
     #[error("State '{state}' has an invalid 'watch': {reason}")]
     InvalidGateWatch { state: StateId, reason: String },

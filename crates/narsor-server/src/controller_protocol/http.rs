@@ -253,7 +253,6 @@ where
             post(post_usage).layer(usage_body_limit()),
         )
         .route("/runner/v1/inputs/{input_id}/ack", post(post_input_ack))
-        .route("/runner/v1/events/{input_id}/ack", post(post_event_ack))
         .route(
             "/runner/v1/commands/{command_id}/ack",
             post(post_command_ack),
@@ -910,20 +909,6 @@ async fn post_input_ack(
     Ok(Json(
         blocking(&service, move |s| {
             s.runner_ack_input(&identity, &input_id, request)
-        })
-        .await?,
-    ))
-}
-
-async fn post_event_ack(
-    State(service): State<Service>,
-    Extension(identity): Extension<RunnerIdentity>,
-    Path(input_id): Path<String>,
-    Json(request): Json<InputAckRequest>,
-) -> ProtocolResult<Json<EventAckResponse>> {
-    Ok(Json(
-        blocking(&service, move |s| {
-            s.runner_ack_event(&identity, &input_id, request)
         })
         .await?,
     ))

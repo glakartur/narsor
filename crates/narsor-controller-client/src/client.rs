@@ -647,22 +647,6 @@ impl RunnerClient {
             .await
     }
 
-    /// `POST /runner/v1/events/:input_id/ack`: the verdict on what ended
-    /// (or did not end) a `wait` step's wait.
-    pub async fn ack_event(
-        &self,
-        input_id: &str,
-        accepted: bool,
-        detail: Option<String>,
-    ) -> Result<EventAckResponse, ClientError> {
-        self.transport
-            .post(
-                &format!("/runner/v1/events/{input_id}/ack"),
-                &InputAckRequest { accepted, detail },
-            )
-            .await
-    }
-
     /// `POST /runner/v1/inputs/:input_id/ack`.
     pub async fn ack_input(
         &self,

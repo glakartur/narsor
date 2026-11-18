@@ -238,9 +238,15 @@ async fn the_queues_view_is_served_with_its_route_and_texts() {
 
     // The page module, reached from the shell and its address (`#/queues`).
     let app = served(&base, "/ui/js/ui/app.js").await;
-    assert!(app.contains("from './queues.js'"), "app.js imports the queues view");
+    assert!(
+        app.contains("from './queues.js'"),
+        "app.js imports the queues view"
+    );
     let store = served(&base, "/ui/js/store.js").await;
-    assert!(store.contains("#/queues"), "store.js knows the queues route");
+    assert!(
+        store.contains("#/queues"),
+        "store.js knows the queues route"
+    );
 
     let queues = served(&base, "/ui/js/ui/queues.js").await;
     for text in [
@@ -255,10 +261,16 @@ async fn the_queues_view_is_served_with_its_route_and_texts() {
     }
     // AE10: the marker of a newest version the schedule does not run.
     let texts = served(&base, "/ui/js/text.js").await;
-    assert!(texts.contains("nie zatwierdzona"), "text.js lacks the marker");
+    assert!(
+        texts.contains("nie zatwierdzona"),
+        "text.js lacks the marker"
+    );
     // R21: the one icon of a task on a queue.
     let list = served(&base, "/ui/js/ui/tasklist.js").await;
-    assert!(list.contains("queueEntryMark"), "the task list shows the queue icon");
+    assert!(
+        list.contains("queueEntryMark"),
+        "the task list shows the queue icon"
+    );
 
     let api = served(&base, "/ui/js/api.js").await;
     for route in [

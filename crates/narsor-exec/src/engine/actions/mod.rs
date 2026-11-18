@@ -40,7 +40,6 @@ pub mod profile;
 pub mod scope;
 pub mod script;
 pub(crate) mod session;
-pub mod wait;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -70,10 +69,6 @@ pub use profile::ProfileExecutor;
 pub use scope::{ScopedRepository, StepScope};
 pub use script::ScriptExecutor;
 pub use session::{AgentEventSink, LoggingEventSink, UsageReporter};
-pub use wait::{
-    ExternalEventDelivery, ExternalEventRequest, PendingExternalEvent, WaitActionError, WaitEnding,
-    WaitExecutor,
-};
 
 /// Environment variable carrying the [`crate::domain::ActionExecution`] id into
 /// the child process.
@@ -294,8 +289,7 @@ pub enum ActionOutcome {
     /// Added in U6 for `HumanAction`, which suspends the moment its state is
     /// entered (§3.3.C). It is a third outcome rather than a separate code path
     /// beside the trait so that U7 handles every way an attempt can end in one
-    /// place, and so that `WaitAction` (§3.3.D) — which suspends for an
-    /// external event instead of a person — plugs in as another
+    /// place, and so that another thing to wait for plugs in as another
     /// [`SuspendedAction`] variant without touching the loop again.
     ///
     /// Suspending is deliberately inert on its own: an executor reports it and
@@ -333,9 +327,6 @@ pub enum SuspendedAction {
     /// same workflow state can continue. This is not a workflow output and
     /// must therefore never select a transition.
     AwaitingAgentInput(HumanInputRequest),
-    /// A `wait` step waits for an external event (§3.3.D); see
-    /// [`wait::suspend`].
-    AwaitingExternalEvent(ExternalEventRequest),
 }
 
 /// An attempt that was stopped because it ran out of time.

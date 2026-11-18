@@ -61,17 +61,4 @@ impl Engine {
         human::suspend(&self.store, execution, &pending)?;
         self.publish_from(&execution.id, from)
     }
-
-    /// Suspends the execution on a `wait` step until an external event or
-    /// the wait's deadline ends it, and records the wait durably.
-    pub(crate) fn suspend_for_event(
-        &self,
-        execution: &mut WorkflowExecution,
-        state: &State,
-        request: ExternalEventRequest,
-    ) -> Result<(), EngineError> {
-        let pending = PendingExternalEvent::new(execution.id.clone(), state.id.clone(), request);
-        wait::suspend(&self.store, execution, &pending)?;
-        Ok(())
-    }
 }

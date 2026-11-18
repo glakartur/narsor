@@ -261,7 +261,6 @@ fn safe_point_snapshot(sequence: u64) -> RunnerSnapshot {
         event_cursor: 0,
         pending_input: None,
         gate_watch: None,
-        event_wait: None,
         conversation: Default::default(),
         timeline: None,
         safe_point: true,
@@ -1931,6 +1930,51 @@ fn a_move_event_names_only_the_movers_tasks_but_ranks_the_whole_queue() {
         record.last_event.kind,
         TaskEventKind::Moved { rank: 3, .. }
     ));
+}
+
+#[test]
+fn a_record_from_before_the_wait_step_was_removed_still_reads() {
+    // D77: the record of a task that waited at a `wait` step kept the
+    // event it waited for and the events queued for it. A build without
+    // the step reads the record and ignores both.
+    let fx = Fixture::new();
+    fx.create("old");
+    let path = fx.root.paths().orchestration_task_file("old");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let record = value.as_object_mut().unwrap();
+    record.insert(
+        "event_wait".into(),
+        serde_json::json!({
+            "episode_id": "wait-1",
+            "event_type": "review.approved",
+            "filter": {"mr": "17"},
+            "since": "2026-11-01T12:00:00Z",
+        }),
+    );
+    record.insert(
+        "event_inputs".into(),
+        serde_json::json!([{
+            "input_id": "event-1",
+            "idempotency_key": "observer:obs-1.4:abc",
+            "episode_id": "wait-1",
+            "event_type": "review.approved",
+            "source": "gitlab",
+            "data": {"mr": 17},
+            "provenance": {"observer_id": "obs-1", "observer_name": "gitlab", "run_id": "obs-1.4"},
+            "status": "queued",
+            "submitted_at": "2026-11-01T12:00:00Z",
+            "updated_at": "2026-11-01T12:00:00Z",
+        }]),
+    );
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let record = fx.reopen().task(&task("old")).unwrap();
+
+    assert_eq!(record.task_id, task("old"));
+    assert!(
+        !record.owner_work_pending(),
+        "an old queued event is no work"
+    );
 }
 
 #[test]

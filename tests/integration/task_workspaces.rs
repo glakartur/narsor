@@ -75,7 +75,6 @@ fn reported(record: &mut TaskRecord, workspaces: Vec<WorkspaceHeader>) {
             event_cursor: 0,
             pending_input: None,
             gate_watch: None,
-            event_wait: None,
             conversation: Default::default(),
             timeline: None,
             safe_point: false,

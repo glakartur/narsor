@@ -110,11 +110,11 @@ fn the_template_is_the_only_builtin_and_demonstrates_engine_features_safely() {
     assert!(review.choices.iter().any(|choice| choice.label == "finish"));
 
     assert!(
-        definition.states.values().all(|state| !matches!(
-            state.action,
-            Some(ActionConfig::Agent(_) | ActionConfig::Wait(_))
-        )),
-        "the template does not invoke an agent or an external event service"
+        definition
+            .states
+            .values()
+            .all(|state| !matches!(state.action, Some(ActionConfig::Agent(_)))),
+        "the template does not invoke an agent"
     );
 
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/template.yaml");
