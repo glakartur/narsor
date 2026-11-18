@@ -1,0 +1,18 @@
+# The review gates of workflows/compound-engineering-change.yaml: a `decision`
+# step with `by: human` and `watch: {queue: mr-review, params: {mr_url,
+# choice}}`. Both automations serve the queue; each one handles only the
+# URLs of its own host and exits 0 for the others.
+#
+# For each wait episode of a gate: `in` of both automations runs at once
+# (one adds the label), `check` runs every 5 minutes until the reviewer
+# removes the label, and when the gate exits, `out` of both runs before the
+# next step starts (one removes the label if it is still there).
+automations: [gitlab-mr-label, github-pr-label]
+mode: on_episodes
+schedule: {cron: "*/5 * * * *"}
+condition:
+  label: narsor-review
+  gitlab:
+    host: gitlab.example.com     # replace with your GitLab host
+  github:
+    host: github.com

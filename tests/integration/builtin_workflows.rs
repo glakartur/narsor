@@ -155,9 +155,9 @@ fn every_example_workflow_in_the_repository_loads_and_validates() {
     );
 }
 
-/// U13: no example workflow has a `wait` step any more, and the review gates
-/// of the compound engineering example put their wait episodes on the queue
-/// `mr-review`, with the params the example observer scripts read.
+/// The review gates of the compound engineering example put their wait
+/// episodes on the queue `mr-review`, with the params the example catalogue's
+/// review automations read. The label is the queue's business, not a param.
 #[test]
 fn the_review_gates_of_the_compound_engineering_example_watch_one_queue() {
     let path =
@@ -185,10 +185,7 @@ fn the_review_gates_of_the_compound_engineering_example_watch_one_queue() {
             Some("{{ context.workspace.code.pr_url }}"),
             "{gate}"
         );
-        assert_eq!(
-            watch.params.get("label").map(String::as_str),
-            Some("narsor-review")
-        );
+        assert!(!watch.params.contains_key("label"), "{gate}");
         assert_eq!(watch.params.get("choice").map(String::as_str), Some(choice));
         assert!(
             state.choices.iter().any(|known| known.label == choice),

@@ -20,8 +20,9 @@ The main entities of the system and their responsibilities are presented below:
 | `Event` | An immutable record of an event in the system | File in `/events/` (append-only) |
 | `Decision` | The result of choosing a transition based on an action result | Entry in `events/` |
 | `AgentSession` | A communication session with an external AI harness | Metadata in `state.json` + logs |
-| `Observer` | An owner's script that runs on a schedule and creates tasks or answers decision gates | `{state}/observers/{id}/` in the control plane |
-| `QueueEntry` | One wait episode of a `decision` gate with `watch`, on an observer queue | `{state}/observer-queues/entries/` in the control plane |
+| `Automation` | Scripts (`check`, optional `in` and `out`) that create tasks or serve decision gates | `{catalog}/automations/{name}/` |
+| `Queue` | The automations that serve a queue of gates or create tasks, with their mode and schedule | `{catalog}/queues/{name}.yaml`; runtime state per (queue, automation) in `{state}/observer-queues/automations/` |
+| `QueueEntry` | One wait episode of a `decision` gate with `watch`, on a queue | `{state}/observer-queues/entries/` in the control plane |
 
 ---
 
@@ -107,7 +108,7 @@ An abstraction of an operation to execute. In the domain model, an Action is par
 - `AgentAction`: Launching an AI harness (Claude Code/OpenCode).
 - `ScriptAction`: Executing a shell command/script.
 - `HumanAction`: Waiting for human intervention. Legacy shape only.
-- `DecisionAction`: A fork that someone other than the step decides, `by: human` or `by: conductor` (unified shape only). A `by: human` decision is shown to the operator as a form built from the step's variables. A `by: human` decision with a `watch` block also puts each wait episode on an observer queue, and an observer can answer it (§2.12). A `by: conductor` decision is put to the conductor, and the operator decides only when the conductor is not sure.
+- `DecisionAction`: A fork that someone other than the step decides, `by: human` or `by: conductor` (unified shape only). A `by: human` decision is shown to the operator as a form built from the step's variables. A `by: human` decision with a `watch` block also puts each wait episode on a queue of the catalogue, and an automation of the queue can answer it (§2.12). A `by: conductor` decision is put to the conductor, and the operator decides only when the conductor is not sure.
 
 **Action configuration:**
 - `type`: Action type.
@@ -282,25 +283,37 @@ Represents a connection to an external AI harness.
 - Every attempt (`retry`) of the same `ActionExecution` gets its own conversation record, just as it gets
   its own `action_execution_id` — two attempts of the same state never share one file.
 
-### 2.12 Observer and QueueEntry
+### 2.12 Automation, Queue and QueueEntry
 
-An **observer** runs an owner's shell script on a schedule (see
-[Observers](../user/observers.md)). It lives in the control plane, not in an
-execution.
+**Automations** and **queues** are files of the catalogue, as workflow
+definitions are (see [Automations and queues](../user/observers.md)). The
+control plane reads them at every load and keeps no copy; it schedules each
+(queue, automation) pair.
 
-**Attributes of an observer:**
-- `name`, `source`, `owner`.
-- `queue`: the name of the queue it serves, in the owner's namespace. A queue is
-  not an entity of its own: it is the observers that name it and the entries
-  that wait on it.
-- `mode`: `on_episodes` (the script runs once for each entry of its queue) or
-  `always` (the script runs on each tick, with no entry). All observers of one
-  queue have the same mode.
+**Attributes of an automation** (`{catalog}/automations/{name}/`):
+- `name`: the directory name.
+- `description`, `params` (the gate params its scripts read), `secrets`
+  (names and environment variables, never values).
+- Scripts: `check` (required), `in` and `out` (optional).
+
+**Attributes of a queue** (`{catalog}/queues/{name}.yaml`):
+- `name`: the file stem. A gate's `watch.queue` names it.
+- `automations`: the automations that serve it.
+- `mode`: `on_episodes` (`check` runs once for each entry of the queue; `in`
+  and `out` run when an episode enters and leaves) or `always` (`check` runs
+  on each tick, with no entry).
 - `schedule`: an interval in seconds or a five-field cron expression in UTC.
   Exactly one is set.
-- `effect`: create a task of a workflow, or none.
-- Script versions (immutable) and the approved version.
-- `state`: `draft`, `active`, `paused`, `needs_attention`, `error`.
+- `condition`: a map handed to the scripts.
+- `tasks` (`always` only): the workflow, its version, workspaces, backend,
+  profile and input mapping of the tasks the scripts create, the task limit
+  of one run and `import_backlog`. The tasks belong to the installation owner.
+
+**Attributes of a pair (queue, automation)** (runtime state):
+- `state`: `active`, `needs_attention`, `error`. A stopped pair runs again
+  when the queue file, `automation.yaml` or `check.sh` changes.
+- The script state of an `always` pair, the failure count and backoff, the
+  run in progress, the last run and the newest errors.
 
 **Attributes of a queue entry:**
 - The key: the task and the wait episode (the id of the gate's pending input
@@ -312,17 +325,26 @@ execution.
 **Lifecycle of an entry:**
 - The control plane adds the entry when a runner snapshot shows a new wait
   episode at a `decision` gate with `watch` (workflow schema §3.3.D).
-- Every exit from the gate removes it. The same snapshot handler removes the
-  old entry before it adds the next one.
+- When the episode begins, `in` of each automation of the queue that has one
+  runs; `check` runs for the entry only when every `in` succeeded. The task
+  record holds where the episode stands (`entering`, `ready`,
+  `entry_failed`, `exiting`, `released`).
+- Every exit from the gate is held on the task record until every `out`
+  ended; then the exit reaches the runner, and the entry is removed. `in` of
+  the next episode of the task waits for `out` of the previous one.
 - Pause, `Interrupted`, auto-resume and a runner restart keep it.
-- A finished, archived or deleted task loses it.
-- An observer answers the gate with `task decide`
+- A finished, archived or deleted task loses it; when it ended at the gate,
+  `out` runs once in the background.
+- A `check` script answers the gate with `task decide`
   (`POST /observer/v1/runs/{run}/decide`). The answer goes through the same
   validation as the answer of a person and becomes the gate's queued input.
   The first answer of an episode wins.
 
 **Storage:**
-- `{state}/observers/{id}/observer.json`, `scripts/{n}.sh`, `errors/`.
+- `{catalog}/automations/{name}/`, `{catalog}/queues/{name}.yaml`: the
+  definitions.
+- `{state}/observer-queues/automations/{queue}/{automation}/state.json`,
+  `errors/{seq}.json`: the runtime state of a pair.
 - `{state}/observer-queues/entries/{entry}.json`: one file per entry, created
   once and never changed.
 

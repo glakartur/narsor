@@ -6,6 +6,79 @@ listed here need no special order. The update notes of the remote backends
 (automatic resume, the read-only runner) are in
 [Remote execution backends](remote-backends.md).
 
+## Update to catalogue automations (D78)
+
+This update moves the configuration of observers from the state to the
+catalogue. Automations (`{catalog}/automations/{name}/`) and queues
+(`{catalog}/queues/{name}.yaml`) are files, as workflow definitions are.
+An automation can have entry and exit scripts (`in.sh`, `out.sh`) that run
+when a gate episode enters and leaves its queue. See
+[Automations and queues](../user/observers.md). The update is a hard
+cutover: Narsor does not migrate the observers stored in
+`{state}/observers/`.
+
+### What changes
+
+| Part | Before | After |
+|---|---|---|
+| Configuration | Observer records in `{state}/observers/`, with script versions and approvals | Catalogue files. No create, approve, pause, resume or delete step: a queue in the catalogue is active. The old records are not read. |
+| Runtime state | Per observer | Per pair (queue, automation): `{state}/observer-queues/automations/{queue}/{automation}/`. The queue entries (`{state}/observer-queues/entries/`) keep their shape. |
+| Script input | contract version 2 (`observer`) | contract version 3: `phase` (`in`, `check`, `out`), `queue`, `automation`, and `exit` for `out`. |
+| Secrets | `{secrets dir}/{owner}/{name}` | `{secrets dir}/{name}`, one flat directory |
+| CLI | `narsor-cli observer …` | Removed. `narsor-cli queue list` and `narsor-cli queue show QUEUE`, read-only. |
+| HTTP API | Owner routes `/control/v1/observers…` | Removed (`404`). `GET /control/v1/observer-queues` and `GET /control/v1/observer-queues/{queue}` remain, read-only. |
+| TUI and web UI | Forms to create, edit, approve, pause, resume and delete observers | Read-only queue views. A waiting gate offers *Uruchom od nowa*. |
+| Worker | Asks for a run every 10 seconds | The server holds the claim up to 25 seconds. |
+
+### Before the update
+
+1. **Write the catalogue files.** For each observer that you keep, write an
+   automation (`automation.yaml` with its description, params and secret
+   names, and `check.sh`) and a queue file (its automations, mode,
+   schedule, condition and, for an observer that created tasks, `tasks`
+   with the workflow mapping). Change each script to contract version 3.
+   Start from [`examples/catalog/`](../../examples/catalog/). The example
+   review automations add and remove the review label themselves: remove
+   the label steps from your workflows (as
+   `workflows/compound-engineering-change.yaml` did). Put the files into
+   the catalogue before the update, so that the new server finds them at
+   its first start.
+2. **Move the secrets.** Move each secret file from the owner's
+   subdirectory up into the secrets directory itself
+   (`{secrets dir}/{name}`).
+3. **Tasks that wait at a watched gate need not finish.** Their queue
+   entries keep their shape, and the new `check` scripts serve them. The
+   entry and exit scripts do not run for an episode that began before the
+   update; to get them, choose *Uruchom od nowa* on the gate after the
+   update (this needs the new runner).
+
+### Update order
+
+1. Stop the server (`narsor-server`). It stops the observer worker first.
+2. Install the new binaries of the server and the observer worker, and the
+   new clients (`narsor`, `narsor-cli`, `narsor-web`). An old client gets
+   `404` for the removed observer routes. Install the new runner
+   (`narsor-runner`, or the new runner image for the `kubernetes` backend)
+   in the same window: an old runner refuses the restart of a waiting gate,
+   and the TUI and the web UI show the refusal.
+3. Start the server. While `{state}/observers/` still holds observer
+   records, it logs one warning at start.
+4. Check the catalogue: `narsor-cli queue list` shows each queue, and under
+   the queues each catalogue file that cannot be used, with the reason.
+   Fix each problem in its file.
+
+### After the update
+
+1. **Look at the first runs.** `narsor-cli queue show QUEUE` shows the
+   automations of the queue with their state, runs and errors, and its
+   entries.
+2. **Delete the old observer records** when the queues work:
+   `{state}/observers/`. Narsor does not read them any more, and the start
+   warning goes away.
+
+The two sections below are for updates to earlier versions. The observer
+commands that they name are removed by the update above.
+
 ## Update that removes the observer source field
 
 This update removes the free-text `source` field of observers. Narsor did
@@ -83,7 +156,8 @@ and the new versions.
 3. **Prepare the scripts of event observers.** A script that delivered
    events (`narsor-cli task event`) must be changed to read contract
    version 2 and to answer with `narsor-cli task decide`. The example
-   scripts in `workflows/observers/examples/` show how.
+   scripts of that version (`workflows/observers/examples/`, now replaced
+   by `examples/catalog/`) showed how.
 4. **Pause the running tasks** (`narsor-cli task pause TASK`). A runner of
    the old version must not run against the new control plane.
 

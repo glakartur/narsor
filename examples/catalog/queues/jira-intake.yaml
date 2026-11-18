@@ -1,0 +1,23 @@
+# New Jira issues become tasks: every 10 minutes, jira-new-issues searches
+# with the JQL of the condition and creates one task for each new issue. The
+# tasks belong to the owner of the installation.
+#
+# The example runs the built-in workflow `template` and gives the issue key
+# to its input `example_text`, so it is safe to try. Replace `workflow_id`
+# and `mapping` with your own triage workflow and its inputs; a workflow
+# that is not in the catalogue makes the queue a problem, and it does not
+# run.
+automations: [jira-new-issues]
+mode: always
+schedule: {cron: "*/10 * * * *"}
+condition:
+  base_url: https://jira.example.com   # replace with your Jira server
+  jql: project = ABC AND issuetype = Bug
+  fields: [key]
+  max_results: 10
+tasks:
+  workflow_id: template
+  mapping:
+    example_text: key                  # workflow input: data field
+  task_limit_per_run: 10
+  import_backlog: false

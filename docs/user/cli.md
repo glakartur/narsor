@@ -346,83 +346,43 @@ $ narsor-cli run pipeline.yaml --input repository=acme-api   # clones /srv/git/a
 $ narsor-cli run pipeline.yaml --input repository=/srv/git/other   # raw remote
 ```
 
-### `observer`
+### `queue`
 
-Observers poll an external source (Jira, GitHub, GitLab) on a schedule with a
-shell script. They create tasks, or answer the decision gates that wait on
-their queue. The control plane keeps the schedule; `narsor-observer-worker`,
-which the server starts when its configuration enables it, runs the scripts
-(see [installation](../operations/installation.md#run-the-observer-worker)).
-How to write an observer and its script is in [Observers](observers.md).
-Every command below is the owner's: in network mode a user who is not the
-installation's owner gets `403`, and another owner's observer is not found.
-An observer is named by its name or its id.
+Automations and queues are files of the catalogue (`{catalog}/automations/`
+and `{catalog}/queues/`). They create tasks, or serve the decision gates
+that wait on their queue. The control plane keeps the schedule;
+`narsor-observer-worker`, which the server starts when its configuration
+enables it, runs the scripts (see
+[installation](../operations/installation.md#run-the-observer-worker)). How
+to write an automation and a queue is in [Automations and queues](observers.md).
+
+The `queue` commands are read-only: no command creates, changes, approves,
+pauses or deletes a queue or an automation. Change the files in the
+catalogue instead. In network mode a user who is not the installation's
+owner gets `403`.
 
 | Command | What it does |
 |---|---|
-| `observer create NAME [--queue QUEUE] [--mode MODE] [--workflow ID [--map INPUT=FIELD]…] [options]` | Creates a draft observer. Nothing runs until a script version is approved. |
-| `observer update OBSERVER [--queue QUEUE] [--mode MODE] [--interval SECONDS \| --cron EXPRESSION]` | Changes the queue, the mode or the schedule. Give at least one; what you do not give stays. The mode must be the mode of the other observers of the queue. |
-| `observer list` | One line per observer: state, script versions, last run, next run; then the last error, a `no worker` warning, a note, and a mark when the newest script version is not approved. |
-| `observer show OBSERVER` | The queue, the mode, the schedule, the configuration (secret references, never values), script versions, the last run, the next run, a `no worker` warning, and the errors of the 20 newest failed or lost runs (reason, exit code, entry, end of stdout and stderr, masked). A successful run leaves no record. |
-| `observer queue list` | One line per queue: its mode, the number of its observers and the number of its entries. |
-| `observer queue show QUEUE` | The observers of the queue (state, script versions, schedule, last run) and its entries, oldest first (task, step, episode, waiting time, params, and for each observer the last run and the last error of the entry). |
-| `observer script set OBSERVER --file FILE` | Saves the next, immutable script version. Saving never approves it. |
-| `observer script show OBSERVER [--version N]` | Prints a script version: a header with the version and whether it is approved, then the script text. The newest version when `--version` is not given. Read it before you approve it. |
-| `observer approve OBSERVER --version N` | The schedule runs this version, and only it. A draft observer becomes active; a paused one stays paused. |
-| `observer pause OBSERVER`, `observer resume OBSERVER` | Stops the schedule; puts a paused observer, or one in `needs_attention` or `error`, back on it. |
-| `observer delete OBSERVER` | Deletes the observer with its scripts and run errors. The tasks it created stay. Cannot be undone. |
-
-Options of `observer create`:
-
-| Option | Meaning |
-|---|---|
-| `--queue QUEUE` | The queue it serves: the `watch.queue` of the gates whose wait episodes it checks. The name of the observer when omitted. |
-| `--mode MODE` | `on_episodes`: the script runs only for the entries of its queue, one run for each entry. `always`: the script runs on each tick, with no entry. All observers of a queue have the same mode. When omitted: `always` with `--workflow`, `on_episodes` without it. |
-| `--workflow ID [--workflow-version N]` | Create a task of this catalogue workflow for each `task create` of the script. The version is the catalogue's when omitted. |
-| `--map INPUT=FIELD` | A workflow input taken from a field of the effect data (repeatable). Only mapped fields reach the task. |
-| `--repository WS=ID`, `--branch WS=BRANCH`, `--backend ID`, `--profile NAME` | What every task of the observer runs on, as in `task create`. The script cannot change it. |
-| `--interval SECONDS` | Time between runs (60 seconds to 30 days). 300 when neither `--interval` nor `--cron` is given. |
-| `--cron EXPRESSION` | A cron expression of five fields (minute hour day-of-month month day-of-week), in UTC, like `'*/10 * * * *'`. No seconds field, no aliases (`@daily`). Not together with `--interval`. |
-| `--condition JSON` | Parameters handed to the script as they are (a JSON object). |
-| `--secret NAME=ENV` | The file `NAME` in your subdirectory of the worker's secrets directory, handed to the script as variable `ENV` (repeatable). |
-| `--task-limit N` | Most tasks one run may create. Past it the observer goes to `needs_attention`. |
-| `--import-backlog` | The first run imports what already matches the condition instead of only remembering where to start. |
-
-Removed with the watch lists: `--deliver-events`, `--watch-list`,
-`--allow-prefix` and `--max-object-len` of `observer create`, and the
-commands `observer watch add|list|remove` and `task event`. The removed
-flags are a usage error that names what replaces them. See
-[Observers](observers.md#10-update-from-watch-lists).
-
-A typical start, all through the CLI:
+| `queue list` | One line per queue of the catalogue: its mode, its schedule, its automations and the number of its entries; a queue that does not run says why. Then the catalogue files that cannot be used, each with the reason. |
+| `queue show QUEUE` | One queue: its mode and schedule, the workflow of the tasks it creates, the problem of its file, its automations (description, scripts, state, the run in progress, the next run, a `no worker` warning, and the newest errors with the exit code, the entry and the reason) and its entries, oldest first (task, step, episode, waiting time, params, and for each automation how it handled the entry). |
 
 ```console
-$ narsor-cli observer create jira-new --mode always --cron '*/10 * * * *' \
-      --workflow triage --map ticket=key \
-      --secret jira-token=JIRA_TOKEN --condition '{"project": "ABC"}'
-$ narsor-cli observer script set jira-new --file jira-new-issues.sh
-Saved version 1 of 'jira-new' (sha256:…). It is not approved: test it by hand, then …
-$ narsor-cli observer script show jira-new
-$ narsor-cli observer approve jira-new --version 1
-$ narsor-cli observer list
-NAME                     STATE            SCRIPT           LAST RUN               NEXT RUN
-jira-new                 active           v1               succeeded 2m ago       in 3m
+$ narsor-cli queue list
+$ narsor-cli queue show mr-review
 ```
 
-Narsor has no dry run. The approval is the only gate before the first
-scheduled run: test the script by hand against the source before you approve
-it (see [Observers](observers.md)).
+The commands `observer create`, `update`, `list`, `show`, `queue list`,
+`queue show`, `script set`, `script show`, `approve`, `pause`, `resume` and
+`delete` are removed with the observers stored in the state (see
+[Automations and queues](observers.md#13-update-from-stored-observers)).
+`narsor-cli observer …` is an unknown command.
 
-After `observer script set` on an active observer, `observer show` gives
-`Script: approved version 1; version 2 not approved` and `observer list`
-gives `v1 (draft v2)` with the line `script: version 2 not approved: …`:
-the schedule keeps running version 1 until `observer approve --version 2`.
-
-#### Commands for an observer's script
+#### Commands for an automation's script
 
 The worker runs a script with `NARSOR_OBSERVER_RUN` (the run's id),
 `NARSOR_SERVER` and `NARSOR_TOKEN` (a token of that run only) set. Two task
-commands then go to the effect routes of the run:
+commands then go to the effect routes of the run. Only a `check` run may
+use them; the server refuses them from an `in` or `out` run:
 
 ```sh
 narsor-cli task create --data "$JSON"
@@ -432,19 +392,20 @@ narsor-cli task decide TASK_ID --episode EPISODE --data '{"choice": …, "reason
 
 - `task create --data JSON` creates a new task on each call. Narsor does not
   remove duplicates: the script records in its state what it already
-  reported. The observer's record decides the workflow, repositories, backend
-  and profile: in a script, `WORKFLOW`, `--input`, `--backend`,
+  reported. The `tasks` of the queue file decide the workflow, repositories,
+  backend and profile: in a script, `WORKFLOW`, `--input`, `--backend`,
   `--repository` and the other options of `task create` are a usage error.
-  The data is a JSON object of the fields the observer maps to workflow
-  inputs; Narsor refuses a field that is not in the map.
+  The data is a JSON object of the fields the queue maps to workflow
+  inputs (`tasks.mapping`); Narsor refuses a field that is not in the map.
 - `task decide TASK_ID --episode EPISODE` answers the gate of the queue
   entry of this run, as a person answers it. `TASK_ID` and `EPISODE` are
   the `task_id` and the `episode` of the entry. Give `--choice` with
   `--reason`, `--var` and `--var-file`, or give `--data` with the whole
   answer, never both. Narsor checks the answer as it checks the answer of a
   person. The first answer of an episode wins; a later one, and an answer
-  for an episode that ended, is refused. The task history shows the
-  observer, its run and the reason.
+  for an episode that ended, is refused. When the queue has `out` scripts,
+  the answer reaches the task when they ended. The task history shows the
+  automation, its run and the reason.
 
 Without `NARSOR_OBSERVER_RUN`, `task create --data` and `task decide` are
 usage errors (exit code `2`). In a script:
@@ -452,7 +413,7 @@ usage errors (exit code `2`). In a script:
 | Answer | Prints | Exit code |
 |---|---|---|
 | created, answered | the server's line | `0` |
-| the run's task limit is reached, the data is refused, the answer is refused (the episode ended, another answer came first, an invalid choice or variables), the token is not valid | the reason, on stderr | `1` |
+| the run's task limit is reached, the data is refused, the answer is refused (the episode ended, another answer came first, an invalid choice or variables), the run is not a `check` run, the token is not valid | the reason, on stderr | `1` |
 | incorrect usage | the reason, on stderr | `2` |
 
 Text that came from a script or a source (answer reasons, stderr) is

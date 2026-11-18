@@ -224,6 +224,17 @@ step (`Akcje › Wybierz krok · krok 2 z 3`):
 3. **Confirm**: the panel shows the name, what the action does, what you typed
    and `! nieodwracalne` for an action that cannot be undone. `Enter` sends.
 
+**A gate that watches a queue.** While a `human` gate waits, the action
+panel offers *Uruchom od nowa*: the gate closes the current wait and asks
+again in a new episode. When the gate watches a queue, the queue's exit
+scripts (`out`) run first, then its entry scripts (`in`). A runner of an
+older version refuses it, and the bar shows the refusal. When an entry
+script of the queue failed after its last retry, the gate step shows the
+status `failure` on *Przebieg*; you can still answer the gate or restart
+it. Each attempt of an entry or exit script is an event of the step on
+*Przebieg*, not a new step. See
+[Automations and queues](observers.md#4-entry-and-exit-scripts).
+
 `Esc` goes back one step or one level and keeps what you typed; on the first
 level it closes the panel. A refresh of the list does not close the panel and
 does not clear a field. When the chosen action is no longer available, the bar
@@ -264,7 +275,7 @@ itself. It goes on by a comment (agent), *Uruchom od nowa* (script step) or
 | `R` | repositories: `a` registers, `d` removes (`!`) | `narsor-cli task repo list` / `add` / `remove` (the same registry on any server; `narsor-cli repo …` is the local one) |
 | `h` | the installation's default agent harness: choose one, or go back to the configured one | `narsor-cli harness default set <harness>` / `reset` (`narsor-cli harness default` shows it) |
 | `L` | the limit of tasks processed at once: one more or one less, until the daemon restarts (then `max_concurrent_tasks` applies again) | `max_concurrent_tasks` in the configuration |
-| `O` | observer queues: the queues with their entries; in a queue its observers and the tasks that wait on it. `a` creates an observer, `e` edits its queue, mode and schedule, `s` edits the script (`$EDITOR`, or a paste field), `v` shows the newest version and approves it, `p` / `r` pause and resume, `d` deletes (`!`). A task with a queue entry has one mark on its row. See [Observers](observers.md#8-queue-views) | `narsor-cli observer queue list` / `show`, `observer create` / `update` / `script set` / `script show` / `approve` / `pause` / `resume` / `delete` |
+| `O` | automation queues, read-only: the queues of the catalogue with their number of entries, a mark on a queue that does not run, and the catalogue files that cannot be used; in a queue its automations (description, scripts, state, runs, errors) and the tasks that wait on it. A task with a queue entry has one mark on its row. See [Automations and queues](observers.md#9-queue-views) | `narsor-cli queue list` / `show`; to change a queue or an automation, change its catalogue file |
 | the header | what the connection offers | `narsor-cli task capabilities` |
 
 **A forced jump** (the panel's *Przejście ręczne*, with a reason) leaves the declared exits of the step and goes

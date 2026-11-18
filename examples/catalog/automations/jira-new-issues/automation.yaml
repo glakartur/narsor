@@ -1,0 +1,8 @@
+# New Jira issues become tasks. It serves a queue of mode `always` with
+# `tasks` (queues/jira-intake.yaml); check.sh has the condition and the
+# state it keeps. It has no in.sh or out.sh: it serves no gate.
+description: Creates one task for each new Jira issue that a JQL query selects
+secrets:
+  # A personal access token that can search the issues. The value is the
+  # file {observer secrets dir}/jira-token.
+  - {name: jira-token, env: JIRA_TOKEN}

@@ -97,7 +97,10 @@ narsor                                              # or open the full-screen in
 ```
 
 The example files are in this repository; `narsor-cli run template --input
-example_text="Hello"` runs the built-in workflow from anywhere.
+example_text="Hello"` runs the built-in workflow from anywhere. An example
+catalogue of automations and queues (a review label on pull and merge
+requests, new Jira issues as tasks) is in [`examples/catalog/`](examples/catalog/);
+see [automations and queues](docs/user/observers.md).
 
 ## Documentation
 
@@ -107,9 +110,10 @@ The full index is in [`docs/README.md`](docs/README.md).
   [browser interface](docs/user/web.md),
   [workflows](docs/user/workflows.md), [AI agents](docs/user/agents.md),
   [conductor](docs/user/conductor.md), [remote tasks](docs/user/remote.md),
-  [observers](docs/user/observers.md), [configuration](docs/user/configuration.md).
+  [automations and queues](docs/user/observers.md), [configuration](docs/user/configuration.md).
 - **Operating** — [installation and server](docs/operations/installation.md),
-  [remote backends](docs/operations/remote-backends.md).
+  [remote backends](docs/operations/remote-backends.md),
+  [updates](docs/operations/updates.md).
 - **Developing** — [CONTRIBUTING.md](CONTRIBUTING.md),
   [building and testing](docs/dev/building-and-testing.md),
   [architecture decisions](docs/dev/architecture.md),

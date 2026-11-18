@@ -45,9 +45,9 @@ The workflow has:
   approve the whole code;
 - the whole conversation with the person in open threads of the pull request,
   and a loop back to the work for each question or note there;
-- a `watch` block on each review gate (queue `mr-review`), so that an
-  observer can answer the gate when the person removes the label
-  `narsor-review` from the pull request.
+- a `watch` block on each review gate (queue `mr-review`, param `mr_url`),
+  so that the queue of the example catalogue can put a review label on the
+  pull request and answer the gate when the person removes it.
 
 It needs an agent harness, the `compound-engineering` skills and `gh` or
 `glab`. Run it by its path from a checkout of this repository:
@@ -57,20 +57,21 @@ narsor-cli validate workflows/compound-engineering-change.yaml
 narsor-cli run workflows/compound-engineering-change.yaml --input description="Add a health endpoint"
 ```
 
-# Example observer scripts
+# Example catalogue: automations and queues
 
-[`observers/examples/`](observers/examples/) has three observer scripts. They
-use `curl` and `jq`:
+Automations and queues are not in this directory: they are catalogue files.
+The example catalogue is in [`../examples/catalog/`](../examples/catalog/).
+Copy it into the catalogue directory of an installation (`{catalog}/automations/`
+and `{catalog}/queues/`) and change the hosts in the queue files. It has:
 
-- `jira-new-issues.sh` creates a task for each new Jira issue that a JQL
-  query finds. On the first run it only records where to start.
-- `github-pr-review.sh` and `gitlab-mr-review.sh` serve a queue of review
-  gates (a `watch` block on a human `decision`, mode `on_episodes`). When the
-  reviewer removes the gate's `label` from the pull or merge request in
-  `mr_url`, the script answers the gate with `narsor-cli task decide` and the
-  gate's `choice` param (default `check_feedback`). Both can serve one
-  queue: each one exits 0 with no answer for a URL that is not on its host.
+- the queue `mr-review` with the automations `gitlab-mr-label` and
+  `github-pr-label`, for the review gates of
+  `compound-engineering-change.yaml`: `in` adds the label `narsor-review` to
+  the pull or merge request, `check` answers the gate when the reviewer
+  removes it, and `out` removes it when the gate exits;
+- the queue `jira-intake` with the automation `jira-new-issues`, which
+  creates a task for each new Jira issue that a JQL query finds.
 
-The header of each script has the `observer create` command, the condition,
-the params and the secrets. With `FAKE_SOURCE_DIR` set, a script reads its
-answers from files and does not use the network.
+The scripts use `curl` and `jq`. With `FAKE_SOURCE_DIR` set, a script reads
+its answers from files and does not use the network. How automations and
+queues work is in [Observers](../docs/user/observers.md).

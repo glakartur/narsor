@@ -30,8 +30,8 @@
 //! entry and dropped exit code 1 ("check again"): every run checks again
 //! until the gate exits. Version 3 moved the configuration to the catalogue:
 //! the `observer` object gave way to `queue` and `automation`, and `phase`
-//! names the script that runs. An `out` run will also get the gate's `exit`
-//! (U5 of the catalogue plan); no build sends it yet.
+//! names the script that runs. An `out` run also gets the gate's `exit`:
+//! the choice and who made it.
 //!
 //! For a queue that creates tasks, exit code 0 with a valid document is
 //! the only result that changes the remembered state (R14). The output is
