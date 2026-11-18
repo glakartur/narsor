@@ -299,25 +299,25 @@ impl ProtocolService {
     }
 
     /// Refuses a new task past the run's limit (R15); an active pair then
-    /// stops (`needs_attention`) until its `check` script changes.
+    /// stops (`needs_attention`) until its catalogue definition changes.
     fn within_task_limit(&self, scope: &mut EffectScope, tasks: &QueueTasks) -> ProtocolResult<()> {
         let limit = tasks.task_limit_per_run;
         if scope.active_run()?.tasks_created < limit {
             return Ok(());
         }
         if scope.record.state == AutomationState::Active {
-            let digest = scope.active_run()?.script_digest.clone();
+            let digest = scope.active_run()?.definition_digest.clone();
             scope.record.state = AutomationState::NeedsAttention;
-            scope.record.stopped_script_digest = Some(digest);
+            scope.record.stopped_definition_digest = Some(digest);
             self.observers
                 .save(&scope.lock, &mut scope.record, scope.now)?;
-            tracing::info!(pair = %scope.record.key, limit, "automations: a run reached its task limit; stopped until the check script changes");
+            tracing::info!(pair = %scope.record.key, limit, "automations: a run reached its task limit; stopped until its definition changes");
         }
         Err(ProtocolError::conflict(
             "observer_task_limit",
             format!(
                 "run {} reached the limit of {limit} new tasks per run; automation '{}' of queue \
-                 '{}' stops until its check script changes",
+                 '{}' stops until its catalogue definition changes",
                 scope.run_id, scope.run_id.key.automation, scope.run_id.key.queue
             ),
         ))

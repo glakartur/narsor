@@ -438,7 +438,7 @@ fn queue_show_says_how_each_automation_processed_each_entry() {
     );
     assert!(text.contains("    next in 3m"), "{text}");
     assert_eq!(
-        text.matches("runs again when its check script changes")
+        text.matches("runs again when its queue file, automation.yaml or check script changes")
             .count(),
         1,
         "only the stopped automation: {text}"

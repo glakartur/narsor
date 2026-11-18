@@ -381,7 +381,7 @@ pub struct QueueAutomationView {
     pub secrets: Vec<ObserverSecretRef>,
     /// `active`, `needs_attention` (a run reached the task limit) or
     /// `error` (too many failed runs). A stopped pair runs again when its
-    /// `check` script changes.
+    /// queue file, `automation.yaml` or `check` script changes.
     pub state: String,
     /// When the next scheduled run is due.
     #[serde(default, skip_serializing_if = "Option::is_none")]

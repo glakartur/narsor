@@ -168,7 +168,7 @@ fn automation_lines(automation: &QueueAutomationView, now: DateTime<Utc>) -> Vec
     }
     if matches!(automation.state.as_str(), "needs_attention" | "error") {
         lines.push(
-            "    stopped: it runs again when its check script changes in the catalogue".to_string(),
+            "    stopped: it runs again when its queue file, automation.yaml or check script changes".to_string(),
         );
     }
     let mut runs = Vec::new();

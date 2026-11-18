@@ -61,7 +61,7 @@ test('the queue page shows automations and entries with no controls that change 
   assert.match(text, /in, check/);
   assert.match(text, /porażki z rzędu 3/);
   assert.match(text, /#4 check · failed, kod 2/);
-  assert.match(text, /skrypt check zmieni się w katalogu/);
+  assert.match(text, /zmieni się plik kolejki, automation.yaml lub skrypt check/);
   assert.match(text, /sprawdza teraz/);
 
   const tags = tagsOf(tree);

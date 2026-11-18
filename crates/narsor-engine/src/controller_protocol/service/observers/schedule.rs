@@ -25,7 +25,8 @@
 //!                 a tick while a run is active or a     → skipped, not queued:
 //!                 round goes on                           next_run_at = the next tick
 //!                 needs_attention or error, and the     → active again, due at once
-//!                 check script changed
+//!                 queue file, automation.yaml or check
+//!                 script changed
 //!                 run past its deadline                 → lost: error file, token spent
 //!                 a record of a pair the catalogue no   → deleted; kept while a run is
 //!                 longer has                              in progress
@@ -91,7 +92,8 @@ use narsor_protocol::controller::{ObserverSecretRef, ObserverWorkerRun};
 use serde::Serialize;
 
 use crate::automations::{
-    AutomationCatalogError, AutomationCatalogLoad, AutomationScript, HookPhase, Queue,
+    pair_definition_digest, Automation, AutomationCatalogError, AutomationCatalogLoad,
+    AutomationScript, HookPhase, Queue,
 };
 use crate::controller_protocol::credentials::{
     observer_run_token_id, token_matches_digest, BearerToken,
@@ -160,7 +162,7 @@ pub struct ObserverPass {
     /// Pairs whose record was deleted: no longer in the catalogue.
     pub removed: Vec<AutomationKey>,
     /// Stopped pairs (`needs_attention`, `error`) back on their schedule
-    /// because their `check` script changed.
+    /// because their catalogue definition changed.
     pub restarted: Vec<AutomationKey>,
     /// Runs that passed their deadline without a result.
     pub lost: Vec<RunId>,
@@ -407,11 +409,11 @@ fn judge_entry_run(report: &RunReport) -> Verdict<()> {
 /// `period × 2^failures` (the interval, or the gap to the next cron fire;
 /// a cron schedule then waits for its first fire from there on), and after
 /// [`MAX_CONSECUTIVE_FAILURES`] the pair goes to `error` (R16) until its
-/// `check` script changes from `script_digest`.
+/// catalogue definition changes from `definition_digest`.
 fn count_failure(
     record: &mut AutomationRecord,
     schedule: Option<&ScheduleConfig>,
-    script_digest: &str,
+    definition_digest: &str,
     now: DateTime<Utc>,
 ) {
     record.consecutive_failures = record.consecutive_failures.saturating_add(1);
@@ -423,8 +425,8 @@ fn count_failure(
         && record.state == AutomationState::Active
     {
         record.state = AutomationState::Error;
-        record.stopped_script_digest = Some(script_digest.to_string());
-        tracing::info!(pair = %record.key, failures = record.consecutive_failures, "automations: too many failed runs; stopped until the check script changes");
+        record.stopped_definition_digest = Some(definition_digest.to_string());
+        tracing::info!(pair = %record.key, failures = record.consecutive_failures, "automations: too many failed runs; stopped until its catalogue definition changes");
     }
 }
 
@@ -485,7 +487,12 @@ impl ProtocolService {
                         self.expire_run_if_lost(key, Some(&queue.schedule), now)
                             .map(|lost| pass.lost.extend(lost))
                     } else if record.state.is_stopped() {
-                        self.restart_if_script_changed(record, now, &mut pass)
+                        match catalog.automations.get(&key.automation) {
+                            Some(automation) => self.restart_if_definition_changed(
+                                record, queue, automation, now, &mut pass,
+                            ),
+                            None => Ok(()),
+                        }
                     } else if tick_while_busy(record, now) {
                         self.skip_busy_tick(key, &queue.schedule, now, &mut pass)
                     } else if scheduled_run_due(record, now) {
@@ -556,7 +563,7 @@ impl ProtocolService {
             let Some(automation) = catalog.automations.get(&key.automation) else {
                 continue;
             };
-            match self.claim_from(&key, queue, &automation.secrets, now) {
+            match self.claim_from(&key, queue, automation, now) {
                 Ok(Some(claimed)) => return Ok(Some(claimed)),
                 Ok(None) => {}
                 Err(error) => {
@@ -635,9 +642,12 @@ impl ProtocolService {
                         record.first_run_done = true;
                         record.consecutive_failures = 0;
                     }
-                    None => {
-                        count_failure(&mut record, schedule.as_ref(), &active.script_digest, now)
-                    }
+                    None => count_failure(
+                        &mut record,
+                        schedule.as_ref(),
+                        &active.definition_digest,
+                        now,
+                    ),
                 }
                 (verdict.status, verdict.exit_code, verdict.error)
             }
@@ -790,22 +800,24 @@ impl ProtocolService {
     }
 
     /// Puts a stopped pair (`needs_attention`, `error`) back on its
-    /// schedule, due at once, when its `check` script is no longer the one
-    /// it stopped with: the catalogue author fixed it. A script that cannot
-    /// be read changes nothing.
-    fn restart_if_script_changed(
+    /// schedule, due at once, when its catalogue definition (the queue
+    /// file, `automation.yaml`, the `check` script) is no longer the one it
+    /// stopped with: the catalogue author changed it.
+    fn restart_if_definition_changed(
         &self,
         seen: &AutomationRecord,
+        queue: &Queue,
+        automation: &Automation,
         now: DateTime<Utc>,
         pass: &mut ObserverPass,
     ) -> Result<(), ObserverError> {
-        let Ok(script) = self
+        let check = self
             .launch
             .automation_script(&seen.key.automation, HookPhase::Check)
-        else {
-            return Ok(());
-        };
-        if seen.stopped_script_digest.as_deref() == Some(script.digest.as_str()) {
+            .map(|script| script.digest)
+            .unwrap_or_default();
+        let current = pair_definition_digest(queue, automation, &check);
+        if seen.stopped_definition_digest.as_deref() == Some(current.as_str()) {
             return Ok(());
         }
         let lock = self.observers.lock(&seen.key)?;
@@ -813,17 +825,17 @@ impl ProtocolService {
             return Ok(());
         };
         if !record.state.is_stopped()
-            || record.stopped_script_digest.as_deref() == Some(script.digest.as_str())
+            || record.stopped_definition_digest.as_deref() == Some(current.as_str())
         {
             return Ok(());
         }
         record.state = AutomationState::Active;
-        record.stopped_script_digest = None;
+        record.stopped_definition_digest = None;
         record.consecutive_failures = 0;
         record.next_run_at = Some(now);
         record.run_due_since = None;
         self.observers.save(&lock, &mut record, now)?;
-        tracing::info!(pair = %record.key, "automations: the check script of a stopped pair changed; it runs again");
+        tracing::info!(pair = %record.key, "automations: the catalogue definition of a stopped pair changed; it runs again");
         pass.restarted.push(record.key);
         Ok(())
     }
@@ -927,7 +939,7 @@ impl ProtocolService {
         &self,
         key: &AutomationKey,
         queue: &Queue,
-        secrets: &[SecretRef],
+        automation: &Automation,
         now: DateTime<Utc>,
     ) -> Result<Option<ClaimedObserverRun>, ObserverError> {
         let lock = self.observers.lock(key)?;
@@ -975,6 +987,7 @@ impl ProtocolService {
                     &lock,
                     &mut record,
                     queue,
+                    &pair_definition_digest(queue, automation, ""),
                     sequence,
                     run_entry,
                     &error,
@@ -1006,6 +1019,7 @@ impl ProtocolService {
             sequence,
             phase: HookPhase::Check,
             script_digest: digest.clone(),
+            definition_digest: pair_definition_digest(queue, automation, &digest),
             claimed_at: now,
             deadline,
             token_digest: token.digest(),
@@ -1020,7 +1034,7 @@ impl ProtocolService {
             script_digest: digest,
             script: text,
             input,
-            secrets: secrets.to_vec(),
+            secrets: automation.secrets.clone(),
             timeout_secs: SCRIPT_TIMEOUT_SECS,
             deadline,
         }))
@@ -1036,6 +1050,7 @@ impl ProtocolService {
         lock: &AutomationLock,
         record: &mut AutomationRecord,
         queue: &Queue,
+        definition_digest: &str,
         sequence: u64,
         entry: Option<RunEntry>,
         error: &AutomationCatalogError,
@@ -1066,7 +1081,7 @@ impl ProtocolService {
                 record.entry_last_runs.insert(entry.entry_id.clone(), now);
                 round_waits_from(record, now);
             }
-            None => count_failure(record, Some(&queue.schedule), "", now),
+            None => count_failure(record, Some(&queue.schedule), definition_digest, now),
         }
         record.last_run = Some(LastRun {
             sequence,

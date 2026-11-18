@@ -106,6 +106,9 @@ pub struct Automation {
     pub secrets: Vec<SecretRef>,
     /// The scripts that exist, by phase; `check` is always there.
     pub scripts: BTreeMap<HookPhase, PathBuf>,
+    /// `sha256:` digest of `automation.yaml` as it was read: a stopped pair
+    /// runs again when it changes.
+    pub definition_digest: String,
 }
 
 impl Automation {
@@ -130,6 +133,9 @@ pub struct Queue {
     pub condition: serde_json::Value,
     /// The tasks its scripts may create; only an `always` queue has them.
     pub tasks: Option<QueueTasks>,
+    /// `sha256:` digest of the queue file as it was read: a stopped pair
+    /// runs again when it changes.
+    pub definition_digest: String,
 }
 
 /// The task-creation settings of an `always` queue.
@@ -142,6 +148,24 @@ pub struct QueueTasks {
     pub task_limit_per_run: u32,
     /// Whether the first run imports what already matches the condition.
     pub import_backlog: bool,
+}
+
+/// The fingerprint of one (queue, automation) pair's definition: the queue
+/// file, the automation's `automation.yaml` and its `check` script, each by
+/// its digest. A stopped pair runs again when it changes. An empty
+/// `check_digest` stands for a script that could not be read.
+pub fn pair_definition_digest(
+    queue: &Queue,
+    automation: &Automation,
+    check_digest: &str,
+) -> String {
+    script_digest(
+        format!(
+            "{}\n{}\n{check_digest}",
+            queue.definition_digest, automation.definition_digest
+        )
+        .as_bytes(),
+    )
 }
 
 /// One catalogue file that could not be used, and why.
@@ -373,13 +397,17 @@ impl AutomationCatalog {
             return Err(self.problem(dir, format!("invalid automation name: {reason}")));
         }
         let file = dir.join(AUTOMATION_FILE);
-        let parsed: AutomationFile = match std::fs::read_to_string(&file) {
-            Ok(text) => serde_yaml::from_str(&text).map_err(|error| self.problem(&file, error))?,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Err(self.problem(&file, "missing: every automation needs one"))
-            }
-            Err(error) => return Err(self.problem(&file, error)),
-        };
+        let (parsed, definition_digest): (AutomationFile, String) =
+            match std::fs::read_to_string(&file) {
+                Ok(text) => (
+                    serde_yaml::from_str(&text).map_err(|error| self.problem(&file, error))?,
+                    script_digest(text.as_bytes()),
+                ),
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    return Err(self.problem(&file, "missing: every automation needs one"))
+                }
+                Err(error) => return Err(self.problem(&file, error)),
+            };
         let params =
             validate_params(parsed.params).map_err(|reason| self.problem(&file, reason))?;
         let secrets =
@@ -416,6 +444,7 @@ impl AutomationCatalog {
             params,
             secrets,
             scripts,
+            definition_digest,
         })
     }
 
@@ -469,6 +498,7 @@ impl AutomationCatalog {
             schedule,
             condition,
             tasks,
+            definition_digest: script_digest(text.as_bytes()),
         })
     }
 

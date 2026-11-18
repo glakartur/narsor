@@ -99,7 +99,8 @@ pub fn time_text(at: DateTime<Utc>) -> String {
 }
 
 /// Whether the (queue, automation) pair is stopped: it runs again only
-/// when its `check` script changes in the catalogue.
+/// when its queue file, `automation.yaml` or `check` script changes in the
+/// catalogue.
 fn stopped(view: &QueueAutomationView) -> bool {
     matches!(view.state.as_str(), "needs_attention" | "error")
 }
@@ -156,7 +157,7 @@ fn automation_description(view: &QueueAutomationView) -> Vec<String> {
     lines.push(format!("state: {}", one_line(&view.state)));
     if stopped(view) {
         lines.push(format!(
-            "{PROBLEM_MARK} stopped: it runs again when its check script changes in the catalogue"
+            "{PROBLEM_MARK} stopped: it runs again when its queue file, automation.yaml or check script changes"
         ));
     }
     if let Some(next) = view.next_run_at {

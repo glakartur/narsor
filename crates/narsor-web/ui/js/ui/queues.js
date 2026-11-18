@@ -3,7 +3,8 @@
 // of queues with their counts and the catalogue files that did not load; a
 // queue page with its automations (scripts, state, last run, recent errors),
 // its entries and the problems of its file. A stopped automation runs again
-// when its `check` script changes in the catalogue.
+// when its queue file, `automation.yaml` or `check` script changes in the
+// catalogue.
 
 import { html, useEffect, useRef, useState } from '../lib.js';
 import { shortId } from '../model.js';
@@ -168,7 +169,7 @@ function AutomationCard({ automation }) {
       ${automation.consecutive_failures > 0 && html`<dt>porażki z rzędu</dt><dd class="role-problem">${automation.consecutive_failures}</dd>`}
     </dl>
     ${automation.worker_missing && html`<p class="role-attention small-text">przebieg czeka na workera dłużej niż jeden interwał — czy narsor-observer-worker działa?</p>`}
-    ${state.stopped && html`<p class="role-attention small-text">zatrzymana — ruszy ponownie, gdy skrypt <code>check</code> zmieni się w katalogu</p>`}
+    ${state.stopped && html`<p class="role-attention small-text">zatrzymana — ruszy ponownie, gdy w katalogu zmieni się plik kolejki, <code>automation.yaml</code> lub skrypt <code>check</code></p>`}
     ${errors.length > 0 && html`<details class="cli-settings">
       <summary>ostatnie błędy (${errors.length})</summary>
       ${errors.map((error) => html`<div key=${error.run_id}>

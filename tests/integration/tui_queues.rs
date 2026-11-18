@@ -283,7 +283,7 @@ fn an_automation_description_shows_its_runtime_state_and_read_only_settings() {
     assert_shows(
         &screen,
         &[
-            "stopped: it runs again when its check script changes",
+            "stopped: it runs again when its queue file",
             "failed runs in a row: 5 (backoff)",
             "a due run waits for a worker",
             "#4 check: failed, exit 3",

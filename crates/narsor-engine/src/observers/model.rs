@@ -594,10 +594,10 @@ pub enum AutomationState {
     #[default]
     Active,
     /// A run went over the queue's task limit (R15): stopped until the
-    /// automation's `check` script changes.
+    /// pair's catalogue definition changes.
     NeedsAttention,
-    /// Too many runs in a row failed (R16): stopped until the automation's
-    /// `check` script changes.
+    /// Too many runs in a row failed (R16): stopped until the pair's
+    /// catalogue definition changes.
     Error,
     /// A state from a newer build. Never written by this one.
     #[serde(other)]
@@ -605,7 +605,7 @@ pub enum AutomationState {
 }
 
 impl AutomationState {
-    /// Whether the pair waits for a change of its `check` script.
+    /// Whether the pair waits for a change of its catalogue definition.
     pub fn is_stopped(self) -> bool {
         matches!(self, Self::NeedsAttention | Self::Error)
     }
@@ -638,6 +638,10 @@ pub struct ActiveRun {
     /// `sha256:` digest of the script text it runs, as the catalogue held
     /// it at the claim.
     pub script_digest: String,
+    /// The fingerprint of the pair's definition at the claim: what the
+    /// pair stops with when this run stops it.
+    #[serde(default)]
+    pub definition_digest: String,
     /// When a worker claimed it.
     pub claimed_at: DateTime<Utc>,
     /// No result by then: the run is lost and its token stops working.
@@ -700,11 +704,12 @@ pub struct AutomationRecord {
     /// Where it stands.
     #[serde(default)]
     pub state: AutomationState,
-    /// The digest of the `check` script when the pair stopped
-    /// (`needs_attention`, `error`): a new script puts it back on its
-    /// schedule.
+    /// The fingerprint of the pair's definition when it stopped
+    /// (`needs_attention`, `error`): the queue file, `automation.yaml` and
+    /// the `check` script ([`crate::automations::pair_definition_digest`]).
+    /// A change of any of them puts it back on its schedule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stopped_script_digest: Option<String>,
+    pub stopped_definition_digest: Option<String>,
     /// The state the last successful run returned, handed to the next one.
     #[serde(default)]
     pub script_state: Option<serde_json::Value>,
@@ -754,7 +759,7 @@ impl AutomationRecord {
             updated_at: None,
             revision: 0,
             state: AutomationState::Active,
-            stopped_script_digest: None,
+            stopped_definition_digest: None,
             script_state: None,
             first_run_done: false,
             next_run_at: None,

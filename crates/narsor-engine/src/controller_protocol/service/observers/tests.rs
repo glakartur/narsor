@@ -563,32 +563,95 @@ fn a_script_unreadable_at_the_claim_is_a_failed_run_with_a_clear_error() {
 }
 
 #[test]
-fn five_failures_stop_the_pair_until_its_check_script_changes() {
-    // R16: no resume route; a new script is what puts it back.
+fn five_failures_stop_the_pair_until_its_catalogue_definition_changes() {
+    // R16: no resume route; a change of the queue file, `automation.yaml`
+    // or `check.sh` puts the pair back.
+    let changes: [(&str, &str); 3] = [
+        (
+            "queues/jira-intake.yaml",
+            "automations: [jira-new]\nmode: always\nschedule: {interval_secs: 600}\n",
+        ),
+        (
+            "automations/jira-new/automation.yaml",
+            "description: fixed\nsecrets:\n  - {name: jira-token, env: JIRA_TOKEN}\n",
+        ),
+        (
+            "automations/jira-new/check.sh",
+            "echo '{\"state\": {}}' # fixed\n",
+        ),
+    ];
+    for (file, text) in changes {
+        let fx = Fixture::new();
+        fx.queue("jira-intake", "jira-new", ObserverMode::Always);
+        let pair = key("jira-intake", "jira-new");
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            fx.service.observer_pass();
+            let run = fx.claim().expect("a due run");
+            fx.finish(&run, exited(1, ""));
+            fx.advance(MAX_RETRY_DELAY_SECS as i64);
+        }
+        assert_eq!(fx.record(&pair).state, AutomationState::Error, "{file}");
+        assert!(fx.service.observer_pass().restarted.is_empty(), "{file}");
+        assert!(fx.claim().is_none(), "{file}");
+
+        fx.write(file, text);
+        let pass = fx.service.observer_pass();
+
+        assert_eq!(pass.restarted, vec![pair.clone()], "{file}");
+        let record = fx.record(&pair);
+        assert_eq!(record.state, AutomationState::Active, "{file}");
+        assert_eq!(record.consecutive_failures, 0, "{file}");
+        fx.service.observer_pass();
+        assert!(fx.claim().is_some(), "{file}");
+    }
+}
+
+#[test]
+fn a_pair_over_its_task_limit_runs_again_after_the_limit_is_raised() {
+    // R15: `needs_attention` until the queue file changes.
     let fx = Fixture::new();
     fx.queue("jira-intake", "jira-new", ObserverMode::Always);
     let pair = key("jira-intake", "jira-new");
-    for _ in 0..MAX_CONSECUTIVE_FAILURES {
-        fx.service.observer_pass();
-        let run = fx.claim().expect("a due run");
-        fx.finish(&run, exited(1, ""));
-        fx.advance(MAX_RETRY_DELAY_SECS as i64);
+    fx.service.observer_pass();
+    let run = fx.claim().unwrap();
+    {
+        // This resolver launches nothing, so the one task the limit allows
+        // is counted by hand.
+        let lock = fx.service.observers().lock(&pair).unwrap();
+        let mut record = fx.record(&pair);
+        record.active_run.as_mut().unwrap().tasks_created = 1;
+        fx.service
+            .observers()
+            .save(&lock, &mut record, fx.now())
+            .unwrap();
     }
-    assert_eq!(fx.record(&pair).state, AutomationState::Error);
-    fx.service.observer_pass();
-    assert!(fx.claim().is_none());
+    let refused = fx
+        .service
+        .observer_create_task(
+            &run.run_id,
+            crate::controller_protocol::wire::ObserverCreateTaskRequest {
+                data: json!({"key": "ABC-2"}),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        refused,
+        ProtocolError::Conflict {
+            code: "observer_task_limit",
+            ..
+        }
+    ));
+    fx.finish(&run, exited(0, r#"{"state": {}}"#));
+    assert_eq!(fx.record(&pair).state, AutomationState::NeedsAttention);
+    assert!(fx.service.observer_pass().restarted.is_empty());
 
-    fx.write(
-        "automations/jira-new/check.sh",
-        "echo '{\"state\": {}}' # fixed\n",
-    );
-    let pass = fx.service.observer_pass();
-    assert_eq!(pass.restarted, vec![pair.clone()]);
-    let record = fx.record(&pair);
-    assert_eq!(record.state, AutomationState::Active);
-    assert_eq!(record.consecutive_failures, 0);
-    fx.service.observer_pass();
-    assert!(fx.claim().is_some());
+    let raised = std::fs::read_to_string(fx.catalog().join("queues/jira-intake.yaml"))
+        .unwrap()
+        .replace("task_limit_per_run: 1", "task_limit_per_run: 5");
+    fx.write("queues/jira-intake.yaml", &raised);
+
+    assert_eq!(fx.service.observer_pass().restarted, vec![pair.clone()]);
+    assert_eq!(fx.record(&pair).state, AutomationState::Active);
 }
 
 #[test]

@@ -66,6 +66,7 @@ fn active_run(sequence: u64) -> ActiveRun {
         sequence,
         phase: HookPhase::Check,
         script_digest: "sha256:0123".into(),
+        definition_digest: "sha256:4567".into(),
         claimed_at: now(),
         deadline: now() + Duration::seconds(360),
         token_digest: "sha256:abc".into(),

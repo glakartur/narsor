@@ -282,7 +282,8 @@ const AUTOMATION_STATE = {
 
 /**
  * The state of an automation as `{text, role, stopped}`. A stopped one runs
- * again when its `check` script changes in the catalogue.
+ * again when its queue file, `automation.yaml` or `check` script changes in
+ * the catalogue.
  */
 export function automationState(state) {
   return AUTOMATION_STATE[state] ?? { text: String(state ?? '?'), role: 'done', stopped: false };
