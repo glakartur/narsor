@@ -264,6 +264,7 @@ itself. It goes on by a comment (agent), *Uruchom od nowa* (script step) or
 | `R` | repositories: `a` registers, `d` removes (`!`) | `narsor-cli task repo list` / `add` / `remove` (the same registry on any server; `narsor-cli repo …` is the local one) |
 | `h` | the installation's default agent harness: choose one, or go back to the configured one | `narsor-cli harness default set <harness>` / `reset` (`narsor-cli harness default` shows it) |
 | `L` | the limit of tasks processed at once: one more or one less, until the daemon restarts (then `max_concurrent_tasks` applies again) | `max_concurrent_tasks` in the configuration |
+| `O` | observer queues: the queues with their entries; in a queue its observers and the tasks that wait on it. `a` creates an observer, `e` edits its queue, mode and schedule, `s` edits the script (`$EDITOR`, or a paste field), `v` shows the newest version and approves it, `p` / `r` pause and resume, `d` deletes (`!`). A task with a queue entry has one mark on its row. See [Observers](observers.md#8-queue-views) | `narsor-cli observer queue list` / `show`, `observer create` / `update` / `script set` / `script show` / `approve` / `pause` / `resume` / `delete` |
 | the header | what the connection offers | `narsor-cli task capabilities` |
 
 **A forced jump** (the panel's *Przejście ręczne*, with a reason) leaves the declared exits of the step and goes

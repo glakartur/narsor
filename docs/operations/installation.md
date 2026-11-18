@@ -244,7 +244,8 @@ on a schedule. The control plane keeps the schedule; a worker process,
 `narsor-observer-worker`, claims the runs that are due, runs their
 scripts and reports the results. The server starts the worker and
 supervises it. How to write an observer and its script is in
-[Observers](../user/observers.md).
+[Observers](../user/observers.md). Before an update from watch lists to
+observer queues, read [Updates](updates.md#update-to-observer-queues-d77).
 
 **Enable the worker.** The worker is off by default. Set these settings in
 the server's configuration file (or as `NARSOR_<NAME>` environment
@@ -274,7 +275,7 @@ worker's requests too.
 
 The server finds `narsor-observer-worker` in its own directory, as it finds
 `narsor-controller`. Scripts call `narsor-cli` for their effects (task
-create, event delivery), from the same directory: on a `server` install add
+create, `task decide`), from the same directory: on a `server` install add
 `--with-frontend`, or copy `narsor-cli` next to `narsor-server`. The worker runs as the server's user. When it stops,
 the server starts it again after a pause that doubles up to 30 seconds. When
 the server stops, it stops the worker first. A run that the worker did not

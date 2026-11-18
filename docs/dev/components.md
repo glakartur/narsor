@@ -122,7 +122,7 @@ graph TD
   obs -- "runs" --> script[observer script]
   script -. "polls" .-> ext([Jira / GitHub / GitLab])
   script -- "calls" --> cli2[narsor-cli]
-  cli2 -. "/observer/v1/runs: tasks, events" .-> server
+  cli2 -. "/observer/v1/runs: tasks, decide" .-> server
 ```
 
 | From | To | Kind | Channel |
@@ -138,7 +138,7 @@ graph TD
 | `narsor-runner` | `narsor-server` | Poll, renew, snapshots, usage, materials | HTTP, `/runner/v1` |
 | `narsor-runner` | agent harness, scripts, git | Execute workflow actions | process (`engine/src/engine/actions/`) |
 | `narsor-observer-worker` | `narsor-server` | Claim due runs, report results | HTTP, `/observer/v1/worker` |
-| Observer script | `narsor-cli` → `narsor-server` | Create tasks, deliver events to waiting tasks | process, then HTTP `/observer/v1/runs` |
+| Observer script | `narsor-cli` → `narsor-server` | Create tasks (`task create --data`); answer the decision gate of its queue entry (`task decide`, `POST /observer/v1/runs/{run}/decide`) | process, then HTTP `/observer/v1/runs` |
 
 Properties of the runtime:
 
@@ -148,6 +148,13 @@ Properties of the runtime:
 - The `local` backend works like the `kubernetes` backend: its controller is
   a separate process that enrolls through the same `/controller/v1`
   protocol.
+- Observer queues live in the control plane only (`narsor-engine`,
+  `observers/` and `controller_protocol/service/observers/`). A runner
+  reports the rendered `watch` of a waiting `decision` gate in its snapshot
+  (`gate_watch`). The control plane keeps one queue entry per wait episode
+  in `{state}/observer-queues/entries/` and removes it when the gate exits.
+  A runner gets an observer's answer as a queued input, as a person's
+  answer. The runner protocol has no event delivery (D77).
 - Only `narsor-runner` executes workflows. The daemon drives no execution:
   its `/executions` routes read what runners keep and hand answers to the
   task of the execution.

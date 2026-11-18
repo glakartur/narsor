@@ -6,19 +6,21 @@ things in Narsor:
 
 - **create a task** for each new object that matches its condition (for
   example, a new Jira issue); or
-- **deliver an event** to a task that waits for it (for example, the
-  approval of a merge request that a `wait` step waits for).
+- **answer a decision gate** of a task that waits on its queue (for
+  example, choose `check_feedback` when the reviewer of a merge request is
+  done).
 
 Narsor has no built-in client for Jira, GitHub or GitLab. A shell script that
 you write and approve talks to the source. Narsor keeps the schedule,
-limits the effects of each run and records where each task came from. The
-script remembers in its state what it already reported (section 3).
+limits the effects of each run and records where each task and each answer
+came from. A script that creates tasks remembers in its state what it
+already reported (section 4).
 
 This page tells you how to write an observer and its script. The commands
 are in [the CLI reference](cli.md#observer). How the server starts the worker is
 in [installation](../operations/installation.md#run-the-observer-worker). The
-`wait` step and its `watch` block are in
-[the workflow schema](../dev/workflow-schema.md) (§3.3.D, WaitAction).
+`watch` block of a `decision` gate is in
+[the workflow schema](../dev/workflow-schema.md) (§3.3.D).
 
 > **Run only scripts that you trust.** In this release the worker runs a
 > script as a separate system user on the worker's host, with the secrets of
@@ -30,51 +32,76 @@ in [installation](../operations/installation.md#run-the-observer-worker). The
 ```text
 control plane                      worker                       script
 -------------                      ------                       ------
-the run is due  ───────────────▶  claims the run
+a tick of the schedule ────────▶  claims the run
                                    (worker key)
                                    starts `sh` with the input
                                    on stdin and the run token  ─▶ reads the source
                                                                   narsor-cli task create …
-              ◀────────────────────────────────────────────────── narsor-cli task event …
+              ◀────────────────────────────────────────────────── narsor-cli task decide …
                                    reads the exit code,        ◀─ prints {"state": …}
                                    stdout and stderr              (only to create tasks)
 saves the state ◀───────────────  reports the result
-or the entry,                      (secrets masked)
-or records an error
+or records an error                (secrets masked)
 ```
 
-1. The control plane keeps the schedule. When the next run of an active
-   observer is due, the run waits for a worker. Each observer has at most
-   one run at a time. An observer with a watch list runs its script one
-   time for each watch entry: one run checks one entry (section 5).
+1. The control plane keeps the schedule. When a tick of an active observer
+   comes, the run waits for a worker. Each observer has at most one run at
+   a time. An observer in mode `on_episodes` runs its script one time for
+   each entry of its queue: one run checks one entry (section 6).
 2. The worker (`narsor-observer-worker`, which the server starts) claims
    the run. It gets a token that is valid only for this run and only until
    the run's deadline.
 3. The worker starts the approved script version with a clean environment.
    The script reads its input on stdin.
 4. The script reads the source and makes its effects with `narsor-cli task
-   create` and `narsor-cli task event`. These commands use the run token.
+   create` and `narsor-cli task decide`. These commands use the run token.
 5. The worker reports the exit code, stdout and stderr. For an observer
    that creates tasks, the script prints its new state on stdout, and a
-   successful run saves it. For an observer with a watch list, the exit
-   code tells whether the entry is done (section 3).
+   successful run saves it. For an observer that checks queue entries, the
+   exit code tells whether the run had an error (section 4).
 
-## 2. Make an observer
+## 2. Queues and run modes
 
-The owner of the installation does all the steps through the CLI. A task
-cannot save or approve a script.
+Each observer serves one **queue**. A queue is a name in your namespace,
+not an object of its own: it is the set of your observers that name it,
+and the entries that wait on it. Several observers can serve one queue (for
+example, one for GitLab and one for GitHub). An observer of another owner
+never sees your entries.
+
+Each observer has a **run mode**:
+
+| Mode | When the script runs | Input |
+|---|---|---|
+| `on_episodes` | Only when its queue has entries: one run for each entry. No entry, no run. | One entry in `entry` |
+| `always` | On each tick of its schedule, also when no task waits. | No `entry` |
+
+All observers of one queue have the same mode. Narsor refuses a create or
+an update that mixes the modes of a queue, and names the mode of the queue.
+Only an `on_episodes` observer can answer a gate. Use `always` for a source
+observer that creates tasks (for example, from Jira).
+
+An entry comes from a workflow: a `decision` step with `by: human` and a
+`watch` block adds one entry for each wait episode of the gate. See
+[the workflow schema](../dev/workflow-schema.md) (§3.3.D) and section 5
+(Answer a gate).
+
+## 3. Make an observer
+
+The owner of the installation does all the steps through the CLI, the TUI
+or the WebUI (section 8). A task cannot save or approve a script.
 
 1. **Write the script.** Start from an example in
    [`workflows/observers/examples/`](../../workflows/observers/examples/):
 
-   | Example | Source | Effect |
-   |---|---|---|
-   | `jira-new-issues.sh` | Jira search (JQL) | A task for each new issue |
-   | `github-pr-review.sh` | GitHub pull requests on the watch list | `review.approved`, `review.changes_requested`, `merged`, `closed` |
-   | `gitlab-mr-review.sh` | GitLab merge requests on the watch list | The same event types |
+   | Example | Source | Mode | Effect |
+   |---|---|---|---|
+   | `jira-new-issues.sh` | Jira search (JQL) | `always` | A task for each new issue |
+   | `github-pr-review.sh` | GitHub pull requests of the queue entries | `on_episodes` | Answers the gate when the review label is removed |
+   | `gitlab-mr-review.sh` | GitLab merge requests of the queue entries | `on_episodes` | The same |
 
    The header of each example gives the `observer create` command, the
-   condition, the secrets and how to test it with a fake source.
+   condition, the gate params, the secrets and how to test it with a fake
+   source.
 
    An agent can help you write the script outside Narsor: give it this
    page and the examples. The script is not part of a workflow.
@@ -84,10 +111,22 @@ cannot save or approve a script.
 
    ```sh
    narsor-cli observer create jira-new --source jira \
+     --queue jira-intake --mode always --cron '*/10 * * * *' \
      --workflow triage --map ticket=key \
      --secret jira-token=JIRA_TOKEN --task-limit 10 \
      --condition '{"base_url": "https://jira.example.com", "jql": "project = ABC", "fields": ["key"]}'
    ```
+
+   ```sh
+   narsor-cli observer create gitlab-mr --source gitlab.example.com \
+     --queue mr-review --mode on_episodes --cron '*/5 * * * *' \
+     --secret gitlab-token=GITLAB_TOKEN \
+     --condition '{"host": "gitlab.example.com"}'
+   ```
+
+   Without `--queue`, the queue is the name of the observer. Without
+   `--mode`, the mode is `always` with `--workflow` and `on_episodes`
+   without it.
 
 3. **Save the script.** Each save makes a new version that does not
    change. A save never approves a version:
@@ -96,49 +135,62 @@ cannot save or approve a script.
    narsor-cli observer script set jira-new --file jira-new-issues.sh
    ```
 
-4. **Test it** with a fake source before you approve it (section 9).
+4. **Test it** with a fake source before you approve it (section 12).
    Narsor has no dry run: the first run of an approved version uses the
    real source and has real effects.
 
-5. **Approve it.** The schedule runs only the approved version:
+5. **Read and approve it.** The schedule runs only the approved version:
 
    ```sh
+   narsor-cli observer script show jira-new
    narsor-cli observer approve jira-new --version 1
    ```
 
 When you save version 2 of an active observer, the schedule continues to
-run version 1 until you approve version 2.
+run version 1 until you approve version 2. The views mark the observer
+until then (`version 2 not approved`).
 
-## 3. The script contract
+To change the queue, the mode or the schedule later, use `observer update`
+(section 7).
+
+## 4. The script contract
 
 The script is a POSIX `sh` script. It can use `curl`, `jq`, `narsor-cli` and
 the tools of a base system.
 
 There are two kinds of scripts:
 
-- A script that **creates tasks** (an observer without a watch list, for
-  example `jira-new-issues.sh`) reads the source one time for each run. It
-  prints its state on stdout, and the next run gets it back.
-- A script that **delivers events** (an observer with a watch list, for
-  example `github-pr-review.sh`) checks one watch entry in each run. It
-  prints nothing on stdout. Its exit code tells Narsor what to do with the
-  entry.
+- A script that **creates tasks** (mode `always`, for example
+  `jira-new-issues.sh`) reads the source one time for each run. It prints
+  its state on stdout, and the next run gets it back.
+- A script that **answers gates** (mode `on_episodes`, for example
+  `github-pr-review.sh`) checks one queue entry in each run. It prints
+  nothing on stdout. When it finds an answer, it calls `narsor-cli task
+  decide`.
 
 ### Input (stdin)
 
-One JSON document (contract version 1):
+One JSON document (contract version 2):
 
 ```json
 {
-  "contract_version": 1,
-  "observer": {"id": "obs-…", "name": "pr-review", "source": "github.com"},
+  "contract_version": 2,
+  "observer": {"id": "obs-…", "name": "github-pr", "source": "github.com"},
   "condition": {"host": "github.com"},
   "state": null,
-  "watch": {
-    "object": "https://github.com/acme/app/pull/17",
+  "entry": {
     "task_id": "…",
-    "event_types": ["review.approved", "merged"],
-    "wait_episode": "…"
+    "episode": "…",
+    "episode_started_at": "2026-11-17T10:00:00Z",
+    "step": "review_work",
+    "params": {"mr_url": "https://github.com/acme/app/pull/17", "label": "narsor-review"},
+    "choices": [
+      {"name": "check_feedback", "description": "The review is done.", "requires_variables": []},
+      {"name": "revise_plan", "description": null, "requires_variables": ["note"]}
+    ],
+    "variables": [
+      {"name": "note", "type": "text", "description": "What to change in the plan."}
+    ]
   },
   "first_run": false,
   "import_backlog": false
@@ -147,13 +199,23 @@ One JSON document (contract version 1):
 
 | Field | Meaning |
 |---|---|
-| `contract_version` | `1`. Stop with an error when it has a different value. |
+| `contract_version` | `2`. Stop with an error when it has a different value. |
 | `observer` | The id, name and source of the observer. |
 | `condition` | The JSON object of `--condition`, as the owner gave it. |
-| `state` | What the last successful run printed in `state`. `null` before the first successful run, and always `null` for an observer with a watch list. |
-| `watch` | The one watch entry that this run checks (only for an observer with a watch list), else `null`. `wait_episode` is the id of the `wait` episode of the task, or `null` when the task does not wait now. |
+| `state` | What the last successful run printed in `state`. `null` before the first successful run, and always `null` for an `on_episodes` observer. |
+| `entry` | The one queue entry that this run checks. Only for an `on_episodes` observer; an `always` observer gets no `entry` field. |
+| `entry.task_id`, `entry.episode` | The task that waits and its wait episode. An answer names both. |
+| `entry.episode_started_at` | When the control plane added the entry. Whether and how the script uses it is up to the script. The example scripts answer only when the merge request changed after this time. |
+| `entry.step` | The workflow state of the gate. |
+| `entry.params` | The rendered `watch.params` of the gate, as text. Narsor does not check them: the script must check each value before it uses it. |
+| `entry.choices` | The choices of the gate, in the workflow's order: name, description, and the variables that an answer with this choice must give. |
+| `entry.variables` | The variables that an answer may give: name, type, description and, when the workflow restricts them, `options`. |
 | `first_run` | `true` until the first run succeeds. |
 | `import_backlog` | `true` when the owner gave `--import-backlog`. |
+
+Version 1 had a `watch` object and the exit code `1` ("check again"). Both
+are removed: a script of version 1 must be changed before it runs again
+(section 10).
 
 ### Result of a script that creates tasks
 
@@ -191,18 +253,24 @@ that it does not create a task on each run.
 > error is then recorded and counted, and a refusal that does not go away
 > brings the observer to `error` after 5 failed runs in a row.
 
-### Result of a script that delivers events
+### Result of a script that answers gates
 
 The exit code is the result. Narsor does not read stdout.
 
 | Exit code | Meaning | Narsor |
 |---|---|---|
-| `0` | Done. For example, the event went to the waiting step of the task, or the pull request is merged or closed. | Removes the watch entry. |
-| `1` | Check the entry again. For example, there is no review yet, or the task does not wait for this event. | Keeps the entry. The next run checks it again. |
-| any other code, or the script runs for longer than its time limit | An error. | Records the error and keeps the entry. The next run checks it again. A new error of the same object replaces the old one. |
+| `0` | The run is done: the script answered the gate, or it has nothing to answer in this run. | Records the time of the run for the entry. |
+| any other code, or the script runs for longer than its time limit | An error. | Records the error for the entry. A new error of the same entry replaces the old one. |
 
-An error of a watch entry is not counted as a failure: the observer does
-not wait longer and does not go to `error`.
+No exit code removes an entry. The entry stays on its queue until its gate
+exits, and the next round checks it again. An error of an entry is not
+counted as a failure: the observer does not wait longer and does not go to
+`error`.
+
+When several observers serve one queue, each script must recognize its own
+entries. A script that does not recognize an entry (for example, the URL is
+on another host) exits with `0` and gives no answer. It must not use its
+token for that entry.
 
 ### Limits
 
@@ -212,11 +280,11 @@ not wait longer and does not go to `error`.
 | stdout | 1 MiB |
 | stderr | 64 KiB (Narsor keeps the start) |
 | Data of one task (`--data`) | 64 KiB |
-| Data of one event (`--data`) | 16 KiB |
+| Params of one entry | 64 params, 16 KiB together |
 | Tasks of one run | `--task-limit` (10 by default, 1000 at most) |
-| Time between runs | `--interval` (300 s by default, 60 s at least) |
+| Schedule | `--interval` (300 s by default, 60 s at least, 30 days at most) or `--cron` (section 6) |
 
-## 4. Effects
+## 5. Effects
 
 The worker gives the script the variables `NARSOR_SERVER`, `NARSOR_TOKEN`
 (the run token) and `NARSOR_OBSERVER_RUN`. With them, two `narsor-cli`
@@ -230,7 +298,7 @@ narsor-cli task create --data "$JSON" </dev/null >&2
 ```
 
 - **A new task on each call.** Narsor does not check whether the object
-  already has a task. The script decides that from its state (section 3).
+  already has a task. The script decides that from its state (section 4).
 - **The observer decides the task.** The workflow, the repositories, the
   backend and the profile come from the observer, not from the script. The
   data has only the fields that the observer maps to workflow inputs
@@ -242,73 +310,86 @@ narsor-cli task create --data "$JSON" </dev/null >&2
 - **Origin.** Each task from an observer has the observer's owner, and it
   records the observer and the run.
 
-### Deliver an event
+### Answer a gate
 
 ```sh
-narsor-cli task event "$TASK_ID" --type review.approved --data "$JSON" </dev/null >&2
+narsor-cli task decide "$TASK_ID" --episode "$EPISODE" \
+  --choice check_feedback --reason "the label was removed" </dev/null >&2
 ```
 
-- The task must be on the watch list of this observer.
-- Narsor writes the event to the history of the task.
-- For Narsor, an event that the task waits for is the same as the owner's
-  choice of a way out of a step. The event ends a `wait` step only when the
-  task waits now, the type is the `event_type` of the step and the data
-  passes its filter. Narsor keeps the event in the task and resumes the
-  task. When the runner of the task does not run at that time, the event
-  waits on the server, and the runner takes it when it runs again. An event
-  that comes before the task waits stays only in the history.
-- **Send an event only when the task waits.** When `wait_episode` is
-  `null`, the task does not wait: do not send the event.
-- **End the entry after the event.** `narsor-cli task event` prints
-  `delivered …` when the event went to the waiting step, and `recorded …`
-  when the server only wrote it to the history. The example scripts exit
-  with `0` only after `delivered`, so that Narsor removes the entry and a
-  task gets one event for each wait. After `recorded` they exit with `1`,
-  and the next run checks the entry again. When the task waits again (a
-  review loop), its `wait` step adds the object to the watch list again.
+or, with the whole answer as JSON (the same object as the answer of a
+`script` step, without artifacts):
 
-## 5. Watch entries (pull and merge requests)
+```sh
+narsor-cli task decide "$TASK_ID" --episode "$EPISODE" \
+  --data '{"choice": "revise_plan", "reason": "…", "variables": {"note": "…"}}' </dev/null >&2
+```
 
-An observer created with `--deliver-events` (or `--watch-list`) looks only
-at the objects on its watch list. When the list is empty, the observer does
-not run.
+| Option | Meaning |
+|---|---|
+| `--choice CHOICE` | The name of a choice of the gate. |
+| `--reason TEXT` | Why the script chose it. The task history shows it. |
+| `--var NAME=VALUE` | A variable of the gate, as text (repeatable). |
+| `--var-file NAME=PATH` | A variable of the gate whose value is the text of a file (repeatable). |
+| `--data JSON` | The whole answer, `{"choice", "reason", "variables"}`. Not together with the options above. |
 
-When the run of the observer is due, Narsor starts a round: one run for
-each entry on the list, one after the other. Each run gets one entry in
-`watch`. The next round starts one interval after the last run of the
-round. An entry that is added during a round waits for the next round.
+- **Only from a run.** The run must be the run of an `on_episodes`
+  observer, and `TASK_ID` and `EPISODE` must be the `task_id` and the
+  `episode` of the entry of this run.
+- **The same checks as for a person.** Narsor refuses the answer when the
+  task does not wait in this episode now, when the choice is not a choice of
+  the gate, when a variable that the choice requires has no value, or when
+  a variable is not declared by the gate. The command then exits with `1`.
+- **The first answer wins.** The first answer of an episode, from a person
+  or from a script, exits the gate. A later answer for the same episode is
+  refused. A retry of the same answer in the same run gets the input that
+  the first call queued.
+- **A paused task.** The answer waits in the task, and the task resumes, as
+  for an answer of a person.
+- **Who answered.** The task history shows the observer and its run, and
+  the reason of the script.
+- **What the command prints.** `answered STEP of task TASK with CHOICE
+  (input ID); the gate exits with it unless another answer came first`.
+  The answer is queued, not yet applied by the runner. The script cannot
+  know at once that it won. This is safe: the episode protects the gate.
+- **No artifacts.** An answer has a choice, a reason and variables only.
 
-An entry is added in one of two ways:
+## 6. Schedule
 
-- **From a workflow.** A `wait` step with a `watch` block adds an entry when
-  the step starts to wait. See
-  [the workflow schema](../dev/workflow-schema.md) (§3.3.D).
-- **By the owner.** `narsor-cli observer watch add OBSERVER --task TASK_ID
-  --object URL --events TYPE[,TYPE…]`.
+The schedule is a property of the observer. It is one of:
 
-An object must start with one of the observer's `--allow-prefix` values and
-must not be longer than `--max-object-len`. A URL prefix includes the host,
-so that a task cannot send the token of the source to a different host. The
-example scripts also check the host before they use the token.
+- **an interval**: `--interval SECONDS`, from 60 seconds to 30 days. When
+  you give no schedule, the interval is 300 seconds;
+- **a cron expression**: `--cron 'EXPRESSION'`, five fields (minute, hour,
+  day of the month, month, day of the week), in UTC. For example,
+  `*/10 * * * *` runs at :00, :10, :20 … and `0 8 * * 1-5` runs at 08:00
+  UTC on each working day.
 
-An entry goes away when the script ends with exit code `0` for it, when
-the task is finished or archived, or when the owner removes it
-(`observer watch remove`).
+Exactly one of the two is set. Narsor refuses a cron expression with a
+seconds field (six fields), an alias (`@daily`), an expression that never
+fires, and an expression that can fire more often than every 60 seconds.
 
-> **A pull request that comes back to the list.** When a task waits again
-> for the same pull or merge request, the old review in the source can
-> still match, and the script would send the same event at once. To prevent
-> this, mark the pull request before it goes back to the watch list (for
-> example, with a label that the script looks for). This is not part of the
-> example scripts: do it in your workflow or in your script.
+- **A tick.** The next tick counts from the last tick, not from the end of
+  the last run.
+- **One run at a time.** A tick that finds the previous run still active,
+  or a round of entries that is not finished, is skipped. It is not queued.
+- **Rounds of `on_episodes`.** At a tick, the observer takes the entries
+  that are on its queue at that time. It runs one time for each entry, one
+  after the other. An entry that is added during a round waits for the next
+  round. No entries at a tick: no run, no error.
+- **Before each run of an entry**, Narsor checks that the task still waits
+  in the episode of the entry. When it does not, Narsor removes the entry
+  and does not run the script.
+- **Restarts.** After the control plane was stopped, an observer runs one
+  time, not one time for each tick that it missed.
 
-## 6. Schedule, failures and states
+## 7. States, failures and changes
 
 | State | Meaning |
 |---|---|
 | `draft` | No version is approved. Nothing runs. |
 | `active` | Runs on its schedule. |
-| `paused` | The owner stopped it (`observer pause`). |
+| `paused` | The owner stopped it (`observer pause`), or the update to queues paused it (section 10). |
 | `needs_attention` | A run went over its task limit. It waits for the owner. |
 | `error` | 5 runs in a row failed. It waits for the owner. |
 
@@ -316,27 +397,67 @@ the task is finished or archived, or when the owner removes it
 back on its schedule and sets the failure count to 0. `observer approve`
 makes a `draft` observer `active`. It does not change other states.
 
+`observer update OBSERVER [--queue QUEUE] [--mode MODE] [--interval
+SECONDS | --cron EXPRESSION]` changes the queue, the mode or the schedule.
+What you do not give stays. The mode must be the mode of the other
+observers of the queue that the observer then serves.
+
 - **Failures.** After a failed run of an observer that creates tasks, the
   next run comes after the interval times 2 for each failure in a row
-  (2, 4, 8 …), at most 1 hour (or the interval, when it is longer). An
-  error of a watch entry is not counted: the next round checks the entry
-  again.
+  (2, 4, 8 …), at most 1 hour (or the interval, when it is longer). With a
+  cron schedule, the run comes at the first fire time after that wait. An
+  error of an entry is not counted.
 - **Errors.** Narsor keeps a record only of a run that failed or was lost:
   the reason, the exit code, and stdout and stderr (masked). It keeps the
-  20 newest records of each observer, and only the newest record of each
-  watched object. `observer show` shows them, with the object of a watch
-  run. A
-  successful run changes only the state and the time of the last run.
+  20 newest records of each observer, and the newest record of each entry.
+  `observer show` shows them, with the entry of an entry run. A successful
+  run changes only the state and the time of the last run.
 - **Lost runs.** When a worker does not report a run before its deadline
   (the time limit plus 1 minute), the run is lost. Its token stops working.
   The state does not change, and a lost run is not a failure of the script.
   `observer show` shows it as an error.
 - **No worker.** When a due run waits for a worker for longer than one
   interval, `observer list` and `observer show` show `no worker`.
-- **Restarts.** After the control plane was stopped, an observer runs one
-  time, not one time for each interval that it missed.
+- **Delete.** `observer delete` removes the observer with its scripts and
+  run errors. It cannot be undone. The tasks that it created stay. When it
+  was the last observer of a queue, the gates of the queue wait for a
+  person.
 
-## 7. Secrets
+## 8. Queue views
+
+The owner manages queues and observers in three places. All of them use
+the same owner routes, and an owner sees only their own observers.
+
+- **TUI**: press `O` on the task list. The list shows each queue with its
+  number of entries, and the description of a queue gives its mode. `Enter` opens a queue: its observers
+  (name, state, approved and newest script version, schedule, last run) and
+  its entries (task, step, episode, start, params, and for each observer
+  the last run and the last error of the entry). In a queue, `a` creates an
+  observer, `e` edits its queue, mode and schedule, `s` edits the script in
+  `$EDITOR` (or a paste field when no editor is set), `v` shows the newest
+  version and then approves it, `p` pauses, `r` resumes and `d` deletes
+  (with a confirmation that names the observer).
+- **WebUI**: the queues page (`Q`, or the button in the header). It shows
+  the same data. Its forms create and edit observers, its script editor
+  saves a new version, and its approve dialog shows the script text before
+  you confirm.
+- **CLI**: `narsor-cli observer queue list` and `narsor-cli observer queue
+  show QUEUE`.
+
+A save in a view never approves a version. The views show the approved
+version and the newest saved version, and mark the observer when they are
+not the same.
+
+The views do not show or change the secrets, the task limit, the workflow
+mapping and the other settings of `observer create`. They show them
+read-only. Set them with the CLI. So a source observer that you create in a
+view needs the CLI for its workflow mapping.
+
+The task list shows one mark on a task while the current wait episode of
+the task has a queue entry. The task view does not show the state of the
+observer runs.
+
+## 9. Secrets
 
 An observer names its secrets with `--secret NAME=ENV`. The control plane
 keeps only these names. The values are files in the secrets directory of
@@ -359,22 +480,51 @@ has one subdirectory for each owner, with one file for each name:
   defence: a script must not print a secret.
 - Do not put a secret on a command line, because other users can read it.
   The examples give the token to `curl` on stdin (`--config -`).
+- **Params are not trusted.** The params of an entry come from a workflow.
+  A script must check a URL in the params (its host and its form) before it
+  sends a token to it. The example scripts do this, and do not fetch a URL
+  that is not theirs.
 
-## 8. Data from the source
+## 10. Update from watch lists
+
+Observers of an earlier version had watch lists and could deliver events
+to a `wait` step. The update to queues reads each old observer as follows:
+
+| Before | After |
+|---|---|
+| no queue | the queue is the name of the observer |
+| watch mode `watch_list` | mode `on_episodes` |
+| watch mode `all` | mode `always` |
+| watch entries, `--allow-prefix`, `--max-object-len` | removed |
+| `--deliver-events` (effect `deliver_event`) | the observer is `paused` (a `draft` stays a `draft`), with a note that says why. Nothing is deleted. |
+| `--interval` | unchanged |
+
+For an observer that delivered events: change its script to contract
+version 2 and `narsor-cli task decide`, set its queue to the queue of the
+gate with `observer update --queue`, save and approve the new script, then
+resume it. The CLI refuses the removed flags (`--deliver-events`,
+`--watch-list`, `--allow-prefix`, `--max-object-len`) and names what
+replaces them. The commands `observer watch …` and `task event` are
+removed. The order of the update is in
+[Updates](../operations/updates.md).
+
+## 11. Data from the source
 
 - **The data is not trusted.** Text from Jira, GitHub or GitLab goes into
-  task inputs and events. A person who can write in the source can write
-  instructions for an agent there. In a workflow that an observer starts,
-  give the agent steps narrow permissions, and treat inputs and
-  `context.event` as data, not as instructions.
+  task inputs and gate answers (the reason and the variables). A person who
+  can write in the source can write instructions for an agent there. In a
+  workflow that an observer starts or answers, give the agent steps narrow
+  permissions, and treat inputs and answer variables as data, not as
+  instructions.
 - **Send only what the workflow needs.** Narsor accepts only the mapped
   fields. Do not map fields with personal data (for example, the reporter
   or the assignee of an issue, comments, e-mail addresses). Before you send
   free text such as a summary or a description, make sure what it holds.
 - **Check before you use.** Quote every variable. Do not use data from the
-  source as a command, a path or an option without a check.
+  source or from the params as a command, a path or an option without a
+  check.
 
-## 9. Test a script
+## 12. Test a script
 
 Each example reads the answers of its source from files when
 `FAKE_SOURCE_DIR` is set, and does not use the network. With a stand-in
@@ -386,13 +536,16 @@ mkdir -p fake/bin
 printf '#!/bin/sh\necho "narsor-cli $*" >&2\n' > fake/bin/narsor-cli
 chmod +x fake/bin/narsor-cli
 echo '{"issues": [{"id": "101", "key": "ABC-101", "fields": {}}]}' > fake/search.json
-echo '{"contract_version": 1, "observer": {"id": "o", "name": "jira-new", "source": "jira"},
+echo '{"contract_version": 2, "observer": {"id": "o", "name": "jira-new", "source": "jira"},
        "condition": {"base_url": "https://jira.example.com", "jql": "project = ABC"},
-       "state": {"last_id": 100}, "watch": null,
+       "state": {"last_id": 100},
        "first_run": false, "import_backlog": false}' |
   PATH="$PWD/fake/bin:$PATH" FAKE_SOURCE_DIR="$PWD/fake" \
   sh workflows/observers/examples/jira-new-issues.sh
 ```
+
+The header of each review example tells which files of the fake source it
+reads. Its input needs an `entry` (section 4).
 
 Narsor has no dry run. Test against the real source by hand, with a
 token that can only read, before you approve the script. Set a low
