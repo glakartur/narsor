@@ -5,6 +5,8 @@
 // approve dialog that shows the script text first; pause, resume and delete.
 // The settings the CLI sets (secrets, task limit, workflow mapping) are shown
 // read only (R34). Everything comes from the owner routes the CLI calls.
+// A dialog with script text that is not saved asks before it closes, and the
+// tab asks before it closes too.
 
 import { html, useEffect, useRef, useState } from '../lib.js';
 import {
@@ -208,6 +210,43 @@ function EntryCard({ entry, known, onOpenTask }) {
 // ---------------------------------------------------------------------------
 // Forms and dialogs
 
+/** The question before a dialog with an unsaved script closes. */
+export const DISCARD_SCRIPT = 'Skrypt ma niezapisane zmiany. Zamknąć okno i odrzucić zmiany?';
+
+/** Keys (`observer_id`, or `new` for the create form) of the dialogs with script text that is not saved. */
+const unsavedScripts = new Set();
+
+/** Whether a script editor or the create form has script text that is not saved. */
+export function hasUnsavedScript() {
+  return unsavedScripts.size > 0;
+}
+
+/** Whether the script text the owner typed (`null` before any typing) differs from the text the dialog opened with. */
+export function scriptChanged(typed, opened) {
+  return typed !== null && typed !== undefined && typed !== (opened ?? '');
+}
+
+/** Closes the dialog, after `ask` confirms when its script is `changed`; whether it closed. */
+export function closeAfterAsking(changed, onClose, ask = (question) => globalThis.confirm(question)) {
+  if (changed && !ask(DISCARD_SCRIPT)) return false;
+  onClose();
+  return true;
+}
+
+/**
+ * Lists the dialog `key` among the unsaved scripts while `changed` (for the
+ * guard before the tab closes), and returns the close that asks first. The
+ * overlay click, Escape, ✕ and Anuluj all go through it.
+ */
+function useScriptDraft(key, changed, onClose) {
+  useEffect(() => {
+    if (changed) unsavedScripts.add(key);
+    else unsavedScripts.delete(key);
+  }, [key, changed]);
+  useEffect(() => () => unsavedScripts.delete(key), [key]);
+  return () => closeAfterAsking(changed, onClose);
+}
+
 /** The problem of a refused write, at the top of its form. */
 function Refusal({ text }) {
   return text ? html`<p class="alert role-problem" role="alert">${text}</p>` : null;
@@ -226,6 +265,7 @@ function ObserverFormDialog({ store, observer = null, defaults = {}, onClose, on
   const [created, setCreated] = useState(null);
   const [sending, setSending] = useState(false);
   const set = (name) => (value) => setForm((old) => ({ ...old, [name]: value }));
+  const close = useScriptDraft(editing ? `edit:${observer.observer_id}` : 'new', scriptChanged(form.script, ''), onClose);
   const field = (name, label, description, required = false) => html`<${Field} id=${`observer-${name}`} name=${label}
     kind=${{ type: 'text', options: [] }} required=${required} description=${description} problem=${problems[name]}
     value=${form[name]} onInput=${set(name)} />`;
@@ -269,7 +309,7 @@ function ObserverFormDialog({ store, observer = null, defaults = {}, onClose, on
     }
   };
 
-  return html`<${Dialog} title=${editing ? `Zmień obserwatora ${observer.name}` : 'Nowy obserwator'} onClose=${onClose} wide>
+  return html`<${Dialog} title=${editing ? `Zmień obserwatora ${observer.name}` : 'Nowy obserwator'} onClose=${close} wide>
     <form class="answer-form observer-form" onSubmit=${submit} novalidate>
       <${Refusal} text=${refusal} />
       ${!editing && field('name', 'nazwa', 'unikalna, np. gitlab-mr', true)}
@@ -297,7 +337,7 @@ function ObserverFormDialog({ store, observer = null, defaults = {}, onClose, on
       ${!editing && html`<p class="hint">${CLI_HINT}</p>`}
       <div class="buttons">
         <button type="submit" class="primary" disabled=${sending}>${editing ? 'Zapisz zmiany' : created ? 'Zapisz skrypt' : 'Utwórz'}</button>
-        <button type="button" onClick=${onClose}>Anuluj</button>
+        <button type="button" onClick=${close}>Anuluj</button>
       </div>
     </form>
   </${Dialog}>`;
@@ -320,6 +360,7 @@ function ScriptEditor({ store, observer, onClose, onDone }) {
   const [sending, setSending] = useState(false);
   const shown = text ?? read.data?.script ?? '';
   const waiting = latest !== null && read.loading && text === null;
+  const close = useScriptDraft(observer.observer_id, scriptChanged(text, read.data?.script), onClose);
 
   const save = async (event) => {
     event.preventDefault();
@@ -339,7 +380,7 @@ function ScriptEditor({ store, observer, onClose, onDone }) {
     }
   };
 
-  return html`<${Dialog} title=${`Skrypt ${observer.name}`} onClose=${onClose} wide>
+  return html`<${Dialog} title=${`Skrypt ${observer.name}`} onClose=${close} wide>
     <form class="answer-form" onSubmit=${save}>
       <${Refusal} text=${refusal} />
       <p class="muted small-text">${latest === null ? 'Brak zapisanego skryptu.' : `Otwarta wersja v${latest}.`}
@@ -349,7 +390,7 @@ function ScriptEditor({ store, observer, onClose, onDone }) {
         value=${waiting ? 'wczytuję…' : shown} onInput=${(event) => setText(event.currentTarget.value)}></textarea>
       <div class="buttons">
         <button type="submit" class="primary" disabled=${sending || waiting}>Zapisz nową wersję</button>
-        <button type="button" onClick=${onClose}>Anuluj</button>
+        <button type="button" onClick=${close}>Anuluj</button>
       </div>
     </form>
   </${Dialog}>`;

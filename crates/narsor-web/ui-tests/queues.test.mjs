@@ -11,7 +11,9 @@ import { ApiError, errorFrom } from '../ui/js/api.js';
 import {
   entryObserverParts, intervalText, modeText, scheduleText, unapprovedText, versionRows,
 } from '../ui/js/text.js';
-import { CLI_HINT, ObserverCard } from '../ui/js/ui/queues.js';
+import {
+  CLI_HINT, DISCARD_SCRIPT, ObserverCard, closeAfterAsking, hasUnsavedScript, scriptChanged,
+} from '../ui/js/ui/queues.js';
 
 function observer(fields = {}) {
   return {
@@ -187,4 +189,27 @@ test('the queues routes round-trip through the address', () => {
   assert.equal(hashOf({ page: 'queues', queue: 'mr review' }), '#/queues/mr%20review');
   assert.equal(hashOf({ page: 'queues', queue: null }), '#/queues');
   assert.equal(hashOf({ page: 'tasks', selectedTaskId: 'task-1', tab: 'info' }), '#/task/task-1/info');
+});
+
+test('a script dialog is changed only by text that differs from the text it opened with', () => {
+  assert.equal(scriptChanged(null, 'echo 1\n'), false, 'nothing typed yet');
+  assert.equal(scriptChanged('echo 1\n', 'echo 1\n'), false, 'typed back to the saved text');
+  assert.equal(scriptChanged('echo 2\n', 'echo 1\n'), true);
+  assert.equal(scriptChanged('', undefined), false, 'empty create form');
+  assert.equal(scriptChanged('echo 1', undefined), true, 'text typed after a failed read');
+  assert.equal(hasUnsavedScript(), false, 'no dialog is open');
+});
+
+test('closing a dialog with an unsaved script asks first and stays open on no', () => {
+  const asked = [];
+  let closed = 0;
+  const onClose = () => { closed += 1; };
+
+  assert.equal(closeAfterAsking(true, onClose, (question) => { asked.push(question); return false; }), false);
+  assert.equal(closed, 0, 'the edit is kept');
+  assert.equal(closeAfterAsking(true, onClose, () => true), true);
+  assert.equal(closed, 1);
+  assert.equal(closeAfterAsking(false, onClose, () => { throw new Error('no question without changes'); }), true);
+  assert.equal(closed, 2);
+  assert.deepEqual(asked, [DISCARD_SCRIPT]);
 });

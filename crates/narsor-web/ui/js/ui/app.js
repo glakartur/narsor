@@ -12,7 +12,7 @@ import { NewTask } from './newtask.js';
 import { ArchivedTask, Harness, History, Limit, Repositories } from './settings.js';
 import { Help } from './help.js';
 import { useNow, useStore } from './hooks.js';
-import { Queues } from './queues.js';
+import { Queues, hasUnsavedScript } from './queues.js';
 import { hashOf, routeOf } from '../store.js';
 import { TaskList } from './tasklist.js';
 import { Toast } from './toast.js';
@@ -70,10 +70,11 @@ export function App({ store, onSignOut }) {
   };
   const toggleQueues = () => (store.state.page === 'queues' ? store.openTasks() : store.openQueues(null));
 
-  // Ask before the tab closes while a form has text that was not sent.
+  // Ask before the tab closes while a form has text that was not sent, or
+  // a script dialog has text that was not saved.
   useEffect(() => {
     const onUnload = (event) => {
-      if (!hasUnsentDraft()) return;
+      if (!hasUnsentDraft() && !hasUnsavedScript()) return;
       event.preventDefault();
       event.returnValue = '';
     };
