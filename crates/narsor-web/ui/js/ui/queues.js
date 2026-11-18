@@ -233,10 +233,39 @@ export function closeAfterAsking(changed, onClose, ask = (question) => globalThi
   return true;
 }
 
+/** An open dialog of the page, over its overlay. */
+const OPEN_DIALOG = '.overlay [role="dialog"]';
+
+/**
+ * Whether a key of the queues page (Escape, Q, ?, u) must not act: the key
+ * comes from inside a dialog, a dialog is open (focus can sit on the page
+ * body after a click on the overlay), or a script is not saved. Each of
+ * them would leave the page and drop the dialog without the question.
+ */
+export function queuesKeysHeld(target, root = globalThis.document) {
+  return hasUnsavedScript()
+    || Boolean(target?.closest?.('[role="dialog"]'))
+    || Boolean(root?.querySelector?.(OPEN_DIALOG));
+}
+
+/**
+ * The dialog that gets focus back when the owner keeps editing: the dialog
+ * around `element` (✕, Anuluj), the dialog in it (the overlay), or else the
+ * open dialog of the page (Escape).
+ */
+export function dialogNear(element, root = globalThis.document) {
+  return element?.closest?.('[role="dialog"]')
+    ?? element?.querySelector?.('[role="dialog"]')
+    ?? root?.querySelector?.(OPEN_DIALOG)
+    ?? null;
+}
+
 /**
  * Lists the dialog `key` among the unsaved scripts while `changed` (for the
  * guard before the tab closes), and returns the close that asks first. The
- * overlay click, Escape, ✕ and Anuluj all go through it.
+ * overlay click, Escape, ✕ and Anuluj all go through it. When the owner
+ * keeps editing, the dialog gets focus back, so the next Escape goes to the
+ * dialog (which asks again) and not to the page.
  */
 function useScriptDraft(key, changed, onClose) {
   useEffect(() => {
@@ -244,7 +273,9 @@ function useScriptDraft(key, changed, onClose) {
     else unsavedScripts.delete(key);
   }, [key, changed]);
   useEffect(() => () => unsavedScripts.delete(key), [key]);
-  return () => closeAfterAsking(changed, onClose);
+  return (event) => {
+    if (!closeAfterAsking(changed, onClose)) dialogNear(event?.currentTarget)?.focus();
+  };
 }
 
 /** The problem of a refused write, at the top of its form. */

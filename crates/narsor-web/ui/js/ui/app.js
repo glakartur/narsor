@@ -12,7 +12,7 @@ import { NewTask } from './newtask.js';
 import { ArchivedTask, Harness, History, Limit, Repositories } from './settings.js';
 import { Help } from './help.js';
 import { useNow, useStore } from './hooks.js';
-import { Queues, hasUnsavedScript } from './queues.js';
+import { Queues, hasUnsavedScript, queuesKeysHeld } from './queues.js';
 import { hashOf, routeOf } from '../store.js';
 import { TaskList } from './tasklist.js';
 import { Toast } from './toast.js';
@@ -93,7 +93,7 @@ export function App({ store, onSignOut }) {
       if (typing(event.target) || actionsOpen || newOpen || dialog) return;
       if (help && event.key === 'Escape') { setHelp(false); return; }
       if (store.state.page === 'queues') {
-        if (event.target instanceof Element && event.target.closest('[role="dialog"]')) return;
+        if (queuesKeysHeld(event.target)) return;
         const back = () => (store.state.queue !== null ? store.openQueues(null) : store.openTasks());
         const action = { Q: toggleQueues, Escape: back, '?': () => setHelp(true), u: () => store.refresh() }[event.key];
         if (action) {

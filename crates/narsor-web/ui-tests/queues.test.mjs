@@ -12,7 +12,7 @@ import {
   entryObserverParts, intervalText, modeText, scheduleText, unapprovedText, versionRows,
 } from '../ui/js/text.js';
 import {
-  CLI_HINT, DISCARD_SCRIPT, ObserverCard, closeAfterAsking, hasUnsavedScript, scriptChanged,
+  CLI_HINT, DISCARD_SCRIPT, ObserverCard, closeAfterAsking, dialogNear, hasUnsavedScript, queuesKeysHeld, scriptChanged,
 } from '../ui/js/ui/queues.js';
 
 function observer(fields = {}) {
@@ -212,4 +212,35 @@ test('closing a dialog with an unsaved script asks first and stays open on no', 
   assert.equal(closeAfterAsking(false, onClose, () => { throw new Error('no question without changes'); }), true);
   assert.equal(closed, 2);
   assert.deepEqual(asked, [DISCARD_SCRIPT]);
+});
+
+/** A stand-in for a DOM element: `closest` and `querySelector` find `dialog` when given. */
+function element({ inside = null, holds = null } = {}) {
+  return {
+    closest: (selector) => (selector === '[role="dialog"]' ? inside : null),
+    querySelector: (selector) => (selector.endsWith('[role="dialog"]') ? holds : null),
+  };
+}
+
+test('the queues page keys wait while a dialog is open, also with focus on the page body', () => {
+  const dialog = { focus() {} };
+  const body = element();
+  const page = (open) => ({ querySelector: (selector) => (open && selector === '.overlay [role="dialog"]' ? dialog : null) });
+
+  assert.equal(queuesKeysHeld(body, page(false)), false, 'no dialog: Escape and Q act');
+  assert.equal(queuesKeysHeld(body, page(true)), true, 'overlay click left focus on the body');
+  assert.equal(queuesKeysHeld(element({ inside: dialog }), page(true)), true, 'the key comes from the dialog');
+  assert.equal(queuesKeysHeld(null, page(true)), true);
+  assert.equal(queuesKeysHeld(body, undefined), false, 'no document');
+});
+
+test('keeping the edit gives focus back to the dialog that asked', () => {
+  const dialog = { name: 'dialog' };
+  const other = { name: 'other' };
+  const page = { querySelector: () => other };
+
+  assert.equal(dialogNear(element({ inside: dialog }), page), dialog, '✕ or Anuluj inside the dialog');
+  assert.equal(dialogNear(element({ holds: dialog }), page), dialog, 'the overlay around the dialog');
+  assert.equal(dialogNear(undefined, page), other, 'Escape: the open dialog of the page');
+  assert.equal(dialogNear(undefined, undefined), null);
 });
