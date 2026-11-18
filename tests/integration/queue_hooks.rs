@@ -15,6 +15,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_engine::automations::HookPhase;
@@ -33,7 +34,7 @@ use narsor_protocol::api::HumanInputDeliveryDto;
 use narsor_protocol::controller::ObserverDecideRequest;
 use serde_json::{json, Value};
 
-use crate::automation_support::{automation, on_episodes_queue, write, CHECK_SCRIPT};
+use crate::automation_support::{always_queue, automation, on_episodes_queue, write, CHECK_SCRIPT};
 use crate::gate_support::{
     past_gates, queued_task, review_gate, runner_problem, running, wait_at, FIRST_RUNNER,
 };
@@ -77,7 +78,7 @@ enum Attempt {
 struct Fixture {
     root: PathBuf,
     clock: Arc<ManualClock>,
-    service: ProtocolService,
+    service: Arc<ProtocolService>,
 }
 
 impl Drop for Fixture {
@@ -113,11 +114,11 @@ impl Fixture {
         }
     }
 
-    fn service_over(root: &PathBuf, clock: &Arc<ManualClock>) -> ProtocolService {
-        ProtocolService::new(
+    fn service_over(root: &PathBuf, clock: &Arc<ManualClock>) -> Arc<ProtocolService> {
+        Arc::new(ProtocolService::new(
             ControlPlane::with_clock(StatePaths::new(root), clock.clone()),
             crate::environment_support::seeded_resolver(root),
-        )
+        ))
     }
 
     /// The server restarts: a new service over the same state.
@@ -479,6 +480,51 @@ fn neither_a_runner_problem_nor_a_restored_entry_runs_the_entry_script_again() {
         1,
         "one entry script attempt in all"
     );
+}
+
+#[test]
+fn an_entry_script_is_claimed_before_a_check_run_due_longer() {
+    // U6: a gate waits on its entry scripts (R8).
+    let fx = Fixture::new(&[(LABEL, &[HookPhase::In])]);
+    automation(&fx.root, "jira-new", CHECK_SCRIPT, &[]);
+    always_queue(
+        &fx.root,
+        "jira-intake",
+        "jira-new",
+        "{interval_secs: 300}",
+        "",
+    );
+    fx.service.observer_pass();
+    fx.advance(Duration::seconds(60));
+    fx.waiting_task();
+
+    fx.claim_entry_script(LABEL);
+    let check = fx.claim().expect("the check run of jira-intake");
+
+    assert_eq!(check.phase, HookPhase::Check);
+    assert_eq!(check.run_id.key.queue, "jira-intake");
+}
+
+#[tokio::test]
+async fn a_waiting_claim_returns_the_entry_script_run_once_the_gate_is_entered() {
+    // U6: `in` starts at once, not at the worker's next poll.
+    let fx = Fixture::new(&[(LABEL, &[HookPhase::In])]);
+    let task = queued_task(&fx.service, "task-1", &owner());
+    running(&fx.service, &task);
+    let mut claim = tokio::spawn(Arc::clone(&fx.service).claim_observer_run_waiting());
+    let waits = tokio::time::timeout(StdDuration::from_millis(200), &mut claim).await;
+    assert!(waits.is_err(), "nothing is due before the gate");
+
+    wait_at(&fx.service, &task, EPISODE, &review_gate(QUEUE));
+
+    let run = tokio::time::timeout(StdDuration::from_secs(5), claim)
+        .await
+        .expect("the claim answers well before the worker's former 10 s poll")
+        .unwrap()
+        .unwrap()
+        .expect("the entry script run");
+    assert_eq!(run.phase, HookPhase::In);
+    assert_eq!(run.input.entry.unwrap().task_id, task);
 }
 
 // ---------------------------------------------------------------------------

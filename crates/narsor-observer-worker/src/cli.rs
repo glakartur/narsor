@@ -13,7 +13,7 @@ use narsor_api_client::api::{ApiClient, ClientError, TokenSource};
 use narsor_protocol::controller::OBSERVER_WORKER_KEY_ENV;
 
 use crate::worker::{
-    check_secrets_dir, current_uid, ProcessRunner, ScriptUser, Worker, WorkerOptions, POLL_INTERVAL,
+    check_secrets_dir, current_uid, ProcessRunner, ScriptUser, Worker, WorkerOptions, CLAIM_PAUSE,
 };
 
 /// The program's exit code on success.
@@ -119,7 +119,7 @@ async fn serve(args: WorkerArgs) -> Result<(), StartError> {
     let worker = Worker::new(client, ProcessRunner, options);
     tracing::info!(server = %args.server, "observer worker: started");
     worker
-        .serve(args.once, POLL_INTERVAL, shutdown_signal())
+        .serve(args.once, CLAIM_PAUSE, shutdown_signal())
         .await
         .map_err(|stop| StartError::Failure(stop.to_string()))
 }

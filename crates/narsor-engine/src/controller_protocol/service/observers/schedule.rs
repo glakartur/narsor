@@ -528,6 +528,8 @@ impl ProtocolService {
                 tracing::warn!(pair = %key, %error, "automations: pass failed");
             }
         }
+        // Ticks flagged, runs lost, retry times come: a waiting claim looks.
+        self.wake_observer_claims();
         pass
     }
 
@@ -598,6 +600,18 @@ impl ProtocolService {
     /// The run's token stops working. A run already ended, or past its
     /// deadline (it is then recorded as lost), is refused with a conflict.
     pub fn finish_observer_run(
+        &self,
+        run_id: &RunId,
+        report: RunReport,
+    ) -> ProtocolResult<LastRun> {
+        let finished = self.record_observer_run_result(run_id, report);
+        // The pair is free again: its round's next entry, or the task's
+        // next entry or exit script, may be due now.
+        self.wake_observer_claims();
+        finished
+    }
+
+    fn record_observer_run_result(
         &self,
         run_id: &RunId,
         report: RunReport,

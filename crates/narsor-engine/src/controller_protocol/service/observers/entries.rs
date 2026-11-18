@@ -89,6 +89,8 @@ impl ProtocolService {
                 Some("the queue entry could not be stored; the server log has the cause".into())
             }
         };
+        // An entry added or removed: its entry or exit scripts may be due.
+        self.wake_observer_claims();
         let (Some(reason), Some(gate)) = (warning, change.began.as_ref()) else {
             return;
         };

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
 use chrono::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 mod enrollment;
 mod lease;
@@ -126,6 +126,9 @@ pub struct ProtocolConfig {
     /// connect before it answers "starting" and leaves the retry to the
     /// client (D63).
     pub reader_connect_wait: std::time::Duration,
+    /// How long the observer worker's claim waits for a due run before it
+    /// answers "nothing" (U6). Below the worker's request timeout.
+    pub observer_claim_wait: std::time::Duration,
 }
 
 impl Default for ProtocolConfig {
@@ -144,6 +147,7 @@ impl Default for ProtocolConfig {
             resume: ResumePolicy::default(),
             slot_release: true,
             reader_connect_wait: std::time::Duration::from_secs(2),
+            observer_claim_wait: std::time::Duration::from_secs(25),
         }
     }
 }
@@ -169,6 +173,10 @@ pub struct ProtocolService {
     /// The catalogue problems of automations and queues the log reported
     /// last: a problem is logged once per change, not on every pass.
     logged_catalog_problems: Mutex<Vec<CatalogProblem>>,
+    /// Wakes the observer worker's waiting claim when a run may have become
+    /// due; `true` once the server releases waiting claims for good (its
+    /// shutdown). See [`ProtocolService::claim_observer_run_waiting`].
+    observer_claims: watch::Sender<bool>,
     harness_usages: scheduling::HarnessUsages,
     /// Most tasks processed at once across all backends; `None` for no limit.
     max_concurrent_tasks: Mutex<Option<u32>>,
@@ -217,6 +225,7 @@ impl ProtocolService {
             observer_worker_key: ObserverWorkerKey::default(),
             installation_owner: Arc::new(|| Some(OwnerRef::new(LOCAL_OWNER))),
             logged_catalog_problems: Mutex::new(Vec::new()),
+            observer_claims: watch::Sender::new(false),
             controller_auth: Arc::new(credentials.clone()),
             runner_auth: Arc::new(credentials.clone()),
             control,
@@ -282,6 +291,9 @@ impl ProtocolService {
     pub fn notify(&self, task_id: &TaskId) {
         // No receiver is not an error: nobody is listening right now.
         let _ = self.changes.send(task_id.clone());
+        // A changed task may give the worker an entry or exit script to run:
+        // its gate was entered or left, or the task ended or was archived.
+        self.wake_observer_claims();
     }
 }
 

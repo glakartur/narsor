@@ -9,7 +9,10 @@
 //! only takes what is due and runs it:
 //!
 //! ```text
-//! every 10 s   claim (worker key)                 → nothing due: wait
+//! claim (worker key), held by the server up to 25 s until a run is due
+//!                                                 → nothing due: claim again
+//!                                                   at once (at most one
+//!                                                   claim per CLAIM_PAUSE)
 //!              run dir (0700, removed afterwards)
 //!              sh script.sh, stdin = the input, env = the list below only
 //!              stdout/stderr read with limits, time limit, process group
@@ -91,8 +94,11 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 
 use narsor_api_client::api::{ApiClient, ClientError};
 
-/// How often the worker asks for a due run when none was due.
-pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// The shortest time between the starts of two claims that found no run,
+/// and the pause after a failed claim. A claim the server held (its
+/// long-poll) is followed by the next one at once; one answered at once
+/// (an older server, a server that stops) waits out the rest of it.
+pub const CLAIM_PAUSE: Duration = Duration::from_secs(2);
 
 /// Most bytes of stdout a script may print: the script contract's limit
 /// (`MAX_SCRIPT_OUTPUT_BYTES` of the control plane). More is a format
@@ -420,16 +426,19 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
     }
 
     /// Claims and handles runs until `shutdown` resolves: a due run is
-    /// followed by the next claim at once, an empty claim by `poll`. With
-    /// `once`, stops after the first claim, due or not.
+    /// followed by the next claim at once, an empty claim by the next one
+    /// once `pause` passed since it started (at once after a claim the
+    /// server held that long), a failed claim by `pause`. With `once`,
+    /// stops after the first claim, due or not.
     pub async fn serve(
         &self,
         once: bool,
-        poll: Duration,
+        pause: Duration,
         shutdown: impl std::future::Future<Output = ()>,
     ) -> Result<(), WorkerStop> {
         tokio::pin!(shutdown);
         loop {
+            let started = tokio::time::Instant::now();
             let claimed = tokio::select! {
                 // Dropping a run in progress kills its process group.
                 () = &mut shutdown => return Ok(()),
@@ -439,14 +448,14 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
                 Ok(Some(_)) if once => return Ok(()),
                 Ok(Some(_)) => continue,
                 Ok(None) if once => return Ok(()),
-                Ok(None) => poll,
+                Ok(None) => pause.saturating_sub(started.elapsed()),
                 Err(error @ (ClientError::Unauthorized | ClientError::Forbidden)) => {
                     return Err(WorkerStop::CredentialRefused(error));
                 }
                 Err(error) if once => return Err(WorkerStop::Claim(error)),
                 Err(error) => {
                     tracing::warn!(%error, "observer worker: claim failed; trying again");
-                    poll
+                    pause
                 }
             };
             tokio::select! {

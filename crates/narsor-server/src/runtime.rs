@@ -248,6 +248,10 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     })?;
     wait_for_sigterm_keeping_discovery(&mut terminate, &paths.daemon_file(), &info).await;
 
+    // A worker's claim held open (a remote worker's too) answers "nothing"
+    // now, so the drain below does not wait for its limit (U6).
+    control.release_observer_claims();
+
     // The worker first, while the API still takes the result of a run in
     // progress; one it cannot report is lost at its deadline.
     if let Some(observer_worker) = observer_worker {

@@ -13,6 +13,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -249,6 +250,31 @@ impl WorkerApi for ServiceApi {
             })
             .map_err(client_error);
         Box::pin(async move { result })
+    }
+}
+
+/// A control plane with no run due: it holds each claim for `hold`, as
+/// its long-poll does, and counts them.
+struct NoRunApi {
+    hold: StdDuration,
+    claims: AtomicUsize,
+}
+
+impl WorkerApi for NoRunApi {
+    fn claim(&self) -> BoxFuture<'_, Result<Option<ObserverWorkerRun>, ClientError>> {
+        self.claims.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            tokio::time::sleep(self.hold).await;
+            Ok(None)
+        })
+    }
+
+    fn report<'a>(
+        &'a self,
+        _run_id: &'a str,
+        _report: &'a ObserverRunReport,
+    ) -> BoxFuture<'a, Result<ObserverRunResultResponse, ClientError>> {
+        Box::pin(async { Err(ClientError::NotFound) })
     }
 }
 
@@ -877,6 +903,46 @@ async fn a_background_process_holding_stdout_past_the_limit_ends_with_it() {
         started.elapsed()
     );
     assert_eq!(report.outcome, ObserverRunOutcome::TimedOut);
+}
+
+// ---------------------------------------------------------------------------
+// The claim loop (U6)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn after_a_held_empty_claim_the_worker_claims_again_at_once() {
+    // A claim the server held longer than the pause is followed by the
+    // next at once (0, 400, 800 ms; with a pause after each: 0, 700 ms);
+    // one it answered at once (an older server, or one that stops) waits
+    // out the pause instead of looping (0, 300, 600, 900 ms).
+    let pause = StdDuration::from_millis(300);
+    let window = StdDuration::from_millis(1000);
+    for (hold, claims_in_window) in [
+        (StdDuration::from_millis(400), 3..=3),
+        (StdDuration::ZERO, 3..=5),
+    ] {
+        let fx = Fixture::new();
+        let api = Arc::new(NoRunApi {
+            hold,
+            claims: AtomicUsize::new(0),
+        });
+        let worker = Worker::new(
+            Arc::clone(&api),
+            FakeRunner::exiting(0, "", ""),
+            fx.options(),
+        );
+
+        worker
+            .serve(false, pause, tokio::time::sleep(window))
+            .await
+            .unwrap();
+
+        let claims = api.claims.load(Ordering::SeqCst);
+        assert!(
+            claims_in_window.contains(&claims),
+            "{claims} claims held {hold:?} each"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -113,6 +113,11 @@ const CONVERSATION_PAGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// and the server's own answer is the failure signal.
 const BRANCH_LISTING_TIMEOUT: Duration = Duration::from_secs(25);
 
+/// How long the observer worker's claim may take: the control plane holds
+/// it up to 25 s while no run is due (a long-poll), so the client waits
+/// longer than that.
+const OBSERVER_CLAIM_TIMEOUT: Duration = Duration::from_secs(40);
+
 /// How long one material upload or blob download may take: tens of
 /// megabytes over a real network, far beyond a control request's bound.
 const MATERIAL_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
@@ -830,11 +835,18 @@ impl ApiClient {
     // -----------------------------------------------------------------
 
     /// Claims the next due observer run, for a client holding the worker
-    /// key — `POST /observer/v1/worker/claim`. `None` when no run is
-    /// due.
+    /// key — `POST /observer/v1/worker/claim`. `None` when no run became
+    /// due while the control plane held the request.
     pub async fn claim_observer_run(&self) -> Result<Option<ObserverWorkerRun>, ClientError> {
         let url = format!("{}/observer/v1/worker/claim", self.base_url);
-        let response: ObserverClaimResponse = self.post_empty(&url).await?;
+        let response = self
+            .send(&self.stream_http, |http, token| {
+                http.post(url.as_str())
+                    .bearer_auth(token)
+                    .timeout(OBSERVER_CLAIM_TIMEOUT)
+            })
+            .await?;
+        let response: ObserverClaimResponse = handle_json_response(response).await?;
         Ok(response.run)
     }
 

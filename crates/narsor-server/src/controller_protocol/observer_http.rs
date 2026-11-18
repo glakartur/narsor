@@ -24,7 +24,7 @@
 //!
 //! | route | body | answer |
 //! | --- | --- | --- |
-//! | `POST /observer/v1/worker/claim` | none | `200` [`ObserverClaimResponse`] |
+//! | `POST /observer/v1/worker/claim` | none | `200` [`ObserverClaimResponse`], held up to 25 s while no run is due |
 //! | `POST /observer/v1/worker/runs/{run}/result` | [`ObserverRunReport`] | `200` [`ObserverRunResultResponse`], `404` no such run, `409` ended |
 //!
 //! The owner's read-only queue views (R21), behind the owner gate
@@ -196,7 +196,9 @@ async fn post_claim(
     Extension(principal): Extension<Principal>,
 ) -> ProtocolResult<Json<ObserverClaimResponse>> {
     require_worker(&principal)?;
-    let claimed = blocking(&service, |s| s.claim_observer_run()).await?;
+    // A long-poll: answers as soon as a run is due, or "nothing" at the
+    // service's limit or the server's shutdown.
+    let claimed = Arc::clone(&service).claim_observer_run_waiting().await?;
     Ok(Json(ObserverClaimResponse {
         run: claimed.map(|claimed| claimed.into_wire()),
     }))
@@ -267,6 +269,7 @@ async fn get_queue(
 mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::time::{Duration as StdDuration, Instant};
 
     use axum::body::Body;
     use axum::extract::Request;
@@ -277,7 +280,9 @@ mod tests {
         AutomationCatalog, AutomationCatalogError, AutomationCatalogLoad, AutomationScript,
         HookPhase,
     };
-    use narsor_engine::controller_protocol::{ClaimedObserverRun, RunOutcome, RunReport};
+    use narsor_engine::controller_protocol::{
+        ClaimedObserverRun, ProtocolConfig, RunOutcome, RunReport,
+    };
     use narsor_engine::domain::{BackendId, WorkflowDefinition};
     use narsor_engine::environment::{
         BackendRecord, LaunchError, LaunchIntent, LaunchResolver, ResolvedLaunch,
@@ -395,14 +400,20 @@ mod tests {
     }
 
     impl Fixture {
+        /// A claim that finds no run answers at once.
         fn new() -> Self {
+            Self::holding_claims(StdDuration::ZERO)
+        }
+
+        /// A claim that finds no run waits up to `claim_wait`.
+        fn holding_claims(claim_wait: StdDuration) -> Self {
             let root =
                 std::env::temp_dir().join(format!("narsor-observer-http-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&root).unwrap();
             let clock = Arc::new(ManualClock(Mutex::new(
                 Utc.with_ymd_and_hms(2026, 11, 13, 12, 0, 0).unwrap(),
             )));
-            let service = Self::service(&root, &clock);
+            let service = Self::service(&root, &clock, claim_wait);
             Self {
                 root,
                 clock,
@@ -410,12 +421,20 @@ mod tests {
             }
         }
 
-        fn service(root: &std::path::Path, clock: &Arc<ManualClock>) -> Service {
-            Arc::new(ProtocolService::new(
+        fn service(
+            root: &std::path::Path,
+            clock: &Arc<ManualClock>,
+            claim_wait: StdDuration,
+        ) -> Service {
+            Arc::new(ProtocolService::with_config(
                 ControlPlane::with_clock(StatePaths::new(root.join("state")), clock.clone()),
                 Arc::new(NoLaunches {
                     catalog: root.join("catalog"),
                 }),
+                ProtocolConfig {
+                    observer_claim_wait: claim_wait,
+                    ..ProtocolConfig::default()
+                },
             ))
         }
 
@@ -747,7 +766,7 @@ mod tests {
         let restarted = Fixture {
             root: fx.root.join("unused"),
             clock: Arc::clone(&fx.clock),
-            service: Fixture::service(&fx.root, &fx.clock),
+            service: Fixture::service(&fx.root, &fx.clock, StdDuration::ZERO),
         };
         let claim = restarted
             .send("POST", "/observer/v1/worker/claim", &current, Value::Null)
@@ -777,6 +796,88 @@ mod tests {
                 assert!(!stored.contains(secret), "{}", path.display());
             }
         }
+    }
+
+    // -- the long-poll claim (U6) --------------------------------------------
+
+    /// Far above every bound the tests below check: a claim that returns
+    /// was woken, not ended by its limit.
+    const LONG_CLAIM: StdDuration = StdDuration::from_secs(60);
+
+    /// Well below the worker's former 10 s poll.
+    const PROMPT: StdDuration = StdDuration::from_secs(5);
+
+    /// Starts a claim with the worker key; it runs until it answers.
+    fn spawn_claim(fx: &Fixture) -> tokio::task::JoinHandle<Value> {
+        let router = fx.router();
+        let key = worker_key(fx);
+        tokio::spawn(async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/observer/v1/worker/claim")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            json_body(response).await
+        })
+    }
+
+    /// The claim still waits after a moment: it found no run and holds.
+    async fn still_waiting(claim: &mut tokio::task::JoinHandle<Value>) -> bool {
+        tokio::time::timeout(StdDuration::from_millis(200), claim)
+            .await
+            .is_err()
+    }
+
+    #[tokio::test]
+    async fn a_waiting_claim_returns_the_run_the_pass_makes_due() {
+        let fx = Fixture::holding_claims(LONG_CLAIM);
+        fx.jira_queue();
+        let mut claim = spawn_claim(&fx);
+        assert!(still_waiting(&mut claim).await, "no run is due yet");
+
+        fx.service.observer_pass();
+
+        let body = tokio::time::timeout(PROMPT, claim).await.unwrap().unwrap();
+        assert_eq!(body["run"]["run_id"], "jira-intake~jira-new~1");
+    }
+
+    #[tokio::test]
+    async fn a_claim_finding_nothing_answers_nothing_at_its_limit() {
+        let limit = StdDuration::from_millis(300);
+        let fx = Fixture::holding_claims(limit);
+        let key = worker_key(&fx);
+
+        let started = Instant::now();
+        let claim = fx
+            .send("POST", "/observer/v1/worker/claim", &key, Value::Null)
+            .await;
+
+        assert_eq!(claim.status(), StatusCode::OK);
+        assert_eq!(json_body(claim).await["run"], Value::Null);
+        assert!(started.elapsed() >= limit, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn the_server_stopping_releases_a_waiting_claim_and_every_later_one() {
+        let fx = Fixture::holding_claims(LONG_CLAIM);
+        let mut claim = spawn_claim(&fx);
+        assert!(still_waiting(&mut claim).await);
+
+        fx.service.release_observer_claims();
+
+        let body = tokio::time::timeout(PROMPT, claim).await.unwrap().unwrap();
+        assert_eq!(body["run"], Value::Null);
+        // A run due now is not handed to a worker that is about to stop.
+        fx.jira_queue();
+        fx.service.observer_pass();
+        let later = tokio::time::timeout(PROMPT, spawn_claim(&fx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(later["run"], Value::Null);
     }
 
     // -- the owner's queue views --------------------------------------------

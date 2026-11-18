@@ -16,8 +16,10 @@
 //! `watch` block ([`crate::observers::QueueEntry`]): the runner's snapshot
 //! adds and removes them ([`entries`]), the entry scripts of each pair run
 //! when an episode enters ([`hooks`]), and the schedule hands the entries
-//! to the pairs of their `on_episodes` queue once those succeeded.
+//! to the pairs of their `on_episodes` queue once those succeeded. The
+//! worker's claim waits for a run to become due ([`claim_wait`]).
 
+mod claim_wait;
 mod effects;
 mod entries;
 mod hooks;
