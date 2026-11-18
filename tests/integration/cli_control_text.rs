@@ -333,6 +333,7 @@ fn review_entry(automations: Vec<QueueEntryAutomationView>) -> QueueEntryView {
         ]
         .into(),
         automations,
+        gate_phase: None,
     }
 }
 

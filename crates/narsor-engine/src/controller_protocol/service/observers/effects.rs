@@ -78,8 +78,7 @@ impl EffectScope {
     /// there is one.
     fn active_run(&mut self) -> ProtocolResult<&mut ActiveRun> {
         self.record
-            .active_run
-            .as_mut()
+            .run_in_progress_mut(self.run_id.sequence)
             .ok_or(ProtocolError::Unauthorized)
     }
 }
@@ -159,8 +158,7 @@ impl ProtocolService {
         let scope = self.effect_scope(run_id)?;
         let active = scope
             .record
-            .active_run
-            .as_ref()
+            .run_in_progress(run_id.sequence)
             .ok_or(ProtocolError::Unauthorized)?;
         if active.phase != HookPhase::Check {
             return Err(ProtocolError::bad_request(
@@ -284,9 +282,9 @@ impl ProtocolService {
             .load(&run_id.key)?
             .ok_or(ProtocolError::Unauthorized)?;
         let now = self.control.now();
-        let in_progress = record.active_run.as_ref().is_some_and(|active| {
-            active.sequence == run_id.sequence && !active.is_past_deadline(now)
-        });
+        let in_progress = record
+            .run_in_progress(run_id.sequence)
+            .is_some_and(|active| !active.is_past_deadline(now));
         if !in_progress {
             return Err(ProtocolError::Unauthorized);
         }

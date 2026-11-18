@@ -40,18 +40,15 @@ impl ProtocolService {
                 self.notify(&identity.task_id);
             }
         }
-        let outcome = self.control.record_runner_snapshot_with(
+        // Before the session check, so a refusal there cannot leave the
+        // queue entries behind the record.
+        let outcome = self.record_runner_snapshot(
             &identity.task_id,
             &identity.incarnation,
             identity.launch_generation,
             snapshot,
             chrono_duration(grace),
         )?;
-        // The queue entries follow the gate's episodes the record now holds:
-        // the ended one's entry goes before the new one's is added (R16,
-        // KTD-5). Before the session check, so a refusal there cannot leave
-        // the entries behind the record.
-        self.follow_gate_episode(&outcome.task, &outcome.gate_change);
         self.credentials
             .touch_runner(identity, None)?
             .ok_or(ProtocolError::Unauthorized)?;
@@ -72,6 +69,37 @@ impl ProtocolService {
             launch: launch_view(identity, &task),
             default_harness: self.default_harness_of(&task),
         })
+    }
+
+    /// Records a runner snapshot of `task_id` (see
+    /// [`crate::orchestration::ControlPlane::record_runner_snapshot_with`])
+    /// and follows the watched gate episodes it ended and began: a new
+    /// episode gets its entry scripts from the catalogue as it is now, in
+    /// the same write (R8, R17), and the queue entries follow the record —
+    /// the ended episode's entry goes before the new one's is added (R16,
+    /// KTD-5).
+    ///
+    /// The runner channel's snapshot route without its credential checks.
+    pub fn record_runner_snapshot(
+        &self,
+        task_id: &crate::domain::TaskId,
+        incarnation: &str,
+        launch_generation: u64,
+        snapshot: crate::orchestration::RunnerSnapshot,
+        grace: chrono::Duration,
+    ) -> Result<crate::orchestration::RunnerReportOutcome, crate::orchestration::OrchestrationError>
+    {
+        let entry_scripts = |queue: &str| self.entry_script_automations(queue);
+        let outcome = self.control.record_runner_snapshot_with(
+            task_id,
+            incarnation,
+            launch_generation,
+            snapshot,
+            grace,
+            Some(&entry_scripts),
+        )?;
+        self.follow_gate_episode(&outcome.task, &outcome.gate_change);
+        Ok(outcome)
     }
 
     /// The installation's default harness as it applies to the task of

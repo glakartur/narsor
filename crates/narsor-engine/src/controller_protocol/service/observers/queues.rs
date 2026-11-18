@@ -136,10 +136,25 @@ impl ProtocolService {
                 .collect(),
             entries: entries
                 .iter()
-                .map(|entry| entry_view(entry, &pairs))
+                .map(|entry| {
+                    let mut view = entry_view(entry, &pairs);
+                    view.gate_phase = self.entry_gate_phase(entry);
+                    view
+                })
                 .collect(),
             problems,
         })
+    }
+
+    /// The automation phase of the episode of `entry`, as its task holds
+    /// it; `None` when the task cannot be read, waits elsewhere or keeps no
+    /// phase. One task read per entry.
+    fn entry_gate_phase(&self, entry: &QueueEntry) -> Option<String> {
+        let task = self.control.task(&entry.task_id).ok()?;
+        task.watched_gate
+            .filter(|gate| gate.episode == entry.episode)?
+            .automation
+            .map(|automation| automation.phase.as_str().to_string())
     }
 
     /// The definition, record and errors of every automation of `queue`.
@@ -328,10 +343,13 @@ fn entry_view(entry: &QueueEntry, pairs: &[PairState<'_>]) -> QueueEntryView {
                 let record = pair.record.as_ref();
                 QueueEntryAutomationView {
                     automation: pair.name.to_string(),
-                    running: record
-                        .and_then(|record| record.active_run.as_ref())
-                        .and_then(|active| active.entry.as_ref())
-                        .is_some_and(|run| run.entry_id == entry.entry_id),
+                    running: record.is_some_and(|record| {
+                        [record.active_run.as_ref(), record.active_hook.as_ref()]
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|active| active.entry.as_ref())
+                            .any(|run| run.entry_id == entry.entry_id)
+                    }),
                     last_run_at: record
                         .and_then(|record| record.entry_last_runs.get(&entry.entry_id))
                         .copied(),
@@ -347,5 +365,6 @@ fn entry_view(entry: &QueueEntry, pairs: &[PairState<'_>]) -> QueueEntryView {
                 }
             })
             .collect(),
+        gate_phase: None,
     }
 }

@@ -434,7 +434,8 @@ pub struct QueueEntryErrorView {
 pub struct QueueEntryAutomationView {
     /// The automation's name.
     pub automation: String,
-    /// A run of the automation checks the entry now.
+    /// A run of the automation (`check`, or an entry script) runs for the
+    /// entry now.
     #[serde(default)]
     pub running: bool,
     /// When a run of the automation for the entry last ended.
@@ -466,6 +467,11 @@ pub struct QueueEntryView {
     /// the entry.
     #[serde(default)]
     pub automations: Vec<QueueEntryAutomationView>,
+    /// Where the automations stand in the episode (`entering`, `ready`,
+    /// `entry_failed`, ...); absent when the task cannot be read or keeps
+    /// no phase (a record from before entry scripts: ready).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_phase: Option<String>,
 }
 
 /// `GET /control/v1/observer-queues/{queue}`: one queue with its

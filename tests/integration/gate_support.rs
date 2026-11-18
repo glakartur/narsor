@@ -1,10 +1,9 @@
 //! Tasks at `decision` gates with a `watch` block, as their runners report
 //! them, for the observer tests.
 //!
-//! A runner's snapshot goes to the control plane
-//! (`ControlPlane::record_runner_snapshot`) and its outcome to the handler
-//! the runner channel calls next (`ProtocolService::follow_gate_episode`):
-//! the snapshot route without its credential check, so no runner session
+//! A runner's snapshot goes through `ProtocolService::record_runner_snapshot`:
+//! the snapshot route without its credential check (the control plane, the
+//! catalogue's entry scripts and the queue entries), so no runner session
 //! and no server are needed.
 
 use chrono::Utc;
@@ -179,12 +178,9 @@ pub fn report(
     waiting: Option<(&str, Option<&GateWatch>)>,
 ) -> RunnerReportOutcome {
     let snapshot = snapshot(service, task, incarnation, execution, waiting);
-    let outcome = service
-        .control_plane()
-        .record_runner_snapshot(task, incarnation, 1, snapshot)
-        .expect("runner snapshot");
-    service.follow_gate_episode(&outcome.task, &outcome.gate_change);
-    outcome
+    service
+        .record_runner_snapshot(task, incarnation, 1, snapshot, grace())
+        .expect("runner snapshot")
 }
 
 /// The task's first runner reports a problem: its last execution, no
@@ -195,12 +191,15 @@ pub fn runner_problem(service: &ProtocolService, task: &TaskId) -> RunnerReportO
         code: "workspace_unavailable".into(),
         message: "the workspace cannot be read".into(),
     });
-    let outcome = service
-        .control_plane()
-        .record_runner_snapshot(task, FIRST_RUNNER, 1, broken)
-        .expect("runner snapshot");
-    service.follow_gate_episode(&outcome.task, &outcome.gate_change);
-    outcome
+    service
+        .record_runner_snapshot(task, FIRST_RUNNER, 1, broken, grace())
+        .expect("runner snapshot")
+}
+
+/// The wait a task at a gate gets before its slot is freed: long enough
+/// that no test sees it.
+fn grace() -> chrono::Duration {
+    chrono::Duration::hours(1)
 }
 
 /// The snapshot [`report`] hands over: the next one of `incarnation`.

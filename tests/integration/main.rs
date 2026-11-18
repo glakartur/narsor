@@ -63,6 +63,7 @@ mod observers_worker;
 mod orchestration;
 mod persistence;
 mod profile_step_flow;
+mod queue_hooks;
 mod registry;
 mod schema_loading;
 mod step_profile_flow;

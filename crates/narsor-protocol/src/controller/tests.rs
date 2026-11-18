@@ -938,6 +938,7 @@ fn queue_views_round_trip_and_old_fields_are_optional() {
                     error: "the script exited with code 2".into(),
                 }),
             }],
+            gate_phase: Some("ready".into()),
         }],
         problems: Vec::new(),
     };

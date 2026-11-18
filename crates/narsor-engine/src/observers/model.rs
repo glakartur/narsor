@@ -727,9 +727,16 @@ pub struct AutomationRecord {
     /// an `on_episodes` queue, in order: each run takes the first (R30).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entry_round: Vec<String>,
-    /// The run in progress, if any: at most one per pair.
+    /// The scheduled run in progress (`check`), if any: at most one per
+    /// pair.
     #[serde(default)]
     pub active_run: Option<ActiveRun>,
+    /// The entry or exit script run in progress (`in`, `out`) for one
+    /// queue entry, if any: at most one per pair, next to the scheduled
+    /// run. It shares the pair's run sequence, but not its schedule, its
+    /// round, its backoff or its failure count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_hook: Option<ActiveRun>,
     /// When a worker last claimed a run.
     #[serde(default)]
     pub last_claim_at: Option<DateTime<Utc>>,
@@ -766,12 +773,29 @@ impl AutomationRecord {
             run_due_since: None,
             entry_round: Vec::new(),
             active_run: None,
+            active_hook: None,
             last_claim_at: None,
             last_run_sequence: 0,
             last_run: None,
             entry_last_runs: BTreeMap::new(),
             consecutive_failures: 0,
         }
+    }
+
+    /// The pair's run in progress with `sequence`, scheduled or hook.
+    pub fn run_in_progress(&self, sequence: u64) -> Option<&ActiveRun> {
+        [self.active_run.as_ref(), self.active_hook.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|active| active.sequence == sequence)
+    }
+
+    /// [`Self::run_in_progress`], to change it.
+    pub fn run_in_progress_mut(&mut self, sequence: u64) -> Option<&mut ActiveRun> {
+        [self.active_run.as_mut(), self.active_hook.as_mut()]
+            .into_iter()
+            .flatten()
+            .find(|active| active.sequence == sequence)
     }
 
     /// Since when a scheduled run waits for a worker to claim it; `None`

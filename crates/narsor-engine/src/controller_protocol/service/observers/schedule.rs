@@ -31,12 +31,15 @@
 //!                 a record of a pair the catalogue no   → deleted; kept while a run is
 //!                 longer has                              in progress
 //! claim           a run past its deadline               → lost (as in the pass)
+//!                 an entry script (`in`) due            → its hook run first (`hooks`)
 //!                 the oldest due                        → active_run + token (once);
 //!                                                         an on_episodes pair's run
 //!                                                         takes the round's next entry
 //!                                                         whose task still waits in its
-//!                                                         episode; the others are removed,
-//!                                                         never run (R18)
+//!                                                         episode and whose entry scripts
+//!                                                         all succeeded (R9); the others
+//!                                                         are removed (gone) or kept, never
+//!                                                         run (R18)
 //!                 its check script cannot be read       → a failed run: error file, no
 //!                                                         worker run
 //! finish (tasks)  exit 0 + valid output                 → state saved, failures = 0, no file
@@ -131,8 +134,7 @@ pub const RUN_DEADLINE_MARGIN_SECS: u64 = 60;
 pub const MAX_STORED_LOG_BYTES: usize = 64 * 1024;
 
 /// Why a lost run ended, as its error file and the queue view say.
-const LOST_MESSAGE: &str =
-    "lost by the worker: no result before the run's deadline; the pair's state is unchanged";
+pub(super) const LOST_MESSAGE: &str = "lost by the worker: no result before the run's deadline";
 
 /// Seconds until the next run after `failures` failed runs in a row:
 /// `interval × 2^failures`, at most [`MAX_RETRY_DELAY_SECS`], never less
@@ -297,13 +299,13 @@ fn skip_passed_tick(
 }
 
 /// `now` plus `secs` seconds, the latest instant when that is too far.
-fn after(now: DateTime<Utc>, secs: u64) -> DateTime<Utc> {
+pub(super) fn after(now: DateTime<Utc>, secs: u64) -> DateTime<Utc> {
     now.checked_add_signed(secs_duration(secs))
         .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
 /// `text` cut to at most [`MAX_STORED_LOG_BYTES`], on a character boundary.
-fn bounded(text: &str) -> String {
+pub(super) fn bounded(text: &str) -> String {
     if text.len() <= MAX_STORED_LOG_BYTES {
         return text.to_string();
     }
@@ -316,13 +318,13 @@ fn bounded(text: &str) -> String {
 
 /// How a run ended, as [`judge_tasks_run`] and [`judge_entry_run`] read
 /// the worker's report.
-struct Verdict<T> {
-    status: RunStatus,
-    exit_code: Option<i32>,
+pub(super) struct Verdict<T> {
+    pub(super) status: RunStatus,
+    pub(super) exit_code: Option<i32>,
     /// Why it failed; `None` for a success.
-    error: Option<String>,
+    pub(super) error: Option<String>,
     /// What a success yields; `None` for a failure.
-    success: Option<T>,
+    pub(super) success: Option<T>,
 }
 
 impl<T> Verdict<T> {
@@ -346,8 +348,9 @@ impl<T> Verdict<T> {
 }
 
 /// The script's exit code, or the verdict of a report that is a failure
-/// whatever the contract: no plain exit.
-fn exit_code_or_failure<T>(outcome: &RunOutcome) -> Result<i32, Verdict<T>> {
+/// whatever the contract: no plain exit. `timeout_secs` is the run's time
+/// limit.
+fn exit_code_or_failure<T>(outcome: &RunOutcome, timeout_secs: u64) -> Result<i32, Verdict<T>> {
     let verdict = match outcome {
         RunOutcome::Exited { exit_code } => return Ok(*exit_code),
         RunOutcome::OutputTooLarge { exit_code } => Verdict::failure(
@@ -358,7 +361,7 @@ fn exit_code_or_failure<T>(outcome: &RunOutcome) -> Result<i32, Verdict<T>> {
         RunOutcome::TimedOut => Verdict::failure(
             RunStatus::TimedOut,
             None,
-            format!("the script ran past its time limit of {SCRIPT_TIMEOUT_SECS} seconds"),
+            format!("the script ran past its time limit of {timeout_secs} seconds"),
         ),
         RunOutcome::WorkerError { message } => {
             Verdict::failure(RunStatus::WorkerError, None, bounded(message))
@@ -384,7 +387,7 @@ fn exited_with<T>(exit_code: i32) -> Verdict<T> {
 /// A `check` run of an `always` queue: exit 0 with a valid output
 /// document is the only success (R14).
 fn judge_tasks_run(report: &RunReport) -> Verdict<ScriptOutput> {
-    match exit_code_or_failure(&report.outcome) {
+    match exit_code_or_failure(&report.outcome, SCRIPT_TIMEOUT_SECS) {
         Ok(0) => match parse_script_output(report.stdout.as_bytes()) {
             Ok(output) => Verdict::success(0, output),
             Err(error) => Verdict::failure(RunStatus::InvalidOutput, Some(0), error.to_string()),
@@ -394,11 +397,12 @@ fn judge_tasks_run(report: &RunReport) -> Verdict<ScriptOutput> {
     }
 }
 
-/// A run for a queue entry: exit 0 is the only success, whether the script
-/// answered the gate or had nothing to report (R14). Stdout is not read,
-/// and no exit code removes the entry.
-fn judge_entry_run(report: &RunReport) -> Verdict<()> {
-    match exit_code_or_failure(&report.outcome) {
+/// A run for a queue entry (`check`, `in`, `out`) with the time limit
+/// `timeout_secs`: exit 0 is the only success, whether the script answered
+/// the gate or had nothing to report (R14). Stdout is not read, and no exit
+/// code removes the entry.
+pub(super) fn judge_entry_run(report: &RunReport, timeout_secs: u64) -> Verdict<()> {
+    match exit_code_or_failure(&report.outcome, timeout_secs) {
         Ok(ENTRY_DONE_EXIT_CODE) => Verdict::success(ENTRY_DONE_EXIT_CODE, ()),
         Ok(exit_code) => exited_with(exit_code),
         Err(verdict) => verdict,
@@ -428,6 +432,15 @@ fn count_failure(
         record.stopped_definition_digest = Some(definition_digest.to_string());
         tracing::info!(pair = %record.key, failures = record.consecutive_failures, "automations: too many failed runs; stopped until its catalogue definition changes");
     }
+}
+
+/// Whether a run of `record` in progress (scheduled or hook) passed its
+/// deadline at `now`.
+fn has_lost_run(record: &AutomationRecord, now: DateTime<Utc>) -> bool {
+    [record.active_run.as_ref(), record.active_hook.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|active| active.is_past_deadline(now))
 }
 
 /// The round's next entry waits for a claim from `now`, not from the claim
@@ -479,11 +492,7 @@ impl ProtocolService {
             let result = match records.get(key) {
                 None => self.mark_run_due(key, queue, now, &mut pass),
                 Some(record) => {
-                    if record
-                        .active_run
-                        .as_ref()
-                        .is_some_and(|active| active.is_past_deadline(now))
-                    {
+                    if has_lost_run(record, now) {
                         self.expire_run_if_lost(key, Some(&queue.schedule), now)
                             .map(|lost| pass.lost.extend(lost))
                     } else if record.state.is_stopped() {
@@ -507,14 +516,10 @@ impl ProtocolService {
             }
         }
         for (key, record) in records.iter().filter(|(key, _)| !pairs.contains_key(key)) {
-            let result = if record
-                .active_run
-                .as_ref()
-                .is_some_and(|active| active.is_past_deadline(now))
-            {
+            let result = if has_lost_run(record, now) {
                 self.expire_run_if_lost(key, None, now)
                     .map(|lost| pass.lost.extend(lost))
-            } else if record.active_run.is_none() {
+            } else if record.active_run.is_none() && record.active_hook.is_none() {
                 self.remove_record(key, &mut pass)
             } else {
                 Ok(())
@@ -540,20 +545,22 @@ impl ProtocolService {
         let now = self.control.now();
         let catalog = self.automation_catalog();
         let pairs = catalog_pairs(&catalog);
+        let records = self.observers.list_readable()?;
         let mut candidates: Vec<(DateTime<Utc>, AutomationKey)> = Vec::new();
-        for record in self.observers.list_readable()? {
+        for record in &records {
             let schedule = pairs.get(&record.key).map(|queue| &queue.schedule);
-            if record
-                .active_run
-                .as_ref()
-                .is_some_and(|active| active.is_past_deadline(now))
-            {
+            if has_lost_run(record, now) {
                 if let Err(error) = self.expire_run_if_lost(&record.key, schedule, now) {
                     tracing::warn!(pair = %record.key, %error, "automations: cannot record a lost run");
                 }
-            } else if let Some(since) = claim_candidate(&record).filter(|_| schedule.is_some()) {
-                candidates.push((since, record.key));
             }
+            if let Some(since) = claim_candidate(record).filter(|_| schedule.is_some()) {
+                candidates.push((since, record.key.clone()));
+            }
+        }
+        // Entry scripts first: a gate waits on them (R8).
+        if let Some(claimed) = self.claim_hook_run(&catalog, &pairs, &records, now)? {
+            return Ok(Some(claimed));
         }
         candidates.sort();
         for (_, key) in candidates {
@@ -604,6 +611,21 @@ impl ProtocolService {
             )
         };
         let mut record = self.observers.load(key)?.ok_or_else(ended)?;
+        if let Some(active) = record
+            .active_hook
+            .clone()
+            .filter(|active| active.sequence == run_id.sequence)
+        {
+            let now = self.control.now();
+            if active.is_past_deadline(now) {
+                self.lose_hook(&lock, &mut record, &active, now)?;
+                return Err(ProtocolError::conflict(
+                    "observer_run_lost",
+                    format!("run {run_id} passed its deadline and was recorded as lost"),
+                ));
+            }
+            return Ok(self.finish_hook_run(&lock, &mut record, &active, &report, now)?);
+        }
         let Some(active) = record
             .active_run
             .clone()
@@ -625,7 +647,7 @@ impl ProtocolService {
         skip_passed_tick(&mut record, schedule.as_ref(), now);
         let (status, exit_code, error) = match &active.entry {
             Some(_) => {
-                let verdict = judge_entry_run(&report);
+                let verdict = judge_entry_run(&report, SCRIPT_TIMEOUT_SECS);
                 if verdict.success.is_some() {
                     record.first_run_done = true;
                 }
@@ -709,9 +731,8 @@ impl ProtocolService {
     pub fn authenticate_observer_run(&self, bearer: &str) -> Option<RunId> {
         let run_id = RunId::parse(observer_run_token_id(bearer)?).ok()?;
         let record = self.observers.load(&run_id.key).ok()??;
-        let active = record.active_run.as_ref()?;
-        let valid = active.sequence == run_id.sequence
-            && token_matches_digest(bearer, &active.token_digest)
+        let active = record.run_in_progress(run_id.sequence)?;
+        let valid = token_matches_digest(bearer, &active.token_digest)
             && !active.is_past_deadline(self.control.now());
         valid.then_some(run_id)
     }
@@ -851,7 +872,7 @@ impl ProtocolService {
         if self
             .observers
             .load(key)?
-            .is_some_and(|record| record.active_run.is_some())
+            .is_some_and(|record| record.active_run.is_some() || record.active_hook.is_some())
         {
             return Ok(());
         }
@@ -862,29 +883,40 @@ impl ProtocolService {
         Ok(())
     }
 
-    /// Records the pair's run in progress as lost if it passed its
-    /// deadline, under the pair's lock. Returns the run lost, if any.
+    /// Records the pair's runs in progress (scheduled and hook) as lost if
+    /// they passed their deadline, under the pair's lock. Returns the runs
+    /// lost.
     fn expire_run_if_lost(
         &self,
         key: &AutomationKey,
         schedule: Option<&ScheduleConfig>,
         now: DateTime<Utc>,
-    ) -> Result<Option<RunId>, ObserverError> {
+    ) -> Result<Vec<RunId>, ObserverError> {
         let lock = self.observers.lock(key)?;
         let Some(mut record) = self.observers.load(key)? else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        let Some(active) = record
+        let mut lost = Vec::new();
+        if let Some(active) = record
             .active_run
             .clone()
             .filter(|active| active.is_past_deadline(now))
-        else {
-            return Ok(None);
-        };
-        self.lose_run(&lock, &mut record, &active, schedule, now)?;
-        let run_id = active.run_id(key);
-        tracing::info!(run = %run_id, "automations: run lost by the worker");
-        Ok(Some(run_id))
+        {
+            self.lose_run(&lock, &mut record, &active, schedule, now)?;
+            lost.push(active.run_id(key));
+        }
+        if let Some(active) = record
+            .active_hook
+            .clone()
+            .filter(|active| active.is_past_deadline(now))
+        {
+            self.lose_hook(&lock, &mut record, &active, now)?;
+            lost.push(active.run_id(key));
+        }
+        for run_id in &lost {
+            tracing::info!(run = %run_id, "automations: run lost by the worker");
+        }
+        Ok(lost)
     }
 
     /// Ends the run `active` as lost: its error file is written, its token
@@ -1158,7 +1190,7 @@ impl ProtocolService {
 }
 
 /// A queue entry as its script sees it (R11).
-fn script_entry(entry: &QueueEntry) -> ScriptEntry {
+pub(super) fn script_entry(entry: &QueueEntry) -> ScriptEntry {
     ScriptEntry {
         task_id: entry.task_id.clone(),
         episode: entry.episode.clone(),

@@ -4,6 +4,7 @@
 //! [`super::lifecycle`] and the durable mutation protocol in
 //! [`super::control_plane`].
 
+use crate::automations::HookPhase;
 use crate::domain::human_input::HumanInputDelivery;
 pub use crate::domain::runner_snapshot::{
     PendingInputRef, RunnerSnapshot, RETIRED_CONDUCTOR_HARNESS,
@@ -15,11 +16,11 @@ use serde::{Deserialize, Serialize};
 
 pub use narsor_protocol::controller::{
     ArchiveTombstone, AttentionItem, AttentionKind, CommandActor, CommandReceipt,
-    ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, GateWatch,
-    HarnessUnavailable, InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary,
-    OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity,
-    ResumeExhaustion, ResumeMessage, ResumeState, RunnerProblem, RunnerState, SlotReleaseReason,
-    TaskEvent, TaskEventKind, TaskProvenance, TaskState, WorkloadLoss,
+    ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, GateAutomationPhase,
+    GateWatch, HarnessUnavailable, InputStatus, InputUpdate, MaterialChange, Observation,
+    ObservedSummary, OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason,
+    ResourceIdentity, ResumeExhaustion, ResumeMessage, ResumeState, RunnerProblem, RunnerState,
+    SlotReleaseReason, TaskEvent, TaskEventKind, TaskProvenance, TaskState, WorkloadLoss,
 };
 
 /// Current schema version of [`TaskRecord`].
@@ -985,6 +986,154 @@ pub struct WatchedGate {
     /// kept: the time of the restore is used then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub began_at: Option<DateTime<Utc>>,
+    /// Where the automations of the gate's queue stand in this episode:
+    /// its phase and its entry (and, later, exit) scripts. Set by the
+    /// snapshot that begins the episode, from the catalogue as it is then;
+    /// a later snapshot of the same episode (pause, `Interrupted`,
+    /// auto-resume, runner restart, a runner problem) keeps it (R19).
+    /// `None` in a record from before entry scripts, or written without the
+    /// catalogue: the episode counts as [`GateAutomationPhase::Ready`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation: Option<GateAutomation>,
+}
+
+impl WatchedGate {
+    /// Whether `check` runs may check the episode (R9): every entry script
+    /// succeeded, or there is none.
+    pub fn automation_ready(&self) -> bool {
+        self.automation
+            .as_ref()
+            .is_none_or(|automation| automation.phase == GateAutomationPhase::Ready)
+    }
+}
+
+/// Most attempts of one entry or exit script in one episode (R12, R15).
+pub const GATE_HOOK_MAX_ATTEMPTS: u32 = 3;
+
+/// The wait before the second and the third attempt of a failed entry or
+/// exit script, in seconds.
+pub const GATE_HOOK_RETRY_DELAYS_SECS: [u64; 2] = [10, 30];
+
+/// How long one attempt of an entry or exit script may run, in seconds.
+pub const GATE_HOOK_TIMEOUT_SECS: u64 = 120;
+
+/// The automations of a watched gate's queue in one episode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateAutomation {
+    /// Where the episode stands.
+    pub phase: GateAutomationPhase,
+    /// The entry (and exit) scripts of the episode, one per automation and
+    /// script phase, in the queue file's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<GateHook>,
+}
+
+impl GateAutomation {
+    /// A new episode whose queue runs the `in` script of `automations`:
+    /// `entering` with one pending `in` each, or `ready` at once when there
+    /// is none (R17).
+    pub fn entering(automations: Vec<String>) -> Self {
+        let hooks: Vec<GateHook> = automations
+            .into_iter()
+            .map(|automation| GateHook::pending(automation, HookPhase::In))
+            .collect();
+        Self {
+            phase: if hooks.is_empty() {
+                GateAutomationPhase::Ready
+            } else {
+                GateAutomationPhase::Entering
+            },
+            hooks,
+        }
+    }
+
+    /// The phase the entry scripts give once none is pending: `ready` when
+    /// every one succeeded or was skipped, `entry_failed` when one failed
+    /// its last attempt; `None` while one is still pending.
+    pub fn entry_outcome(&self) -> Option<GateAutomationPhase> {
+        let mut entry = self.hooks.iter().filter(|hook| hook.hook == HookPhase::In);
+        if entry
+            .clone()
+            .any(|hook| hook.status == GateHookStatus::Pending)
+        {
+            return None;
+        }
+        Some(if entry.any(|hook| hook.status == GateHookStatus::Failed) {
+            GateAutomationPhase::EntryFailed
+        } else {
+            GateAutomationPhase::Ready
+        })
+    }
+}
+
+/// One entry or exit script of one automation in one episode.
+///
+/// The run in progress is not here: it is the (queue, automation) pair's
+/// hook run (`AutomationRecord::active_hook`). The task changes when an
+/// attempt ends, so a claim writes no task event and a lost claim leaves
+/// nothing behind on the task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateHook {
+    /// The automation.
+    pub automation: String,
+    /// `in` or `out`.
+    pub hook: HookPhase,
+    /// Where it stands.
+    pub status: GateHookStatus,
+    /// Attempts that ended (a lost run counts).
+    #[serde(default)]
+    pub attempts: u32,
+    /// The earliest time of the next attempt, after a failed one; `None`:
+    /// at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    /// Why the latest attempt failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl GateHook {
+    /// A script not tried yet.
+    pub fn pending(automation: String, hook: HookPhase) -> Self {
+        Self {
+            automation,
+            hook,
+            status: GateHookStatus::Pending,
+            attempts: 0,
+            next_attempt_at: None,
+            last_error: None,
+        }
+    }
+}
+
+/// Where one entry or exit script stands. A run in progress is still
+/// `pending` here: the pair's record has the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateHookStatus {
+    /// Not tried yet, or failed with attempts left.
+    Pending,
+    /// An attempt succeeded.
+    Succeeded,
+    /// The last attempt failed: no more automatic attempts.
+    Failed,
+    /// No script ran: the automation left the queue or lost the script.
+    Skipped,
+    /// A status from a newer build: never run again by this one.
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// How one attempt of an entry or exit script ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateHookOutcome {
+    /// The script exited 0.
+    Succeeded,
+    /// It failed, timed out, could not start, or was lost; the reason.
+    Failed(String),
+    /// No script ran (the automation left the queue or lost the script);
+    /// the reason.
+    Skipped(String),
 }
 
 /// How a runner snapshot moved the task between watched gate episodes

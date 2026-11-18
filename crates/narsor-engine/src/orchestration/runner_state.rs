@@ -15,16 +15,22 @@
 use super::control_plane::{refresh_slot_release_due, ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    GateChange, InputOutcome, InputRequest, InputStatus, InputUpdate, QueuedInput,
-    RunnerObservation, RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind,
-    TaskProvenance, TaskRecord, WatchedGate,
+    GateAutomation, GateAutomationPhase, GateChange, GateHookOutcome, GateHookStatus, InputOutcome,
+    InputRequest, InputStatus, InputUpdate, QueuedInput, RunnerObservation, RunnerReportOutcome,
+    RunnerSnapshot, RunnerState, TaskEventKind, TaskProvenance, TaskRecord, WatchedGate,
+    GATE_HOOK_MAX_ATTEMPTS, GATE_HOOK_RETRY_DELAYS_SECS,
 };
+use crate::automations::HookPhase;
 use crate::domain::display::bounded_detail;
 use crate::domain::{one_line_label, without_unsafe_chars, TaskId, GENERATED_TITLE_MAX_CHARS};
 use crate::environment::backend::DEFAULT_SLOT_RELEASE_GRACE_SECS;
 use chrono::{DateTime, Duration, Utc};
 use narsor_protocol::api::{ConversationState, EventLink, Timeline};
 use narsor_protocol::controller::ResumeMessage;
+
+/// For a queue, the automations whose entry script (`in`) runs when an
+/// episode enters it, as the catalogue says now.
+pub type EntryScripts<'a> = dyn Fn(&str) -> Vec<String> + 'a;
 
 /// How many keys of comments already taken a record remembers.
 const RESUME_MESSAGES_REMEMBERED: usize = 32;
@@ -53,6 +59,7 @@ impl ControlPlane {
             launch_generation,
             snapshot,
             Duration::seconds(i64::try_from(DEFAULT_SLOT_RELEASE_GRACE_SECS).unwrap_or(i64::MAX)),
+            None,
         )
     }
 
@@ -61,6 +68,13 @@ impl ControlPlane {
     /// is freed, as the backend is configured now. The snapshot also sets
     /// or clears the task's slot-release deadline (D62, see
     /// [`refresh_slot_release_due`]).
+    ///
+    /// `entry_scripts` names, for a queue, the automations whose entry
+    /// script (`in`) runs when an episode enters it: asked only for an
+    /// episode the snapshot begins, so the episode's automation phase is
+    /// written with the episode itself ([`WatchedGate::automation`]).
+    /// Without it the new episode has no automation phase and counts as
+    /// ready.
     pub fn record_runner_snapshot_with(
         &self,
         task_id: &TaskId,
@@ -68,6 +82,7 @@ impl ControlPlane {
         launch_generation: u64,
         mut snapshot: RunnerSnapshot,
         grace: Duration,
+        entry_scripts: Option<&EntryScripts<'_>>,
     ) -> Result<RunnerReportOutcome> {
         // A remote runner's word is not trusted with a terminal: what the
         // attention carries is cleaned before it is stored or announced.
@@ -140,7 +155,7 @@ impl ControlPlane {
             // waits at no watched gate.
             let gate_change =
                 if snapshot.execution_cursor.execution_id.is_some() && snapshot.problem.is_none() {
-                    follow_watched_gate(record, &snapshot, now)
+                    follow_watched_gate(record, &snapshot, now, entry_scripts)
                 } else {
                     GateChange::default()
                 };
@@ -494,6 +509,121 @@ impl ControlPlane {
         self.mutate(task_id, |_, _| Ok(Mutation::Changed(kind, ())))?;
         Ok(())
     }
+
+    /// Records the end of one attempt of the `hook` script of `automation`
+    /// in the watched gate episode `episode` (R12): one event in the task's
+    /// history, the script's status, and the gate's phase once no entry
+    /// script is pending (`ready`, or `entry_failed` after a last failed
+    /// attempt).
+    ///
+    /// A failed attempt with attempts left waits
+    /// [`GATE_HOOK_RETRY_DELAYS_SECS`] for the next one; after
+    /// [`GATE_HOOK_MAX_ATTEMPTS`] the script fails for good: no automatic
+    /// attempt follows.
+    ///
+    /// Returns the gate's new phase when it changed. Changes nothing (and
+    /// returns `None`) when the task no longer waits in `episode`, or the
+    /// script is not pending there: the attempt is of no use any more.
+    pub fn record_gate_hook_attempt(
+        &self,
+        task_id: &TaskId,
+        episode: &str,
+        automation: &str,
+        hook: HookPhase,
+        outcome: &GateHookOutcome,
+    ) -> Result<Option<GateAutomationPhase>> {
+        let (_, changed) = self.mutate(task_id, |record, now| {
+            let Some(gate) = record
+                .watched_gate
+                .as_mut()
+                .filter(|gate| gate.episode == episode)
+            else {
+                return Ok(Mutation::Unchanged(None));
+            };
+            let (step, queue) = (
+                bounded_name(&gate.watch.step),
+                bounded_name(&gate.watch.queue),
+            );
+            let Some(state) = gate
+                .automation
+                .as_mut()
+                .filter(|state| state.phase == GateAutomationPhase::Entering)
+            else {
+                return Ok(Mutation::Unchanged(None));
+            };
+            let Some(script) = state.hooks.iter_mut().find(|script| {
+                script.automation == automation
+                    && script.hook == hook
+                    && script.status == GateHookStatus::Pending
+            }) else {
+                return Ok(Mutation::Unchanged(None));
+            };
+            let (mut error, mut skipped, mut retry_at) = (None, None, None);
+            match outcome {
+                GateHookOutcome::Succeeded => {
+                    script.attempts += 1;
+                    script.status = GateHookStatus::Succeeded;
+                    script.next_attempt_at = None;
+                }
+                GateHookOutcome::Failed(reason) => {
+                    script.attempts += 1;
+                    let reason = bounded_detail(reason);
+                    script.last_error = Some(reason.clone());
+                    error = Some(reason);
+                    match retry_delay(script.attempts) {
+                        Some(delay) => {
+                            let at = now + delay;
+                            script.next_attempt_at = Some(at);
+                            retry_at = Some(at);
+                        }
+                        None => {
+                            script.status = GateHookStatus::Failed;
+                            script.next_attempt_at = None;
+                        }
+                    }
+                }
+                GateHookOutcome::Skipped(reason) => {
+                    script.status = GateHookStatus::Skipped;
+                    script.next_attempt_at = None;
+                    skipped = Some(bounded_detail(reason));
+                }
+            }
+            let attempt = script.attempts;
+            let gate_phase = state.entry_outcome();
+            if let Some(phase) = gate_phase {
+                state.phase = phase;
+            }
+            let kind = TaskEventKind::GateHookAttempt {
+                step,
+                queue,
+                episode: bounded_name(episode),
+                automation: bounded_name(automation),
+                hook: hook.as_str().to_string(),
+                attempt,
+                error,
+                skipped,
+                retry_at,
+                gate_phase,
+            };
+            Ok(Mutation::Changed(kind, gate_phase))
+        })?;
+        Ok(changed)
+    }
+}
+
+/// The wait before the attempt after `attempts` failed ones, `None` when
+/// none follows.
+fn retry_delay(attempts: u32) -> Option<Duration> {
+    if attempts >= GATE_HOOK_MAX_ATTEMPTS {
+        return None;
+    }
+    let index = usize::try_from(attempts.saturating_sub(1)).unwrap_or(usize::MAX);
+    let secs = GATE_HOOK_RETRY_DELAYS_SECS
+        .get(index)
+        .or(GATE_HOOK_RETRY_DELAYS_SECS.last())
+        .copied()
+        .unwrap_or_default();
+    Some(Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX)))
 }
 
 /// Keeps [`TaskRecord::watched_gate`] in step with a snapshot of a runner
@@ -504,12 +634,14 @@ fn follow_watched_gate(
     record: &mut TaskRecord,
     snapshot: &RunnerSnapshot,
     now: DateTime<Utc>,
+    entry_scripts: Option<&EntryScripts<'_>>,
 ) -> GateChange {
     let current = match (&snapshot.pending_input, &snapshot.gate_watch) {
         (Some(pending), Some(watch)) => Some(WatchedGate {
             episode: pending.id.clone(),
             watch: watch.clone(),
             began_at: Some(now),
+            automation: None,
         }),
         _ => None,
     };
@@ -517,6 +649,13 @@ fn follow_watched_gate(
     if known == current.as_ref().map(|gate| &gate.episode) {
         return GateChange::default();
     }
+    // Only here, where the episode begins: a snapshot of the same episode
+    // returned above, so a pause or a restart never runs `in` again (R19).
+    let current = current.map(|mut gate| {
+        gate.automation =
+            entry_scripts.map(|scripts| GateAutomation::entering(scripts(&gate.watch.queue)));
+        gate
+    });
     let ended = std::mem::replace(&mut record.watched_gate, current.clone());
     GateChange {
         ended,

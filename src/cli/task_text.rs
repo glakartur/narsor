@@ -907,6 +907,29 @@ pub fn event_line(event: &TaskEvent) -> String {
         } => format!(
             "warning: step {step} waits on queue {queue} (episode {episode}): {reason}"
         ),
+        TaskEventKind::GateHookAttempt {
+            step,
+            automation,
+            hook,
+            attempt,
+            error,
+            skipped,
+            retry_at,
+            gate_phase,
+            ..
+        } => {
+            let result = match (error, skipped) {
+                (Some(error), _) => format!("attempt {attempt} failed: {error}"),
+                (None, Some(reason)) => format!("skipped: {reason}"),
+                (None, None) => format!("attempt {attempt} succeeded"),
+            };
+            let next = match (retry_at, gate_phase) {
+                (Some(at), _) => format!("; next attempt at {}", at.to_rfc3339()),
+                (None, Some(phase)) => format!("; gate automations {}", phase.as_str()),
+                (None, None) => String::new(),
+            };
+            format!("step {step}: {hook} script of automation {automation}, {result}{next}")
+        }
         TaskEventKind::OwnerCommandAccepted { command, .. } => {
             format!("owner command {command:?}")
         }

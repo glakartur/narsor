@@ -5,7 +5,9 @@
 //! ```text
 //! runner snapshot  watched episode ended        → its entry removed
 //!                  watched episode began        → its entry added, after the removal,
-//!                                                 under the same lock
+//!                                                 under the same lock; the episode's
+//!                                                 entry scripts were set with it
+//!                                                 (`entering`, or `ready` without any)
 //!                    added, and the catalogue has no usable on_episodes queue
 //!                    of that name                → warning in the task's history
 //!                    refused or not stored      → warning in the task's history
@@ -15,7 +17,8 @@
 //! schedule         an entry whose task no longer waits in its episode, or ended,
 //!                  was archived or is gone      → removed, never run (R18, R19)
 //!                  an entry whose task waits, but whose runner reports a problem
-//!                  or is starting (no pending input)
+//!                  or is starting (no pending input), or whose entry scripts
+//!                  have not all succeeded (R9)
 //!                                               → kept, not run (R17)
 //!                  a task of the queue that waits in its watched episode with
 //!                  no entry, or with an entry file that cannot be parsed
@@ -38,6 +41,7 @@
 
 use std::collections::HashSet;
 
+use crate::automations::HookPhase;
 use crate::controller_protocol::service::ProtocolService;
 use crate::domain::TaskId;
 use crate::observers::{queue_entry_id, EntryWrite, ObserverError, ObserverMode, QueueEntry};
@@ -137,6 +141,9 @@ impl ProtocolService {
             Ok(task) => {
                 if !waits_in(&task, &entry.owner, &entry.episode) {
                     EntryWait::Gone
+                } else if !gate_ready(&task) {
+                    tracing::debug!(task = %entry.task_id, episode = %entry.episode, "automations: the entry scripts of a waiting task have not all succeeded; its queue entry is not checked");
+                    EntryWait::Unknown
                 } else if gate_takes_answer(&task, &entry.episode) {
                     EntryWait::Waits
                 } else {
@@ -355,6 +362,32 @@ impl ProtocolService {
         }
     }
 
+    /// The automations of queue `queue` whose entry script (`in`) runs
+    /// when an episode enters it, in the queue file's order (R8). None for
+    /// a queue the catalogue has no usable `on_episodes` queue of: no
+    /// automation serves it, so nothing holds the gate back (R17).
+    pub(crate) fn entry_script_automations(&self, queue: &str) -> Vec<String> {
+        let catalog = self.automation_catalog();
+        let Some(found) = catalog
+            .queues
+            .get(queue)
+            .filter(|found| found.mode == ObserverMode::OnEpisodes)
+        else {
+            return Vec::new();
+        };
+        found
+            .automations
+            .iter()
+            .filter(|name| {
+                catalog
+                    .automations
+                    .get(*name)
+                    .is_some_and(|automation| automation.has(HookPhase::In))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Why no automation of the queue of `gate` can answer it, `None` when
     /// the catalogue has a usable `on_episodes` queue of that name (R9,
     /// R27).
@@ -412,9 +445,17 @@ pub(super) fn gate_takes_answer(task: &TaskRecord, episode: &str) -> bool {
         .is_some_and(|pending| pending.id == episode)
 }
 
+/// Whether the automations of `task`'s watched episode may run `check`
+/// (R9): every entry script succeeded, or there is none.
+pub(super) fn gate_ready(task: &TaskRecord) -> bool {
+    task.watched_gate
+        .as_ref()
+        .is_some_and(WatchedGate::automation_ready)
+}
+
 /// Whether `task` can take no more answers: finished, archived (or being
 /// archived).
-fn task_ended(task: &TaskRecord) -> bool {
+pub(super) fn task_ended(task: &TaskRecord) -> bool {
     task.archive.is_some()
         || task.runner_state.is_archival()
         || task.task_state() == TaskState::Finished

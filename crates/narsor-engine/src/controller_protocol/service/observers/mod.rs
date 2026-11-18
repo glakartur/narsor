@@ -14,11 +14,13 @@
 //!
 //! The entries of queues are the wait episodes of `decision` gates with a
 //! `watch` block ([`crate::observers::QueueEntry`]): the runner's snapshot
-//! adds and removes them ([`entries`]), and the schedule hands them to the
-//! pairs of their `on_episodes` queue.
+//! adds and removes them ([`entries`]), the entry scripts of each pair run
+//! when an episode enters ([`hooks`]), and the schedule hands the entries
+//! to the pairs of their `on_episodes` queue once those succeeded.
 
 mod effects;
 mod entries;
+mod hooks;
 mod queues;
 mod schedule;
 #[cfg(test)]
