@@ -261,11 +261,20 @@ export function dialogNear(element, root = globalThis.document) {
 }
 
 /**
+ * Gives focus back to `dialog` when the focus is not in it (after a click on
+ * the overlay it is on the page body). A field that has the focus (the
+ * script text after Escape) keeps it, with its caret.
+ */
+export function keepFocusIn(dialog, active = globalThis.document?.activeElement) {
+  if (dialog && !dialog.contains(active)) dialog.focus();
+}
+
+/**
  * Lists the dialog `key` among the unsaved scripts while `changed` (for the
  * guard before the tab closes), and returns the close that asks first. The
  * overlay click, Escape, ✕ and Anuluj all go through it. When the owner
- * keeps editing, the dialog gets focus back, so the next Escape goes to the
- * dialog (which asks again) and not to the page.
+ * keeps editing, the focus stays in the dialog, so the next Escape goes to
+ * the dialog (which asks again) and not to the page.
  */
 function useScriptDraft(key, changed, onClose) {
   useEffect(() => {
@@ -274,7 +283,7 @@ function useScriptDraft(key, changed, onClose) {
   }, [key, changed]);
   useEffect(() => () => unsavedScripts.delete(key), [key]);
   return (event) => {
-    if (!closeAfterAsking(changed, onClose)) dialogNear(event?.currentTarget)?.focus();
+    if (!closeAfterAsking(changed, onClose)) keepFocusIn(dialogNear(event?.currentTarget));
   };
 }
 

@@ -12,7 +12,7 @@ import {
   entryObserverParts, intervalText, modeText, scheduleText, unapprovedText, versionRows,
 } from '../ui/js/text.js';
 import {
-  CLI_HINT, DISCARD_SCRIPT, ObserverCard, closeAfterAsking, dialogNear, hasUnsavedScript, queuesKeysHeld, scriptChanged,
+  CLI_HINT, DISCARD_SCRIPT, ObserverCard, closeAfterAsking, dialogNear, hasUnsavedScript, keepFocusIn, queuesKeysHeld, scriptChanged,
 } from '../ui/js/ui/queues.js';
 
 function observer(fields = {}) {
@@ -243,4 +243,20 @@ test('keeping the edit gives focus back to the dialog that asked', () => {
   assert.equal(dialogNear(element({ holds: dialog }), page), dialog, 'the overlay around the dialog');
   assert.equal(dialogNear(undefined, page), other, 'Escape: the open dialog of the page');
   assert.equal(dialogNear(undefined, undefined), null);
+});
+
+test('keeping the edit leaves the focus in a field of the dialog, else gives it to the dialog', () => {
+  const textarea = { name: 'textarea' };
+  const body = { name: 'body' };
+  const focused = [];
+  const dialog = { contains: (node) => node === textarea, focus: () => focused.push('dialog') };
+
+  keepFocusIn(dialog, textarea);
+  assert.deepEqual(focused, [], 'Escape in the script text: the caret stays');
+  keepFocusIn(dialog, body);
+  assert.deepEqual(focused, ['dialog'], 'a click on the overlay left the focus on the body');
+  keepFocusIn(dialog, null);
+  assert.deepEqual(focused, ['dialog', 'dialog']);
+  keepFocusIn(null, body);
+  assert.deepEqual(focused, ['dialog', 'dialog'], 'no dialog: nothing to focus');
 });
