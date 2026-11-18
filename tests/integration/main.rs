@@ -22,6 +22,7 @@ mod actions_agent;
 mod actions_human;
 mod actions_script;
 mod agent_harness_selection;
+mod automations_catalog;
 mod backend_contract;
 mod branches;
 mod builtin_workflows;

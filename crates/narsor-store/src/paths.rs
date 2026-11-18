@@ -13,6 +13,8 @@
 //! ```text
 //! {catalog}/repositories/{id}.yaml   -- CatalogPaths: declared, shareable,
 //! {catalog}/workflows/{name}.yaml                     mountable read-only
+//! {catalog}/automations/{name}/…     -- automation definition and scripts
+//! {catalog}/queues/{name}.yaml       -- queues served by automations
 //!
 //! {state}/executions/{id}/…          -- StatePaths: owned by one process
 //! {state}/narsor.log
@@ -56,6 +58,13 @@ pub const BACKENDS_DIR: &str = "backends";
 
 /// Directory holding user profiles, under the catalogue root.
 pub const PROFILES_DIR: &str = "profiles";
+
+/// Directory holding automations (one subdirectory each: definition and
+/// scripts), under the catalogue root.
+pub const AUTOMATIONS_DIR: &str = "automations";
+
+/// Directory holding queue definitions, under the catalogue root.
+pub const QUEUES_DIR: &str = "queues";
 
 /// The runtime catalogue (runtime bundle and tool packages), under the
 /// catalogue root.
@@ -774,6 +783,16 @@ impl CatalogPaths {
     /// `{root}/profiles`
     pub fn profiles_dir(&self) -> PathBuf {
         self.root.join(PROFILES_DIR)
+    }
+
+    /// `{root}/automations`
+    pub fn automations_dir(&self) -> PathBuf {
+        self.root.join(AUTOMATIONS_DIR)
+    }
+
+    /// `{root}/queues`
+    pub fn queues_dir(&self) -> PathBuf {
+        self.root.join(QUEUES_DIR)
     }
 
     /// `{root}/runtime.yaml`

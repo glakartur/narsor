@@ -673,7 +673,7 @@ impl ObserverStore {
 }
 
 /// `sha256:` digest of a script's bytes, as [`super::ScriptVersion`] holds it.
-fn script_digest(bytes: &[u8]) -> String {
+pub(crate) fn script_digest(bytes: &[u8]) -> String {
     format!("sha256:{}", sha256_hex(bytes))
 }
 
