@@ -189,10 +189,12 @@ fn observer_effect_requests_refuse_fields_a_script_may_not_choose() {
 #[test]
 fn a_worker_run_hides_its_token_and_an_unknown_outcome_is_unrecognized() {
     let run = super::ObserverWorkerRun {
-        run_id: "obs-1.1".into(),
-        owner: "owner".into(),
-        token: "nso.obs-1.1.secret-part".into(),
-        script_version: 1,
+        run_id: "mr-review~gitlab-mr-label~1".into(),
+        phase: "check".into(),
+        queue: "mr-review".into(),
+        automation: "gitlab-mr-label".into(),
+        token: "nso.mr-review~gitlab-mr-label~1.secret-part".into(),
+        script_digest: "sha256:00".into(),
         script: "true".into(),
         input: serde_json::json!({}),
         secrets: Vec::new(),
@@ -200,13 +202,7 @@ fn a_worker_run_hides_its_token_and_an_unknown_outcome_is_unrecognized() {
         deadline: Utc::now(),
     };
     assert!(!format!("{run:?}").contains("secret-part"));
-    assert_eq!(serde_json::to_value(&run).unwrap()["owner"], "owner");
-    // A server that does not say whose run it is: the worker refuses to
-    // pick a secrets directory for it.
-    let mut without_owner = serde_json::to_value(&run).unwrap();
-    without_owner.as_object_mut().unwrap().remove("owner");
-    let parsed: super::ObserverWorkerRun = serde_json::from_value(without_owner).unwrap();
-    assert_eq!(parsed.owner, "");
+    assert_eq!(serde_json::to_value(&run).unwrap()["phase"], "check");
 
     let outcome: super::ObserverRunOutcome =
         serde_json::from_value(serde_json::json!({"kind": "exploded", "why": "newer"})).unwrap();
@@ -859,155 +855,70 @@ fn an_observers_answer_names_its_entry_and_refuses_artifacts() {
 }
 
 #[test]
-fn an_observer_update_names_only_what_changes_and_refuses_other_fields() {
-    let request: super::UpdateObserverRequest =
-        serde_json::from_value(serde_json::json!({"queue": "mr-review", "mode": "on_episodes"}))
-            .unwrap();
-    assert_eq!(request.queue.as_deref(), Some("mr-review"));
-    assert_eq!(request.mode, Some(super::ObserverMode::OnEpisodes));
-    assert!(!request.is_empty());
-    let value = serde_json::to_value(&request).unwrap();
-    assert_eq!(
-        value,
-        serde_json::json!({"queue": "mr-review", "mode": "on_episodes"})
-    );
-    assert_eq!(
-        serde_json::from_value::<super::UpdateObserverRequest>(value).unwrap(),
-        request
-    );
-
-    let schedule = super::UpdateObserverRequest {
-        cron: Some("*/5 * * * *".into()),
-        ..Default::default()
-    };
-    assert_eq!(
-        serde_json::to_value(&schedule).unwrap(),
-        serde_json::json!({"cron": "*/5 * * * *"})
-    );
-    assert!(super::UpdateObserverRequest::default().is_empty());
-
-    // The name and the effect are not changed by an update.
-    for refused in [
-        serde_json::json!({"name": "other"}),
-        serde_json::json!({"mode": "sometimes"}),
-        serde_json::json!({"secrets": []}),
-    ] {
-        assert!(
-            serde_json::from_value::<super::UpdateObserverRequest>(refused.clone()).is_err(),
-            "{refused}"
-        );
-    }
-}
-
-#[test]
-fn a_create_observer_request_refuses_the_removed_source_field() {
-    let request: super::CreateObserverRequest =
-        serde_json::from_value(serde_json::json!({"name": "jira-new"})).unwrap();
-    assert!(serde_json::to_value(&request)
-        .unwrap()
-        .get("source")
-        .is_none());
-
-    let old_client = serde_json::json!({"name": "jira-new", "source": "jira"});
-    let error = serde_json::from_value::<super::CreateObserverRequest>(old_client).unwrap_err();
-    assert!(
-        error.to_string().contains("unknown field `source`"),
-        "{error}"
-    );
-}
-
-fn observer_view_for_queue() -> super::ObserverView {
-    super::ObserverView {
-        observer_id: "obs-1".into(),
-        name: "gitlab-mr".into(),
-        state: "active".into(),
-        effect: "none".into(),
-        workflow_id: None,
-        queue: "mr-review".into(),
-        mode: "on_episodes".into(),
-        interval_secs: None,
-        cron: Some("*/5 * * * *".into()),
-        task_limit_per_run: 10,
-        secrets: Vec::new(),
-        mapping: Default::default(),
-        approved_version: Some(2),
-        latest_version: Some(3),
-        next_run_at: None,
-        waiting_for_claim_since: None,
-        worker_missing: false,
-        last_claim_at: None,
-        active_run: None,
-        last_run: None,
-        consecutive_failures: 0,
-        note: None,
-        created_at: Utc::now(),
-    }
-}
-
-#[test]
-fn an_observer_view_shows_its_secrets_and_mapping_only_when_it_has_them() {
-    // R34: read-only settings ride on the view; none, no field.
-    let plain = observer_view_for_queue();
-    let value = serde_json::to_value(&plain).unwrap();
-    assert!(value.get("secrets").is_none());
-    assert!(value.get("mapping").is_none());
-    // Covers AE10: both versions are on the wire.
-    assert_eq!(value["approved_version"], 2);
-    assert_eq!(value["latest_version"], 3);
-    assert_eq!(
-        serde_json::from_value::<super::ObserverView>(value).unwrap(),
-        plain
-    );
-
-    let mut source = observer_view_for_queue();
-    source.secrets = vec![super::ObserverSecretRef {
-        name: "jira-token".into(),
-        env: "JIRA_TOKEN".into(),
-    }];
-    source.mapping = [("ticket".to_string(), "key".to_string())].into();
-    let value = serde_json::to_value(&source).unwrap();
-    assert_eq!(
-        value["secrets"],
-        serde_json::json!([{"name": "jira-token", "env": "JIRA_TOKEN"}])
-    );
-    assert_eq!(value["mapping"], serde_json::json!({"ticket": "key"}));
-    assert_eq!(
-        serde_json::from_value::<super::ObserverView>(value).unwrap(),
-        source
-    );
-}
-
-#[test]
-fn queue_views_round_trip_with_entries_and_their_processing_state() {
+fn queue_views_round_trip_and_old_fields_are_optional() {
     let list = super::ObserverQueueListResponse {
         queues: vec![
             super::ObserverQueueSummary {
                 queue: "mr-review".into(),
                 mode: Some("on_episodes".into()),
-                observers: 2,
+                interval_secs: None,
+                cron: Some("*/5 * * * *".into()),
+                automations: vec!["gitlab-mr-label".into()],
                 entries: 1,
+                problem: None,
             },
             super::ObserverQueueSummary {
-                queue: "orphan".into(),
+                queue: "broken".into(),
                 mode: None,
-                observers: 0,
-                entries: 3,
+                interval_secs: None,
+                cron: None,
+                automations: Vec::new(),
+                entries: 0,
+                problem: Some("automation 'missing' is not in the catalogue".into()),
             },
         ],
+        problems: vec![super::CatalogProblemView {
+            file: "queues/broken.yaml".into(),
+            reason: "automation 'missing' is not in the catalogue".into(),
+        }],
     };
     let value = serde_json::to_value(&list).unwrap();
-    assert_eq!(value["queues"][0]["entries"], 1);
     assert!(value["queues"][1].get("mode").is_none());
     assert_eq!(
         serde_json::from_value::<super::ObserverQueueListResponse>(value).unwrap(),
         list
     );
+    // A server from before the catalogue sends no problems and no
+    // automations: a new client still reads it.
+    let old: super::ObserverQueueListResponse = serde_json::from_value(serde_json::json!({
+        "queues": [{"queue": "q", "observers": 1, "entries": 0}]
+    }))
+    .unwrap();
+    assert!(old.problems.is_empty());
+    assert!(old.queues[0].automations.is_empty());
 
     let now = Utc::now();
     let queue = super::ObserverQueueView {
         queue: "mr-review".into(),
         mode: Some("on_episodes".into()),
-        observers: vec![observer_view_for_queue()],
+        interval_secs: None,
+        cron: Some("*/5 * * * *".into()),
+        workflow_id: None,
+        automations: vec![super::QueueAutomationView {
+            automation: "gitlab-mr-label".into(),
+            description: "label".into(),
+            scripts: vec!["in".into(), "check".into(), "out".into()],
+            secrets: Vec::new(),
+            state: "active".into(),
+            next_run_at: Some(now),
+            waiting_for_claim_since: None,
+            worker_missing: false,
+            last_claim_at: None,
+            active_run: None,
+            last_run: None,
+            consecutive_failures: 0,
+            errors: Vec::new(),
+        }],
         entries: vec![super::QueueEntryView {
             entry_id: "a".repeat(64),
             task_id: "task-1".into(),
@@ -1015,34 +926,27 @@ fn queue_views_round_trip_with_entries_and_their_processing_state() {
             episode: "input-1".into(),
             started_at: now,
             params: [("mr_url".to_string(), "https://x/1".to_string())].into(),
-            observers: vec![
-                super::QueueEntryObserverView {
-                    observer: "gitlab-mr".into(),
-                    running: false,
-                    last_run_at: Some(now),
-                    last_error: Some(super::QueueEntryErrorView {
-                        run_id: "obs-1.4".into(),
-                        status: "failed".into(),
-                        finished_at: now,
-                        exit_code: Some(2),
-                        error: "the script exited with code 2".into(),
-                    }),
-                },
-                super::QueueEntryObserverView {
-                    observer: "github-pr".into(),
-                    running: true,
-                    last_run_at: None,
-                    last_error: None,
-                },
-            ],
+            automations: vec![super::QueueEntryAutomationView {
+                automation: "gitlab-mr-label".into(),
+                running: false,
+                last_run_at: Some(now),
+                last_error: Some(super::QueueEntryErrorView {
+                    run_id: "mr-review~gitlab-mr-label~4".into(),
+                    status: "failed".into(),
+                    finished_at: now,
+                    exit_code: Some(2),
+                    error: "the script exited with code 2".into(),
+                }),
+            }],
         }],
+        problems: Vec::new(),
     };
     let value = serde_json::to_value(&queue).unwrap();
-    let entry = &value["entries"][0];
-    assert_eq!(entry["params"]["mr_url"], "https://x/1");
-    assert_eq!(entry["observers"][0]["last_error"]["exit_code"], 2);
-    assert!(entry["observers"][1].get("last_run_at").is_none());
-    assert!(entry["observers"][1].get("last_error").is_none());
+    assert_eq!(
+        value["entries"][0]["automations"][0]["last_error"]["exit_code"],
+        2
+    );
+    assert!(value["automations"][0].get("secrets").is_none());
     assert_eq!(
         serde_json::from_value::<super::ObserverQueueView>(value).unwrap(),
         queue

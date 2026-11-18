@@ -27,7 +27,7 @@ export function Header({ state, now, onHelp, onSignOut, onDialog, onQueues }) {
         ${slot && html`<button class="chip" title="Limit zadań (L)" onClick=${() => onDialog('limit')}>sloty ${slot.used}${slot.limit !== null ? `/${slot.limit}` : ''}</button>`}
         <span class=${`chip counter ${questions ? 'role-attention' : 'role-done'}`} title="Czekają na odpowiedź">? ${questions}</span>
         <span class=${`chip counter ${problems ? 'role-problem' : 'role-done'}`} title="Mają problem">! ${problems}</span>
-        <button class=${`small${state.page === 'queues' ? ' active' : ''}`} title="Kolejki obserwatorów (Q)" aria-pressed=${state.page === 'queues'}
+        <button class=${`small${state.page === 'queues' ? ' active' : ''}`} title="Kolejki automatyzacji (Q)" aria-pressed=${state.page === 'queues'}
           onClick=${onQueues}>Kolejki</button>
         <button class="small" title="Historia (H)" onClick=${() => onDialog('history')}>Historia</button>
         <button class="small" title="Repozytoria (R)" onClick=${() => onDialog('repositories')}>Repozytoria</button>

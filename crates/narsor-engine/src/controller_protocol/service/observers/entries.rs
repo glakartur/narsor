@@ -6,8 +6,8 @@
 //! runner snapshot  watched episode ended        → its entry removed
 //!                  watched episode began        → its entry added, after the removal,
 //!                                                 under the same lock
-//!                    added, and no active on_episodes observer of the queue
-//!                                               → warning in the task's history
+//!                    added, and the catalogue has no usable on_episodes queue
+//!                    of that name                → warning in the task's history
 //!                    refused or not stored      → warning in the task's history
 //!                  same episode (pause, Interrupted, auto-resume, runner restart)
 //!                                               → nothing (R17)
@@ -27,8 +27,8 @@
 //!
 //! The task's record and the entry are two writes: a control plane that
 //! stops between them leaves a waiting task without its entry, and no later
-//! snapshot adds it (the episode is known). The tick of an `on_episodes`
-//! observer of the queue adds it back ([`ProtocolService::restore_queue_entries`]).
+//! snapshot adds it (the episode is known). The tick of a pair of the
+//! `on_episodes` queue adds it back ([`ProtocolService::restore_queue_entries`]).
 //!
 //! The warning is written once per episode: only the snapshot that begins
 //! the episode adds the entry, and an entry id is the task's and the
@@ -40,9 +40,7 @@ use std::collections::HashSet;
 
 use crate::controller_protocol::service::ProtocolService;
 use crate::domain::TaskId;
-use crate::observers::{
-    queue_entry_id, EntryWrite, ObserverError, ObserverMode, ObserverState, QueueEntry,
-};
+use crate::observers::{queue_entry_id, EntryWrite, ObserverError, ObserverMode, QueueEntry};
 use crate::orchestration::{
     GateChange, OrchestrationError, OwnerRef, TaskRecord, TaskState, WatchedGate,
 };
@@ -154,18 +152,18 @@ impl ProtocolService {
         }
     }
 
-    /// Adds back the entries of `owner`'s queue `queue` that a task waiting
-    /// in its watched episode has none of, or whose file cannot be parsed;
-    /// returns how many. Called at the
-    /// tick of an `on_episodes` observer of the queue, so its cost (one read
-    /// of the task records) comes at most once per tick.
+    /// Adds back the entries of queue `queue` that a task waiting in its
+    /// watched episode has none of, or whose file cannot be parsed; returns
+    /// how many. Called at the tick of a pair of the `on_episodes` queue, so
+    /// its cost (one read of the task records) comes at most once per tick
+    /// and pair.
     ///
     /// Each entry is added under the lock of the queue entries after the
     /// task is read again, so it never comes back for an episode a snapshot
     /// ended meanwhile. No warning: the snapshot that began the episode
     /// wrote the one there is. Failures are logged; the next tick tries
     /// again.
-    pub(super) fn restore_queue_entries(&self, owner: &OwnerRef, queue: &str) -> usize {
+    pub(super) fn restore_queue_entries(&self, queue: &str) -> usize {
         let tasks = match self.control.list_tasks() {
             Ok(tasks) => tasks,
             Err(error) => {
@@ -177,7 +175,7 @@ impl ProtocolService {
             .into_iter()
             .filter(|task| {
                 task.watched_gate.as_ref().is_some_and(|gate| {
-                    gate.watch.queue == queue && waits_in(task, owner, &gate.episode)
+                    gate.watch.queue == queue && waits_in(task, &task.owner, &gate.episode)
                 })
             })
             .filter(|task| self.entry_needs_write(task))
@@ -352,38 +350,44 @@ impl ProtocolService {
             EntryWrite::Created => {
                 drop(lock);
                 tracing::info!(task = %task.task_id, queue = %began.watch.queue, episode = %began.episode, "observers: a gate added a queue entry");
-                self.queue_unserved(&task.owner, began)
+                Ok(self.queue_unserved(began))
             }
         }
     }
 
-    /// Why no observer of `owner`'s queue of `gate` can answer it, `None`
-    /// when an active `on_episodes` observer serves the queue (R9, R27).
-    fn queue_unserved(
-        &self,
-        owner: &OwnerRef,
-        gate: &WatchedGate,
-    ) -> Result<Option<String>, ObserverError> {
+    /// Why no automation of the queue of `gate` can answer it, `None` when
+    /// the catalogue has a usable `on_episodes` queue of that name (R9,
+    /// R27).
+    fn queue_unserved(&self, gate: &WatchedGate) -> Option<String> {
         let queue = &gate.watch.queue;
-        let observers = self.observers.queue_observers(owner, queue)?;
-        let on_episodes = || {
-            observers
+        let catalog = self.automation_catalog();
+        let reason = match catalog.queues.get(queue) {
+            Some(found) if found.mode == ObserverMode::OnEpisodes => return None,
+            Some(_) => format!(
+                "queue '{queue}' runs its automations in mode always, which cannot answer a \
+                 gate; the gate waits for a person"
+            ),
+            None if catalog
+                .problems
                 .iter()
-                .filter(|record| record.config.mode == ObserverMode::OnEpisodes)
+                .any(|problem| problem_names_queue(&problem.file, queue)) =>
+            {
+                format!(
+                    "the catalogue file of queue '{queue}' cannot be used; the gate waits for a \
+                     person"
+                )
+            }
+            None => format!("queue '{queue}' is not in the catalogue; the gate waits for a person"),
         };
-        let reason = if on_episodes().any(|record| record.state == ObserverState::Active) {
-            return Ok(None);
-        } else if observers.is_empty() {
-            format!("queue '{queue}' has no observer; the gate waits for a person")
-        } else if on_episodes().next().is_none() {
-            format!(
-                "the observers of queue '{queue}' run in mode always and cannot answer a gate; the gate waits for a person"
-            )
-        } else {
-            format!("no observer of queue '{queue}' is active; the gate waits for a person")
-        };
-        Ok(Some(reason))
+        Some(reason)
     }
+}
+
+/// Whether the catalogue file `file` (relative to the catalogue root) is the
+/// file of queue `queue`.
+pub(super) fn problem_names_queue(file: &std::path::Path, queue: &str) -> bool {
+    file.parent() == Some(std::path::Path::new("queues"))
+        && file.file_stem().and_then(|stem| stem.to_str()) == Some(queue)
 }
 
 /// Whether `task` of `owner` still waits at its watched gate in `episode`:

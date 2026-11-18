@@ -1,64 +1,59 @@
-//! Durable files of observers.
+//! Durable files of catalogue automations: the runtime record of each
+//! (queue, automation) pair, and the queue entries.
 //!
 //! ```text
-//! {state}/observers/create.lock                     creation and deletion (unique names)
-//! {state}/observers/{id}/observer.json              ObserverRecord (atomic replace)
-//! {state}/observers/{id}/observer.lock              per-observer mutation lock
-//! {state}/observers/{id}/scripts/{n}.sh             script version n (exclusive create, immutable)
-//! {state}/observers/{id}/errors/{seq:08}.json       RunFailure of a failed or lost run (atomic
-//!                                                   replace; the newest 20 kept, the
-//!                                                   newest one per queue entry)
-//! {state}/observer-queues/entries.lock              additions and removals of queue entries
-//! {state}/observer-queues/entries/{entry}.json      QueueEntry (exclusive create, never changed
-//!                                                   unless corrupt)
+//! {state}/observer-queues/automations/{queue}/{automation}/
+//!     state.json          AutomationRecord (atomic replace)
+//!     state.lock          per-pair mutation lock
+//!     errors/{seq:08}.json
+//!                         RunFailure of a failed or lost run (atomic replace;
+//!                         the newest 20 kept, the newest one per queue entry)
+//! {state}/observer-queues/entries.lock
+//!                         additions and removals of queue entries
+//! {state}/observer-queues/entries/{entry}.json
+//!                         QueueEntry (exclusive create, never changed unless
+//!                         corrupt)
 //! ```
+//!
+//! The pair records are not under `{state}/automations/`: by default the
+//! catalogue shares the state root, and its `automations/` holds the
+//! automation definitions.
 //!
 //! # Locks and commit protocol
 //!
 //! Mirrors [`crate::orchestration::store`]: every read-modify-write runs
-//! under the observer's advisory `flock(2)`, which the kernel releases when
-//! the holder dies, and every file is replaced atomically (temp + fsync +
+//! under the pair's advisory `flock(2)`, which the kernel releases when the
+//! holder dies, and every file is replaced atomically (temp + fsync +
 //! rename) or created exclusively (hard link, `EEXIST` instead of
-//! clobbering). Methods that mutate an observer's files take the
-//! [`ObserverLock`] as proof that the caller holds it, and methods that add
-//! or remove queue entries take the [`QueueEntriesLock`]. The order is
-//! fixed: `create.lock`, then an observer's lock, then `entries.lock`; never
-//! the other way round.
+//! clobbering). Methods that mutate a pair's files take the
+//! [`AutomationLock`] as proof that the caller holds it, and methods that
+//! add or remove queue entries take the [`QueueEntriesLock`]. The order is
+//! fixed: a pair's lock, then `entries.lock`; never the other way round.
 //!
-//! # Queues
+//! # Records
 //!
-//! A queue is a name in the namespace of an owner (R6, R7), not a file: the
-//! observers whose configuration names it and the entries that name it. All
-//! observers of one owner's queue have the same mode (R26). The check runs
-//! under `create.lock` in [`ObserverStore::create`] and
-//! [`ObserverStore::update_config`], the only writes that set a queue or a
-//! mode, so two concurrent writes cannot mix the modes of one queue (KTD-7).
-//!
-//! # Records of an older version
-//!
-//! A version 1 record (watch lists) is read as version 2 (queues), see
-//! [`super::migrate`]; the next save writes version 2.
-//!
-//! The record is the commit point of a script version: the script file is
-//! written first and listed in the record second, so a crash in between
-//! leaves an unlisted file that the next save of that version replaces. A
-//! deletion removes the record first, so a crash half way through leaves a
-//! directory without `observer.json`, which no listing reports.
+//! The configuration of a pair is the catalogue's; the record holds only
+//! what the schedule learns at run time. It is created on first need (the
+//! first save under the pair's lock) and deleted when the pair is no longer
+//! in the catalogue and has no run in progress. A deletion removes the
+//! record first, so a crash half way through leaves a directory without
+//! `state.json`, which no listing reports and the next save reuses.
 //!
 //! A run in progress lives in the record only (`active_run`). A run leaves
 //! a file only when it fails or is lost; a successful run changes the
 //! record and nothing else.
+//!
+//! The records of the stored observers of older versions
+//! (`{state}/observers/`) are never read here ([`super::migrate`]).
 
-use super::migrate::migrate_v1_record;
 use super::model::{
-    sha256_hex, ObserverConfig, ObserverId, ObserverRecord, QueueEntry, RunFailure,
-    MAX_SCRIPT_BYTES, OBSERVER_RECORD_VERSION, QUEUE_ENTRY_VERSION, RUN_FAILURE_VERSION,
+    sha256_hex, AutomationKey, AutomationRecord, QueueEntry, RunFailure, AUTOMATION_RECORD_VERSION,
+    QUEUE_ENTRY_VERSION, RUN_FAILURE_VERSION,
 };
 use super::{ObserverError, Result};
-use crate::domain::WorkflowDefinition;
 use crate::persistence::atomic::{
-    cleanup_orphaned_temp_files, read_json, remove_file_if_exists, write_atomic_exclusive,
-    write_json_atomic, write_json_atomic_exclusive,
+    cleanup_orphaned_temp_files, read_json, remove_file_if_exists, write_json_atomic,
+    write_json_atomic_exclusive,
 };
 use crate::persistence::lock::{FileLock, FileLockError};
 use crate::persistence::paths::{is_temp_file, parse_event_file_name, StatePaths};
@@ -68,30 +63,30 @@ use narsor_protocol::controller::OwnerRef;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// How many execution errors of an observer the store keeps: writing one
-/// more deletes the oldest.
+/// How many execution errors of a pair the store keeps: writing one more
+/// deletes the oldest.
 pub const KEPT_RUN_FAILURES: usize = 20;
 
-/// Proof that the caller holds one observer's lock. Released when dropped.
+/// Proof that the caller holds one pair's lock. Released when dropped.
 #[derive(Debug)]
-pub struct ObserverLock {
-    observer_id: ObserverId,
+pub struct AutomationLock {
+    key: AutomationKey,
     _lock: FileLock,
 }
 
-impl ObserverLock {
-    /// The observer this lock is for.
-    pub fn observer_id(&self) -> &ObserverId {
-        &self.observer_id
+impl AutomationLock {
+    /// The pair this lock is for.
+    pub fn key(&self) -> &AutomationKey {
+        &self.key
     }
 
-    fn require(&self, observer_id: &ObserverId) -> Result<()> {
-        if &self.observer_id == observer_id {
+    fn require(&self, key: &AutomationKey) -> Result<()> {
+        if &self.key == key {
             Ok(())
         } else {
             Err(ObserverError::LockMismatch {
-                lock: self.observer_id.clone(),
-                record: observer_id.clone(),
+                lock: self.key.clone(),
+                record: key.clone(),
             })
         }
     }
@@ -117,15 +112,15 @@ pub enum EntryWrite {
 /// and the ids of the entry files it could not read.
 #[derive(Debug, Clone, Default)]
 pub struct EntryScan {
-    /// The readable entries of every owner, oldest first.
+    /// The readable entries of every queue, oldest first.
     pub entries: Vec<QueueEntry>,
     /// Ids of the entry files that exist but cannot be read: corrupt, of a
     /// newer version, or unreadable for the filesystem.
     pub unreadable: Vec<String>,
 }
 
-/// The observers' file store. Holds no state beyond paths, so any number of
-/// handles in any number of threads are safe.
+/// The automations' file store. Holds no state beyond paths, so any number
+/// of handles in any number of threads are safe.
 #[derive(Debug, Clone)]
 pub struct ObserverStore {
     paths: StatePaths,
@@ -144,295 +139,114 @@ impl ObserverStore {
 
     // -- records ------------------------------------------------------------
 
-    /// True when a record for `observer_id` exists.
-    pub fn exists(&self, observer_id: &ObserverId) -> bool {
-        self.paths
-            .observer_record_file(observer_id.as_str())
-            .exists()
-    }
-
-    /// Loads an observer's record.
-    pub fn load(&self, observer_id: &ObserverId) -> Result<ObserverRecord> {
-        let path = self.paths.observer_record_file(observer_id.as_str());
-        if !path.exists() {
-            return Err(ObserverError::NotFound(observer_id.clone()));
-        }
-        let mut value: serde_json::Value = read_json(&path)?;
-        let version = value
-            .get("record_version")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|version| u32::try_from(version).ok())
-            .unwrap_or(0);
-        check_version(&path, version, OBSERVER_RECORD_VERSION)?;
-        if version < OBSERVER_RECORD_VERSION {
-            migrate_v1_record(&mut value);
-        }
-        serde_json::from_value(value).map_err(|source| {
-            PersistenceError::Deserialize {
-                path: path.clone(),
-                source,
+    /// The record of `key`, `None` when the pair has none yet.
+    pub fn load(&self, key: &AutomationKey) -> Result<Option<AutomationRecord>> {
+        let path = self
+            .paths
+            .automation_state_file(&key.queue, &key.automation);
+        let record: AutomationRecord = match read_json(&path) {
+            Ok(record) => record,
+            Err(PersistenceError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None)
             }
-            .into()
-        })
+            Err(error) => return Err(error.into()),
+        };
+        check_version(&path, record.record_version, AUTOMATION_RECORD_VERSION)?;
+        if &record.key != key {
+            return Err(ObserverError::LockMismatch {
+                lock: key.clone(),
+                record: record.key,
+            });
+        }
+        Ok(Some(record))
     }
 
-    /// Every observer, sorted by name.
-    ///
-    /// A directory without `observer.json` (a crash during creation or
-    /// deletion) or whose name is not an observer id is skipped.
-    pub fn list(&self) -> Result<Vec<ObserverRecord>> {
+    /// The record of `key`, or a new one (not saved yet) when the pair has
+    /// none.
+    pub fn load_or_new(&self, key: &AutomationKey, now: DateTime<Utc>) -> Result<AutomationRecord> {
+        Ok(self
+            .load(key)?
+            .unwrap_or_else(|| AutomationRecord::new(key.clone(), now)))
+    }
+
+    /// Every record that can be read, sorted by pair: a record that cannot
+    /// (corrupt, or written by a newer build) is logged and skipped, so it
+    /// does not stop the others (D7).
+    pub fn list_readable(&self) -> Result<Vec<AutomationRecord>> {
         let mut records = Vec::new();
-        for observer_id in self.observer_ids()? {
-            match self.load(&observer_id) {
-                Ok(record) => records.push(record),
+        for key in self.record_keys()? {
+            match self.load(&key) {
+                Ok(Some(record)) => records.push(record),
                 // Deleted between the listing and the read.
-                Err(ObserverError::NotFound(_)) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        records.sort_by(|left, right| left.config.name.cmp(&right.config.name));
-        Ok(records)
-    }
-
-    /// Every observer that can be read, sorted by name: a record that
-    /// cannot (corrupt, or written by a newer build) is logged and skipped,
-    /// so it does not stop the others (D7).
-    ///
-    /// For the schedule only. The owner's views and [`Self::create`] use
-    /// the strict [`Self::list`], which reports such a record.
-    pub fn list_readable(&self) -> Result<Vec<ObserverRecord>> {
-        let mut records = Vec::new();
-        for observer_id in self.observer_ids()? {
-            match self.load(&observer_id) {
-                Ok(record) => records.push(record),
-                Err(ObserverError::NotFound(_)) => {}
+                Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(observer = %observer_id, %error, "observers: skipping an unreadable observer record");
+                    tracing::warn!(pair = %key, %error, "automations: skipping an unreadable runtime record");
                 }
             }
         }
-        records.sort_by(|left, right| left.config.name.cmp(&right.config.name));
         Ok(records)
     }
 
-    /// The observers of `owner`'s queue `queue`, sorted by name (R7). An
-    /// unreadable record is skipped, as in [`Self::list_readable`].
-    pub fn queue_observers(&self, owner: &OwnerRef, queue: &str) -> Result<Vec<ObserverRecord>> {
-        Ok(self
-            .list_readable()?
-            .into_iter()
-            .filter(|record| &record.owner == owner && record.config.queue == queue)
-            .collect())
-    }
-
-    /// The observer named `name`, if any.
-    pub fn find_by_name(&self, name: &str) -> Result<Option<ObserverRecord>> {
-        Ok(self
-            .list()?
-            .into_iter()
-            .find(|record| record.config.name.as_str() == name))
-    }
-
-    /// Creates a draft observer owned by `owner`.
-    ///
-    /// `workflow` is the catalogue's definition of the workflow a "create a
-    /// task" effect names (`None`: not found); it is ignored for any other
-    /// effect. The configuration is validated first; the name is checked for
-    /// uniqueness and the mode against the other observers of the owner's
-    /// queue (R26) under `create.lock`.
-    pub fn create(
-        &self,
-        owner: OwnerRef,
-        config: ObserverConfig,
-        workflow: Option<&WorkflowDefinition>,
-        now: DateTime<Utc>,
-    ) -> Result<ObserverRecord> {
-        config.validate()?;
-        config.validate_workflow(workflow)?;
-        let _create = self.lock_creation()?;
-        let records = self.list()?;
-        if records
-            .iter()
-            .any(|record| record.config.name == config.name)
-        {
-            return Err(ObserverError::NameTaken(config.name));
-        }
-        check_queue_mode(&records, &owner, &config, None)?;
-        let mut record = ObserverRecord::new(ObserverId::generate(), owner, config, now);
-        // A random id that is already taken is all but impossible; draw
-        // again rather than reuse anything.
-        while !write_json_atomic_exclusive(
-            &self.paths.observer_record_file(record.observer_id.as_str()),
-            &record,
-        )? {
-            record.observer_id = ObserverId::generate();
-        }
-        Ok(record)
-    }
-
-    /// Replaces the configuration of an observer (its queue, mode or
-    /// schedule, say), checked as [`Self::create`] checks a new one: valid,
-    /// a unique name, and the mode of the queue it then serves (R26, KTD-7).
-    /// A "create a task" effect is checked against `workflow` only when it
-    /// changes: the catalogue may have a newer version of the workflow the
-    /// observer was made for.
-    ///
-    /// The rest of the record (state, scripts, runs) is kept; a new queue
-    /// or mode ends the current round of entries, and a new schedule of a
-    /// scheduled observer counts its next tick from `now`.
-    pub fn update_config(
-        &self,
-        observer_id: &ObserverId,
-        config: ObserverConfig,
-        workflow: Option<&WorkflowDefinition>,
-        now: DateTime<Utc>,
-    ) -> Result<ObserverRecord> {
-        config.validate()?;
-        let _create = self.lock_creation()?;
-        let lock = self.lock(observer_id)?;
-        let records = self.list()?;
-        if records
-            .iter()
-            .any(|record| &record.observer_id != observer_id && record.config.name == config.name)
-        {
-            return Err(ObserverError::NameTaken(config.name));
-        }
-        let mut record = self.load(observer_id)?;
-        if record.config.effect != config.effect {
-            config.validate_workflow(workflow)?;
-        }
-        check_queue_mode(&records, &record.owner, &config, Some(observer_id))?;
-        if record.config.queue != config.queue || record.config.mode != config.mode {
-            // The round holds entries of the old queue, or none is due.
-            record.entry_round.clear();
-            record.entry_last_runs.clear();
-        }
-        if record.config.schedule != config.schedule && record.next_run_at.is_some() {
-            record.next_run_at = Some(config.schedule.next_after(now));
-        }
-        record.config = config;
-        self.save(&lock, &mut record, now)?;
-        Ok(record)
-    }
-
-    /// Deletes an observer and every file of it. `Ok(false)` when there was
-    /// none.
-    pub fn delete(&self, observer_id: &ObserverId) -> Result<bool> {
-        let _create = self.lock_creation()?;
-        let _lock = match self.lock(observer_id) {
-            Ok(lock) => lock,
-            Err(ObserverError::NotFound(_)) => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        // The record first: from here on the observer does not exist, even
-        // if the rest of the directory outlives a crash.
-        let record = self.paths.observer_record_file(observer_id.as_str());
-        fs::remove_file(&record).map_err(|source| PersistenceError::io(&record, source))?;
-        let dir = self.paths.observer_dir(observer_id.as_str());
-        fs::remove_dir_all(&dir).map_err(|source| PersistenceError::io(&dir, source))?;
-        Ok(true)
-    }
-
-    /// Takes the observer's lock, refusing an observer that does not exist
-    /// (before or after waiting for it).
-    pub fn lock(&self, observer_id: &ObserverId) -> Result<ObserverLock> {
-        if !self.exists(observer_id) {
-            return Err(ObserverError::NotFound(observer_id.clone()));
-        }
-        let lock = FileLock::acquire(self.paths.observer_lock_file(observer_id.as_str()))
-            .map_err(lock_error)?;
-        // Deleted while this caller waited for the lock.
-        if !self.exists(observer_id) {
-            return Err(ObserverError::NotFound(observer_id.clone()));
-        }
-        Ok(ObserverLock {
-            observer_id: observer_id.clone(),
+    /// Takes the lock of `key`'s record; the pair need not have a record
+    /// yet.
+    pub fn lock(&self, key: &AutomationKey) -> Result<AutomationLock> {
+        key.validate()?;
+        let lock = FileLock::acquire(
+            self.paths
+                .automation_state_lock_file(&key.queue, &key.automation),
+        )
+        .map_err(lock_error)?;
+        Ok(AutomationLock {
+            key: key.clone(),
             _lock: lock,
         })
     }
 
-    /// Atomically replaces an observer's record at the current schema
-    /// version, one revision later.
+    /// Atomically replaces a pair's record (or creates it) at the current
+    /// schema version, one revision later.
     pub fn save(
         &self,
-        lock: &ObserverLock,
-        record: &mut ObserverRecord,
+        lock: &AutomationLock,
+        record: &mut AutomationRecord,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        lock.require(&record.observer_id)?;
-        let previous = self.load(&record.observer_id)?;
-        record.record_version = OBSERVER_RECORD_VERSION;
-        record.revision = previous.revision + 1;
+        lock.require(&record.key)?;
+        let previous = self
+            .load(&record.key)?
+            .map_or(0, |previous| previous.revision);
+        record.record_version = AUTOMATION_RECORD_VERSION;
+        record.revision = previous + 1;
         record.updated_at = Some(now);
-        let path = self.paths.observer_record_file(record.observer_id.as_str());
+        let path = self
+            .paths
+            .automation_state_file(&record.key.queue, &record.key.automation);
         Ok(write_json_atomic(&path, record)?)
     }
 
-    // -- scripts ------------------------------------------------------------
-
-    /// Saves `script` as the observer's next, immutable script version and
-    /// returns its number. Never touches `approved_version` (R11).
-    pub fn add_script(
-        &self,
-        observer_id: &ObserverId,
-        script: &str,
-        now: DateTime<Utc>,
-    ) -> Result<u32> {
-        if script.trim().is_empty() || script.len() > MAX_SCRIPT_BYTES || script.contains('\0') {
-            return Err(ObserverError::invalid(
-                "script",
-                format!("must be non-empty text of at most {MAX_SCRIPT_BYTES} bytes"),
-            ));
-        }
-        let lock = self.lock(observer_id)?;
-        let mut record = self.load(observer_id)?;
-        let version = record.latest_script_version().unwrap_or(0) + 1;
-        let path = self
+    /// Deletes a pair's record and its run errors. `Ok(false)` when there
+    /// was no record. The caller checked that no run is in progress.
+    pub fn delete(&self, lock: &AutomationLock) -> Result<bool> {
+        let key = lock.key();
+        let record = self
             .paths
-            .observer_script_file(observer_id.as_str(), version);
-        if !write_atomic_exclusive(&path, script.as_bytes())? {
-            // A file the record never listed: left by a crash between the
-            // two writes, and read by nobody. Replace it.
-            fs::remove_file(&path).map_err(|source| PersistenceError::io(&path, source))?;
-            if !write_atomic_exclusive(&path, script.as_bytes())? {
-                return Err(PersistenceError::io(
-                    &path,
-                    std::io::Error::from(std::io::ErrorKind::AlreadyExists),
-                )
-                .into());
+            .automation_state_file(&key.queue, &key.automation);
+        // The record first: from here on the pair has no state, even if the
+        // rest of the directory outlives a crash.
+        if !remove_file_if_exists(&record)? {
+            return Ok(false);
+        }
+        let dir = self.paths.automation_state_dir(&key.queue, &key.automation);
+        if let Err(source) = fs::remove_dir_all(&dir) {
+            if source.kind() != std::io::ErrorKind::NotFound {
+                return Err(PersistenceError::io(&dir, source).into());
             }
         }
-        record.scripts.push(super::model::ScriptVersion {
-            version,
-            created_at: now,
-            sha256: script_digest(script.as_bytes()),
-        });
-        self.save(&lock, &mut record, now)?;
-        Ok(version)
-    }
-
-    /// Reads script version `version`, checked against its digest.
-    pub fn load_script(&self, observer_id: &ObserverId, version: u32) -> Result<String> {
-        let record = self.load(observer_id)?;
-        let listed =
-            record
-                .script_version(version)
-                .ok_or_else(|| ObserverError::ScriptNotFound {
-                    observer_id: observer_id.clone(),
-                    version,
-                })?;
-        let path = self
-            .paths
-            .observer_script_file(observer_id.as_str(), version);
-        let bytes = fs::read(&path).map_err(|source| PersistenceError::io(&path, source))?;
-        let corrupt = || ObserverError::ScriptCorrupt {
-            observer_id: observer_id.clone(),
-            version,
-        };
-        if script_digest(&bytes) != listed.sha256 {
-            return Err(corrupt());
-        }
-        String::from_utf8(bytes).map_err(|_| corrupt())
+        // The queue's directory goes with its last pair; another pair's
+        // directory keeps it (the removal then fails, which is fine).
+        let _ = fs::remove_dir(self.paths.automation_queue_dir(&key.queue));
+        Ok(true)
     }
 
     // -- run failures -------------------------------------------------------
@@ -441,35 +255,36 @@ impl ObserverStore {
     /// older errors of the same queue entry (a new error replaces the old
     /// one, R23) and the oldest errors beyond [`KEPT_RUN_FAILURES`].
     /// Writing the same run's error again replaces it.
-    pub fn record_failure(&self, lock: &ObserverLock, failure: &RunFailure) -> Result<()> {
-        lock.require(&failure.observer_id)?;
-        let id = failure.observer_id.as_str();
-        write_json_atomic(
-            &self.paths.observer_error_file(id, failure.sequence),
-            failure,
-        )?;
+    pub fn record_failure(&self, lock: &AutomationLock, failure: &RunFailure) -> Result<()> {
+        lock.require(&failure.key)?;
+        let key = &failure.key;
+        let file = |sequence| {
+            self.paths
+                .automation_error_file(&key.queue, &key.automation, sequence)
+        };
+        write_json_atomic(&file(failure.sequence), failure)?;
         if failure.entry_id.is_some() {
-            for older in self.list_failures(&failure.observer_id)? {
+            for older in self.list_failures(key)? {
                 if older.sequence != failure.sequence && older.entry_id == failure.entry_id {
-                    remove_file_if_exists(&self.paths.observer_error_file(id, older.sequence))?;
+                    remove_file_if_exists(&file(older.sequence))?;
                 }
             }
         }
-        let sequences = self.failure_sequences(&failure.observer_id)?;
+        let sequences = self.failure_sequences(key)?;
         let surplus = sequences.len().saturating_sub(KEPT_RUN_FAILURES);
         for sequence in &sequences[..surplus] {
-            remove_file_if_exists(&self.paths.observer_error_file(id, *sequence))?;
+            remove_file_if_exists(&file(*sequence))?;
         }
         Ok(())
     }
 
-    /// The kept execution errors of an observer, newest first.
-    pub fn list_failures(&self, observer_id: &ObserverId) -> Result<Vec<RunFailure>> {
+    /// The kept execution errors of a pair, newest first.
+    pub fn list_failures(&self, key: &AutomationKey) -> Result<Vec<RunFailure>> {
         let mut failures = Vec::new();
-        for sequence in self.failure_sequences(observer_id)?.into_iter().rev() {
+        for sequence in self.failure_sequences(key)?.into_iter().rev() {
             let path = self
                 .paths
-                .observer_error_file(observer_id.as_str(), sequence);
+                .automation_error_file(&key.queue, &key.automation, sequence);
             match read_json::<RunFailure>(&path) {
                 Ok(failure) => {
                     check_version(&path, failure.record_version, RUN_FAILURE_VERSION)?;
@@ -484,9 +299,11 @@ impl ObserverStore {
         Ok(failures)
     }
 
-    /// Sequence numbers of an observer's error files, oldest first.
-    fn failure_sequences(&self, observer_id: &ObserverId) -> Result<Vec<u64>> {
-        let dir = self.paths.observer_errors_dir(observer_id.as_str());
+    /// Sequence numbers of a pair's error files, oldest first.
+    fn failure_sequences(&self, key: &AutomationKey) -> Result<Vec<u64>> {
+        let dir = self
+            .paths
+            .automation_errors_dir(&key.queue, &key.automation);
         let mut sequences: Vec<u64> = json_file_stems(&dir)?
             .iter()
             .filter_map(|name| parse_event_file_name(&format!("{name}.json")))
@@ -498,7 +315,7 @@ impl ObserverStore {
     // -- queue entries ------------------------------------------------------
 
     /// Takes the lock of the queue entries: every addition and removal of
-    /// an entry holds it. Taken after an observer's lock, never before.
+    /// an entry holds it. Taken after a pair's lock, never before.
     pub fn lock_queue_entries(&self) -> Result<QueueEntriesLock> {
         let lock = FileLock::acquire(self.paths.queue_entries_lock_file()).map_err(lock_error)?;
         Ok(QueueEntriesLock { _lock: lock })
@@ -521,7 +338,7 @@ impl ObserverStore {
     }
 
     /// Replaces the file of `entry` when it cannot be parsed, so a waiting
-    /// task's corrupt entry does not keep its gate from every observer.
+    /// task's corrupt entry does not keep its gate from every automation.
     /// `Ok(false)`, and nothing written, when the file is missing, readable,
     /// of a newer version (another build's to read) or cannot be read at
     /// all.
@@ -572,7 +389,7 @@ impl ObserverStore {
 
     /// Every queue entry of every owner, oldest first. An entry file that
     /// cannot be read (corrupt, or of a newer version) is logged and
-    /// skipped, as in [`Self::list_readable`]: all owners share the
+    /// skipped, as in [`Self::list_readable`]: all queues share the
     /// directory, so one bad file must not stop every queue.
     pub fn list_queue_entries(&self) -> Result<Vec<QueueEntry>> {
         Ok(self.scan_queue_entries()?.entries)
@@ -601,8 +418,8 @@ impl ObserverStore {
         Ok(scan)
     }
 
-    /// The entries of `owner`'s queue `queue`, oldest first (R7): an entry
-    /// of another owner's queue of the same name is not among them.
+    /// The entries of `owner`'s tasks on queue `queue`, oldest first: what
+    /// the owner's queue view shows.
     pub fn queue_entries(&self, owner: &OwnerRef, queue: &str) -> Result<Vec<QueueEntry>> {
         Ok(self
             .list_queue_entries()?
@@ -613,16 +430,15 @@ impl ObserverStore {
 
     // -- housekeeping -------------------------------------------------------
 
-    /// Removes the temporary files of interrupted writes in every
-    /// observer's directories. Returns the paths removed.
+    /// Removes the temporary files of interrupted writes in every pair's
+    /// directories and in the queue entries. Returns the paths removed.
     pub fn cleanup_orphaned_temp_files(&self) -> Result<Vec<PathBuf>> {
         let mut removed = Vec::new();
-        for observer_id in self.observer_dirs()? {
-            let id = observer_id.as_str();
+        for key in self.pair_dirs()? {
             for dir in [
-                self.paths.observer_dir(id),
-                self.paths.observer_scripts_dir(id),
-                self.paths.observer_errors_dir(id),
+                self.paths.automation_state_dir(&key.queue, &key.automation),
+                self.paths
+                    .automation_errors_dir(&key.queue, &key.automation),
             ] {
                 removed.extend(cleanup_orphaned_temp_files(&dir)?);
             }
@@ -633,46 +449,56 @@ impl ObserverStore {
         Ok(removed)
     }
 
-    fn lock_creation(&self) -> Result<FileLock> {
-        FileLock::acquire(self.paths.observers_create_lock_file()).map_err(lock_error)
-    }
-
-    /// Ids of every observer with a record, sorted.
-    fn observer_ids(&self) -> Result<Vec<ObserverId>> {
+    /// Pairs with a record, sorted.
+    fn record_keys(&self) -> Result<Vec<AutomationKey>> {
         Ok(self
-            .observer_dirs()?
+            .pair_dirs()?
             .into_iter()
-            .filter(|observer_id| self.exists(observer_id))
+            .filter(|key| {
+                self.paths
+                    .automation_state_file(&key.queue, &key.automation)
+                    .exists()
+            })
             .collect())
     }
 
-    /// Ids of every directory named like an observer, record or not, sorted.
-    fn observer_dirs(&self) -> Result<Vec<ObserverId>> {
-        let dir = self.paths.observers_dir();
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(source) => return Err(PersistenceError::io(&dir, source).into()),
-        };
-        let mut ids = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|source| PersistenceError::io(&dir, source))?;
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            let Ok(observer_id) = ObserverId::parse(name) else {
-                continue;
-            };
-            if entry.path().is_dir() {
-                ids.push(observer_id);
+    /// Every directory named like a pair, record or not, sorted.
+    fn pair_dirs(&self) -> Result<Vec<AutomationKey>> {
+        let mut keys = Vec::new();
+        for queue in sub_dirs(&self.paths.automation_states_dir())? {
+            for automation in sub_dirs(&self.paths.automation_queue_dir(&queue))? {
+                if let Ok(key) = AutomationKey::new(queue.clone(), automation) {
+                    keys.push(key);
+                }
             }
         }
-        ids.sort();
-        Ok(ids)
+        keys.sort();
+        Ok(keys)
     }
 }
 
-/// `sha256:` digest of a script's bytes, as [`super::ScriptVersion`] holds it.
+/// The names of the directories directly in `dir`; empty when `dir` does
+/// not exist.
+fn sub_dirs(dir: &Path) -> Result<Vec<String>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(PersistenceError::io(dir, source).into()),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| PersistenceError::io(dir, source))?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+/// `sha256:` digest of a script's bytes, as a run records it.
 pub(crate) fn script_digest(bytes: &[u8]) -> String {
     format!("sha256:{}", sha256_hex(bytes))
 }
@@ -692,30 +518,6 @@ fn read_entry(path: &Path) -> Result<QueueEntry> {
     let entry: QueueEntry = read_json(path)?;
     check_version(path, entry.record_version, QUEUE_ENTRY_VERSION)?;
     Ok(entry)
-}
-
-/// Refuses `config` when another observer of `owner`'s queue (`except`
-/// aside) runs in another mode (R26): the refusal names the queue's mode.
-fn check_queue_mode(
-    records: &[ObserverRecord],
-    owner: &OwnerRef,
-    config: &ObserverConfig,
-    except: Option<&ObserverId>,
-) -> Result<()> {
-    let other = records.iter().find(|record| {
-        Some(&record.observer_id) != except
-            && &record.owner == owner
-            && record.config.queue == config.queue
-            && record.config.mode != config.mode
-    });
-    match other {
-        Some(other) => Err(ObserverError::QueueModeMismatch {
-            queue: config.queue.clone(),
-            mode: other.config.mode,
-            observer: other.config.name.clone(),
-        }),
-        None => Ok(()),
-    }
 }
 
 /// A queue entry id is a hex SHA-256: anything else is not a file name this

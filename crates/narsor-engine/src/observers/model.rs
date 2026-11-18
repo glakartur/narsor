@@ -1,10 +1,12 @@
-//! Records of observers: the observer itself (with its run in progress),
-//! the execution errors of its runs and the entries of observer queues.
+//! Records of catalogue automations: the runtime record of one (queue,
+//! automation) pair (with its run in progress), the execution errors of its
+//! runs and the entries of observer queues.
 //!
-//! Everything here is plain data plus the validation of what an owner may
-//! configure. The durable layout and the locks live in [`super::store`]; the
-//! scheduling and the effect routes that mutate these records belong to the
-//! control-plane service.
+//! Everything here is plain data. What a queue or an automation does comes
+//! from the catalogue ([`crate::automations`]); this module keeps only what
+//! the schedule learns at run time. The durable layout and the locks live
+//! in [`super::store`]; the scheduling and the effect routes that mutate
+//! these records belong to the control-plane service.
 //!
 //! Every field added after version 1 of a record carries `#[serde(default)]`,
 //! so a record written by an older build still loads. Enums that a client may
@@ -12,10 +14,8 @@
 
 use super::schedule_expr::CronSchedule;
 use super::{ObserverError, Result};
-pub use crate::domain::observer_name::MAX_OBSERVER_NAME_LEN;
-use crate::domain::observer_name::{
-    name_like_problem, observer_name_problem, queue_name_problem, OBSERVER_ID_PREFIX,
-};
+use crate::automations::HookPhase;
+use crate::domain::observer_name::{name_like_problem, queue_name_problem};
 use crate::domain::{BackendId, TaskId, WorkflowDefinition};
 use chrono::{DateTime, Utc};
 pub use narsor_protocol::controller::ObserverMode;
@@ -28,10 +28,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-/// Current schema version of [`ObserverRecord`]. Version 1 had watch lists
-/// instead of queues; the store migrates it when it reads it
-/// ([`super::migrate`]).
-pub const OBSERVER_RECORD_VERSION: u32 = 2;
+/// Current schema version of [`AutomationRecord`].
+pub const AUTOMATION_RECORD_VERSION: u32 = 1;
 /// Current schema version of [`RunFailure`].
 pub const RUN_FAILURE_VERSION: u32 = 1;
 /// Current schema version of [`QueueEntry`].
@@ -39,11 +37,11 @@ pub const QUEUE_ENTRY_VERSION: u32 = 1;
 
 /// Interval between two scheduled runs when the owner names none (5 min).
 pub const DEFAULT_INTERVAL_SECS: u64 = 300;
-/// Shortest interval an observer may have (R17), and the shortest gap
+/// Shortest interval a queue may have (R17), and the shortest gap
 /// between two fires of a cron schedule (R28): it protects the API limits
 /// of the source.
 pub const MIN_INTERVAL_SECS: u64 = 60;
-/// Longest interval an observer may have (30 days). Keeps every deadline the
+/// Longest interval a queue may have (30 days). Keeps every deadline the
 /// scheduler computes far inside what a timestamp can hold.
 pub const MAX_INTERVAL_SECS: u64 = 30 * 24 * 60 * 60;
 
@@ -54,7 +52,7 @@ pub const MAX_TASK_LIMIT_PER_RUN: u32 = 1000;
 
 /// Largest condition, serialized as JSON.
 pub const MAX_CONDITION_BYTES: usize = 64 * 1024;
-/// Most secret references one observer may hold.
+/// Most secret references one automation may hold.
 pub const MAX_SECRET_REFS: usize = 32;
 /// Largest script version.
 pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
@@ -77,133 +75,79 @@ fn validate_name_like(field: &'static str, value: &str, allow_dot: bool) -> Resu
     }
 }
 
-/// The random, never reused identifier of one observer.
-///
-/// Distinct from the name: deleting an observer and creating another with
-/// the same name gives a new id. An id never contains `.`, which keeps `{observer}.{sequence}` run ids
-/// unambiguous and the id a safe path component.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[serde(try_from = "String", into = "String")]
-pub struct ObserverId(String);
+/// The separator of the parts of a [`RunId`]: no queue or automation name
+/// holds it, and it needs no escaping in a URL path.
+const RUN_ID_SEPARATOR: char = '~';
 
-impl ObserverId {
-    /// A fresh random id.
-    pub fn generate() -> Self {
-        Self(format!(
-            "{OBSERVER_ID_PREFIX}{}",
-            uuid::Uuid::new_v4().simple()
-        ))
-    }
-
-    /// Validates and wraps `value`.
-    pub fn parse(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        validate_name_like("observer id", &value, false)?;
-        Ok(Self(value))
-    }
-
-    /// The id as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+/// One (queue, automation) pair of the catalogue: the scheduling unit, and
+/// the key of its runtime record (R2).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AutomationKey {
+    /// The queue, a catalogue file stem.
+    pub queue: String,
+    /// The automation, a catalogue directory name.
+    pub automation: String,
 }
 
-impl TryFrom<String> for ObserverId {
-    type Error = ObserverError;
-
-    fn try_from(value: String) -> Result<Self> {
-        Self::parse(value)
+impl AutomationKey {
+    /// The pair of `queue` and `automation`, both checked as the
+    /// catalogue checks them: safe path components.
+    pub fn new(queue: impl Into<String>, automation: impl Into<String>) -> Result<Self> {
+        let key = Self {
+            queue: queue.into(),
+            automation: automation.into(),
+        };
+        key.validate()?;
+        Ok(key)
     }
-}
 
-impl From<ObserverId> for String {
-    fn from(value: ObserverId) -> Self {
-        value.0
-    }
-}
-
-impl fmt::Display for ObserverId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// The unique, owner-chosen name of an observer (the handle the CLI uses).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[serde(try_from = "String", into = "String")]
-pub struct ObserverName(String);
-
-impl ObserverName {
-    /// Validates and wraps `value`.
-    pub fn parse(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        match observer_name_problem(&value) {
-            None => Ok(Self(value)),
-            Some(reason) => Err(ObserverError::invalid("name", reason)),
+    /// Refuses a queue or automation name that is no safe path component.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(reason) = queue_name_problem(&self.queue) {
+            return Err(ObserverError::invalid("queue", reason));
         }
-    }
-
-    /// Whether `value` has the form of an observer id rather than a name.
-    pub fn looks_like_id(value: &str) -> bool {
-        value.starts_with(OBSERVER_ID_PREFIX)
-    }
-
-    /// The name as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
+        validate_name_like("automation", &self.automation, true)
     }
 }
 
-impl TryFrom<String> for ObserverName {
-    type Error = ObserverError;
-
-    fn try_from(value: String) -> Result<Self> {
-        Self::parse(value)
-    }
-}
-
-impl From<ObserverName> for String {
-    fn from(value: ObserverName) -> Self {
-        value.0
-    }
-}
-
-impl fmt::Display for ObserverName {
+impl fmt::Display for AutomationKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        write!(f, "{}/{}", self.queue, self.automation)
     }
 }
 
-/// One run of one observer: `{observer_id}.{sequence}`, on the wire as that
-/// string.
+/// One run of one (queue, automation) pair:
+/// `{queue}~{automation}~{sequence}`, on the wire as that string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct RunId {
-    /// The observer.
-    pub observer_id: ObserverId,
-    /// The run's sequence number within the observer, from 1.
+    /// The pair.
+    pub key: AutomationKey,
+    /// The run's sequence number within the pair, from 1.
     pub sequence: u64,
 }
 
 impl RunId {
-    /// The run `sequence` of `observer_id`.
-    pub fn new(observer_id: ObserverId, sequence: u64) -> Self {
-        Self {
-            observer_id,
-            sequence,
-        }
+    /// The run `sequence` of `key`.
+    pub fn new(key: AutomationKey, sequence: u64) -> Self {
+        Self { key, sequence }
     }
 
-    /// Parses `{observer_id}.{sequence}`.
+    /// Parses `{queue}~{automation}~{sequence}`.
     pub fn parse(value: &str) -> Result<Self> {
         let refusal = || ObserverError::invalid("run id", format!("'{value}' is not a run id"));
-        let (observer, sequence) = value.split_once('.').ok_or_else(refusal)?;
-        let observer_id = ObserverId::parse(observer).map_err(|_| refusal())?;
+        let mut parts = value.split(RUN_ID_SEPARATOR);
+        let (Some(queue), Some(automation), Some(sequence), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(refusal());
+        };
+        let key = AutomationKey::new(queue, automation).map_err(|_| refusal())?;
         if sequence.is_empty() || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(refusal());
         }
         let sequence = sequence.parse().map_err(|_| refusal())?;
-        Ok(Self::new(observer_id, sequence))
+        Ok(Self::new(key, sequence))
     }
 }
 
@@ -223,7 +167,11 @@ impl From<RunId> for String {
 
 impl fmt::Display for RunId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}", self.observer_id, self.sequence)
+        write!(
+            f,
+            "{}{RUN_ID_SEPARATOR}{}{RUN_ID_SEPARATOR}{}",
+            self.key.queue, self.key.automation, self.sequence
+        )
     }
 }
 
@@ -231,7 +179,7 @@ impl fmt::Display for RunId {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// When an observer runs (R28): an interval, or a five-field cron
+/// When the automations of a queue run (R28): an interval, or a five-field cron
 /// expression in UTC. Exactly one of the two.
 ///
 /// On disk and on the wire `{"interval_secs": 300}` or
@@ -435,19 +383,7 @@ impl ScheduleConfig {
     }
 }
 
-/// Which tasks an observer's script may create in Narsor. Answering the
-/// gate of a queue entry needs no effect: it follows from the mode.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ObserverEffect {
-    /// Create a new task from the effect data (R3).
-    CreateTask(CreateTaskEffect),
-    /// Create no tasks.
-    #[default]
-    None,
-}
-
-/// The "create a task" effect: what every task the observer creates runs.
+/// The "create a task" effect: what every task an `always` queue creates runs.
 ///
 /// The script supplies only the effect data. The workflow,
 /// repositories, backend and profile come from here, and only the fields
@@ -457,7 +393,7 @@ pub enum ObserverEffect {
 pub struct CreateTaskEffect {
     /// Workflow to run.
     pub workflow_id: String,
-    /// Workflow version the observer was validated against.
+    /// Workflow version the queue was validated against.
     pub workflow_version: u32,
     /// Repository choices for the workspaces of the workflow, by workspace
     /// name, as in a task create request.
@@ -513,7 +449,7 @@ impl CreateTaskEffect {
             _ => {
                 return Err(ObserverError::invalid(
                     "effect data",
-                    "must be a JSON object of the fields the observer's mapping names",
+                    "must be a JSON object of the fields the queue's mapping names",
                 ))
             }
         };
@@ -527,7 +463,7 @@ impl CreateTaskEffect {
             return Err(ObserverError::invalid(
                 "effect data",
                 format!(
-                    "field {} is not in the observer's mapping",
+                    "field {} is not in the queue's mapping",
                     unmapped.join(", ")
                 ),
             ));
@@ -646,162 +582,36 @@ impl SecretRef {
     }
 }
 
-/// What the owner configures: everything about an observer except its
-/// script and its run-time state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ObserverConfig {
-    /// Unique name.
-    pub name: ObserverName,
-    /// Parameters handed to the script as they are (a JSON object).
-    #[serde(default = "empty_object")]
-    pub condition: serde_json::Value,
-    /// When it runs.
-    #[serde(default)]
-    pub schedule: ScheduleConfig,
-    /// The tasks its script may create.
-    #[serde(default)]
-    pub effect: ObserverEffect,
-    /// The queue it serves, a name in its owner's namespace (R6, R7).
-    pub queue: String,
-    /// Whether it runs for the entries of its queue only, or on every tick
-    /// (R25). The same for every observer of the queue (R26).
-    pub mode: ObserverMode,
-    /// Secrets handed to the script.
-    #[serde(default)]
-    pub secrets: Vec<SecretRef>,
-    /// Most tasks one run may create (R15).
-    #[serde(default = "default_task_limit_per_run")]
-    pub task_limit_per_run: u32,
-    /// Whether the first run imports what already matches the condition,
-    /// rather than only remembering where to start from.
-    #[serde(default)]
-    pub import_backlog: bool,
-}
-
-fn empty_object() -> serde_json::Value {
-    serde_json::Value::Object(serde_json::Map::new())
-}
-
-fn default_task_limit_per_run() -> u32 {
-    DEFAULT_TASK_LIMIT_PER_RUN
-}
-
-impl ObserverConfig {
-    /// A configuration with every optional part at its default: the queue
-    /// named after the observer, the default interval.
-    pub fn new(name: ObserverName, effect: ObserverEffect, mode: ObserverMode) -> Self {
-        Self {
-            queue: name.as_str().to_string(),
-            name,
-            condition: empty_object(),
-            schedule: ScheduleConfig::default(),
-            effect,
-            mode,
-            secrets: Vec::new(),
-            task_limit_per_run: DEFAULT_TASK_LIMIT_PER_RUN,
-            import_backlog: false,
-        }
-    }
-
-    /// Checks everything that does not need the workflow catalogue.
-    pub fn validate(&self) -> Result<()> {
-        if !self.condition.is_object() {
-            return Err(ObserverError::invalid(
-                "condition",
-                "the condition must be a JSON object",
-            ));
-        }
-        let condition_len = serde_json::to_vec(&self.condition)
-            .map(|bytes| bytes.len())
-            .unwrap_or(usize::MAX);
-        if condition_len > MAX_CONDITION_BYTES {
-            return Err(ObserverError::invalid(
-                "condition",
-                format!("the condition has more than {MAX_CONDITION_BYTES} bytes"),
-            ));
-        }
-        self.schedule.validate()?;
-        if let Some(reason) = queue_name_problem(&self.queue) {
-            return Err(ObserverError::invalid("queue", reason));
-        }
-        if let ObserverEffect::CreateTask(effect) = &self.effect {
-            effect.validate()?;
-        }
-        if self.secrets.len() > MAX_SECRET_REFS {
-            return Err(ObserverError::invalid(
-                "secrets",
-                format!("at most {MAX_SECRET_REFS} secrets"),
-            ));
-        }
-        let mut envs = BTreeSet::new();
-        for secret in &self.secrets {
-            secret.validate()?;
-            if !envs.insert(secret.env.as_str()) {
-                return Err(ObserverError::invalid(
-                    "secrets.env",
-                    format!("'{}' is used twice", secret.env),
-                ));
-            }
-        }
-        if self.task_limit_per_run == 0 || self.task_limit_per_run > MAX_TASK_LIMIT_PER_RUN {
-            return Err(ObserverError::invalid(
-                "task_limit_per_run",
-                format!("must be between 1 and {MAX_TASK_LIMIT_PER_RUN}"),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Checks the "create a task" effect against its workflow, as found in
-    /// the catalogue (`None`: not found). An observer that creates no tasks
-    /// needs none.
-    pub fn validate_workflow(&self, workflow: Option<&WorkflowDefinition>) -> Result<()> {
-        let ObserverEffect::CreateTask(effect) = &self.effect else {
-            return Ok(());
-        };
-        match workflow {
-            Some(workflow) => effect.validate_against(workflow),
-            None => Err(ObserverError::WorkflowNotFound(effect.workflow_id.clone())),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// The observer record
+// The runtime record of a (queue, automation) pair
 // ---------------------------------------------------------------------------
 
-/// Where an observer stands.
+/// Where a (queue, automation) pair stands.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ObserverState {
-    /// No script version was approved yet; nothing runs on schedule.
+pub enum AutomationState {
+    /// Runs on the queue's schedule.
     #[default]
-    Draft,
-    /// Runs on schedule.
     Active,
-    /// Stopped by the owner.
-    Paused,
-    /// A run went over its task limit (R15); waits for the owner.
+    /// A run went over the queue's task limit (R15): stopped until the
+    /// automation's `check` script changes.
     NeedsAttention,
-    /// Too many runs in a row failed (R16); waits for the owner.
+    /// Too many runs in a row failed (R16): stopped until the automation's
+    /// `check` script changes.
     Error,
     /// A state from a newer build. Never written by this one.
     #[serde(other)]
     Unrecognized,
 }
 
-/// One immutable script version, as the record lists it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScriptVersion {
-    /// Version number, from 1.
-    pub version: u32,
-    /// When it was saved.
-    pub created_at: DateTime<Utc>,
-    /// `sha256:` digest of the script bytes, checked on every read.
-    pub sha256: String,
+impl AutomationState {
+    /// Whether the pair waits for a change of its `check` script.
+    pub fn is_stopped(self) -> bool {
+        matches!(self, Self::NeedsAttention | Self::Error)
+    }
 }
 
-/// The latest finished run, as `observer list` shows it.
+/// The latest finished run, as the queue view shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastRun {
     /// Its sequence number.
@@ -815,16 +625,19 @@ pub struct LastRun {
     pub error: Option<String>,
 }
 
-/// The run a worker claimed and did not report yet, as the observer's
-/// record holds it. Nothing else of a run is stored unless it fails
+/// The run a worker claimed and did not report yet, as the pair's record
+/// holds it. Nothing else of a run is stored unless it fails
 /// ([`RunFailure`]); its input is built at the claim and handed to the
 /// worker only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveRun {
-    /// Sequence number within the observer, from 1.
+    /// Sequence number within the pair, from 1.
     pub sequence: u64,
-    /// The script version it runs.
-    pub script_version: u32,
+    /// The script phase it runs. Only a `check` run answers a gate.
+    pub phase: HookPhase,
+    /// `sha256:` digest of the script text it runs, as the catalogue held
+    /// it at the claim.
+    pub script_digest: String,
     /// When a worker claimed it.
     pub claimed_at: DateTime<Utc>,
     /// No result by then: the run is lost and its token stops working.
@@ -834,7 +647,7 @@ pub struct ActiveRun {
     /// Tasks this run created so far, checked against the limit (R15).
     #[serde(default)]
     pub tasks_created: u32,
-    /// The queue entry the run checks, for an `on_episodes` observer (one
+    /// The queue entry the run checks, for an `on_episodes` queue (one
     /// entry per run, R30).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<RunEntry>,
@@ -852,9 +665,9 @@ pub struct RunEntry {
 }
 
 impl ActiveRun {
-    /// The run's id within `observer_id`.
-    pub fn run_id(&self, observer_id: &ObserverId) -> RunId {
-        RunId::new(observer_id.clone(), self.sequence)
+    /// The run's id within `key`.
+    pub fn run_id(&self, key: &AutomationKey) -> RunId {
+        RunId::new(key.clone(), self.sequence)
     }
 
     /// Whether the run passed its deadline at `now`: lost, its token spent.
@@ -863,38 +676,19 @@ impl ActiveRun {
     }
 }
 
-/// Reads `active_run` as an [`ActiveRun`], or as nothing when an earlier
-/// build of this branch left a bare sequence number there: that run has no
-/// token digest any more, so it can only be forgotten.
-fn active_run_or_legacy<'de, D>(deserializer: D) -> std::result::Result<Option<ActiveRun>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Stored {
-        Run(ActiveRun),
-        // Read only to tell it from a malformed run.
-        Legacy(#[allow(dead_code)] u64),
-    }
-    Ok(match Option::<Stored>::deserialize(deserializer)? {
-        Some(Stored::Run(run)) => Some(run),
-        Some(Stored::Legacy(_)) | None => None,
-    })
-}
-
-/// The durable record of one observer: `observers/{id}/observer.json`.
+/// The durable runtime record of one (queue, automation) pair:
+/// `observer-queues/automations/{queue}/{automation}/state.json`.
 ///
-/// The record is the commit point of the observer: a script version or a
-/// run exists for the observer only once the record says so.
+/// Created on the first pass that finds the pair in the catalogue, deleted
+/// on a pass that finds it gone and no run in progress (R2). The
+/// configuration is never here: the catalogue holds it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ObserverRecord {
-    /// Schema version, [`OBSERVER_RECORD_VERSION`].
+pub struct AutomationRecord {
+    /// Schema version, [`AUTOMATION_RECORD_VERSION`].
     pub record_version: u32,
-    /// Random id, never reused.
-    pub observer_id: ObserverId,
-    /// Who created it; the tasks it creates belong to them.
-    pub owner: OwnerRef,
+    /// The pair.
+    #[serde(flatten)]
+    pub key: AutomationKey,
     /// When it was created.
     pub created_at: DateTime<Utc>,
     /// When it was last changed.
@@ -903,21 +697,18 @@ pub struct ObserverRecord {
     /// Incremented by every save.
     #[serde(default)]
     pub revision: u64,
-    /// What the owner configured.
-    pub config: ObserverConfig,
     /// Where it stands.
     #[serde(default)]
-    pub state: ObserverState,
-    /// Every script version, oldest first.
-    #[serde(default)]
-    pub scripts: Vec<ScriptVersion>,
-    /// The only version the schedule runs (R11).
-    #[serde(default)]
-    pub approved_version: Option<u32>,
+    pub state: AutomationState,
+    /// The digest of the `check` script when the pair stopped
+    /// (`needs_attention`, `error`): a new script puts it back on its
+    /// schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_script_digest: Option<String>,
     /// The state the last successful run returned, handed to the next one.
     #[serde(default)]
     pub script_state: Option<serde_json::Value>,
-    /// Whether a run has succeeded since the observer was created.
+    /// Whether a run has succeeded since the record was created.
     #[serde(default)]
     pub first_run_done: bool,
     /// When the next scheduled run is due.
@@ -928,11 +719,11 @@ pub struct ObserverRecord {
     #[serde(default)]
     pub run_due_since: Option<DateTime<Utc>>,
     /// The ids of the queue entries still to check in the current round of
-    /// an `on_episodes` observer, in order: each run takes the first (R30).
+    /// an `on_episodes` queue, in order: each run takes the first (R30).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entry_round: Vec<String>,
-    /// The run in progress, if any: at most one per observer.
-    #[serde(default, deserialize_with = "active_run_or_legacy")]
+    /// The run in progress, if any: at most one per pair.
+    #[serde(default)]
     pub active_run: Option<ActiveRun>,
     /// When a worker last claimed a run.
     #[serde(default)]
@@ -943,40 +734,27 @@ pub struct ObserverRecord {
     /// The latest finished run.
     #[serde(default)]
     pub last_run: Option<LastRun>,
-    /// When a run of this observer for each queue entry (by id) last
-    /// ended, whatever its outcome: what the queues view shows of an entry
-    /// next to its newest error (R23). Holds the entries of the current
-    /// round only: a new round, queue or mode drops the others.
+    /// When a run of this pair for each queue entry (by id) last ended,
+    /// whatever its outcome: what the queues view shows of an entry next to
+    /// its newest error (R23). Holds the entries of the current round only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub entry_last_runs: BTreeMap<String, DateTime<Utc>>,
-    /// Failed runs in a row since the last success or owner resume.
+    /// Failed runs in a row since the last success.
     #[serde(default)]
     pub consecutive_failures: u32,
-    /// What the server wants the owner to know about the observer: why an
-    /// update paused it, say. Cleared when the owner resumes it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
 }
 
-impl ObserverRecord {
-    /// A new draft record.
-    pub fn new(
-        observer_id: ObserverId,
-        owner: OwnerRef,
-        config: ObserverConfig,
-        now: DateTime<Utc>,
-    ) -> Self {
+impl AutomationRecord {
+    /// A new active record, due at once.
+    pub fn new(key: AutomationKey, now: DateTime<Utc>) -> Self {
         Self {
-            record_version: OBSERVER_RECORD_VERSION,
-            observer_id,
-            owner,
+            record_version: AUTOMATION_RECORD_VERSION,
+            key,
             created_at: now,
             updated_at: None,
             revision: 0,
-            config,
-            state: ObserverState::Draft,
-            scripts: Vec::new(),
-            approved_version: None,
+            state: AutomationState::Active,
+            stopped_script_digest: None,
             script_state: None,
             first_run_done: false,
             next_run_at: None,
@@ -988,18 +766,7 @@ impl ObserverRecord {
             last_run: None,
             entry_last_runs: BTreeMap::new(),
             consecutive_failures: 0,
-            note: None,
         }
-    }
-
-    /// The newest script version number, `None` before the first.
-    pub fn latest_script_version(&self) -> Option<u32> {
-        self.scripts.last().map(|script| script.version)
-    }
-
-    /// The listing of script version `version`, if it exists.
-    pub fn script_version(&self, version: u32) -> Option<&ScriptVersion> {
-        self.scripts.iter().find(|script| script.version == version)
     }
 
     /// Since when a scheduled run waits for a worker to claim it; `None`
@@ -1008,12 +775,12 @@ impl ObserverRecord {
         self.run_due_since.filter(|_| self.active_run.is_none())
     }
 
-    /// Whether a run waited for a claim past the schedule's next fire at
-    /// `now` (one interval, for an interval schedule): no worker seems to
-    /// be polling, which `observer list` and `observer show` warn about.
-    pub fn worker_missing(&self, now: DateTime<Utc>) -> bool {
+    /// Whether a run waited for a claim past `schedule`'s next fire at
+    /// `now`: no worker seems to be polling, which the queue views warn
+    /// about.
+    pub fn worker_missing(&self, schedule: &ScheduleConfig, now: DateTime<Utc>) -> bool {
         self.waiting_for_claim_since()
-            .is_some_and(|since| now > self.config.schedule.next_after(since))
+            .is_some_and(|since| now > schedule.next_after(since))
     }
 }
 
@@ -1048,22 +815,28 @@ pub enum RunStatus {
     Unrecognized,
 }
 
-/// The execution error of one run: `observers/{id}/errors/{sequence:08}.json`.
+/// The execution error of one run:
+/// `observer-queues/automations/{queue}/{automation}/errors/{sequence:08}.json`.
 ///
 /// Written only for a run that did not succeed (a failure, an invalid
 /// output, a time-out, a worker error) or was lost. A successful run leaves
 /// no file. The store keeps the newest [`super::store::KEPT_RUN_FAILURES`]
-/// of each observer, and only the newest of each queue entry (R23).
+/// of each pair, and only the newest of each queue entry (R23).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunFailure {
     /// Schema version, [`RUN_FAILURE_VERSION`].
     pub record_version: u32,
-    /// The observer.
-    pub observer_id: ObserverId,
-    /// Sequence number of the run within the observer.
+    /// The pair.
+    #[serde(flatten)]
+    pub key: AutomationKey,
+    /// Sequence number of the run within the pair.
     pub sequence: u64,
-    /// The script version it ran.
-    pub script_version: u32,
+    /// The script phase it ran.
+    pub phase: HookPhase,
+    /// `sha256:` digest of the script text it ran; empty when the script
+    /// could not be read at the claim.
+    #[serde(default)]
+    pub script_digest: String,
     /// When a worker claimed it.
     pub claimed_at: DateTime<Utc>,
     /// When it ended (the result came, or it was found lost).
@@ -1091,7 +864,7 @@ pub struct RunFailure {
 impl RunFailure {
     /// The run's id.
     pub fn run_id(&self) -> RunId {
-        RunId::new(self.observer_id.clone(), self.sequence)
+        RunId::new(self.key.clone(), self.sequence)
     }
 }
 
@@ -1111,8 +884,8 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// `observer-queues/entries/{entry_id}.json`.
 ///
 /// Keyed by task and episode (KTD-4): one episode has one entry, and a new
-/// episode of the same gate (a review loop) has a new one. The queue is a
-/// name in the namespace of the task's owner (R7). The entry holds what the
+/// episode of the same gate (a review loop) has a new one. The entry keeps
+/// the task's owner; the queue is a catalogue queue. The entry holds what the
 /// gate reported when the episode began: the rendered params and the
 /// choices and variables an answer may use. It is never changed, only
 /// created and removed.
@@ -1225,49 +998,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_generated_observer_id_is_valid_and_has_no_dot() {
-        let id = ObserverId::generate();
-        assert!(ObserverId::parse(id.as_str()).is_ok());
-        assert!(!id.as_str().contains('.'));
-        assert_ne!(id, ObserverId::generate());
-    }
-
-    #[test]
-    fn observer_ids_and_names_refuse_unsafe_values() {
-        for value in ["", ".hidden", "a/b", "a.b", &"x".repeat(65)] {
-            assert!(ObserverId::parse(value).is_err(), "{value}");
-        }
-        assert!(ObserverName::parse("jira.abc").is_ok());
-        assert!(ObserverName::parse("../etc").is_err());
-        assert!(serde_json::from_str::<ObserverName>("\"a b\"").is_err());
-    }
-
-    #[test]
-    fn a_name_may_not_take_the_form_of_an_observer_id() {
-        // Otherwise another owner could shadow an observer reached by id.
-        let id = ObserverId::generate();
-        assert!(ObserverName::parse(id.as_str()).is_err());
-        assert!(ObserverName::looks_like_id(id.as_str()));
-        assert!(ObserverName::parse("observer-jira").is_ok());
-        assert!(!ObserverName::looks_like_id("observer-jira"));
-    }
-
-    #[test]
-    fn a_run_id_round_trips_and_refuses_garbage() {
-        let run = RunId::new(ObserverId::parse("obs-1").unwrap(), 42);
-        assert_eq!(run.to_string(), "obs-1.42");
-        assert_eq!(RunId::parse("obs-1.42").unwrap(), run);
-        for value in ["obs-1", "obs-1.", "obs-1.x", ".1", "obs-1.+4", "a.b.1"] {
+    fn a_run_id_round_trips_with_dotted_names_and_refuses_garbage() {
+        let key = AutomationKey::new("mr.review", "gitlab-mr.label").unwrap();
+        let run = RunId::new(key, 42);
+        assert_eq!(run.to_string(), "mr.review~gitlab-mr.label~42");
+        assert_eq!(RunId::parse("mr.review~gitlab-mr.label~42").unwrap(), run);
+        assert_eq!(
+            serde_json::to_value(&run).unwrap(),
+            "mr.review~gitlab-mr.label~42"
+        );
+        for value in [
+            "q~a", "q~a~", "q~a~x", "~a~1", "q~~1", "q~a~+4", "q~a~1~2", "q/x~a~1", "q~.a~1",
+        ] {
             assert!(RunId::parse(value).is_err(), "{value}");
         }
-    }
-
-    #[test]
-    fn a_run_id_serializes_as_its_string() {
-        let run = RunId::new(ObserverId::parse("obs-1").unwrap(), 7);
-        assert_eq!(serde_json::to_value(&run).unwrap(), "obs-1.7");
-        assert_eq!(serde_json::from_str::<RunId>("\"obs-1.7\"").unwrap(), run);
-        assert!(serde_json::from_str::<RunId>("\"obs-1\"").is_err());
     }
 
     #[test]

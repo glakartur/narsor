@@ -1,7 +1,7 @@
 // Texts the views show that are not about one task's state: harness names,
 // usage limits, the harness of the header. Pure functions, tested in Node.
 
-import { percent, scaled, timeToReset, unapprovedVersion } from './model.js';
+import { percent, scaled, timeToReset } from './model.js';
 
 const HARNESS_SHORT = {
   'claude-code': 'claude',
@@ -240,7 +240,7 @@ export function clock(at) {
 }
 
 // ---------------------------------------------------------------------------
-// Observer queues (U11)
+// Automation queues (U11)
 
 /** A date and time in the browser's zone; `''` for none. */
 export function dateTime(at) {
@@ -256,10 +256,10 @@ export function intervalText(seconds) {
   return `co ${seconds}s`;
 }
 
-/** The schedule of an observer: `co 5m` or `cron 0 9 * * 1 (UTC)`. */
-export function scheduleText(observer) {
-  if (observer?.cron) return `cron ${observer.cron} (UTC)`;
-  if (typeof observer?.interval_secs === 'number') return intervalText(observer.interval_secs);
+/** The schedule of a queue: `co 5m` or `cron 0 9 * * 1 (UTC)`. */
+export function scheduleText(queue) {
+  if (queue?.cron) return `cron ${queue.cron} (UTC)`;
+  if (typeof queue?.interval_secs === 'number') return intervalText(queue.interval_secs);
   return '—';
 }
 
@@ -270,40 +270,22 @@ const MODE_TEXT = {
 
 /** The run mode with what it means; an unknown mode as it is. */
 export function modeText(mode) {
-  if (!mode) return 'brak obserwatorów';
+  if (!mode) return '—';
   return MODE_TEXT[mode] ?? mode;
 }
 
-const OBSERVER_STATE = {
-  draft: { text: 'szkic', role: 'done' },
-  active: { text: 'aktywny', role: 'live' },
-  paused: { text: 'wstrzymany', role: 'calm' },
-  needs_attention: { text: 'czeka na Ciebie', role: 'attention' },
-  error: { text: 'błąd', role: 'problem' },
+const AUTOMATION_STATE = {
+  active: { text: 'aktywna', role: 'live', stopped: false },
+  needs_attention: { text: 'czeka na Ciebie', role: 'attention', stopped: true },
+  error: { text: 'błąd', role: 'problem', stopped: true },
 };
 
-/** The state of an observer as `{text, role}`. */
-export function observerState(state) {
-  return OBSERVER_STATE[state] ?? { text: String(state ?? '?'), role: 'done' };
-}
-
 /**
- * The two labelled rows of the script versions (KTD-10, R32): the version
- * the schedule runs and the newest saved one.
+ * The state of an automation as `{text, role, stopped}`. A stopped one runs
+ * again when its `check` script changes in the catalogue.
  */
-export function versionRows(observer) {
-  const approved = observer?.approved_version;
-  const latest = observer?.latest_version;
-  return [
-    ['wersja zatwierdzona', approved !== undefined && approved !== null ? `v${approved}` : 'brak'],
-    ['wersja najnowsza', latest !== undefined && latest !== null ? `v${latest}` : 'brak skryptu'],
-  ];
-}
-
-/** The mark of a newest version that is not approved (R32, AE10); `null` for none. */
-export function unapprovedText(observer) {
-  const version = unapprovedVersion(observer);
-  return version === null ? null : `wersja ${version} nie zatwierdzona`;
+export function automationState(state) {
+  return AUTOMATION_STATE[state] ?? { text: String(state ?? '?'), role: 'done', stopped: false };
 }
 
 /** The latest finished run: `#4 succeeded · 12.11.2026, 10:05:00`; `null` for none. */
@@ -313,10 +295,10 @@ export function lastRunText(run) {
 }
 
 /**
- * How one observer processed one queue entry (R23), as `{text, role}`
+ * How one automation processed one queue entry (R23), as `{text, role}`
  * parts: a run checks it now, the last run time, the newest error.
  */
-export function entryObserverParts(view) {
+export function entryAutomationParts(view) {
   const parts = [];
   if (view?.running) parts.push({ text: 'sprawdza teraz', role: 'live' });
   if (view?.last_run_at) parts.push({ text: `ostatni przebieg ${dateTime(view.last_run_at)}`, role: 'done' });

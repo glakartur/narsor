@@ -168,15 +168,9 @@ impl From<crate::observers::ObserverError> for ProtocolError {
         use crate::observers::ObserverError as E;
         let message = error.to_string();
         match error {
-            E::NotFound(_) => Self::NotFound,
             E::Invalid { .. } => Self::bad_request("invalid_observer", message),
-            E::ScriptNotFound { .. } => Self::bad_request("script_version_not_found", message),
-            E::WorkflowNotFound(_) => Self::bad_request("workflow_not_found", message),
-            E::NameTaken(_) => Self::conflict("observer_name_taken", message),
-            E::QueueModeMismatch { .. } => Self::conflict("queue_mode_mismatch", message),
             E::Persistence(_)
             | E::Lock { .. }
-            | E::ScriptCorrupt { .. }
             | E::UnsupportedRecordVersion { .. }
             | E::LockMismatch { .. } => Self::Internal(message),
         }

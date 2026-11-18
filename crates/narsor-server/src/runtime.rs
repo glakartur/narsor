@@ -39,7 +39,7 @@ use narsor_engine::controller_protocol::{AutoResumePass, ProtocolService};
 use narsor_engine::engine::HarnessRegistry;
 use narsor_engine::environment::{BackendKind, BackendRecord, EnvironmentCatalog};
 use narsor_engine::launch::{CatalogLaunchResolver, HarnessDefaults, OwnerDefaults};
-use narsor_engine::observers::ObserverStore;
+use narsor_engine::observers::{stored_observers_warning, ObserverStore};
 use narsor_engine::orchestration::ControlPlane;
 use narsor_engine::persistence::{DaemonInfo, DefaultHarnessSelector};
 use narsor_engine::workflows::WorkflowResolver;
@@ -153,10 +153,20 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     });
     // A stopped task is read by a read-only runner its controller starts
     // (D63): the control plane reads no task storage, local backend or not.
-    let control = Arc::new(
-        ProtocolService::new(control_plane, launch.clone())
-            .with_max_concurrent_tasks(config.max_concurrent_tasks()),
-    );
+    let mut service = ProtocolService::new(control_plane, launch.clone())
+        .with_max_concurrent_tasks(config.max_concurrent_tasks());
+    // The tasks an `always` queue creates belong to the installation owner
+    // (A4): the trusted mode's local owner, or the network owner claimed or
+    // configured, read at each use.
+    if let ServerSecurity::Network { auth, .. } = &security {
+        let auth = Arc::clone(auth);
+        service = service.with_installation_owner(Arc::new(move || {
+            auth.owners()
+                .owner()
+                .map(|owner| owner.identity().owner_ref())
+        }));
+    }
+    let control = Arc::new(service);
     let _scheduler = spawn_periodic_admission(Arc::clone(&control));
 
     let api_handle = crate::api::serve(
@@ -484,8 +494,9 @@ fn server_security(
 /// Repairs the control plane's own records (U2) — orphaned temporary files
 /// and events a crash kept out of a task's log — before the API serves
 /// them, so a stream replay never skips one. It judges no task: a task's runner state changes only through its controller's
-/// reconciliation, never because this process restarted. The observer
-/// store's orphaned temporary files are removed here too. Best-effort: a
+/// reconciliation, never because this process restarted. The automation
+/// store's orphaned temporary files are removed here too, and stored
+/// observers of older versions get their one warning. Best-effort: a
 /// failure is logged and the daemon still starts.
 pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
     match control.recover() {
@@ -513,6 +524,11 @@ pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
         Err(error) => {
             tracing::warn!(error = %error, "daemon: control-plane recovery failed");
         }
+    }
+    // Stored observers of older versions are never read: automations and
+    // queues are catalogue files now (R22). Say so once.
+    if let Some(warning) = stored_observers_warning(control.store().paths()) {
+        tracing::warn!("daemon: {warning}");
     }
     let observers = ObserverStore::new(control.store().paths().clone());
     match observers.cleanup_orphaned_temp_files() {

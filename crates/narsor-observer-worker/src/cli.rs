@@ -37,9 +37,8 @@ pub struct WorkerArgs {
     #[arg(long, value_name = "URL")]
     pub server: String,
 
-    /// The directory of the observers' secrets: one subdirectory per
-    /// observer owner, one file per secret reference name in it. Must be
-    /// accessible to its owner only.
+    /// The directory of the automations' secrets: one file per secret name,
+    /// flat. Must be accessible to its owner only.
     #[arg(long, value_name = "DIRECTORY")]
     pub secrets_dir: Option<PathBuf>,
 

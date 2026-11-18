@@ -1,11 +1,15 @@
-//! The effects an observer's script has in Narsor, through the routes its
-//! run token opens (R12, R13, R15, R19):
+//! The effects an automation's script has in Narsor, through the routes
+//! its run token opens (R12, R13, R15, R19):
 //!
 //! ```text
-//! create task   no create_task effect → refused
-//!               over limit            → refused; observer needs_attention
-//!               otherwise             → create_task (random id) → created
-//! decide        run with no entry (always), or another task or episode
+//! create task   the queue has no `tasks` settings (now) → refused
+//!               no installation owner (unclaimed)       → refused
+//!               over limit            → refused; pair needs_attention
+//!               otherwise             → create_task (random id), owned by
+//!                                       the installation owner → created
+//! decide        a run whose phase is not `check`
+//!                                     → refused (not_a_check_run)
+//!               run with no entry (always), or another task or episode
 //!                                     → refused
 //!               task no longer waits in the episode (answered, left, ended)
 //!                                     → refused (stale_episode)
@@ -16,8 +20,8 @@
 //!               another answer for the episode queued or taken
 //!                                     → refused (first wins)
 //!               otherwise             → input queued for the gate, by the
-//!                                       observer and its run; a paused task
-//!                                       resumed → delivered
+//!                                       automation and its run; a paused
+//!                                       task resumed → delivered
 //! ```
 //!
 //! The server does not deduplicate tasks: every call creates one. The
@@ -25,21 +29,21 @@
 //! is one per run and episode: a retry of the same answer returns the
 //! input it queued.
 //!
-//! Every effect runs under the observer's lock, so it is serialized with
-//! the other effects of the run and with the run's result: an effect never
-//! lands after the run ended.
+//! Every effect runs under the pair's lock, so it is serialized with the
+//! other effects of the run and with the run's result: an effect never
+//! lands after the run ended. The queue's task settings are read from the
+//! catalogue at each effect (R2).
 
 use chrono::{DateTime, Utc};
 
+use crate::automations::{HookPhase, QueueTasks};
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::ProtocolService;
 use crate::controller_protocol::wire::*;
 use crate::domain::TaskId;
 use crate::engine::actions::check_gate_answer;
 use crate::engine::HumanInputDelivery;
-use crate::observers::{
-    ActiveRun, ObserverEffect, ObserverError, ObserverLock, ObserverRecord, ObserverState, RunId,
-};
+use crate::observers::{ActiveRun, AutomationLock, AutomationRecord, AutomationState, RunId};
 use crate::orchestration::{
     observer_decide_key, InputRequest, OrchestrationError, TaskProvenance, TaskRecord,
 };
@@ -49,11 +53,11 @@ use super::entries::waits_in;
 /// Most bytes of a "create a task" effect's data, as JSON.
 pub const MAX_EFFECT_DATA_BYTES: usize = 64 * 1024;
 
-/// The run an effect belongs to, read under the observer's lock: the
-/// observer's record and its run in progress.
+/// The run an effect belongs to, read under the pair's lock: the pair's
+/// record and its run in progress.
 struct EffectScope {
-    lock: ObserverLock,
-    record: ObserverRecord,
+    lock: AutomationLock,
+    record: AutomationRecord,
     run_id: RunId,
     now: DateTime<Utc>,
 }
@@ -61,9 +65,11 @@ struct EffectScope {
 impl EffectScope {
     /// The provenance of what this run causes (R19).
     fn provenance(&self) -> TaskProvenance {
+        // The provenance keeps its stored shape: the queue stands where
+        // the observer's id stood, the automation where its name stood.
         TaskProvenance {
-            observer_id: self.record.observer_id.to_string(),
-            observer_name: self.record.config.name.to_string(),
+            observer_id: self.record.key.queue.clone(),
+            observer_name: self.record.key.automation.clone(),
             run_id: self.run_id.to_string(),
         }
     }
@@ -80,26 +86,46 @@ impl EffectScope {
 
 impl ProtocolService {
     /// Creates a task from the effect data for the run `run_id`
-    /// authenticated (R3, R15, R19).
+    /// authenticated (R3, R6, R15, R19).
     ///
-    /// The task belongs to the observer's owner, gets a random id and runs
-    /// what the observer's record says; the script supplies only the data.
-    /// Past the run's task limit the call is refused with a conflict and an
-    /// active observer goes to `needs_attention`.
+    /// The task belongs to the installation owner (A4), gets a random id
+    /// and runs what the queue file's `tasks` settings say now; the script
+    /// supplies only the data. Past the run's task limit the call is
+    /// refused with a conflict and an active pair goes to
+    /// `needs_attention`.
     pub fn observer_create_task(
         &self,
         run_id: &RunId,
         request: ObserverCreateTaskRequest,
     ) -> ProtocolResult<ObserverEffectResponse> {
         let mut scope = self.effect_scope(run_id)?;
-        let ObserverEffect::CreateTask(effect) = &scope.record.config.effect else {
-            return Err(effect_not_allowed(&scope.record, "create tasks"));
-        };
+        let tasks = self
+            .automation_catalog()
+            .queues
+            .remove(&run_id.key.queue)
+            .and_then(|queue| queue.tasks)
+            .ok_or_else(|| {
+                ProtocolError::bad_request(
+                    "effect_not_allowed",
+                    format!(
+                        "queue '{}' creates no tasks: its file has no `tasks` settings",
+                        run_id.key.queue
+                    ),
+                )
+            })?;
         check_size("effect data", &request.data, MAX_EFFECT_DATA_BYTES)?;
-        let task_request = effect.task_request(&request.data).map_err(invalid_effect)?;
-        self.within_task_limit(&mut scope)?;
-        let summary =
-            self.create_task_from(&scope.record.owner, task_request, Some(scope.provenance()))?;
+        let task_request = tasks
+            .effect
+            .task_request(&request.data)
+            .map_err(invalid_effect)?;
+        self.within_task_limit(&mut scope, &tasks)?;
+        let owner = (self.installation_owner)().ok_or_else(|| {
+            ProtocolError::conflict(
+                "no_installation_owner",
+                "the installation has no owner yet; tasks of queues belong to the owner",
+            )
+        })?;
+        let summary = self.create_task_from(&owner, task_request, Some(scope.provenance()))?;
         let created = TaskId::parse(summary.task_id.to_string())
             .map_err(|error| ProtocolError::Internal(error.to_string()))?;
         let active = scope.active_run()?;
@@ -122,26 +148,37 @@ impl ProtocolService {
     /// gate's form ([`check_gate_answer`]), queued for the episode it names
     /// so the runner refuses it should the episode be gone by then, and a
     /// paused task resumed to take it (AE5). The input and the answer's
-    /// event name the observer and its run (R15). The reply says the answer
-    /// was queued, not that the runner applied it.
+    /// event name the automation and its run (R15). The reply says the
+    /// answer was queued, not that the runner applied it. Only a `check`
+    /// run answers: an `in` or `out` script never decides the gate.
     pub fn observer_decide(
         &self,
         run_id: &RunId,
         request: ObserverDecideRequest,
     ) -> ProtocolResult<ObserverEffectResponse> {
         let scope = self.effect_scope(run_id)?;
-        let Some(entry) = scope
+        let active = scope
             .record
             .active_run
             .as_ref()
-            .and_then(|active| active.entry.clone())
-        else {
+            .ok_or(ProtocolError::Unauthorized)?;
+        if active.phase != HookPhase::Check {
+            return Err(ProtocolError::bad_request(
+                "not_a_check_run",
+                format!(
+                    "run {run_id} runs the {} script of automation '{}': only a check run \
+                     answers a gate",
+                    active.phase, run_id.key.automation
+                ),
+            ));
+        }
+        let Some(entry) = active.entry.clone() else {
             return Err(ProtocolError::bad_request(
                 "no_queue_entry",
                 format!(
-                    "run {run_id} of observer '{}' runs for no queue entry: only a run of an \
-                     on_episodes observer for an entry answers a gate",
-                    scope.record.config.name
+                    "run {run_id} of automation '{}' runs for no queue entry: only a run of an \
+                     on_episodes queue for an entry answers a gate",
+                    run_id.key.automation
                 ),
             ));
         };
@@ -173,7 +210,7 @@ impl ProtocolService {
             Err(OrchestrationError::TaskNotFound(_)) => return Err(stale()),
             Err(error) => return Err(error.into()),
         };
-        if !waits_in(&task, &scope.record.owner, &entry.episode) {
+        if !waits_in(&task, &task.owner, &entry.episode) {
             return Err(stale());
         }
         // The gate waits, but a runner that reports a problem or is still
@@ -224,7 +261,7 @@ impl ProtocolService {
         )?;
         if !outcome.replayed {
             self.notify(&task.task_id);
-            tracing::info!(run = %run_id, task = %task.task_id, episode = %entry.episode, choice = %request.choice, "observers: a script answered a gate");
+            tracing::info!(run = %run_id, task = %task.task_id, episode = %entry.episode, choice = %request.choice, "automations: a check script answered a gate");
         }
         if !outcome.input.status.is_settled() {
             self.resume_for_work(&task, &outcome.input.idempotency_key)?;
@@ -237,13 +274,15 @@ impl ProtocolService {
         })
     }
 
-    /// Takes the observer's lock and reads the observer's record under it,
-    /// refusing a run that is no longer the observer's run in progress
-    /// before its deadline: its token stopped working between the gate and
-    /// now.
+    /// Takes the pair's lock and reads the pair's record under it,
+    /// refusing a run that is no longer the pair's run in progress before
+    /// its deadline: its token stopped working between the gate and now.
     fn effect_scope(&self, run_id: &RunId) -> ProtocolResult<EffectScope> {
-        let lock = self.observers.lock(&run_id.observer_id).map_err(run_gone)?;
-        let record = self.observers.load(&run_id.observer_id).map_err(run_gone)?;
+        let lock = self.observers.lock(&run_id.key)?;
+        let record = self
+            .observers
+            .load(&run_id.key)?
+            .ok_or(ProtocolError::Unauthorized)?;
         let now = self.control.now();
         let in_progress = record.active_run.as_ref().is_some_and(|active| {
             active.sequence == run_id.sequence && !active.is_past_deadline(now)
@@ -259,25 +298,27 @@ impl ProtocolService {
         })
     }
 
-    /// Refuses a new task past the run's limit (R15); an active observer
-    /// then waits for its owner (`needs_attention`).
-    fn within_task_limit(&self, scope: &mut EffectScope) -> ProtocolResult<()> {
-        let limit = scope.record.config.task_limit_per_run;
+    /// Refuses a new task past the run's limit (R15); an active pair then
+    /// stops (`needs_attention`) until its `check` script changes.
+    fn within_task_limit(&self, scope: &mut EffectScope, tasks: &QueueTasks) -> ProtocolResult<()> {
+        let limit = tasks.task_limit_per_run;
         if scope.active_run()?.tasks_created < limit {
             return Ok(());
         }
-        if scope.record.state == ObserverState::Active {
-            scope.record.state = ObserverState::NeedsAttention;
+        if scope.record.state == AutomationState::Active {
+            let digest = scope.active_run()?.script_digest.clone();
+            scope.record.state = AutomationState::NeedsAttention;
+            scope.record.stopped_script_digest = Some(digest);
             self.observers
                 .save(&scope.lock, &mut scope.record, scope.now)?;
-            tracing::info!(observer = %scope.record.observer_id, limit, "observers: a run reached its task limit; waiting for the owner");
+            tracing::info!(pair = %scope.record.key, limit, "automations: a run reached its task limit; stopped until the check script changes");
         }
         Err(ProtocolError::conflict(
             "observer_task_limit",
             format!(
-                "run {} reached the limit of {limit} new tasks per run; observer '{}' waits for its owner",
-                scope.run_id,
-                scope.record.config.name
+                "run {} reached the limit of {limit} new tasks per run; automation '{}' of queue \
+                 '{}' stops until its check script changes",
+                scope.run_id, scope.run_id.key.automation, scope.run_id.key.queue
             ),
         ))
     }
@@ -296,31 +337,14 @@ fn decided_message(task: &TaskRecord, choice: &str, input_id: &str) -> String {
     )
 }
 
-/// A run that went away under the caller (its observer deleted): its token
-/// no longer proves anything.
-fn run_gone(error: ObserverError) -> ProtocolError {
-    match error {
-        ObserverError::NotFound(_) => ProtocolError::Unauthorized,
-        other => other.into(),
-    }
-}
-
 /// Effect data the script got wrong.
-fn invalid_effect(error: ObserverError) -> ProtocolError {
+fn invalid_effect(error: crate::observers::ObserverError) -> ProtocolError {
     match error {
-        ObserverError::Invalid { .. } => {
+        crate::observers::ObserverError::Invalid { .. } => {
             ProtocolError::bad_request("invalid_effect_data", error.to_string())
         }
         other => other.into(),
     }
-}
-
-/// The refusal of an effect the observer's record does not allow.
-fn effect_not_allowed(record: &ObserverRecord, what: &str) -> ProtocolError {
-    ProtocolError::bad_request(
-        "effect_not_allowed",
-        format!("observer '{}' may not {what}", record.config.name),
-    )
 }
 
 /// Refuses data larger than `limit` bytes as JSON.

@@ -66,7 +66,7 @@ pub enum OpeningKind {
     Repositories,
     /// `h`: the default harness.
     Harness,
-    /// `O`: the owner's observer queues.
+    /// `O`: the queues (read only).
     Queues,
 }
 
@@ -158,10 +158,8 @@ pub(super) enum JobKey {
     Branches(String),
     /// The read of the limit of tasks processed at once (`L`).
     Limit,
-    /// The read of one observer queue of the queues view.
+    /// The read of one queue of the queues view.
     Queue(String),
-    /// The read of an observer's script text, to approve or to edit it.
-    Script(String),
     /// The read of the usage limits of the harnesses, in the background: no
     /// screen waits for it, so it does not animate the marker.
     Usage,

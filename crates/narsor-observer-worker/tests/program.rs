@@ -109,10 +109,12 @@ async fn serve_worker_routes(
 
 fn program_run(script: &str) -> ObserverWorkerRun {
     ObserverWorkerRun {
-        run_id: "obs-1.1".to_string(),
-        owner: "owner".to_string(),
+        run_id: "q~a~1".to_string(),
+        phase: "check".to_string(),
+        queue: "q".to_string(),
+        automation: "a".to_string(),
         token: "nso.run.tok3n-SENTINEL".to_string(),
-        script_version: 1,
+        script_digest: "sha256:00".to_string(),
         script: script.to_string(),
         input: json!({ "state": { "cursor": 4 } }),
         secrets: Vec::new(),
@@ -167,7 +169,7 @@ async fn the_program_claims_with_its_key_runs_the_script_and_reports_over_http()
     let [(run, report)] = seen.reports.as_slice() else {
         panic!("one result expected: {:?}", seen.reports);
     };
-    assert_eq!(run, "obs-1.1");
+    assert_eq!(run, "q~a~1");
     assert_eq!(report.outcome, ObserverRunOutcome::Exited { exit_code: 0 });
     assert_eq!(report.stdout, "{\"state\":{\"seen\":true}}");
     // The run's token never leaves the worker; the input reached stdin.

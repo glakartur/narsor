@@ -12,7 +12,7 @@ import { NewTask } from './newtask.js';
 import { ArchivedTask, Harness, History, Limit, Repositories } from './settings.js';
 import { Help } from './help.js';
 import { useNow, useStore } from './hooks.js';
-import { Queues, hasUnsavedScript, queuesKeysHeld } from './queues.js';
+import { Queues } from './queues.js';
 import { hashOf, routeOf } from '../store.js';
 import { TaskList } from './tasklist.js';
 import { Toast } from './toast.js';
@@ -70,11 +70,10 @@ export function App({ store, onSignOut }) {
   };
   const toggleQueues = () => (store.state.page === 'queues' ? store.openTasks() : store.openQueues(null));
 
-  // Ask before the tab closes while a form has text that was not sent, or
-  // a script dialog has text that was not saved.
+  // Ask before the tab closes while a form has text that was not sent.
   useEffect(() => {
     const onUnload = (event) => {
-      if (!hasUnsentDraft() && !hasUnsavedScript()) return;
+      if (!hasUnsentDraft()) return;
       event.preventDefault();
       event.returnValue = '';
     };
@@ -93,7 +92,6 @@ export function App({ store, onSignOut }) {
       if (typing(event.target) || actionsOpen || newOpen || dialog) return;
       if (help && event.key === 'Escape') { setHelp(false); return; }
       if (store.state.page === 'queues') {
-        if (queuesKeysHeld(event.target)) return;
         const back = () => (store.state.queue !== null ? store.openQueues(null) : store.openTasks());
         const action = { Q: toggleQueues, Escape: back, '?': () => setHelp(true), u: () => store.refresh() }[event.key];
         if (action) {

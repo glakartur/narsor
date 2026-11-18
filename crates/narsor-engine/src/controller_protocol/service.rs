@@ -30,11 +30,12 @@ use super::credentials::{
 };
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
+use crate::automations::CatalogProblem;
 use crate::domain::TaskId;
 use crate::environment::LaunchResolver;
 use crate::materials::{MaterialLimits, MaterialStore};
 use crate::observers::ObserverStore;
-use crate::orchestration::{ControlPlane, ResumePolicy};
+use crate::orchestration::{ControlPlane, OwnerRef, ResumePolicy};
 use reads::Relay;
 
 /// Converts a configured period; one too large for the calendar counts as
@@ -57,6 +58,11 @@ pub use tasks::{task_actions, task_panel, task_workspaces};
 /// verified OIDC `(issuer, subject)` instead
 /// ([`crate::auth::OidcIdentity::owner_ref`]).
 pub const LOCAL_OWNER: &str = "local";
+
+/// Who the installation owner is right now: the owner of the tasks an
+/// `always` queue creates (A4). `None` while a network installation is
+/// unclaimed.
+pub type InstallationOwner = Arc<dyn Fn() -> Option<OwnerRef> + Send + Sync>;
 
 /// How many change notifications may queue for a slow listener before it
 /// lags — a lagging listener rescans instead of losing anything.
@@ -158,6 +164,11 @@ pub struct ProtocolService {
     observers: ObserverStore,
     /// The digest of the observer worker's key, in memory only (D5).
     observer_worker_key: ObserverWorkerKey,
+    /// The owner of the tasks the automations of `always` queues create.
+    installation_owner: InstallationOwner,
+    /// The catalogue problems of automations and queues the log reported
+    /// last: a problem is logged once per change, not on every pass.
+    logged_catalog_problems: Mutex<Vec<CatalogProblem>>,
     harness_usages: scheduling::HarnessUsages,
     /// Most tasks processed at once across all backends; `None` for no limit.
     max_concurrent_tasks: Mutex<Option<u32>>,
@@ -204,6 +215,8 @@ impl ProtocolService {
             materials,
             observers,
             observer_worker_key: ObserverWorkerKey::default(),
+            installation_owner: Arc::new(|| Some(OwnerRef::new(LOCAL_OWNER))),
+            logged_catalog_problems: Mutex::new(Vec::new()),
             controller_auth: Arc::new(credentials.clone()),
             runner_auth: Arc::new(credentials.clone()),
             control,
@@ -223,6 +236,14 @@ impl ProtocolService {
     /// all backends, `None` for no limit.
     pub fn with_max_concurrent_tasks(self, limit: Option<u32>) -> Self {
         *self.lock_max_concurrent_tasks() = limit;
+        self
+    }
+
+    /// Returns the service with another source of the installation owner
+    /// than the trusted mode's [`LOCAL_OWNER`]: a network server's claimed
+    /// owner, read at each use.
+    pub fn with_installation_owner(mut self, owner: InstallationOwner) -> Self {
+        self.installation_owner = owner;
         self
     }
 

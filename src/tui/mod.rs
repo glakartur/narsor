@@ -34,14 +34,6 @@
 //! meanwhile. The event stream is opened by
 //! [`task_app::EventFeed::ensure_open`] only once a read gave the application
 //! a cursor, and resumes from it after every drop.
-//!
-//! # An editor borrows the terminal
-//!
-//! The script edit of the queues view (KTD-10) runs `$VISUAL` / `$EDITOR`
-//! in the same terminal. The loop pauses the key reader
-//! ([`ReaderPause`]) so it reads nothing the editor should get, gives the
-//! terminal back with [`restore_terminal`], runs the editor, and takes the
-//! terminal over again ([`TerminalGuard::resume`]) before the next draw.
 
 pub mod chat;
 pub mod chooser;
@@ -183,13 +175,6 @@ impl TerminalGuard {
         Ok(Self { terminal })
     }
 
-    /// Takes the screen over again after [`restore_terminal`] gave it to
-    /// another program (an editor), and has the next draw paint all of it.
-    pub fn resume(&mut self) -> io::Result<()> {
-        take_screen().inspect_err(|_| restore_terminal())?;
-        self.terminal.clear()
-    }
-
     /// The terminal to draw on.
     pub fn terminal(&mut self) -> &mut Tui {
         &mut self.terminal
@@ -262,7 +247,6 @@ pub async fn run(
     let styles = Styles::from_env();
     let mut app = TaskApp::new(client.clone(), connection_name, refresh_interval);
     app.set_spinner(spinner::Spinner::from_env());
-    app.set_editor(queues::script::editor_from(|name| std::env::var(name).ok()));
     app.detail_mut()
         .set_hyperlinks(detail::hyperlinks_supported(|name| {
             std::env::var(name).ok()
@@ -271,12 +255,9 @@ pub async fn run(
 
     let mut guard = TerminalGuard::enter()?;
     let stop = Arc::new(AtomicBool::new(false));
-    let pause = Arc::new(ReaderPause::default());
     let (keys_tx, mut keys_rx) = mpsc::unbounded_channel();
     let reader_stop = Arc::clone(&stop);
-    let reader_pause = Arc::clone(&pause);
-    let reader =
-        std::thread::spawn(move || read_terminal_events(&keys_tx, &reader_stop, &reader_pause));
+    let reader = std::thread::spawn(move || read_terminal_events(&keys_tx, &reader_stop));
 
     // The first read comes after the first draw: an unreachable server shows
     // "łączę z …" instead of a blank terminal.
@@ -314,14 +295,6 @@ pub async fn run(
             _ = tokio::time::sleep(wait) => app.advance_animation(),
         }
 
-        if let Some((editor, request)) = app.take_editor_request() {
-            let edited = with_terminal_lent(&mut guard, &pause, || {
-                queues::script::edit_in_editor(&editor, &request.text)
-            })?;
-            let follow = app.on_script_edited(request, edited);
-            app.dispatch(follow).await;
-        }
-
         feed.ensure_open(&app);
         app.start_refresh_if_due(Instant::now());
         app.start_usage_if_due(Instant::now());
@@ -351,67 +324,9 @@ fn wait_until_next_due(app: &TaskApp, now: Instant) -> Duration {
     .fold(TICK, Duration::min)
 }
 
-/// Holds the key reader still while another program uses the terminal.
-#[derive(Default)]
-pub struct ReaderPause {
-    /// The loop asks the reader to stop reading.
-    requested: AtomicBool,
-    /// The reader has seen the request and reads nothing.
-    idle: AtomicBool,
-}
-
-impl ReaderPause {
-    /// Asks the reader to stop reading and waits, a second at most, until
-    /// it does: a poll under way ends within [`KEY_POLL_INTERVAL`].
-    fn hold(&self) {
-        self.requested.store(true, Ordering::SeqCst);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !self.idle.load(Ordering::SeqCst) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// Lets the reader read again.
-    fn release(&self) {
-        self.requested.store(false, Ordering::SeqCst);
-    }
-
-    /// The reader's side: whether it must not read now.
-    fn holding(&self) -> bool {
-        let held = self.requested.load(Ordering::SeqCst);
-        self.idle.store(held, Ordering::SeqCst);
-        held
-    }
-}
-
-/// Lends the terminal to `work` (an editor): the key reader held, the
-/// terminal restored, then taken over again. A failure to take it back
-/// ends the interface; the guard restores what it can.
-fn with_terminal_lent<T>(
-    guard: &mut TerminalGuard,
-    pause: &ReaderPause,
-    work: impl FnOnce() -> T,
-) -> io::Result<T> {
-    pause.hold();
-    restore_terminal();
-    let result = work();
-    let back = guard.resume();
-    pause.release();
-    back.map(|()| result)
-}
-
-/// Forwards terminal events until the loop asks it to stop; reads nothing
-/// while [`ReaderPause`] holds it.
-fn read_terminal_events(
-    sender: &mpsc::UnboundedSender<TerminalEvent>,
-    stop: &AtomicBool,
-    pause: &ReaderPause,
-) {
+/// Forwards terminal events until the loop asks it to stop.
+fn read_terminal_events(sender: &mpsc::UnboundedSender<TerminalEvent>, stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
-        if pause.holding() {
-            std::thread::sleep(Duration::from_millis(20));
-            continue;
-        }
         match event::poll(KEY_POLL_INTERVAL) {
             Ok(true) => match event::read() {
                 Ok(terminal_event) => {

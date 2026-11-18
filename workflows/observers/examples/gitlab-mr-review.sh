@@ -94,8 +94,8 @@ done_with() {
 command -v jq >/dev/null 2>&1 || fail "jq is not installed"
 
 input=$(cat)
-printf '%s' "$input" | jq -e '.contract_version == 2' >/dev/null ||
-    fail "the input is not version 2 of the script contract"
+printf '%s' "$input" | jq -e '.contract_version == 3' >/dev/null ||
+    fail "the input is not version 3 of the script contract"
 entry=$(printf '%s' "$input" | jq -c '.entry // empty')
 [ -n "$entry" ] || fail "the input has no queue entry: create the observer with --mode on_episodes"
 

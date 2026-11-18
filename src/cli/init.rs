@@ -474,7 +474,7 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
     (
         SettingKey::ObserverSecretsDir,
         "\"\"",
-        "Observer secrets: one subdirectory per owner, one file per secret name; empty: no secrets.",
+        "Observer secrets: one file per secret name; a script gets only the secrets its automation declares; empty: no secrets.",
     ),
     (
         SettingKey::ObserverScriptUser,

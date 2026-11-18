@@ -1,6 +1,6 @@
 //! The text `narsor task workflows|validate|capabilities|repo` print
 //! (`narsor::cli::control_text`), the text of `narsor-cli usage`, the text
-//! of `narsor-cli observer queue …` (`narsor::cli::observer_text`) and the
+//! of `narsor-cli queue …` (`narsor::cli::queue_text`) and the
 //! typing of `task create --file` inputs.
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -8,15 +8,15 @@ use narsor::cli::control_text::{
     capabilities_lines, repository_row, typed_inputs, usage_lines, validation_lines,
     workflow_lines, NO_USAGE,
 };
-use narsor::cli::observer_text::{queue_list_output, queue_show_output};
+use narsor::cli::queue_text::{queue_list_output, queue_show_output};
 use narsor_engine::controller_protocol::{
     ValidateWorkflowResponse, WorkflowInputView, WorkflowSource,
 };
 use narsor_engine::domain::ParamType;
 use narsor_protocol::controller::{
-    HarnessUsageResponse, HarnessUsageView, ObserverQueueListResponse, ObserverQueueSummary,
-    ObserverQueueView, ObserverView, QueueEntryErrorView, QueueEntryObserverView, QueueEntryView,
-    UsageLimit, UsageStatus,
+    CatalogProblemView, HarnessUsageResponse, HarnessUsageView, ObserverQueueListResponse,
+    ObserverQueueSummary, ObserverQueueView, QueueAutomationView, QueueEntryAutomationView,
+    QueueEntryErrorView, QueueEntryView, UsageLimit, UsageStatus,
 };
 use serde_json::json;
 
@@ -297,40 +297,27 @@ fn usage_text_from_the_server_carries_no_control_characters() {
 }
 
 // ---------------------------------------------------------------------------
-// `narsor-cli observer queue …` (U10)
+// `narsor-cli queue …` (U9)
 // ---------------------------------------------------------------------------
 
 fn queue_now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 11, 17, 12, 0, 0).unwrap()
 }
 
-/// An `on_episodes` observer `name` of `queue` on a cron schedule, with
-/// the script versions given.
-fn queue_observer(
-    name: &str,
-    queue: &str,
-    approved: Option<u32>,
-    latest: Option<u32>,
-) -> ObserverView {
+/// The automation `name` of a queue, active, with a `check` script.
+fn queue_automation(name: &str) -> QueueAutomationView {
     serde_json::from_value(json!({
-        "observer_id": format!("obs-{name}"),
-        "name": name,
-        "state": if approved.is_some() { "active" } else { "draft" },
-        "effect": "none",
-        "queue": queue,
-        "mode": "on_episodes",
-        "cron": "*/5 * * * *",
-        "task_limit_per_run": 10,
-        "approved_version": approved,
-        "latest_version": latest,
-        "worker_missing": false,
+        "automation": name,
+        "description": "Answers when the label is gone",
+        "scripts": ["in", "check", "out"],
+        "state": "active",
+        "next_run_at": queue_now() + chrono::Duration::minutes(3),
         "consecutive_failures": 0,
-        "created_at": queue_now(),
     }))
     .unwrap()
 }
 
-fn review_entry(observers: Vec<QueueEntryObserverView>) -> QueueEntryView {
+fn review_entry(automations: Vec<QueueEntryAutomationView>) -> QueueEntryView {
     QueueEntryView {
         entry_id: "entry-1".into(),
         task_id: "task-1".into(),
@@ -345,27 +332,44 @@ fn review_entry(observers: Vec<QueueEntryObserverView>) -> QueueEntryView {
             ),
         ]
         .into(),
-        observers,
+        automations,
+    }
+}
+
+fn summary(
+    queue: &str,
+    automations: &[&str],
+    entries: u32,
+    problem: Option<&str>,
+) -> ObserverQueueSummary {
+    ObserverQueueSummary {
+        queue: queue.into(),
+        mode: problem.is_none().then(|| "on_episodes".to_string()),
+        interval_secs: None,
+        cron: problem.is_none().then(|| "*/5 * * * *".to_string()),
+        automations: automations.iter().map(|name| name.to_string()).collect(),
+        entries,
+        problem: problem.map(str::to_string),
     }
 }
 
 #[test]
-fn queue_list_aligns_a_row_per_queue_and_says_when_there_is_none() {
+fn queue_list_shows_each_queue_and_the_files_that_did_not_load() {
+    // AE8: the bad file is listed with its problem, the others normally.
     let listing = ObserverQueueListResponse {
         queues: vec![
-            ObserverQueueSummary {
-                queue: "mr-review".into(),
-                mode: Some("on_episodes".into()),
-                observers: 2,
-                entries: 13,
-            },
-            ObserverQueueSummary {
-                queue: "unserved".into(),
-                mode: None,
-                observers: 0,
-                entries: 1,
-            },
+            summary(
+                "broken",
+                &[],
+                0,
+                Some("automation 'missing' is not in the catalogue"),
+            ),
+            summary("mr-review", &["gitlab-mr-label"], 13, None),
         ],
+        problems: vec![CatalogProblemView {
+            file: "queues/broken.yaml".into(),
+            reason: "automation 'missing' is not in the catalogue".into(),
+        }],
     };
 
     let text = queue_list_output(&listing);
@@ -374,36 +378,40 @@ fn queue_list_aligns_a_row_per_queue_and_says_when_there_is_none() {
     assert_eq!(
         lines,
         [
-            "QUEUE                    MODE         OBSERVERS ENTRIES",
-            "mr-review                on_episodes          2      13",
-            "unserved                 -                    0       1",
+            "QUEUE                    MODE         SCHEDULE                     ENTRIES  AUTOMATIONS",
+            "broken                   -            -                                  0  ! automation 'missing' is not in the catalogue",
+            "mr-review                on_episodes  cron '*/5 * * * *' (UTC)          13  gitlab-mr-label",
+            "Catalogue files that cannot be used:",
+            "  queues/broken.yaml: automation 'missing' is not in the catalogue",
         ]
     );
     assert!(queue_list_output(&ObserverQueueListResponse::default()).starts_with("No queues."));
 }
 
 #[test]
-fn queue_show_says_how_each_observer_processed_each_entry() {
+fn queue_show_says_how_each_automation_processed_each_entry() {
+    let mut stopped = queue_automation("gitlab-ci");
+    stopped.state = "error".into();
     let view = ObserverQueueView {
         queue: "mr-review".into(),
         mode: Some("on_episodes".into()),
-        observers: vec![
-            queue_observer("gitlab-mr", "mr-review", Some(1), Some(2)),
-            queue_observer("gitlab-ci", "mr-review", Some(3), Some(3)),
-        ],
+        interval_secs: None,
+        cron: Some("*/5 * * * *".into()),
+        workflow_id: None,
+        automations: vec![queue_automation("gitlab-mr-label"), stopped],
         entries: vec![review_entry(vec![
-            QueueEntryObserverView {
-                observer: "gitlab-ci".into(),
+            QueueEntryAutomationView {
+                automation: "gitlab-ci".into(),
                 running: true,
                 last_run_at: None,
                 last_error: None,
             },
-            QueueEntryObserverView {
-                observer: "gitlab-mr".into(),
+            QueueEntryAutomationView {
+                automation: "gitlab-mr-label".into(),
                 running: false,
                 last_run_at: Some(queue_now() - chrono::Duration::minutes(2)),
                 last_error: Some(QueueEntryErrorView {
-                    run_id: "obs-gitlab-mr.7".into(),
+                    run_id: "mr-review~gitlab-mr-label~7".into(),
                     status: "failed".into(),
                     finished_at: queue_now() - chrono::Duration::minutes(2),
                     exit_code: Some(3),
@@ -411,6 +419,7 @@ fn queue_show_says_how_each_observer_processed_each_entry() {
                 }),
             },
         ])],
+        problems: Vec::new(),
     };
 
     let text = queue_show_output(&view, queue_now());
@@ -420,18 +429,20 @@ fn queue_show_says_how_each_observer_processed_each_entry() {
         "{text}"
     );
     assert!(
-        text.contains(
-            "    script: version 2 not approved: approve it with `narsor-cli observer approve \
-             gitlab-mr --version 2`"
-        ),
+        text.contains("Schedule: cron '*/5 * * * *' (UTC)"),
         "{text}"
     );
-    assert_eq!(
-        text.matches("not approved").count(),
-        1,
-        "an approved newest version is not marked: {text}"
+    assert!(
+        text.contains("  gitlab-mr-label (in, check, out): active\n"),
+        "{text}"
     );
-    assert!(text.contains("cron '*/5 * * * *' (UTC)"), "{text}");
+    assert!(text.contains("    next in 3m"), "{text}");
+    assert_eq!(
+        text.matches("runs again when its check script changes")
+            .count(),
+        1,
+        "only the stopped automation: {text}"
+    );
     assert!(
         text.contains("  task-1                   review_work          input-3              25m\n"),
         "{text}"
@@ -443,8 +454,8 @@ fn queue_show_says_how_each_observer_processed_each_entry() {
     assert!(text.contains("    gitlab-ci: running\n"), "{text}");
     assert!(
         text.contains(
-            "    gitlab-mr: last run 2m ago; last error: failed 2m ago, exit 3: the script \
-             exited with code 3\n"
+            "    gitlab-mr-label: last run 2m ago; last error: failed 2m ago, exit 3: the \
+             script exited with code 3\n"
         ),
         "{text}"
     );
@@ -453,8 +464,8 @@ fn queue_show_says_how_each_observer_processed_each_entry() {
 #[test]
 fn queue_text_from_the_server_carries_no_control_characters() {
     let hostile = "x\u{1b}]0;pwned\u{7}y\u{202e}z";
-    let mut entry = review_entry(vec![QueueEntryObserverView {
-        observer: hostile.into(),
+    let mut entry = review_entry(vec![QueueEntryAutomationView {
+        automation: hostile.into(),
         running: false,
         last_run_at: None,
         last_error: Some(QueueEntryErrorView {
@@ -469,18 +480,26 @@ fn queue_text_from_the_server_carries_no_control_characters() {
     entry.step = hostile.into();
     entry.episode = hostile.into();
     entry.params = [(hostile.to_string(), hostile.to_string())].into();
+    let mut automation = queue_automation(hostile);
+    automation.description = hostile.into();
     let view = ObserverQueueView {
         queue: hostile.into(),
         mode: Some(hostile.into()),
-        observers: vec![queue_observer(hostile, hostile, None, Some(1))],
+        interval_secs: None,
+        cron: Some(hostile.into()),
+        workflow_id: Some(hostile.into()),
+        automations: vec![automation],
         entries: vec![entry],
+        problems: vec![CatalogProblemView {
+            file: hostile.into(),
+            reason: hostile.into(),
+        }],
     };
     let listing = ObserverQueueListResponse {
-        queues: vec![ObserverQueueSummary {
-            queue: hostile.into(),
-            mode: Some(hostile.into()),
-            observers: 1,
-            entries: 1,
+        queues: vec![summary(hostile, &[hostile], 1, Some(hostile))],
+        problems: vec![CatalogProblemView {
+            file: hostile.into(),
+            reason: hostile.into(),
         }],
     };
 

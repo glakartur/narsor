@@ -349,7 +349,7 @@ pub enum View {
     History(Box<History>),
     /// The registered repositories, over the details.
     Repositories(Box<Repositories>),
-    /// The owner's observer queues, over the details (`O`).
+    /// The queues (read only), over the details (`O`).
     Queues(Box<super::queues::Queues>),
     /// A view whose read has not come back: the details area shows the
     /// loading marker, `Esc` gives the list back and the answer opens the view.
@@ -367,7 +367,7 @@ pub enum ViewKind {
     History,
     /// The repositories.
     Repositories,
-    /// The observer queues.
+    /// The queues (read only).
     Queues,
     /// A view that waits for its read.
     Opening(OpeningKind),
@@ -384,10 +384,8 @@ pub enum Request {
     OpenHistory,
     /// `R`: read the registry and open the repositories.
     OpenRepositories,
-    /// `O`: read the owner's observer queues and open them.
+    /// `O`: read the queues and open them (read only).
     OpenQueues,
-    /// A write of the queues view.
-    QueueWrite(Box<super::queues::QueueWrite>),
     /// Send the task being created under this id (the first attempt, or by
     /// hand once it was not sent).
     SendTask(String),
@@ -503,9 +501,6 @@ pub struct TaskApp {
     /// When the next read of the usage limits is due: at once, then a period
     /// after the previous read finished ([`usage::USAGE_PERIOD`]).
     next_usage_at: Instant,
-    /// The editor a script is edited in (`$VISUAL` / `$EDITOR`); a paste
-    /// field when none.
-    editor: Option<String>,
 }
 
 /// What a read of the list must tell after work was sent to a task without a
@@ -563,7 +558,6 @@ impl TaskApp {
             branch_source,
             harness_usage: None,
             next_usage_at: Instant::now(),
-            editor: None,
         }
     }
 
@@ -694,7 +688,6 @@ impl TaskApp {
                 View::Repositories(open) => open
                     .form()
                     .is_some_and(super::chooser::Chooser::is_confirming),
-                View::Queues(_) => self.queues_confirming(),
                 _ => false,
             };
         in_view || self.panel_confirming() || self.conductor_confirming()
@@ -816,7 +809,6 @@ impl TaskApp {
             View::Repositories(_) if self.focus == Focus::Details => {
                 self.on_repositories_paste(pasted)
             }
-            View::Queues(_) if self.focus == Focus::Details => self.on_queues_paste(pasted),
             View::Tasks if self.panel_typing() => self.on_panel_paste(pasted),
             View::Tasks if self.conductor_typing() => self.on_conductor_paste(pasted),
             _ => {}
@@ -1174,7 +1166,6 @@ impl TaskApp {
             Request::OpenHistory => self.start_opening(OpeningKind::History),
             Request::OpenRepositories => self.start_opening(OpeningKind::Repositories),
             Request::OpenQueues => self.start_opening(OpeningKind::Queues),
-            Request::QueueWrite(write) => self.queue_write(*write).await,
             Request::SendTask(id) => self.send_task(&id).await,
             Request::ValidatePath(path) => self.validate_path(&path).await,
             Request::AddRepository(request) => self.add_repository(&request).await,

@@ -1,6 +1,6 @@
 //! The example observer scripts against a fake source: each one reads the
 //! answers of its source from `FAKE_SOURCE_DIR` and calls a stand-in
-//! `narsor-cli` that records its arguments. The input follows version 2 of
+//! `narsor-cli` that records its arguments. The input follows version 3 of
 //! the script contract. The Jira script (`always`) must print a document
 //! that the contract accepts; a PR/MR script (`on_episodes`) checks one
 //! queue entry and answers its gate with `narsor-cli task decide` (U13).
@@ -147,7 +147,9 @@ impl Drop for Sandbox {
 fn input(condition: Value, state: Value, entry: Value) -> Value {
     let mut input = json!({
         "contract_version": SCRIPT_CONTRACT_VERSION,
-        "observer": {"id": "obs-1", "name": "example"},
+        "phase": "check",
+        "queue": "example-queue",
+        "automation": "example",
         "condition": condition,
         "state": state,
         "first_run": state.is_null(),
@@ -331,7 +333,7 @@ const LATER: &str = "2026-11-17T10:20:00.123Z";
 const EARLIER: &str = "2026-11-17T09:50:00Z";
 
 /// The queue entry of a review gate (`review_work`) for `url`, as the
-/// control plane hands it to the script (contract version 2), with the
+/// control plane hands it to the script (contract version 3), with the
 /// params `mr_url`, `label` and the `extra` ones.
 fn review_entry(url: &str, extra: &[(&str, &str)]) -> Value {
     let mut params: BTreeMap<String, String> = [
@@ -610,7 +612,7 @@ fn a_bad_input_or_param_is_an_error_of_the_run() {
             github_input(Value::Null),
             "no queue entry",
         ),
-        ("gitlab-mr-review.sh", version_one, "not version 2"),
+        ("gitlab-mr-review.sh", version_one, "not version 3"),
         (
             "gitlab-mr-review.sh",
             gitlab_input(no_label),

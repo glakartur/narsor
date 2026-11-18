@@ -1,15 +1,18 @@
-//! The script contract (R12): what an observer's script reads on stdin and
-//! what its result is (D18).
+//! The script contract (R12): what an automation's script reads on stdin
+//! and what its result is (D18).
 //!
 //! ```text
-//! stdin   one JSON document, ScriptInput (contract_version 2)
+//! stdin   one JSON document, ScriptInput (contract_version 3), with the
+//!         script's `phase` (`in`, `check`, `out`), its `queue` and its
+//!         `automation`
 //!
-//! an observer in mode `always`: no `entry` field
+//! a `check` run of a queue in mode `always`: no `entry` field
 //!   stdout  one JSON document, ScriptOutput: {"state": …}
 //!   exit 0 + a document parse_script_output accepts → the state is saved
 //!   anything else                                   → error, state kept
 //!
-//! an observer in mode `on_episodes`: one run checks one queue entry,
+//! a `check` run of a queue in mode `on_episodes`: one run checks one
+//! queue entry,
 //! `entry` holds it (task, episode and its start, step, params, the
 //! gate's choices and variables)
 //!   stdout  not read
@@ -17,7 +20,7 @@
 //!                                   the gate (`narsor-cli task decide`)
 //!                                   or had nothing to report
 //!   any other result              → error, recorded for the entry; the
-//!                                   observer's state does not change
+//!                                   pair's state does not change
 //! ```
 //!
 //! No exit code removes an entry: the entry goes when its gate exits
@@ -25,15 +28,18 @@
 //!
 //! Version 2 (R11) replaced the watched object of version 1 with the queue
 //! entry and dropped exit code 1 ("check again"): every run checks again
-//! until the gate exits.
+//! until the gate exits. Version 3 moved the configuration to the catalogue:
+//! the `observer` object gave way to `queue` and `automation`, and `phase`
+//! names the script that runs. An `out` run will also get the gate's `exit`
+//! (U5 of the catalogue plan); no build sends it yet.
 //!
-//! For an observer that creates tasks, exit code 0 with a valid document is
+//! For a queue that creates tasks, exit code 0 with a valid document is
 //! the only result that changes the remembered state (R14). The output is
 //! untrusted: it is bounded before it is parsed, and anything beyond the one
 //! document — trailing text, unknown fields — is refused rather than
 //! ignored.
 
-use super::model::{ObserverId, ObserverName};
+use crate::automations::HookPhase;
 use crate::domain::TaskId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -41,7 +47,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// Version of the contract a [`ScriptInput`] follows.
-pub const SCRIPT_CONTRACT_VERSION: u32 = 2;
+pub const SCRIPT_CONTRACT_VERSION: u32 = 3;
 
 /// Largest stdout document a script may print (1 MiB).
 pub const MAX_SCRIPT_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -49,15 +55,6 @@ pub const MAX_SCRIPT_OUTPUT_BYTES: usize = 1024 * 1024;
 /// The exit code of a run that checked its queue entry: the only exit
 /// code of such a run that is no error (R14).
 pub const ENTRY_DONE_EXIT_CODE: i32 = 0;
-
-/// The observer, as its script sees it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScriptObserver {
-    /// Its id.
-    pub id: ObserverId,
-    /// Its name.
-    pub name: ObserverName,
-}
 
 /// One queue entry, as its script sees it (R11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,23 +109,45 @@ pub struct ScriptVariable {
     pub options: Vec<String>,
 }
 
+/// How the gate of an `out` run's entry was left: the choice and who made
+/// it (R11). Reserved for the exit scripts; no run carries it yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptExit {
+    /// The choice the gate exited with; absent when the task ended at the
+    /// gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<String>,
+    /// Who chose it: `person`, `automation`, `operator` or `task_end`.
+    pub author: String,
+    /// The automation run that answered, for an `automation` author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
 /// What the script reads on stdin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScriptInput {
     /// [`SCRIPT_CONTRACT_VERSION`].
     pub contract_version: u32,
-    /// The observer.
-    pub observer: ScriptObserver,
-    /// The owner's condition, as configured.
+    /// The script that runs: `in`, `check` or `out`.
+    pub phase: HookPhase,
+    /// The queue of the run.
+    pub queue: String,
+    /// The automation of the run.
+    pub automation: String,
+    /// The queue's condition, as its file gives it.
     pub condition: serde_json::Value,
     /// The state the last successful run returned; `None` before the first.
     #[serde(default)]
     pub state: Option<serde_json::Value>,
-    /// The one queue entry this run checks, for an `on_episodes` observer;
-    /// absent for an `always` observer (R25).
+    /// The one queue entry this run checks, for an `on_episodes` queue;
+    /// absent for an `always` queue (R25).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<ScriptEntry>,
-    /// No run of this observer has succeeded yet.
+    /// How the gate was left, for an `out` run only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<ScriptExit>,
+    /// No run of this pair has succeeded yet.
     #[serde(default)]
     pub first_run: bool,
     /// On the first run, import what already matches instead of only
@@ -144,7 +163,7 @@ impl ScriptInput {
     }
 }
 
-/// What the script of an observer that creates tasks prints on stdout.
+/// What the `check` script of an `always` queue prints on stdout.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScriptOutput {

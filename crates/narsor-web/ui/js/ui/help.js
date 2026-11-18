@@ -16,7 +16,7 @@ const KEYS = [
   ['R', 'repozytoria'],
   ['h', 'domyślny harness'],
   ['L', 'limit zadań'],
-  ['Q', 'kolejki obserwatorów (Esc: wstecz)'],
+  ['Q', 'kolejki automatyzacji (Esc: wstecz)'],
   ['u', 'odśwież teraz'],
   ['?', 'ta pomoc'],
 ];

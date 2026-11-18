@@ -70,8 +70,8 @@ fail() {
 command -v jq >/dev/null 2>&1 || fail "jq is not installed"
 
 input=$(cat)
-printf '%s' "$input" | jq -e '.contract_version == 2' >/dev/null ||
-    fail "the input is not version 2 of the script contract"
+printf '%s' "$input" | jq -e '.contract_version == 3' >/dev/null ||
+    fail "the input is not version 3 of the script contract"
 
 # read_input FILTER: the value of a jq filter over the input, as text.
 read_input() {

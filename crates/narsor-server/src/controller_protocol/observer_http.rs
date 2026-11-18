@@ -1,5 +1,5 @@
-//! The observers' HTTP routes outside the owner gate, and the owner's routes
-//! of the observers.
+//! The automations' HTTP routes outside the owner gate, and the owner's
+//! read-only queue views.
 //!
 //! The effect routes of an observer run's script (U3), behind the observer
 //! run gate ([`crate::auth_gate::require_observer_run`]):
@@ -10,7 +10,8 @@
 //! | `POST /observer/v1/runs/{run}/decide` | [`ObserverDecideRequest`] | `200` delivered |
 //!
 //! Each answers an [`ObserverEffectResponse`]. `decide` answers the gate of
-//! the queue entry the run was started for, and no other (KTD-6). They are merged outside the
+//! the queue entry the run was started for, and no other (KTD-6), and only
+//! from a `check` run. They are merged outside the
 //! owner gate, which never accepts a run token; the run gate in turn
 //! accepts nothing but the token of a run in progress before its deadline,
 //! and only for that run's own path. Refusals of the gate are a bare `401`;
@@ -19,35 +20,25 @@
 //! The worker routes (U6), behind the observer worker gate
 //! ([`crate::auth_gate::require_observer_worker`]). The worker is the
 //! server's own, started with a key the server makes at each of its starts
-//! (D5); it claims the runs of every owner's observers:
+//! (D5); it claims the runs of every (queue, automation) pair:
 //!
 //! | route | body | answer |
 //! | --- | --- | --- |
 //! | `POST /observer/v1/worker/claim` | none | `200` [`ObserverClaimResponse`] |
 //! | `POST /observer/v1/worker/runs/{run}/result` | [`ObserverRunReport`] | `200` [`ObserverRunResultResponse`], `404` no such run, `409` ended |
 //!
-//! The owner's routes for the observers (U7, R21), behind the owner gate
-//! ([`observer_owner_routes`]); `{observer}` is a name or an id, and
-//! another owner's observer is a bare `404`:
+//! The owner's read-only queue views (R21), behind the owner gate
+//! ([`observer_owner_routes`]). Queues and automations are catalogue files:
+//! no route creates, changes or deletes them, and the routes of the stored
+//! observers of older versions (`/control/v1/observers…`) are gone (a bare
+//! `404`, R22):
 //!
 //! | route | body | answer |
 //! | --- | --- | --- |
-//! | `GET /control/v1/observers` | none | [`ObserverListResponse`] |
-//! | `POST /control/v1/observers` | [`CreateObserverRequest`] | `201` [`ObserverView`] |
-//! | `GET /control/v1/observers/{observer}` | none | [`ObserverDetailView`] |
-//! | `PATCH /control/v1/observers/{observer}` | [`UpdateObserverRequest`] | [`ObserverView`] |
-//! | `DELETE /control/v1/observers/{observer}` | none | [`ObserverView`] |
-//! | `POST /control/v1/observers/{observer}/scripts` | [`SetObserverScriptRequest`] | `201` [`ObserverScriptView`] |
-//! | `GET /control/v1/observers/{observer}/scripts/{version}` | none | [`ObserverScriptTextView`] |
-//! | `POST /control/v1/observers/{observer}/approve` | [`ApproveObserverRequest`] | [`ObserverView`] |
-//! | `POST /control/v1/observers/{observer}/pause` | none | [`ObserverView`] |
-//! | `POST /control/v1/observers/{observer}/resume` | none | [`ObserverView`] |
 //! | `GET /control/v1/observer-queues` | none | [`ObserverQueueListResponse`] |
 //! | `GET /control/v1/observer-queues/{queue}` | none | [`ObserverQueueView`] |
 //!
-//! A queue is a name in the owner's namespace (R7): another owner's queue
-//! of the same name is a bare `404`, as is a name nothing of the caller's
-//! names.
+//! A queue view shows the caller's entries only.
 //!
 //! They need the owner gate's [`OwnerRef`] and [`Operator`]: anyone else
 //! gets a bare `403`.
@@ -72,13 +63,10 @@ use narsor_engine::controller_protocol::service::{
     ProtocolService, MAX_EFFECT_DATA_BYTES, MAX_STORED_LOG_BYTES,
 };
 use narsor_engine::controller_protocol::wire::{
-    ApproveObserverRequest, CreateObserverRequest, ObserverClaimResponse,
-    ObserverCreateTaskRequest, ObserverDecideRequest, ObserverDetailView, ObserverEffectResponse,
-    ObserverListResponse, ObserverQueueListResponse, ObserverQueueView, ObserverRunReport,
-    ObserverRunResultResponse, ObserverScriptTextView, ObserverScriptView, ObserverView,
-    SetObserverScriptRequest, UpdateObserverRequest,
+    ObserverClaimResponse, ObserverCreateTaskRequest, ObserverDecideRequest,
+    ObserverEffectResponse, ObserverQueueListResponse, ObserverQueueView, ObserverRunReport,
+    ObserverRunResultResponse,
 };
-use narsor_engine::observers::MAX_SCRIPT_BYTES;
 use narsor_engine::observers::{RunId, MAX_SCRIPT_OUTPUT_BYTES};
 use narsor_engine::orchestration::OwnerRef;
 
@@ -92,10 +80,6 @@ const MAX_EFFECT_BODY: usize = MAX_EFFECT_DATA_BYTES + 16 * 1024;
 /// stored stderr, each of which JSON escaping may double, and room for the
 /// outcome.
 const MAX_RESULT_BODY: usize = 2 * (MAX_SCRIPT_OUTPUT_BYTES + MAX_STORED_LOG_BYTES) + 16 * 1024;
-
-/// Largest owner request body: a script, which JSON escaping may double,
-/// and room for the rest.
-const MAX_OWNER_BODY: usize = 2 * MAX_SCRIPT_BYTES + 64 * 1024;
 
 /// The routes outside the owner gate: the effect routes behind the observer
 /// run gate, the worker routes behind the observer worker gate.
@@ -115,47 +99,24 @@ where
         .route("/observer/v1/worker/claim", post(post_claim))
         .route("/observer/v1/worker/runs/{run}/result", post(post_result))
         .layer(DefaultBodyLimit::max(MAX_RESULT_BODY))
-        .layer(middleware::from_fn_with_state(
+        // Only the matched routes: a path no route serves (a removed
+        // observer management route, say) stays a plain `404`.
+        .route_layer(middleware::from_fn_with_state(
             Arc::clone(&service),
             require_observer_worker,
         ))
         .with_state(service)
 }
 
-/// The owner's observer routes; they expect the owner gate's [`OwnerRef`]
-/// and [`Operator`] in the request extensions.
+/// The owner's read-only queue routes; they expect the owner gate's
+/// [`OwnerRef`] and [`Operator`] in the request extensions.
 pub fn observer_owner_routes<S>(service: Service) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
-        .route(
-            "/control/v1/observers",
-            get(list_observers).post(post_observer),
-        )
-        .route(
-            "/control/v1/observers/{observer}",
-            get(get_observer)
-                .patch(patch_observer)
-                .delete(delete_observer),
-        )
-        .route(
-            "/control/v1/observers/{observer}/scripts",
-            post(post_script),
-        )
-        .route(
-            "/control/v1/observers/{observer}/scripts/{version}",
-            get(get_script),
-        )
-        .route(
-            "/control/v1/observers/{observer}/approve",
-            post(post_approve),
-        )
-        .route("/control/v1/observers/{observer}/pause", post(post_pause))
-        .route("/control/v1/observers/{observer}/resume", post(post_resume))
         .route("/control/v1/observer-queues", get(list_queues))
         .route("/control/v1/observer-queues/{queue}", get(get_queue))
-        .layer(DefaultBodyLimit::max(MAX_OWNER_BODY))
         .with_state(service)
 }
 
@@ -168,7 +129,9 @@ where
         .route("/observer/v1/runs/{run}/tasks", post(post_task))
         .route("/observer/v1/runs/{run}/decide", post(post_decide))
         .layer(DefaultBodyLimit::max(MAX_EFFECT_BODY))
-        .layer(middleware::from_fn_with_state(
+        // Only the matched routes: a path no route serves (a removed
+        // observer management route, say) stays a plain `404`.
+        .route_layer(middleware::from_fn_with_state(
             Arc::clone(&service),
             require_observer_run,
         ))
@@ -274,60 +237,8 @@ fn require_owner_operator(
 }
 
 // ---------------------------------------------------------------------------
-// The owner's observer routes
+// The owner's queue views
 // ---------------------------------------------------------------------------
-
-async fn list_observers(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-) -> ProtocolResult<Json<ObserverListResponse>> {
-    let owner = require_owner_operator(owner, operator)?;
-    Ok(Json(
-        blocking(&service, move |s| s.observers_of(&owner)).await?,
-    ))
-}
-
-async fn post_observer(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-    body: Bytes,
-) -> ProtocolResult<(StatusCode, Json<ObserverView>)> {
-    let owner = require_owner_operator(owner, operator)?;
-    let request: CreateObserverRequest = parse_json(&body, "observer request")?;
-    let created = blocking(&service, move |s| s.create_observer(&owner, request)).await?;
-    Ok((StatusCode::CREATED, Json(created)))
-}
-
-async fn get_observer(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-    Path(observer): Path<String>,
-) -> ProtocolResult<Json<ObserverDetailView>> {
-    let owner = require_owner_operator(owner, operator)?;
-    Ok(Json(
-        blocking(&service, move |s| s.observer_detail(&owner, &observer)).await?,
-    ))
-}
-
-async fn patch_observer(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-    Path(observer): Path<String>,
-    body: Bytes,
-) -> ProtocolResult<Json<ObserverView>> {
-    let owner = require_owner_operator(owner, operator)?;
-    let request: UpdateObserverRequest = parse_json(&body, "observer update")?;
-    Ok(Json(
-        blocking(&service, move |s| {
-            s.update_observer(&owner, &observer, request)
-        })
-        .await?,
-    ))
-}
 
 async fn list_queues(
     State(service): State<Service>,
@@ -352,90 +263,6 @@ async fn get_queue(
     ))
 }
 
-async fn delete_observer(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-    Path(observer): Path<String>,
-) -> ProtocolResult<Json<ObserverView>> {
-    let owner = require_owner_operator(owner, operator)?;
-    Ok(Json(
-        blocking(&service, move |s| s.delete_observer(&owner, &observer)).await?,
-    ))
-}
-
-async fn post_script(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-    Path(observer): Path<String>,
-    body: Bytes,
-) -> ProtocolResult<(StatusCode, Json<ObserverScriptView>)> {
-    let owner = require_owner_operator(owner, operator)?;
-    let request: SetObserverScriptRequest = parse_json(&body, "observer request")?;
-    let saved = blocking(&service, move |s| {
-        s.add_observer_script(&owner, &observer, &request.script)
-    })
-    .await?;
-    Ok((StatusCode::CREATED, Json(saved)))
-}
-
-async fn get_script(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-    Path((observer, version)): Path<(String, u32)>,
-) -> ProtocolResult<Json<ObserverScriptTextView>> {
-    let owner = require_owner_operator(owner, operator)?;
-    Ok(Json(
-        blocking(&service, move |s| {
-            s.observer_script(&owner, &observer, version)
-        })
-        .await?,
-    ))
-}
-
-async fn post_approve(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-    Path(observer): Path<String>,
-    body: Bytes,
-) -> ProtocolResult<Json<ObserverView>> {
-    let owner = require_owner_operator(owner, operator)?;
-    let request: ApproveObserverRequest = parse_json(&body, "observer request")?;
-    Ok(Json(
-        blocking(&service, move |s| {
-            s.approve_observer_version_for(&owner, &observer, request.version)
-        })
-        .await?,
-    ))
-}
-
-async fn post_pause(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-    Path(observer): Path<String>,
-) -> ProtocolResult<Json<ObserverView>> {
-    let owner = require_owner_operator(owner, operator)?;
-    Ok(Json(
-        blocking(&service, move |s| s.pause_observer_for(&owner, &observer)).await?,
-    ))
-}
-
-async fn post_resume(
-    State(service): State<Service>,
-    owner: Option<Extension<OwnerRef>>,
-    operator: Option<Extension<Operator>>,
-    Path(observer): Path<String>,
-) -> ProtocolResult<Json<ObserverView>> {
-    let owner = require_owner_operator(owner, operator)?;
-    Ok(Json(
-        blocking(&service, move |s| s.resume_observer_for(&owner, &observer)).await?,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -446,15 +273,17 @@ mod tests {
     use axum::http::header;
     use axum::response::Response;
     use chrono::{DateTime, Duration, TimeZone, Utc};
+    use narsor_engine::automations::{
+        AutomationCatalog, AutomationCatalogError, AutomationCatalogLoad, AutomationScript,
+        HookPhase,
+    };
     use narsor_engine::controller_protocol::{ClaimedObserverRun, RunOutcome, RunReport};
     use narsor_engine::domain::{BackendId, WorkflowDefinition};
     use narsor_engine::environment::{
         BackendRecord, LaunchError, LaunchIntent, LaunchResolver, ResolvedLaunch,
         SlotReleaseTimings,
     };
-    use narsor_engine::observers::{
-        CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverId, ObserverMode, ObserverName,
-    };
+    use narsor_engine::observers::AutomationKey;
     use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef};
     use narsor_engine::persistence::StatePaths;
     use serde_json::{json, Value};
@@ -475,9 +304,11 @@ mod tests {
         }
     }
 
-    /// Launches nothing: these routes are tested on their gates and
-    /// refusals.
-    struct NoLaunches;
+    /// Launches nothing, and serves the automation catalogue under
+    /// `catalog`: these routes are tested on their gates and refusals.
+    struct NoLaunches {
+        catalog: PathBuf,
+    }
 
     impl LaunchResolver for NoLaunches {
         fn resolve(&self, _intent: &LaunchIntent) -> Result<ResolvedLaunch, LaunchError> {
@@ -519,9 +350,24 @@ mod tests {
                 })
             }
         }
+
+        fn automation_catalog(&self) -> AutomationCatalogLoad {
+            AutomationCatalog::new(&self.catalog).load(|workflow| {
+                self.workflow_definition(workflow)
+                    .map_err(|error| error.to_string())
+            })
+        }
+
+        fn automation_script(
+            &self,
+            automation: &str,
+            phase: HookPhase,
+        ) -> Result<AutomationScript, AutomationCatalogError> {
+            AutomationCatalog::new(&self.catalog).script(automation, phase)
+        }
     }
 
-    /// The `triage` workflow observers create tasks of.
+    /// The `triage` workflow the `jira-intake` queue creates tasks of.
     fn triage() -> WorkflowDefinition {
         serde_json::from_value(json!({
             "id": "triage",
@@ -548,10 +394,6 @@ mod tests {
         }
     }
 
-    fn owner() -> OwnerRef {
-        OwnerRef::new("local")
-    }
-
     impl Fixture {
         fn new() -> Self {
             let root =
@@ -560,10 +402,7 @@ mod tests {
             let clock = Arc::new(ManualClock(Mutex::new(
                 Utc.with_ymd_and_hms(2026, 11, 13, 12, 0, 0).unwrap(),
             )));
-            let service = Arc::new(ProtocolService::new(
-                ControlPlane::with_clock(StatePaths::new(&root), clock.clone()),
-                Arc::new(NoLaunches),
-            ));
+            let service = Self::service(&root, &clock);
             Self {
                 root,
                 clock,
@@ -571,8 +410,34 @@ mod tests {
             }
         }
 
-        fn now(&self) -> DateTime<Utc> {
-            self.clock.now()
+        fn service(root: &std::path::Path, clock: &Arc<ManualClock>) -> Service {
+            Arc::new(ProtocolService::new(
+                ControlPlane::with_clock(StatePaths::new(root.join("state")), clock.clone()),
+                Arc::new(NoLaunches {
+                    catalog: root.join("catalog"),
+                }),
+            ))
+        }
+
+        fn write(&self, relative: &str, text: &str) {
+            let path = self.root.join("catalog").join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+
+        /// The `always` queue `jira-intake` of the automation `jira-new`,
+        /// which creates `triage` tasks: due once the pass runs.
+        fn jira_queue(&self) {
+            self.write(
+                "automations/jira-new/automation.yaml",
+                "description: new Jira issues\n",
+            );
+            self.write("automations/jira-new/check.sh", "echo '{\"state\": {}}'\n");
+            self.write(
+                "queues/jira-intake.yaml",
+                "automations: [jira-new]\nmode: always\nschedule: {interval_secs: 300}\n\
+                 tasks:\n  workflow_id: triage\n  mapping: {ticket: key}\n",
+            );
         }
 
         fn router(&self) -> Router {
@@ -586,36 +451,9 @@ mod tests {
                 .merge(observer_routes(Arc::clone(&self.service)))
         }
 
-        /// An active observer of `effect`, approved and due.
-        fn observer(&self, name: &str, effect: ObserverEffect, mode: ObserverMode) -> ObserverId {
-            self.observer_of(owner(), name, effect, mode)
-        }
-
-        /// The same, of `owner`.
-        fn observer_of(
-            &self,
-            owner: OwnerRef,
-            name: &str,
-            effect: ObserverEffect,
-            mode: ObserverMode,
-        ) -> ObserverId {
-            let config = ObserverConfig::new(ObserverName::parse(name).unwrap(), effect, mode);
-            let workflow = triage();
-            let store = self.service.observers();
-            let id = store
-                .create(owner, config, Some(&workflow), self.now())
-                .unwrap()
-                .observer_id;
-            store
-                .add_script(&id, "echo '{\"state\": {}}'\n", self.now())
-                .unwrap();
-            self.service.approve_observer_version(&id, 1).unwrap();
-            id
-        }
-
-        /// The claimed run of an active "create a task" observer.
+        /// The claimed run of the `jira-intake` queue.
         fn effect_run(&self) -> ClaimedObserverRun {
-            jira_observer(self);
+            self.jira_queue();
             self.service.observer_pass();
             self.service.claim_observer_run().unwrap().unwrap()
         }
@@ -639,12 +477,24 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    async fn json_body_is_empty(response: Response) -> bool {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    }
+
     fn tasks_uri(run: &ClaimedObserverRun) -> String {
         format!("/observer/v1/runs/{}/tasks", run.run_id)
     }
 
     fn effect() -> Value {
         json!({"data": {"key": "ABC-1"}})
+    }
+
+    /// The worker key, as the server makes it when it starts the worker.
+    fn worker_key(fx: &Fixture) -> String {
+        fx.service.issue_observer_worker_key().expose().to_string()
     }
 
     #[tokio::test]
@@ -667,8 +517,9 @@ mod tests {
         assert_eq!(owner.status(), StatusCode::UNAUTHORIZED);
 
         let other_run = format!(
-            "/observer/v1/runs/{}.{}/tasks",
-            run.run_id.observer_id,
+            "/observer/v1/runs/{}~{}~{}/tasks",
+            run.run_id.key.queue,
+            run.run_id.key.automation,
             run.run_id.sequence + 1
         );
         let elsewhere = fx
@@ -676,13 +527,6 @@ mod tests {
             .await;
         assert_eq!(elsewhere.status(), StatusCode::UNAUTHORIZED);
         assert!(json_body_is_empty(elsewhere).await);
-    }
-
-    async fn json_body_is_empty(response: Response) -> bool {
-        axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .is_empty()
     }
 
     #[tokio::test]
@@ -709,22 +553,6 @@ mod tests {
         let refused = fx.send("POST", &uri, run.token.expose(), artifacts).await;
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_body(refused).await["code"], "invalid_request");
-    }
-
-    #[tokio::test]
-    async fn a_run_token_opens_no_owner_route() {
-        let fx = Fixture::new();
-        let run = fx.effect_run();
-
-        let list = fx
-            .send("GET", "/control/v1/tasks", run.token.expose(), Value::Null)
-            .await;
-
-        assert_eq!(list.status(), StatusCode::UNAUTHORIZED);
-        let owner = fx
-            .send("GET", "/control/v1/tasks", OWNER_TOKEN, Value::Null)
-            .await;
-        assert_eq!(owner.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -762,26 +590,14 @@ mod tests {
     #[tokio::test]
     async fn a_create_request_naming_a_workflow_or_backend_is_a_coded_400() {
         let fx = Fixture::new();
-        let id = fx.observer(
-            "jira-new",
-            ObserverEffect::CreateTask(CreateTaskEffect {
-                workflow_id: "triage".into(),
-                workflow_version: 1,
-                workspaces: Default::default(),
-                backend_id: None,
-                profile: None,
-                mapping: [("ticket".to_string(), "key".to_string())].into(),
-            }),
-            ObserverMode::Always,
-        );
-        assert!(fx.service.observer_pass().due.contains(&id));
-        let run = fx.service.claim_observer_run().unwrap().unwrap();
-        let uri = format!("/observer/v1/runs/{}/tasks", run.run_id);
+        let run = fx.effect_run();
 
         for field in ["workflow_id", "backend_id", "inputs"] {
-            let mut body = json!({"data": {"key": "ABC-1"}});
+            let mut body = effect();
             body[field] = json!("other");
-            let refused = fx.send("POST", &uri, run.token.expose(), body).await;
+            let refused = fx
+                .send("POST", &tasks_uri(&run), run.token.expose(), body)
+                .await;
             assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{field}");
             let error = json_body(refused).await;
             assert_eq!(error["code"], "invalid_request");
@@ -806,32 +622,11 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    /// An active "create a task" observer, due once the pass runs.
-    fn jira_observer(fx: &Fixture) -> ObserverId {
-        fx.observer(
-            "jira-all",
-            ObserverEffect::CreateTask(CreateTaskEffect {
-                workflow_id: "triage".into(),
-                workflow_version: 1,
-                workspaces: Default::default(),
-                backend_id: None,
-                profile: None,
-                mapping: [("ticket".to_string(), "key".to_string())].into(),
-            }),
-            ObserverMode::Always,
-        )
-    }
-
-    /// The worker key, as the server makes it when it starts the worker.
-    fn worker_key(fx: &Fixture) -> String {
-        fx.service.issue_observer_worker_key().expose().to_string()
-    }
-
     #[tokio::test]
-    async fn a_worker_claims_a_run_and_reports_its_result() {
+    async fn a_worker_claims_a_catalogue_run_and_reports_its_result() {
         let fx = Fixture::new();
         let credential = worker_key(&fx);
-        let id = jira_observer(&fx);
+        fx.jira_queue();
         fx.service.observer_pass();
 
         let claim = fx
@@ -846,10 +641,17 @@ mod tests {
         assert_eq!(claim.status(), StatusCode::OK);
         let run = json_body(claim).await["run"].clone();
         let run_id = run["run_id"].as_str().unwrap().to_string();
-        assert!(run_id.starts_with(id.as_str()), "{run_id}");
+        assert_eq!(run_id, "jira-intake~jira-new~1");
         assert!(run["token"].as_str().unwrap().starts_with("nso."));
-        assert_eq!(run["owner"], "local");
-        assert_eq!(run["input"]["observer"]["name"], "jira-all");
+        assert_eq!(run["phase"], "check");
+        assert_eq!(run["queue"], "jira-intake");
+        assert_eq!(run["automation"], "jira-new");
+        assert!(run["script_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert_eq!(run["input"]["contract_version"], 3);
+        assert_eq!(run["input"]["phase"], "check");
         assert_eq!(run["script"], "echo '{\"state\": {}}'\n");
         let empty = fx
             .send(
@@ -873,7 +675,8 @@ mod tests {
         let body = json_body(result).await;
         assert_eq!(body["status"], "succeeded");
         assert_eq!(body["run_id"], run_id.as_str());
-        let record = fx.service.observers().load(&id).unwrap();
+        let key = AutomationKey::new("jira-intake", "jira-new").unwrap();
+        let record = fx.service.observers().load(&key).unwrap().unwrap();
         assert_eq!(record.script_state, Some(json!({"cursor": 5})));
 
         let again = fx
@@ -888,50 +691,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_owner_sees_only_the_errors_of_failed_runs() {
-        let fx = Fixture::new();
-        let credential = worker_key(&fx);
-        jira_observer(&fx);
-        for report in [
-            json!({"outcome": {"kind": "exited", "exit_code": 0}, "stdout": "{\"state\": {}}"}),
-            json!({"outcome": {"kind": "exited", "exit_code": 4}, "stderr": "boom"}),
-        ] {
-            fx.service.observer_pass();
-            let run = fx.service.claim_observer_run().unwrap().unwrap();
-            let result = fx
-                .send(
-                    "POST",
-                    &format!("/observer/v1/worker/runs/{}/result", run.run_id),
-                    &credential,
-                    report,
-                )
-                .await;
-            assert_eq!(result.status(), StatusCode::OK);
-            *fx.clock.0.lock().unwrap() += Duration::seconds(3600);
-        }
-
-        let detail = fx
-            .send(
-                "GET",
-                "/control/v1/observers/jira-all",
-                OWNER_TOKEN,
-                Value::Null,
-            )
-            .await;
-
-        assert_eq!(detail.status(), StatusCode::OK);
-        let body = json_body(detail).await;
-        let errors = body["errors"].as_array().unwrap();
-        assert_eq!(errors.len(), 1, "{body}");
-        assert_eq!(errors[0]["sequence"], 2);
-        assert_eq!(errors[0]["status"], "failed");
-        assert_eq!(errors[0]["exit_code"], 4);
-        assert_eq!(errors[0]["stderr"], "boom");
-        assert!(body.get("runs").is_none());
-        assert_eq!(body["observer"]["last_run"]["status"], "failed");
-    }
-
-    #[tokio::test]
     async fn each_credential_opens_only_its_own_routes() {
         let fx = Fixture::new();
         let credential = worker_key(&fx);
@@ -939,11 +698,11 @@ mod tests {
 
         for (method, uri) in [
             ("GET", "/control/v1/tasks"),
-            ("GET", "/control/v1/observers"),
-            ("POST", "/control/v1/observers"),
-            ("POST", "/control/v1/observers/jira-all/approve"),
+            ("GET", "/control/v1/observer-queues"),
         ] {
             let refused = fx.send(method, uri, &credential, json!({})).await;
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            let refused = fx.send(method, uri, run.token.expose(), json!({})).await;
             assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
         let refused = fx
@@ -971,89 +730,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_key_of_an_earlier_start_of_the_worker_is_refused() {
+    async fn a_restarted_server_refuses_the_key_of_its_predecessor() {
         let fx = Fixture::new();
         let earlier = worker_key(&fx);
         let current = worker_key(&fx);
-
         let refused = fx
             .send("POST", "/observer/v1/worker/claim", &earlier, Value::Null)
             .await;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
         let accepted = fx
             .send("POST", "/observer/v1/worker/claim", &current, Value::Null)
             .await;
-
-        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
-        assert!(json_body_is_empty(refused).await);
         assert_eq!(accepted.status(), StatusCode::OK);
-    }
 
-    #[tokio::test]
-    async fn a_restarted_server_refuses_the_key_of_its_predecessor() {
-        let fx = Fixture::new();
-        let key = worker_key(&fx);
         // The same state root, a new process: the digest lived in memory.
         let restarted = Fixture {
             root: fx.root.join("unused"),
             clock: Arc::clone(&fx.clock),
-            service: Arc::new(ProtocolService::new(
-                ControlPlane::with_clock(StatePaths::new(&fx.root), fx.clock.clone()),
-                Arc::new(NoLaunches),
-            )),
+            service: Fixture::service(&fx.root, &fx.clock),
         };
-
         let claim = restarted
-            .send("POST", "/observer/v1/worker/claim", &key, Value::Null)
+            .send("POST", "/observer/v1/worker/claim", &current, Value::Null)
             .await;
-
         assert_eq!(claim.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn the_worker_claims_and_reports_the_runs_of_every_owner() {
-        let fx = Fixture::new();
-        let key = worker_key(&fx);
-        let stranger = OwnerRef::new("someone-else");
-        fx.observer_of(
-            stranger.clone(),
-            "theirs",
-            ObserverEffect::CreateTask(CreateTaskEffect {
-                workflow_id: "triage".into(),
-                workflow_version: 1,
-                workspaces: Default::default(),
-                backend_id: None,
-                profile: None,
-                mapping: Default::default(),
-            }),
-            ObserverMode::Always,
-        );
-        fx.service.observer_pass();
-
-        let claim = fx
-            .send("POST", "/observer/v1/worker/claim", &key, Value::Null)
-            .await;
-
-        let run = json_body(claim).await["run"].clone();
-        assert_eq!(run["owner"], stranger.0.as_str());
-        let result = fx
-            .send(
-                "POST",
-                &format!(
-                    "/observer/v1/worker/runs/{}/result",
-                    run["run_id"].as_str().unwrap()
-                ),
-                &key,
-                json!({"outcome": {"kind": "exited", "exit_code": 0}, "stdout": "{\"state\": {}}"}),
-            )
-            .await;
-        assert_eq!(result.status(), StatusCode::OK);
-        assert_eq!(json_body(result).await["status"], "succeeded");
     }
 
     #[tokio::test]
     async fn the_worker_key_is_written_nowhere() {
         let fx = Fixture::new();
-        jira_observer(&fx);
+        fx.jira_queue();
         let key = worker_key(&fx);
         fx.service.observer_pass();
         let claim = fx
@@ -1074,278 +779,18 @@ mod tests {
         }
     }
 
-    // -- the owner's observer routes ----------------------------------------
-
-    /// The body of an observer named `name` that answers the gates of the
-    /// `mr-review` queue.
-    fn queue_observer_body(name: &str) -> Value {
-        json!({
-            "name": name,
-            "queue": "mr-review",
-            "cron": "*/5 * * * *",
-        })
-    }
+    // -- the owner's queue views --------------------------------------------
 
     #[tokio::test]
-    async fn the_owner_creates_scripts_approves_and_deletes_an_observer() {
+    async fn the_queue_views_are_read_only_and_list_the_bad_files() {
         let fx = Fixture::new();
-
-        let created = fx
-            .send(
-                "POST",
-                "/control/v1/observers",
-                OWNER_TOKEN,
-                queue_observer_body("mr-review"),
-            )
-            .await;
-        assert_eq!(created.status(), StatusCode::CREATED);
-        let created = json_body(created).await;
-        assert_eq!(created["state"], "draft");
-        assert_eq!(created["effect"], "none");
-        assert_eq!(created["queue"], "mr-review");
-        assert_eq!(created["mode"], "on_episodes");
-        assert_eq!(created["cron"], "*/5 * * * *");
-        assert!(created.get("interval_secs").is_none());
-
-        let script = fx
-            .send(
-                "POST",
-                "/control/v1/observers/mr-review/scripts",
-                OWNER_TOKEN,
-                json!({"script": "echo '{\"state\": {}}'\n"}),
-            )
-            .await;
-        assert_eq!(script.status(), StatusCode::CREATED);
-        assert_eq!(json_body(script).await["version"], 1);
-        let approved = fx
-            .send(
-                "POST",
-                "/control/v1/observers/mr-review/approve",
-                OWNER_TOKEN,
-                json!({"version": 1}),
-            )
-            .await;
-        assert_eq!(approved.status(), StatusCode::OK);
-        assert_eq!(json_body(approved).await["state"], "active");
-
-        // Covers AE6: a new version is a draft; version 1 still runs.
-        fx.send(
-            "POST",
-            "/control/v1/observers/mr-review/scripts",
-            OWNER_TOKEN,
-            json!({"script": "echo '{\"state\": {\"v\": 2}}'\n"}),
-        )
-        .await;
-        let id = created["observer_id"].as_str().unwrap();
-        let shown = fx
-            .send(
-                "GET",
-                &format!("/control/v1/observers/{id}"),
-                OWNER_TOKEN,
-                Value::Null,
-            )
-            .await;
-        assert_eq!(shown.status(), StatusCode::OK);
-        let shown = json_body(shown).await;
-        assert_eq!(shown["observer"]["approved_version"], 1);
-        assert_eq!(shown["observer"]["latest_version"], 2);
-        assert_eq!(shown["scripts"].as_array().unwrap().len(), 2);
-
-        let paused = fx
-            .send(
-                "POST",
-                "/control/v1/observers/mr-review/pause",
-                OWNER_TOKEN,
-                Value::Null,
-            )
-            .await;
-        assert_eq!(json_body(paused).await["state"], "paused");
-        let resumed = fx
-            .send(
-                "POST",
-                "/control/v1/observers/mr-review/resume",
-                OWNER_TOKEN,
-                Value::Null,
-            )
-            .await;
-        assert_eq!(json_body(resumed).await["state"], "active");
-
-        let listed = fx
-            .send("GET", "/control/v1/observers", OWNER_TOKEN, Value::Null)
-            .await;
-        assert_eq!(json_body(listed).await["observers"][0]["name"], "mr-review");
-
-        let deleted = fx
-            .send(
-                "DELETE",
-                "/control/v1/observers/mr-review",
-                OWNER_TOKEN,
-                Value::Null,
-            )
-            .await;
-        assert_eq!(deleted.status(), StatusCode::OK);
-        let gone = fx
-            .send(
-                "GET",
-                "/control/v1/observers/mr-review",
-                OWNER_TOKEN,
-                Value::Null,
-            )
-            .await;
-        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn a_create_task_observer_takes_the_catalogue_version_and_refuses_an_unknown_workflow() {
-        let fx = Fixture::new();
-        let body = |workflow: &str| {
-            json!({
-                "name": "jira-new",
-                "interval_secs": 300,
-                "effect": {"kind": "create_task", "workflow_id": workflow, "mapping": {"ticket": "key"}},
-            })
-        };
-
-        let unknown = fx
-            .send("POST", "/control/v1/observers", OWNER_TOKEN, body("nope"))
-            .await;
-        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(json_body(unknown).await["code"], "unknown_workflow");
-
-        let created = fx
-            .send("POST", "/control/v1/observers", OWNER_TOKEN, body("triage"))
-            .await;
-        assert_eq!(created.status(), StatusCode::CREATED);
-        assert_eq!(json_body(created).await["workflow_id"], "triage");
-        let record = fx
-            .service
-            .observers()
-            .find_by_name("jira-new")
-            .unwrap()
-            .unwrap();
-        let ObserverEffect::CreateTask(effect) = record.config.effect else {
-            panic!("a create-task observer");
-        };
-        assert_eq!(effect.workflow_version, 1);
-
-        let taken = fx
-            .send("POST", "/control/v1/observers", OWNER_TOKEN, body("triage"))
-            .await;
-        assert_eq!(taken.status(), StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn a_create_request_refuses_a_bad_schedule_and_a_mode_mixed_into_a_queue() {
-        // Covers AE8, AE9.
-        let fx = Fixture::new();
-        let create = |body: Value| fx.send("POST", "/control/v1/observers", OWNER_TOKEN, body);
-
-        for (field, value) in [
-            ("cron", json!("*/30 * * * * *")),
-            ("cron", json!("@daily")),
-            ("interval_secs", json!(10)),
-        ] {
-            let mut body = queue_observer_body("gitlab-mr");
-            body.as_object_mut().unwrap().remove("cron");
-            body[field] = value;
-            let refused = create(body).await;
-            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{field}");
-            assert_eq!(json_body(refused).await["code"], "invalid_observer");
-        }
-        let mut both = queue_observer_body("gitlab-mr");
-        both["interval_secs"] = json!(300);
-        let both = create(both).await;
-        assert_eq!(json_body(both).await["code"], "invalid_observer");
-        let mut neither = queue_observer_body("gitlab-mr");
-        neither.as_object_mut().unwrap().remove("cron");
-        let neither = create(neither).await;
-        assert_eq!(json_body(neither).await["code"], "invalid_observer");
-        let removed = create(json!({
-            "name": "old", "interval_secs": 300,
-            "watch_list": true, "allowed_object_prefixes": ["https://x/"],
-        }))
-        .await;
-        assert_eq!(json_body(removed).await["code"], "invalid_request");
-        // An older client still sends the removed `source` label.
-        let mut with_source = queue_observer_body("gitlab-mr");
-        with_source["source"] = json!("gitlab");
-        let with_source = create(with_source).await;
-        assert_eq!(with_source.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(json_body(with_source).await["code"], "invalid_request");
-
-        let created = create(queue_observer_body("gitlab-mr")).await;
-        assert_eq!(created.status(), StatusCode::CREATED);
-        assert!(json_body(created).await.get("source").is_none());
-        let mut always = queue_observer_body("jira-intake");
-        always["mode"] = json!("always");
-        let mixed = create(always).await;
-        assert_eq!(mixed.status(), StatusCode::CONFLICT);
-        let mixed = json_body(mixed).await;
-        assert_eq!(mixed["code"], "queue_mode_mismatch");
-        assert!(
-            mixed["message"].as_str().unwrap().contains("on_episodes"),
-            "{mixed}"
+        fx.jira_queue();
+        fx.write(
+            "queues/broken.yaml",
+            "automations: [missing]\nmode: on_episodes\nschedule: {interval_secs: 300}\n",
         );
-    }
 
-    #[tokio::test]
-    async fn the_owner_updates_an_observer_and_reads_its_queues() {
-        // R24, R35: the update route and the two queue routes.
-        let fx = Fixture::new();
-        fx.observer("gitlab-mr", ObserverEffect::None, ObserverMode::OnEpisodes);
-        fx.observer("jira-new", ObserverEffect::None, ObserverMode::Always);
-
-        let moved = fx
-            .send(
-                "PATCH",
-                "/control/v1/observers/gitlab-mr",
-                OWNER_TOKEN,
-                json!({"queue": "mr-review", "cron": "*/5 * * * *"}),
-            )
-            .await;
-        assert_eq!(moved.status(), StatusCode::OK);
-        let moved = json_body(moved).await;
-        assert_eq!(moved["queue"], "mr-review");
-        assert_eq!(moved["cron"], "*/5 * * * *");
-        assert!(moved.get("interval_secs").is_none());
-        assert_eq!(moved["state"], "active");
-
-        // Covers AE8: the refusal names the queue's mode.
-        let mixed = fx
-            .send(
-                "PATCH",
-                "/control/v1/observers/jira-new",
-                OWNER_TOKEN,
-                json!({"queue": "mr-review"}),
-            )
-            .await;
-        assert_eq!(mixed.status(), StatusCode::CONFLICT);
-        let mixed = json_body(mixed).await;
-        assert_eq!(mixed["code"], "queue_mode_mismatch");
-        assert!(
-            mixed["message"].as_str().unwrap().contains("on_episodes"),
-            "{mixed}"
-        );
-        // Covers AE9.
-        let seconds = fx
-            .send(
-                "PATCH",
-                "/control/v1/observers/jira-new",
-                OWNER_TOKEN,
-                json!({"cron": "*/30 * * * * *"}),
-            )
-            .await;
-        assert_eq!(seconds.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(json_body(seconds).await["code"], "invalid_observer");
-        for body in [json!({"name": "renamed"}), json!({})] {
-            let refused = fx
-                .send("PATCH", "/control/v1/observers/jira-new", OWNER_TOKEN, body)
-                .await;
-            assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
-            assert_eq!(json_body(refused).await["code"], "invalid_request");
-        }
-
-        let listed = fx
+        let list = fx
             .send(
                 "GET",
                 "/control/v1/observer-queues",
@@ -1353,37 +798,53 @@ mod tests {
                 Value::Null,
             )
             .await;
-        assert_eq!(listed.status(), StatusCode::OK);
-        assert_eq!(
-            json_body(listed).await,
-            json!({"queues": [
-                {"queue": "jira-new", "mode": "always", "observers": 1, "entries": 0},
-                {"queue": "mr-review", "mode": "on_episodes", "observers": 1, "entries": 0},
-            ]})
-        );
+        assert_eq!(list.status(), StatusCode::OK);
+        let list = json_body(list).await;
+        assert_eq!(list["queues"][0]["queue"], "broken");
+        assert!(list["queues"][0]["problem"]
+            .as_str()
+            .unwrap()
+            .contains("missing"));
+        assert_eq!(list["queues"][1]["queue"], "jira-intake");
+        assert_eq!(list["queues"][1]["automations"], json!(["jira-new"]));
+        assert_eq!(list["problems"][0]["file"], "queues/broken.yaml");
+
         let shown = fx
             .send(
                 "GET",
-                "/control/v1/observer-queues/mr-review",
+                "/control/v1/observer-queues/jira-intake",
                 OWNER_TOKEN,
                 Value::Null,
             )
             .await;
         assert_eq!(shown.status(), StatusCode::OK);
         let shown = json_body(shown).await;
-        assert_eq!(shown["mode"], "on_episodes");
-        assert_eq!(shown["observers"][0]["name"], "gitlab-mr");
-        assert_eq!(shown["entries"], json!([]));
+        assert_eq!(shown["automations"][0]["scripts"], json!(["check"]));
+        assert_eq!(shown["workflow_id"], "triage");
+
+        // R22: the routes that managed stored observers are gone.
+        for (method, uri) in [
+            ("POST", "/control/v1/observers"),
+            ("GET", "/control/v1/observers"),
+            ("PATCH", "/control/v1/observers/jira-new"),
+            ("POST", "/control/v1/observers/jira-new/approve"),
+            ("POST", "/control/v1/observers/jira-new/pause"),
+            ("DELETE", "/control/v1/observers/jira-new"),
+        ] {
+            let gone = fx
+                .send(method, uri, OWNER_TOKEN, json!({"name": "jira-new"}))
+                .await;
+            assert_eq!(gone.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
         let unknown = fx
             .send(
                 "GET",
-                "/control/v1/observer-queues/gitlab-mr",
+                "/control/v1/observer-queues/nothing",
                 OWNER_TOKEN,
                 Value::Null,
             )
             .await;
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
-        assert!(json_body_is_empty(unknown).await);
     }
 
     /// A router whose gate let `owner` through, as the owner (`operator`)
@@ -1404,98 +865,21 @@ mod tests {
         ))
     }
 
-    async fn call(router: Router, method: &str, uri: &str, body: Value) -> Response {
-        let request = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-        router.oneshot(request).await.unwrap()
-    }
-
     #[tokio::test]
-    async fn only_the_owner_manages_observers() {
+    async fn only_the_owner_reads_the_queues() {
         // R21: a user who is not the installation's owner is refused with
-        // a bare 403; another owner's observer is not found.
+        // a bare 403.
         let fx = Fixture::new();
-        fx.observer("mr-review", ObserverEffect::None, ObserverMode::OnEpisodes);
-
+        fx.jira_queue();
         let stranger = router_for(&fx, "someone-else", false);
-        let create = call(
-            stranger.clone(),
-            "POST",
-            "/control/v1/observers",
-            queue_observer_body("mine"),
-        )
-        .await;
-        assert_eq!(create.status(), StatusCode::FORBIDDEN);
-        assert!(json_body_is_empty(create).await);
-        let list = call(
-            stranger.clone(),
-            "GET",
-            "/control/v1/observers",
-            Value::Null,
-        )
-        .await;
-        assert_eq!(list.status(), StatusCode::FORBIDDEN);
-        for (method, uri, body) in [
-            (
-                "PATCH",
-                "/control/v1/observers/mr-review",
-                json!({"cron": "*/5 * * * *"}),
-            ),
-            ("GET", "/control/v1/observer-queues", Value::Null),
-            ("GET", "/control/v1/observer-queues/mr-review", Value::Null),
-        ] {
-            let refused = call(stranger.clone(), method, uri, body).await;
-            assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{method} {uri}");
-        }
-
-        let other_owner = router_for(&fx, "someone-else", true);
-        let listed = call(
-            other_owner.clone(),
-            "GET",
-            "/control/v1/observers",
-            Value::Null,
-        )
-        .await;
-        assert!(json_body(listed).await["observers"]
-            .as_array()
-            .unwrap()
-            .is_empty());
-        let queues = call(
-            other_owner.clone(),
-            "GET",
+        for uri in [
             "/control/v1/observer-queues",
-            Value::Null,
-        )
-        .await;
-        assert_eq!(json_body(queues).await, json!({"queues": []}));
-        for (method, uri, body) in [
-            ("GET", "/control/v1/observers/mr-review", Value::Null),
-            (
-                "PATCH",
-                "/control/v1/observers/mr-review",
-                json!({"cron": "*/5 * * * *"}),
-            ),
-            ("GET", "/control/v1/observer-queues/mr-review", Value::Null),
-            (
-                "POST",
-                "/control/v1/observers/mr-review/approve",
-                json!({"version": 1}),
-            ),
-            ("POST", "/control/v1/observers/mr-review/pause", Value::Null),
-            ("DELETE", "/control/v1/observers/mr-review", Value::Null),
+            "/control/v1/observer-queues/jira-intake",
         ] {
-            let refused = call(other_owner.clone(), method, uri, body).await;
-            assert_eq!(refused.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+            let request = Request::get(uri).body(Body::empty()).unwrap();
+            let refused = stranger.clone().oneshot(request).await.unwrap();
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{uri}");
+            assert!(json_body_is_empty(refused).await);
         }
-        assert!(fx
-            .service
-            .observers()
-            .find_by_name("mr-review")
-            .unwrap()
-            .is_some());
     }
 }
