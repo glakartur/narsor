@@ -89,7 +89,7 @@ impl ProtocolService {
         grace: chrono::Duration,
     ) -> Result<crate::orchestration::RunnerReportOutcome, crate::orchestration::OrchestrationError>
     {
-        let entry_scripts = |queue: &str| self.entry_script_automations(queue);
+        let entry_scripts = |queue: &str| self.gate_scripts(queue);
         let outcome = self.control.record_runner_snapshot_with(
             task_id,
             incarnation,

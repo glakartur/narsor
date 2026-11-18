@@ -212,6 +212,18 @@ pub enum OrchestrationError {
         pending_input_id: String,
     },
 
+    /// The watched gate episode was already left by another exit, whose
+    /// exit scripts run or ran: the first exit wins (R10).
+    #[error("task '{task_id}' cannot take this exit of episode '{episode}': {reason}")]
+    GateExitHeld {
+        /// The task.
+        task_id: TaskId,
+        /// The episode.
+        episode: String,
+        /// Which exit came first.
+        reason: String,
+    },
+
     /// An input idempotency key was reused for a different answer.
     #[error(
         "input idempotency key '{key}' of task '{task_id}' was already used for another answer"

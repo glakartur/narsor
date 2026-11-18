@@ -1,8 +1,12 @@
-//! Integration tests of entry scripts (`in`) at watched gates (U4): `in`
-//! runs when an episode enters its queue, `check` waits until every `in`
-//! succeeded (R8, R9), a failed `in` is retried and then fails the entry
-//! (R12, AE2), a queue without entry scripts is ready at once (R17, AE7),
-//! and neither a runner problem nor a restored entry runs `in` again (R19).
+//! Integration tests of entry (`in`) and exit (`out`) scripts at watched
+//! gates (U4, U5): `in` runs when an episode enters its queue, `check`
+//! waits until every `in` succeeded (R8, R9), a failed `in` is retried and
+//! then fails the entry (R12, AE2), a queue without entry scripts is ready
+//! at once (R17, AE7), and neither a runner problem nor a restored entry
+//! runs `in` again (R19). Every exit of the gate is held until `out` ended
+//! (R10, R11, R14, R15, AE1, AE3, AE5), a task that ends at the gate runs
+//! `out` once (R18, AE6), and `out` of an episode ends before `in` of the
+//! next one (AE4).
 //!
 //! A real `ProtocolService` over a temporary root (catalogue and state) and
 //! a manual clock; the runner channel is reached through `gate_support`, the
@@ -15,20 +19,41 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_engine::automations::HookPhase;
 use narsor_engine::controller_protocol::{
-    ClaimedObserverRun, ProtocolService, RunOutcome, RunReport,
+    ClaimedObserverRun, OwnerCommandRequest, ProtocolError, ProtocolService, RunOutcome, RunReport,
+    SubmitInputRequest,
 };
 use narsor_engine::domain::TaskId;
-use narsor_engine::observers::queue_entry_id;
+use narsor_engine::observers::{queue_entry_id, ScriptExit};
 use narsor_engine::orchestration::{
-    Clock, ControlPlane, GateAutomationPhase, OwnerRef, TaskEventKind,
+    Clock, ControlPlane, GateAutomationPhase, OperatorCommand, OperatorCommandRequest,
+    OwnerCommand, OwnerRef, TaskEventKind,
 };
 use narsor_engine::persistence::StatePaths;
+use narsor_protocol::api::HumanInputDeliveryDto;
+use narsor_protocol::controller::ObserverDecideRequest;
+use serde_json::{json, Value};
 
 use crate::automation_support::{automation, on_episodes_queue, write, CHECK_SCRIPT};
-use crate::gate_support::{queued_task, review_gate, runner_problem, wait_at};
+use crate::gate_support::{
+    past_gates, queued_task, review_gate, runner_problem, running, wait_at, FIRST_RUNNER,
+};
 
 const QUEUE: &str = "mr-review";
 const EPISODE: &str = "input-1";
+const LABEL: &str = "gitlab-mr-label";
+const IN_OUT: &[HookPhase] = &[HookPhase::In, HookPhase::Out];
+
+fn owner() -> OwnerRef {
+    OwnerRef::new("owner")
+}
+
+/// The code of a coded refusal; panics on any other.
+fn refusal_code(error: ProtocolError) -> &'static str {
+    match error {
+        ProtocolError::BadRequest { code, .. } | ProtocolError::Conflict { code, .. } => code,
+        other => panic!("not a coded refusal: {other:?}"),
+    }
+}
 
 /// A clock the test moves by hand.
 #[derive(Debug)]
@@ -63,15 +88,16 @@ impl Drop for Fixture {
 
 impl Fixture {
     /// Queue `mr-review` (every 300 s) served by `automations`, each given
-    /// as its name and whether it has an `in` script.
-    fn new(automations: &[(&str, bool)]) -> Self {
+    /// as its name and its scripts besides `check` (`in`, `out`).
+    fn new(automations: &[(&str, &[HookPhase])]) -> Self {
         let root =
             std::env::temp_dir().join(format!("narsor-queue-hooks-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        for (name, entry_script) in automations {
+        for (name, hooks) in automations {
             automation(&root, name, CHECK_SCRIPT, &[]);
-            if *entry_script {
-                write(&root, &format!("automations/{name}/in.sh"), "exit 0\n");
+            for hook in *hooks {
+                let file = hook.script_file();
+                write(&root, &format!("automations/{name}/{file}"), "exit 0\n");
             }
         }
         let names: Vec<&str> = automations.iter().map(|(name, _)| *name).collect();
@@ -79,10 +105,7 @@ impl Fixture {
         let clock = Arc::new(ManualClock(Mutex::new(
             Utc.with_ymd_and_hms(2026, 11, 18, 12, 0, 0).unwrap(),
         )));
-        let service = ProtocolService::new(
-            ControlPlane::with_clock(StatePaths::new(&root), clock.clone()),
-            crate::environment_support::seeded_resolver(&root),
-        );
+        let service = Self::service_over(&root, &clock);
         Self {
             root,
             clock,
@@ -90,13 +113,27 @@ impl Fixture {
         }
     }
 
+    fn service_over(root: &PathBuf, clock: &Arc<ManualClock>) -> ProtocolService {
+        ProtocolService::new(
+            ControlPlane::with_clock(StatePaths::new(root), clock.clone()),
+            crate::environment_support::seeded_resolver(root),
+        )
+    }
+
+    /// The server restarts: a new service over the same state.
+    fn restart(&mut self) {
+        self.service = Self::service_over(&self.root, &self.clock);
+    }
+
     fn advance(&self, by: Duration) {
         *self.clock.0.lock().unwrap() += by;
     }
 
-    /// Task `task-1`, waiting at the review gate of `mr-review`.
+    /// Task `task-1`, running and waiting at the review gate of
+    /// `mr-review`.
     fn waiting_task(&self) -> TaskId {
-        let task = queued_task(&self.service, "task-1", &OwnerRef::new("owner"));
+        let task = queued_task(&self.service, "task-1", &owner());
+        running(&self.service, &task);
         wait_at(&self.service, &task, EPISODE, &review_gate(QUEUE));
         task
     }
@@ -121,12 +158,95 @@ impl Fixture {
 
     /// The claimed `in` run of `automation` for the task's episode.
     fn claim_entry_script(&self, automation: &str) -> ClaimedObserverRun {
-        let run = self.claim().expect("an entry script run");
-        assert_eq!(run.phase, HookPhase::In);
-        assert_eq!(run.input.phase, HookPhase::In);
+        self.claim_hook(HookPhase::In, automation, EPISODE)
+    }
+
+    /// The claimed `hook` run of `automation` for `episode`.
+    fn claim_hook(&self, hook: HookPhase, automation: &str, episode: &str) -> ClaimedObserverRun {
+        let run = self.claim().expect("an entry or exit script run");
+        assert_eq!(run.phase, hook);
+        assert_eq!(run.input.phase, hook);
         assert_eq!(run.run_id.key.automation, automation);
-        assert_eq!(run.input.entry.as_ref().unwrap().episode, EPISODE);
+        assert_eq!(run.input.entry.as_ref().unwrap().episode, episode);
         run
+    }
+
+    /// The task's first runner polls: the answers and the operator commands
+    /// it gets, by their choice and target.
+    fn runner_gets(&self, task: &TaskId) -> Vec<String> {
+        let control = self.service.control_plane();
+        let (inputs, _) = control
+            .deliver_inputs(task, FIRST_RUNNER, 1, Some(EPISODE))
+            .unwrap();
+        let (commands, _) = control
+            .deliver_operator_commands(task, FIRST_RUNNER, 1)
+            .unwrap();
+        inputs
+            .into_iter()
+            .filter_map(|input| input.delivery?.chosen_label)
+            .chain(
+                commands
+                    .into_iter()
+                    .filter_map(|queued| match queued.command {
+                        OperatorCommand::Transition { target, .. } => Some(target),
+                        _ => None,
+                    }),
+            )
+            .collect()
+    }
+
+    /// The person answers the gate through the owner's route.
+    fn person_answers(
+        &self,
+        task: &TaskId,
+        choice: &str,
+        values: Value,
+    ) -> Result<(), ProtocolError> {
+        self.service
+            .submit_input(
+                &owner(),
+                task.as_str(),
+                SubmitInputRequest {
+                    pending_input_id: EPISODE.to_string(),
+                    idempotency_key: format!("person-{choice}"),
+                    delivery: HumanInputDeliveryDto {
+                        chosen_label: Some(choice.to_string()),
+                        values: values.as_object().cloned().unwrap_or_default(),
+                        episode: Some(EPISODE.to_string()),
+                        ..HumanInputDeliveryDto::default()
+                    },
+                },
+            )
+            .map(|_| ())
+    }
+
+    /// The owner sends a transition to `target` (the control plane's
+    /// queue, where the hold is; the route adds only offer checks).
+    fn operator_transition(&self, task: &TaskId, target: &str) {
+        self.service
+            .control_plane()
+            .queue_operator_command(
+                task,
+                OperatorCommandRequest {
+                    command: OperatorCommand::Transition {
+                        target: target.to_string(),
+                        forced: false,
+                        reason: None,
+                    },
+                    idempotency_key: "transition-1".into(),
+                    expected_generation: None,
+                    requested_by: owner(),
+                },
+            )
+            .unwrap();
+    }
+
+    fn has_entry(&self, task: &TaskId, episode: &str) -> bool {
+        self.service
+            .observers()
+            .queue_entry(&queue_entry_id(task, episode))
+            .unwrap()
+            .is_some()
     }
 
     /// The tick of the queue comes: the pass flags its pairs, a claim takes
@@ -150,6 +270,19 @@ impl Fixture {
     /// The entry script attempts in the task's history: `(automation,
     /// failed, gate phase it moved to)`.
     fn attempts(&self, task: &TaskId) -> Vec<(String, bool, Option<GateAutomationPhase>)> {
+        self.hook_attempts(task, "in")
+            .into_iter()
+            .map(|(automation, failed, _, phase)| (automation, failed, phase))
+            .collect()
+    }
+
+    /// The `hook` script attempts in the task's history: `(automation,
+    /// failed, retried, gate phase it moved to)`.
+    fn hook_attempts(
+        &self,
+        task: &TaskId,
+        wanted: &str,
+    ) -> Vec<(String, bool, bool, Option<GateAutomationPhase>)> {
         self.service
             .control_plane()
             .events_since(task, 0)
@@ -160,11 +293,11 @@ impl Fixture {
                     automation,
                     hook,
                     error,
+                    retry_at,
                     gate_phase,
                     ..
-                } => {
-                    assert_eq!(hook, "in");
-                    Some((automation, error.is_some(), gate_phase))
+                } if hook == wanted => {
+                    Some((automation, error.is_some(), retry_at.is_some(), gate_phase))
                 }
                 _ => None,
             })
@@ -175,7 +308,7 @@ impl Fixture {
 #[test]
 fn the_entry_script_runs_first_and_check_waits_until_it_succeeded() {
     // Covers AE1 (entry part), R8, R9.
-    let fx = Fixture::new(&[("gitlab-mr-label", true)]);
+    let fx = Fixture::new(&[(LABEL, &[HookPhase::In])]);
     let task = fx.waiting_task();
     assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Entering));
     // The tick flags the pair while `in` has not run: no `check` before it.
@@ -223,7 +356,7 @@ fn a_failing_entry_script_is_retried_and_after_the_last_attempt_the_entry_fails(
         ),
     ];
     for (case, attempts, expected) in cases {
-        let fx = Fixture::new(&[("gitlab-mr-label", true)]);
+        let fx = Fixture::new(&[(LABEL, &[HookPhase::In])]);
         let task = fx.waiting_task();
         for (index, attempt) in attempts.iter().enumerate() {
             if index > 0 {
@@ -283,7 +416,7 @@ fn a_failing_entry_script_is_retried_and_after_the_last_attempt_the_entry_fails(
 #[test]
 fn a_queue_without_entry_scripts_is_ready_at_once() {
     // Covers AE7, R17.
-    let fx = Fixture::new(&[("jira-review", false)]);
+    let fx = Fixture::new(&[("jira-review", &[])]);
     let task = fx.waiting_task();
 
     assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Ready));
@@ -297,7 +430,7 @@ fn a_queue_without_entry_scripts_is_ready_at_once() {
 fn the_entry_stays_entering_until_every_entry_script_ended() {
     // Two automations, one at a time per task: one `in` succeeds, the other
     // fails three times.
-    let fx = Fixture::new(&[("gitlab-mr-label", true), ("sonar-gate", true)]);
+    let fx = Fixture::new(&[(LABEL, &[HookPhase::In]), ("sonar-gate", &[HookPhase::In])]);
     let task = fx.waiting_task();
 
     let first = fx.claim_entry_script("gitlab-mr-label");
@@ -319,7 +452,7 @@ fn the_entry_stays_entering_until_every_entry_script_ended() {
 fn neither_a_runner_problem_nor_a_restored_entry_runs_the_entry_script_again() {
     // R19 and the learning of 2026-11-18: a problem snapshot keeps the
     // episode and its phase; an entry added back does not start `in`.
-    let fx = Fixture::new(&[("gitlab-mr-label", true)]);
+    let fx = Fixture::new(&[(LABEL, &[HookPhase::In])]);
     let task = fx.waiting_task();
     let run = fx.claim_entry_script("gitlab-mr-label");
 
@@ -346,4 +479,231 @@ fn neither_a_runner_problem_nor_a_restored_entry_runs_the_entry_script_again() {
         1,
         "one entry script attempt in all"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Exit scripts and the exit hold (U5)
+// ---------------------------------------------------------------------------
+
+/// The gate of `fx`'s task is ready: its `in` ran and succeeded.
+fn ready_gate(fx: &Fixture) -> TaskId {
+    let task = fx.waiting_task();
+    let run = fx.claim_entry_script(LABEL);
+    fx.finish(&run, 0);
+    task
+}
+
+#[test]
+fn a_check_answer_reaches_the_runner_only_after_out_ended() {
+    // Covers AE1 (exit part) and AE5, R10, R11, R15: `out` gets the choice
+    // and its author; the answer is held until `out` succeeded, or failed
+    // its last attempt (logged), and is then delivered.
+    let cases: [(&str, &[i32]); 2] = [("out succeeds", &[0]), ("out fails 3 times", &[1, 1, 1])];
+    for (case, exits) in cases {
+        let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+        let task = ready_gate(&fx);
+        let check = fx.next_tick_run().expect("a check run");
+        let entry = check.input.entry.as_ref().unwrap();
+        fx.service
+            .observer_decide(
+                &check.run_id,
+                ObserverDecideRequest {
+                    task_id: entry.task_id.to_string(),
+                    episode: entry.episode.clone(),
+                    choice: "check_feedback".into(),
+                    reason: None,
+                    variables: Default::default(),
+                },
+            )
+            .unwrap();
+        fx.finish(&check, 0);
+        assert_eq!(
+            fx.phase(&task),
+            Some(GateAutomationPhase::Exiting),
+            "{case}"
+        );
+        // The person answers while `out` runs: the first exit wins.
+        let late = fx.person_answers(&task, "check_feedback", json!({}));
+        assert_eq!(
+            refusal_code(late.unwrap_err()),
+            "input_already_queued",
+            "{case}"
+        );
+
+        for (index, code) in exits.iter().enumerate() {
+            if index > 0 {
+                fx.advance(Duration::seconds(if index == 1 { 10 } else { 30 }));
+            }
+            assert!(
+                fx.runner_gets(&task).is_empty(),
+                "{case}: delivered before out ended"
+            );
+            let out = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+            assert_eq!(
+                out.input.exit,
+                Some(ScriptExit {
+                    choice: Some("check_feedback".into()),
+                    author: "automation".into(),
+                    run_id: Some(check.run_id.to_string()),
+                }),
+                "{case}"
+            );
+            fx.finish(&out, *code);
+        }
+
+        assert_eq!(
+            fx.phase(&task),
+            Some(GateAutomationPhase::Released),
+            "{case}"
+        );
+        let last = fx.hook_attempts(&task, "out").pop().unwrap();
+        assert_eq!(
+            (last.1, last.2, last.3),
+            (exits != [0], false, Some(GateAutomationPhase::Released)),
+            "{case}: the last attempt in the history"
+        );
+        assert_eq!(fx.runner_gets(&task), vec!["check_feedback"], "{case}");
+        // The runner takes the answer: the next step starts, the entry goes.
+        past_gates(&fx.service, &task);
+        assert!(!fx.has_entry(&task, EPISODE), "{case}");
+        assert!(fx.claim().is_none(), "{case}: no run after the exit");
+    }
+}
+
+#[test]
+fn a_manual_exit_is_held_like_an_answer_and_a_second_exit_is_refused() {
+    // Covers AE3, R14: after a failed `in` the person chooses `revise_plan`;
+    // an operator transition is held the same way.
+    let cases = [
+        ("person after a failed in", true),
+        ("operator transition", false),
+    ];
+    for (case, person) in cases {
+        let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+        let task = fx.waiting_task();
+        let (choice, author) = if person {
+            for delay in [0, 10, 30] {
+                fx.advance(Duration::seconds(delay));
+                let run = fx.claim_entry_script(LABEL);
+                fx.finish(&run, 1);
+            }
+            assert_eq!(fx.phase(&task), Some(GateAutomationPhase::EntryFailed));
+            fx.person_answers(&task, "revise_plan", json!({"note": "split it"}))
+                .unwrap();
+            ("revise_plan", "person")
+        } else {
+            let run = fx.claim_entry_script(LABEL);
+            fx.finish(&run, 0);
+            fx.operator_transition(&task, "check_work_feedback");
+            ("check_work_feedback", "operator")
+        };
+        assert_eq!(
+            fx.phase(&task),
+            Some(GateAutomationPhase::Exiting),
+            "{case}"
+        );
+        let second = fx.person_answers(&task, "check_feedback", json!({}));
+        assert_eq!(
+            refusal_code(second.unwrap_err()),
+            "input_already_queued",
+            "{case}"
+        );
+        assert!(
+            fx.runner_gets(&task).is_empty(),
+            "{case}: delivered before out"
+        );
+
+        let out = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+        let exit = out.input.exit.clone().unwrap();
+        assert_eq!(
+            (exit.choice.as_deref(), exit.author.as_str()),
+            (Some(choice), author),
+            "{case}"
+        );
+        fx.finish(&out, 0);
+
+        assert_eq!(fx.runner_gets(&task), vec![choice], "{case}");
+    }
+}
+
+#[test]
+fn a_held_exit_survives_a_server_restart() {
+    // The held exit lives on the task record, not in memory.
+    let mut fx = Fixture::new(&[(LABEL, IN_OUT)]);
+    let task = ready_gate(&fx);
+    fx.person_answers(&task, "check_feedback", json!({}))
+        .unwrap();
+
+    fx.restart();
+    assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Exiting));
+    assert!(fx.runner_gets(&task).is_empty());
+    let out = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+    assert_eq!(out.input.exit.as_ref().unwrap().author, "person");
+    fx.finish(&out, 0);
+
+    assert_eq!(fx.runner_gets(&task), vec!["check_feedback"]);
+}
+
+#[test]
+fn a_task_archived_at_the_gate_ends_at_once_and_runs_out_once() {
+    // Covers AE6, R18: no hold, one attempt, its failure in the history.
+    let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+    let task = ready_gate(&fx);
+
+    fx.service
+        .command(
+            &owner(),
+            task.as_str(),
+            OwnerCommandRequest {
+                command: OwnerCommand::Archive,
+                idempotency_key: "archive-1".into(),
+                expected_generation: None,
+            },
+        )
+        .unwrap();
+    assert!(fx.service.control_plane().task(&task).unwrap().has_ended());
+    let out = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+    assert_eq!(out.input.exit.as_ref().unwrap().author, "task_end");
+    assert_eq!(out.input.exit.as_ref().unwrap().choice, None);
+    fx.finish(&out, 1);
+
+    let attempts = fx.hook_attempts(&task, "out");
+    assert_eq!(
+        attempts,
+        vec![(
+            LABEL.to_string(),
+            true,
+            false,
+            Some(GateAutomationPhase::Released)
+        )]
+    );
+    fx.advance(Duration::seconds(60));
+    assert!(fx.claim().is_none(), "no second attempt");
+    assert!(!fx.has_entry(&task, EPISODE));
+}
+
+#[test]
+fn out_of_a_left_episode_ends_before_in_of_the_next_one() {
+    // Covers AE4: the runner leaves the gate with no held exit (defensive)
+    // and loops back to it; `out` of the first episode runs after the fact,
+    // and `in` of the second waits for it.
+    let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+    let task = ready_gate(&fx);
+    past_gates(&fx.service, &task);
+    wait_at(&fx.service, &task, "input-2", &review_gate(QUEUE));
+    assert!(
+        fx.has_entry(&task, EPISODE),
+        "the left episode keeps its entry"
+    );
+
+    let out = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+    assert_eq!(out.input.exit.as_ref().unwrap().author, "runner");
+    assert!(
+        fx.claim().is_none(),
+        "in of the next episode while out runs"
+    );
+    fx.finish(&out, 0);
+
+    assert!(!fx.has_entry(&task, EPISODE));
+    fx.claim_hook(HookPhase::In, LABEL, "input-2");
 }

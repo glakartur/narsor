@@ -3,7 +3,9 @@
 //! task view reads of them (R21).
 //!
 //! ```text
-//! runner snapshot  watched episode ended        → its entry removed
+//! runner snapshot  watched episode ended        → its entry removed, unless its exit
+//!                                                 scripts still run (removed once
+//!                                                 they ended)
 //!                  watched episode began        → its entry added, after the removal,
 //!                                                 under the same lock; the episode's
 //!                                                 entry scripts were set with it
@@ -13,7 +15,8 @@
 //!                    refused or not stored      → warning in the task's history
 //!                  same episode (pause, Interrupted, auto-resume, runner restart)
 //!                                               → nothing (R17)
-//! owner's archive  the entry of the task's episode removed (R19)
+//! owner's archive  the entry of the task's episode removed (R19), once its exit
+//!                  scripts ran (one attempt, R18)
 //! schedule         an entry whose task no longer waits in its episode, or ended,
 //!                  was archived or is gone      → removed, never run (R18, R19)
 //!                  an entry whose task waits, but whose runner reports a problem
@@ -46,7 +49,7 @@ use crate::controller_protocol::service::ProtocolService;
 use crate::domain::TaskId;
 use crate::observers::{queue_entry_id, EntryWrite, ObserverError, ObserverMode, QueueEntry};
 use crate::orchestration::{
-    GateChange, OrchestrationError, OwnerRef, TaskRecord, TaskState, WatchedGate,
+    GateChange, GateScripts, OrchestrationError, OwnerRef, TaskRecord, WatchedGate,
 };
 
 /// Whether a queue entry's task still waits in the entry's episode.
@@ -101,11 +104,16 @@ impl ProtocolService {
     }
 
     /// Removes the queue entry of the task's watched episode, if it has
-    /// one: an archived task's gate can never be answered (R19).
+    /// one: an archived task's gate can never be answered (R19). An entry
+    /// whose exit scripts still run stays until they ended (R18).
     pub(crate) fn drop_queue_entry_of(&self, task: &TaskRecord) {
         let Some(gate) = &task.watched_gate else {
             return;
         };
+        if task.exiting_gate(&gate.episode).is_some() {
+            tracing::info!(task = %task.task_id, episode = %gate.episode, "automations: the task ended at a gate with exit scripts; its queue entry stays until they ran");
+            return;
+        }
         let entry_id = queue_entry_id(&task.task_id, &gate.episode);
         let removed = self
             .observers
@@ -139,7 +147,10 @@ impl ProtocolService {
     pub(super) fn entry_wait(&self, entry: &QueueEntry) -> EntryWait {
         match self.control.task(&entry.task_id) {
             Ok(task) => {
-                if !waits_in(&task, &entry.owner, &entry.episode) {
+                if exit_scripts_run(&task, entry) {
+                    tracing::debug!(task = %entry.task_id, episode = %entry.episode, "automations: the exit scripts of a queue entry's episode run; the entry is kept, not checked");
+                    EntryWait::Unknown
+                } else if !waits_in(&task, &entry.owner, &entry.episode) {
                     EntryWait::Gone
                 } else if !gate_ready(&task) {
                     tracing::debug!(task = %entry.task_id, episode = %entry.episode, "automations: the entry scripts of a waiting task have not all succeeded; its queue entry is not checked");
@@ -325,7 +336,13 @@ impl ProtocolService {
         change: &GateChange,
     ) -> Result<Option<String>, ObserverError> {
         let lock = self.observers.lock_queue_entries()?;
-        if let Some(ended) = &change.ended {
+        // An episode left with exit scripts still to run keeps its entry
+        // until they ended.
+        if let Some(ended) = change
+            .ended
+            .as_ref()
+            .filter(|ended| task.exiting_gate(&ended.episode).is_none())
+        {
             let entry_id = queue_entry_id(&task.task_id, &ended.episode);
             match self.observers.remove_queue_entry(&lock, &entry_id) {
                 Ok(true) => {
@@ -362,30 +379,37 @@ impl ProtocolService {
         }
     }
 
-    /// The automations of queue `queue` whose entry script (`in`) runs
-    /// when an episode enters it, in the queue file's order (R8). None for
-    /// a queue the catalogue has no usable `on_episodes` queue of: no
-    /// automation serves it, so nothing holds the gate back (R17).
-    pub(crate) fn entry_script_automations(&self, queue: &str) -> Vec<String> {
+    /// The automations of queue `queue` whose entry (`in`) and exit
+    /// (`out`) scripts run for an episode that enters it, in the queue
+    /// file's order (R8, R10). None for a queue the catalogue has no usable
+    /// `on_episodes` queue of: no automation serves it, so nothing holds the
+    /// gate back (R17).
+    pub(crate) fn gate_scripts(&self, queue: &str) -> GateScripts {
         let catalog = self.automation_catalog();
         let Some(found) = catalog
             .queues
             .get(queue)
             .filter(|found| found.mode == ObserverMode::OnEpisodes)
         else {
-            return Vec::new();
+            return GateScripts::default();
         };
-        found
-            .automations
-            .iter()
-            .filter(|name| {
-                catalog
-                    .automations
-                    .get(*name)
-                    .is_some_and(|automation| automation.has(HookPhase::In))
-            })
-            .cloned()
-            .collect()
+        let with = |hook: HookPhase| -> Vec<String> {
+            found
+                .automations
+                .iter()
+                .filter(|name| {
+                    catalog
+                        .automations
+                        .get(*name)
+                        .is_some_and(|automation| automation.has(hook))
+                })
+                .cloned()
+                .collect()
+        };
+        GateScripts {
+            entry: with(HookPhase::In),
+            exit: with(HookPhase::Out),
+        }
     }
 
     /// Why no automation of the queue of `gate` can answer it, `None` when
@@ -456,7 +480,11 @@ pub(super) fn gate_ready(task: &TaskRecord) -> bool {
 /// Whether `task` can take no more answers: finished, archived (or being
 /// archived).
 pub(super) fn task_ended(task: &TaskRecord) -> bool {
-    task.archive.is_some()
-        || task.runner_state.is_archival()
-        || task.task_state() == TaskState::Finished
+    task.has_ended()
+}
+
+/// Whether the exit scripts of `entry`'s episode still run for `task`: its
+/// entry stays, as the index the hook claim walks, but is never checked.
+pub(super) fn exit_scripts_run(task: &TaskRecord, entry: &QueueEntry) -> bool {
+    task.owner == entry.owner && task.exiting_gate(&entry.episode).is_some()
 }

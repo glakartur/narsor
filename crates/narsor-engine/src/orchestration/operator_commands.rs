@@ -24,10 +24,11 @@
 use super::control_plane::{ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    OperatorCommand, OperatorCommandOutcome, OperatorCommandRequest, OperatorCommandStatus,
-    QueuedOperatorCommand, RunnerState, TaskEventKind, TaskRecord,
+    GateExit, GateExitAuthor, HeldExitItem, OperatorCommand, OperatorCommandOutcome,
+    OperatorCommandRequest, OperatorCommandStatus, QueuedOperatorCommand, RunnerState,
+    TaskEventKind, TaskRecord,
 };
-use super::runner_state::fence_runner;
+use super::runner_state::{fence_runner, hold_gate_exit};
 use crate::domain::display::bounded_detail;
 use crate::domain::TaskId;
 
@@ -120,8 +121,30 @@ impl ControlPlane {
                         .map(|runner| runner.launch_generation)
                 })
                 .unwrap_or(record.generation);
+            let command_id = next_command_id(record);
+            // A transition or a step chosen at a watched gate leaves it:
+            // with exit scripts it waits for them like an answer (R10).
+            if let Some(target) = gate_exit_target(&request.command) {
+                hold_gate_exit(
+                    record,
+                    None,
+                    GateExit {
+                        choice: Some(target.to_string()),
+                        author: GateExitAuthor::Operator,
+                        run_id: None,
+                        held: Some(HeldExitItem::Command {
+                            command_id: command_id.clone(),
+                        }),
+                        at: now,
+                    },
+                )
+                .map_err(|reason| OrchestrationError::OperatorCommandRefused {
+                    task_id: record.task_id.clone(),
+                    reason,
+                })?;
+            }
             let queued = QueuedOperatorCommand {
-                command_id: next_command_id(record),
+                command_id,
                 idempotency_key: request.idempotency_key.clone(),
                 command: request.command.clone(),
                 requested_by: request.requested_by.clone(),
@@ -336,12 +359,31 @@ fn open_commands(record: &TaskRecord) -> Vec<QueuedOperatorCommand> {
 }
 
 /// The open commands meant for the runner of `launch_generation`: one
-/// accepted for a later launch (a paused task's work) waits for it.
+/// accepted for a later launch (a paused task's work) waits for it, and one
+/// a watched gate holds waits for its exit scripts (R10).
 fn commands_for(record: &TaskRecord, launch_generation: u64) -> Vec<QueuedOperatorCommand> {
+    let held = match record.held_exit_item() {
+        Some(HeldExitItem::Command { command_id }) => Some(command_id.as_str()),
+        _ => None,
+    };
     open_commands(record)
         .into_iter()
-        .filter(|command| command.launch_generation == launch_generation)
+        .filter(|command| {
+            command.launch_generation == launch_generation
+                && held != Some(command.command_id.as_str())
+        })
         .collect()
+}
+
+/// The state or step `command` leaves a gate for, when it is a command that
+/// leaves one (a transition, a chosen step).
+fn gate_exit_target(command: &OperatorCommand) -> Option<&str> {
+    match command {
+        OperatorCommand::Transition { target, .. } | OperatorCommand::SelectStep { target, .. } => {
+            Some(target)
+        }
+        _ => None,
+    }
 }
 
 /// Why an unsettled command can no longer be carried out by the runner of

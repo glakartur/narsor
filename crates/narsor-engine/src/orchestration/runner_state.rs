@@ -15,10 +15,11 @@
 use super::control_plane::{refresh_slot_release_due, ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    GateAutomation, GateAutomationPhase, GateChange, GateHookOutcome, GateHookStatus, InputOutcome,
-    InputRequest, InputStatus, InputUpdate, QueuedInput, RunnerObservation, RunnerReportOutcome,
+    GateAutomation, GateAutomationPhase, GateChange, GateExit, GateExitAuthor, GateHookOutcome,
+    GateHookStatus, GateScripts, HeldExitItem, InputOutcome, InputRequest, InputStatus,
+    InputUpdate, OperatorCommandStatus, QueuedInput, RunnerObservation, RunnerReportOutcome,
     RunnerSnapshot, RunnerState, TaskEventKind, TaskProvenance, TaskRecord, WatchedGate,
-    GATE_HOOK_MAX_ATTEMPTS, GATE_HOOK_RETRY_DELAYS_SECS,
+    GATE_HOOK_RETRY_DELAYS_SECS,
 };
 use crate::automations::HookPhase;
 use crate::domain::display::bounded_detail;
@@ -28,9 +29,9 @@ use chrono::{DateTime, Duration, Utc};
 use narsor_protocol::api::{ConversationState, EventLink, Timeline};
 use narsor_protocol::controller::ResumeMessage;
 
-/// For a queue, the automations whose entry script (`in`) runs when an
-/// episode enters it, as the catalogue says now.
-pub type EntryScripts<'a> = dyn Fn(&str) -> Vec<String> + 'a;
+/// For a queue, the automations whose entry (`in`) and exit (`out`)
+/// scripts run for an episode that enters it, as the catalogue says now.
+pub type EntryScripts<'a> = dyn Fn(&str) -> GateScripts + 'a;
 
 /// How many keys of comments already taken a record remembers.
 const RESUME_MESSAGES_REMEMBERED: usize = 32;
@@ -70,7 +71,7 @@ impl ControlPlane {
     /// [`refresh_slot_release_due`]).
     ///
     /// `entry_scripts` names, for a queue, the automations whose entry
-    /// script (`in`) runs when an episode enters it: asked only for an
+    /// (`in`) and exit (`out`) scripts run for an episode: asked only for an
     /// episode the snapshot begins, so the episode's automation phase is
     /// written with the episode itself ([`WatchedGate::automation`]).
     /// Without it the new episode has no automation phase and counts as
@@ -281,8 +282,33 @@ impl ControlPlane {
                 });
             }
 
+            let input_id = format!("input-{}", record.inputs.len() + 1);
+            // With exit scripts the answer waits for them (R10); the first
+            // exit of the episode wins.
+            hold_gate_exit(
+                record,
+                Some(&request.pending_input_id),
+                GateExit {
+                    choice: delivery.chosen_label.clone(),
+                    author: if observer.is_some() {
+                        GateExitAuthor::Automation
+                    } else {
+                        GateExitAuthor::Person
+                    },
+                    run_id: observer.as_ref().map(|observer| observer.run_id.clone()),
+                    held: Some(HeldExitItem::Input {
+                        input_id: input_id.clone(),
+                    }),
+                    at: now,
+                },
+            )
+            .map_err(|reason| OrchestrationError::GateExitHeld {
+                task_id: record.task_id.clone(),
+                episode: request.pending_input_id.clone(),
+                reason,
+            })?;
             let input = QueuedInput {
-                input_id: format!("input-{}", record.inputs.len() + 1),
+                input_id,
                 idempotency_key: request.idempotency_key.clone(),
                 pending_input_id: request.pending_input_id.clone(),
                 status: InputStatus::Queued,
@@ -399,9 +425,17 @@ impl ControlPlane {
         let (_, delivered) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
             let mut updates = obsolete_undelivered(record, pending_input_id, now);
+            // The answer a gate holds waits until its exit scripts ended
+            // (R10).
+            let held = match record.held_exit_item() {
+                Some(HeldExitItem::Input { input_id }) => Some(input_id.clone()),
+                _ => None,
+            };
             let mut deliverable = Vec::new();
             for input in record.inputs.iter_mut() {
-                if Some(input.pending_input_id.as_str()) != pending_input_id {
+                if Some(input.pending_input_id.as_str()) != pending_input_id
+                    || held.as_ref() == Some(&input.input_id)
+                {
                     continue;
                 }
                 match input.status {
@@ -511,19 +545,24 @@ impl ControlPlane {
     }
 
     /// Records the end of one attempt of the `hook` script of `automation`
-    /// in the watched gate episode `episode` (R12): one event in the task's
-    /// history, the script's status, and the gate's phase once no entry
-    /// script is pending (`ready`, or `entry_failed` after a last failed
-    /// attempt).
+    /// in the watched gate episode `episode` (R12, R15): one event in the
+    /// task's history, the script's status, and the gate's phase once no
+    /// script of that kind is pending: `ready`, or `entry_failed` after a
+    /// last failed `in`; `released` once every `out` ended, whatever its
+    /// result.
     ///
     /// A failed attempt with attempts left waits
     /// [`GATE_HOOK_RETRY_DELAYS_SECS`] for the next one; after
-    /// [`GATE_HOOK_MAX_ATTEMPTS`] the script fails for good: no automatic
-    /// attempt follows.
+    /// [`GateAutomation::max_attempts`] the script fails for good: no
+    /// automatic attempt follows. An `out` of a task that ended at the gate
+    /// starts the exit (author `task_end`, one attempt, R18). An episode the
+    /// task left ([`TaskRecord::exiting_gates`]) is forgotten once
+    /// released.
     ///
     /// Returns the gate's new phase when it changed. Changes nothing (and
-    /// returns `None`) when the task no longer waits in `episode`, or the
-    /// script is not pending there: the attempt is of no use any more.
+    /// returns `None`) when the episode is not in the phase of the script
+    /// (`entering` for `in`, `exiting` for `out`), or the script is not
+    /// pending there: the attempt is of no use any more.
     pub fn record_gate_hook_attempt(
         &self,
         task_id: &TaskId,
@@ -533,24 +572,17 @@ impl ControlPlane {
         outcome: &GateHookOutcome,
     ) -> Result<Option<GateAutomationPhase>> {
         let (_, changed) = self.mutate(task_id, |record, now| {
-            let Some(gate) = record
-                .watched_gate
-                .as_mut()
-                .filter(|gate| gate.episode == episode)
-            else {
+            let Some(gate) = gate_of_hook(record, episode, hook, now) else {
                 return Ok(Mutation::Unchanged(None));
             };
             let (step, queue) = (
                 bounded_name(&gate.watch.step),
                 bounded_name(&gate.watch.queue),
             );
-            let Some(state) = gate
-                .automation
-                .as_mut()
-                .filter(|state| state.phase == GateAutomationPhase::Entering)
-            else {
+            let Some(state) = gate.automation.as_mut() else {
                 return Ok(Mutation::Unchanged(None));
             };
+            let max_attempts = state.max_attempts(hook);
             let Some(script) = state.hooks.iter_mut().find(|script| {
                 script.automation == automation
                     && script.hook == hook
@@ -570,7 +602,7 @@ impl ControlPlane {
                     let reason = bounded_detail(reason);
                     script.last_error = Some(reason.clone());
                     error = Some(reason);
-                    match retry_delay(script.attempts) {
+                    match retry_delay(script.attempts, max_attempts) {
                         Some(delay) => {
                             let at = now + delay;
                             script.next_attempt_at = Some(at);
@@ -589,10 +621,20 @@ impl ControlPlane {
                 }
             }
             let attempt = script.attempts;
-            let gate_phase = state.entry_outcome();
+            let gate_phase = match hook {
+                HookPhase::Out => state.exit_outcome(),
+                _ => state.entry_outcome(),
+            };
             if let Some(phase) = gate_phase {
                 state.phase = phase;
             }
+            record.exiting_gates.retain(|gate| {
+                gate.episode != episode
+                    || gate
+                        .automation
+                        .as_ref()
+                        .is_some_and(|state| state.phase == GateAutomationPhase::Exiting)
+            });
             let kind = TaskEventKind::GateHookAttempt {
                 step,
                 queue,
@@ -611,10 +653,131 @@ impl ControlPlane {
     }
 }
 
+/// The gate of `episode` whose `hook` script may record an attempt now:
+/// for `in`, the watched gate while `entering`; for `out`, an episode the
+/// task left with exit scripts, or the watched gate while `exiting`. A
+/// task that ended at the gate with exit scripts not run yet starts its
+/// exit here (author `task_end`, R18).
+fn gate_of_hook<'a>(
+    record: &'a mut TaskRecord,
+    episode: &str,
+    hook: HookPhase,
+    now: DateTime<Utc>,
+) -> Option<&'a mut WatchedGate> {
+    let ended = record.has_ended();
+    if hook == HookPhase::Out {
+        if let Some(index) = record
+            .exiting_gates
+            .iter()
+            .position(|gate| gate.episode == episode)
+        {
+            return record.exiting_gates.get_mut(index);
+        }
+    }
+    let gate = record
+        .watched_gate
+        .as_mut()
+        .filter(|gate| gate.episode == episode)?;
+    let state = gate.automation.as_mut()?;
+    let current = match (hook, state.phase) {
+        (HookPhase::In, GateAutomationPhase::Entering)
+        | (HookPhase::Out, GateAutomationPhase::Exiting) => true,
+        (
+            HookPhase::Out,
+            GateAutomationPhase::Entering
+            | GateAutomationPhase::Ready
+            | GateAutomationPhase::EntryFailed,
+        ) if ended && state.exit_pending() => {
+            state.begin_exit(GateExit {
+                choice: None,
+                author: GateExitAuthor::TaskEnd,
+                run_id: None,
+                held: None,
+                at: now,
+            });
+            true
+        }
+        _ => false,
+    };
+    current.then_some(gate)
+}
+
+/// Holds `exit` of the watched gate (of `episode`, when given) while its
+/// exit scripts run (R10): the gate goes to `exiting`, or to `released`
+/// at once when no exit script is left. Nothing is held at a gate whose
+/// queue has no exit script (R17), nor at no watched gate.
+///
+/// A second exit of the episode is refused (the first wins): the reason is
+/// returned. An exit whose item was never delivered (refused or made
+/// obsolete meanwhile) gives way to the new one, which is then held as
+/// long as the exit scripts still run.
+pub(super) fn hold_gate_exit(
+    record: &mut TaskRecord,
+    episode: Option<&str>,
+    exit: GateExit,
+) -> std::result::Result<(), String> {
+    let Some(gate) = record
+        .watched_gate
+        .as_ref()
+        .filter(|gate| episode.is_none_or(|episode| gate.episode == episode))
+    else {
+        return Ok(());
+    };
+    if let Some(earlier) = gate
+        .automation
+        .as_ref()
+        .and_then(|state| state.exit.as_ref())
+        .filter(|earlier| exit_item_live(record, earlier))
+    {
+        let by = match &earlier.choice {
+            Some(choice) => format!("'{choice}'"),
+            None => "an exit".to_string(),
+        };
+        return Err(format!(
+            "gate episode {} is already left by {by} of the {}; its exit scripts run, and the \
+             first exit wins",
+            gate.episode,
+            earlier.author.as_str()
+        ));
+    }
+    let Some(state) = record
+        .watched_gate
+        .as_mut()
+        .and_then(|gate| gate.automation.as_mut())
+        .filter(|state| state.hooks.iter().any(|hook| hook.hook == HookPhase::Out))
+    else {
+        return Ok(());
+    };
+    match state.phase {
+        GateAutomationPhase::Entering
+        | GateAutomationPhase::Ready
+        | GateAutomationPhase::EntryFailed => state.begin_exit(exit),
+        GateAutomationPhase::Exiting | GateAutomationPhase::Released => state.exit = Some(exit),
+        GateAutomationPhase::Unrecognized => {}
+    }
+    Ok(())
+}
+
+/// Whether the item of `exit` still leaves the gate: it waits, it is on
+/// its way to the runner, or the runner took it.
+fn exit_item_live(record: &TaskRecord, exit: &GateExit) -> bool {
+    match &exit.held {
+        None => true,
+        Some(HeldExitItem::Input { input_id }) => record.input(input_id).is_some_and(|input| {
+            !input.status.is_settled() || input.status == InputStatus::Consumed
+        }),
+        Some(HeldExitItem::Command { command_id }) => {
+            record.operator_command(command_id).is_some_and(|command| {
+                !command.status.is_settled() || command.status == OperatorCommandStatus::Applied
+            })
+        }
+    }
+}
+
 /// The wait before the attempt after `attempts` failed ones, `None` when
-/// none follows.
-fn retry_delay(attempts: u32) -> Option<Duration> {
-    if attempts >= GATE_HOOK_MAX_ATTEMPTS {
+/// none follows (after `max_attempts`).
+fn retry_delay(attempts: u32, max_attempts: u32) -> Option<Duration> {
+    if attempts >= max_attempts {
         return None;
     }
     let index = usize::try_from(attempts.saturating_sub(1)).unwrap_or(usize::MAX);
@@ -657,10 +820,41 @@ fn follow_watched_gate(
         gate
     });
     let ended = std::mem::replace(&mut record.watched_gate, current.clone());
+    // The runner left with exit scripts still to run: no exit was held
+    // (or a held one was overtaken). They run now, after the fact, before
+    // any entry script of the task's next episode (R10).
+    if let Some(left) = left_with_exit_scripts(ended.clone(), now) {
+        record.exiting_gates.push(left);
+    }
     GateChange {
         ended,
         began: current,
     }
+}
+
+/// `gate`, which the runner left, when its exit scripts have not all
+/// ended: in phase `exiting`, by the runner when no exit was held.
+fn left_with_exit_scripts(gate: Option<WatchedGate>, now: DateTime<Utc>) -> Option<WatchedGate> {
+    let mut gate = gate?;
+    let state = gate.automation.as_mut()?;
+    match state.phase {
+        GateAutomationPhase::Exiting => {}
+        GateAutomationPhase::Entering
+        | GateAutomationPhase::Ready
+        | GateAutomationPhase::EntryFailed
+            if state.exit_pending() =>
+        {
+            state.begin_exit(GateExit {
+                choice: None,
+                author: GateExitAuthor::Runner,
+                run_id: None,
+                held: None,
+                at: now,
+            });
+        }
+        _ => return None,
+    }
+    Some(gate)
 }
 
 /// The longest step, queue or episode a [`TaskEventKind::GateQueueWarning`]

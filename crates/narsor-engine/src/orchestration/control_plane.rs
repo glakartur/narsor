@@ -210,6 +210,7 @@ impl ControlPlane {
             resume_message: None,
             resume_message_taken: Vec::new(),
             watched_gate: None,
+            exiting_gates: Vec::new(),
             provenance: request.provenance,
             last_event: TaskEvent {
                 sequence: 1,

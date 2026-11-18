@@ -378,6 +378,13 @@ pub struct TaskRecord {
     /// pause, a loss or a restart) does not end the episode (R17).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watched_gate: Option<WatchedGate>,
+    /// Watched gate episodes the task left while their exit scripts (`out`)
+    /// had not all ended: the runner left the gate by an exit the control
+    /// plane did not hold (R10, defensive). Each one stays here, phase
+    /// `exiting`, until every exit script ended; its queue entry stays with
+    /// it, as the index the hook claim walks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exiting_gates: Vec<WatchedGate>,
     /// The observer and run that created the task (R19);
     /// `None` for a task its owner created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -672,6 +679,51 @@ impl TaskRecord {
             .as_ref()
             .and_then(|runner| runner.snapshot.pending_input.as_ref())
             .map(|pending| pending.id.as_str())
+    }
+
+    /// Whether the task can take no more answers: finished, archived (or
+    /// being archived).
+    pub fn has_ended(&self) -> bool {
+        self.archive.is_some()
+            || self.runner_state.is_archival()
+            || self.task_state() == TaskState::Finished
+    }
+
+    /// The gate of `episode` whose exit scripts (`out`) run now (R10,
+    /// R18): an episode the task left with exit scripts to run, its watched
+    /// gate in phase `exiting`, or the watched gate of a task that ended
+    /// there with exit scripts not yet run (one attempt, R18).
+    pub fn exiting_gate(&self, episode: &str) -> Option<&WatchedGate> {
+        if let Some(gate) = self
+            .exiting_gates
+            .iter()
+            .find(|gate| gate.episode == episode)
+        {
+            return Some(gate);
+        }
+        let gate = self
+            .watched_gate
+            .as_ref()
+            .filter(|gate| gate.episode == episode)?;
+        let automation = gate.automation.as_ref()?;
+        let exiting = automation.phase == GateAutomationPhase::Exiting
+            || (self.has_ended() && automation.exit_pending());
+        exiting.then_some(gate)
+    }
+
+    /// The item (an answer or an operator command) the watched gate holds
+    /// back from the runner while its exit scripts run; `None` when none is
+    /// held.
+    pub fn held_exit_item(&self) -> Option<&HeldExitItem> {
+        self.watched_gate
+            .as_ref()?
+            .automation
+            .as_ref()
+            .filter(|automation| automation.phase == GateAutomationPhase::Exiting)?
+            .exit
+            .as_ref()?
+            .held
+            .as_ref()
     }
 
     /// Finds a queued input by id.
@@ -1026,24 +1078,100 @@ pub struct GateAutomation {
     /// script phase, in the queue file's order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hooks: Vec<GateHook>,
+    /// How the episode is left, once an exit came while the queue has exit
+    /// scripts (R10, R11): the choice, its author and the item held back
+    /// from the runner until every exit script ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<GateExit>,
+}
+
+/// The automations of a queue whose entry (`in`) and exit (`out`) scripts
+/// run for an episode, as the catalogue says when the episode begins.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GateScripts {
+    /// The automations with an `in` script, in the queue file's order.
+    pub entry: Vec<String>,
+    /// The automations with an `out` script, in the queue file's order.
+    pub exit: Vec<String>,
 }
 
 impl GateAutomation {
-    /// A new episode whose queue runs the `in` script of `automations`:
-    /// `entering` with one pending `in` each, or `ready` at once when there
-    /// is none (R17).
-    pub fn entering(automations: Vec<String>) -> Self {
-        let hooks: Vec<GateHook> = automations
+    /// A new episode of a queue with `scripts`: `entering` with one pending
+    /// `in` each, or `ready` at once when there is none (R17). The `out`
+    /// scripts are recorded now, pending, so a catalogue change during the
+    /// episode does not change which automations run `out`.
+    pub fn entering(scripts: GateScripts) -> Self {
+        let entering = !scripts.entry.is_empty();
+        let hooks: Vec<GateHook> = scripts
+            .entry
             .into_iter()
             .map(|automation| GateHook::pending(automation, HookPhase::In))
+            .chain(
+                scripts
+                    .exit
+                    .into_iter()
+                    .map(|automation| GateHook::pending(automation, HookPhase::Out)),
+            )
             .collect();
         Self {
-            phase: if hooks.is_empty() {
-                GateAutomationPhase::Ready
-            } else {
+            phase: if entering {
                 GateAutomationPhase::Entering
+            } else {
+                GateAutomationPhase::Ready
             },
             hooks,
+            exit: None,
+        }
+    }
+
+    /// Whether an exit script of the episode has not ended yet (none ran,
+    /// or one waits for its next attempt).
+    pub fn exit_pending(&self) -> bool {
+        self.hooks
+            .iter()
+            .any(|hook| hook.hook == HookPhase::Out && hook.status == GateHookStatus::Pending)
+    }
+
+    /// The episode is left by `exit`: phase `exiting` while an exit script
+    /// is pending, `released` when none is. An entry script not run yet
+    /// never runs (`skipped`); one in progress ends, but its result no
+    /// longer changes the phase (R14).
+    pub fn begin_exit(&mut self, exit: GateExit) {
+        for hook in self
+            .hooks
+            .iter_mut()
+            .filter(|hook| hook.hook == HookPhase::In && hook.status == GateHookStatus::Pending)
+        {
+            hook.status = GateHookStatus::Skipped;
+            hook.next_attempt_at = None;
+        }
+        self.phase = if self.exit_pending() {
+            GateAutomationPhase::Exiting
+        } else {
+            GateAutomationPhase::Released
+        };
+        self.exit = Some(exit);
+    }
+
+    /// The phase the exit scripts give: `released` once none is pending
+    /// (each succeeded, failed its last attempt or was skipped, R15);
+    /// `None` while one is.
+    pub fn exit_outcome(&self) -> Option<GateAutomationPhase> {
+        (!self.exit_pending()).then_some(GateAutomationPhase::Released)
+    }
+
+    /// Most attempts of one script of `hook`: one for an exit script of a
+    /// task that ended at the gate (R18), [`GATE_HOOK_MAX_ATTEMPTS`]
+    /// otherwise.
+    pub fn max_attempts(&self, hook: HookPhase) -> u32 {
+        let task_end = self
+            .exit
+            .as_ref()
+            .is_some_and(|exit| exit.author == GateExitAuthor::TaskEnd);
+        if hook == HookPhase::Out && task_end {
+            1
+        } else {
+            GATE_HOOK_MAX_ATTEMPTS
         }
     }
 
@@ -1064,6 +1192,80 @@ impl GateAutomation {
             GateAutomationPhase::Ready
         })
     }
+}
+
+/// How a watched gate episode is left while its queue has exit scripts
+/// (R10, R11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateExit {
+    /// The choice it is left by; `None` when the task ended at the gate or
+    /// the runner left it by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<String>,
+    /// Who chose it.
+    pub author: GateExitAuthor,
+    /// The automation run that answered, for an `automation` author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// The answer or operator command held back from the runner while the
+    /// exit scripts run; `None` when nothing waits for them (the task
+    /// ended at the gate, or the runner already left it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<HeldExitItem>,
+    /// When the exit came.
+    pub at: DateTime<Utc>,
+}
+
+/// Who left a watched gate episode (R11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateExitAuthor {
+    /// The owner answered the gate.
+    Person,
+    /// A `check` run answered it (`task decide`).
+    Automation,
+    /// The owner sent an operator command (a transition, a step).
+    Operator,
+    /// The task ended at the gate (archive, R18).
+    TaskEnd,
+    /// The runner left the gate with no exit the control plane held.
+    Runner,
+    /// An author from a newer build.
+    #[serde(other)]
+    Unrecognized,
+}
+
+impl GateExitAuthor {
+    /// The wire name, as an exit script reads it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Automation => "automation",
+            Self::Operator => "operator",
+            Self::TaskEnd => "task_end",
+            Self::Runner => "runner",
+            Self::Unrecognized => "unrecognized",
+        }
+    }
+}
+
+/// The item a watched gate holds back from the runner while its exit
+/// scripts run. The item stays where it is ([`TaskRecord::inputs`],
+/// [`TaskRecord::operator_commands`]); delivery skips it until the gate is
+/// `released`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum HeldExitItem {
+    /// A queued answer.
+    Input {
+        /// Its id.
+        input_id: String,
+    },
+    /// A queued operator command.
+    Command {
+        /// Its id.
+        command_id: String,
+    },
 }
 
 /// One entry or exit script of one automation in one episode.

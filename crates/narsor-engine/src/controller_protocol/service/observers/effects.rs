@@ -2,7 +2,9 @@
 //! its run token opens (R12, R13, R15, R19):
 //!
 //! ```text
-//! create task   the queue has no `tasks` settings (now) → refused
+//! create task   a run whose phase is not `check`
+//!                                     → refused (not_a_check_run)
+//!               the queue has no `tasks` settings (now) → refused
 //!               no installation owner (unclaimed)       → refused
 //!               over limit            → refused; pair needs_attention
 //!               otherwise             → create_task (random id), owned by
@@ -49,6 +51,22 @@ use crate::orchestration::{
 };
 
 use super::entries::waits_in;
+
+/// Refuses an effect of a run that is not a `check` run: an `in` or `out`
+/// script neither answers a gate nor creates a task.
+fn require_check_run(active: &ActiveRun, run_id: &RunId) -> ProtocolResult<()> {
+    if active.phase == HookPhase::Check {
+        return Ok(());
+    }
+    Err(ProtocolError::bad_request(
+        "not_a_check_run",
+        format!(
+            "run {run_id} runs the {} script of automation '{}': only a check run has effects \
+             (answers a gate, creates a task)",
+            active.phase, run_id.key.automation
+        ),
+    ))
+}
 
 /// Most bytes of a "create a task" effect's data, as JSON.
 pub const MAX_EFFECT_DATA_BYTES: usize = 64 * 1024;
@@ -98,6 +116,7 @@ impl ProtocolService {
         request: ObserverCreateTaskRequest,
     ) -> ProtocolResult<ObserverEffectResponse> {
         let mut scope = self.effect_scope(run_id)?;
+        require_check_run(scope.active_run()?, run_id)?;
         let tasks = self
             .automation_catalog()
             .queues
@@ -160,16 +179,7 @@ impl ProtocolService {
             .record
             .run_in_progress(run_id.sequence)
             .ok_or(ProtocolError::Unauthorized)?;
-        if active.phase != HookPhase::Check {
-            return Err(ProtocolError::bad_request(
-                "not_a_check_run",
-                format!(
-                    "run {run_id} runs the {} script of automation '{}': only a check run \
-                     answers a gate",
-                    active.phase, run_id.key.automation
-                ),
-            ));
-        }
+        require_check_run(active, run_id)?;
         let Some(entry) = active.entry.clone() else {
             return Err(ProtocolError::bad_request(
                 "no_queue_entry",

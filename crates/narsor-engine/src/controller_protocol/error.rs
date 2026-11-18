@@ -124,7 +124,10 @@ impl From<OrchestrationError> for ProtocolError {
             E::RunnerSuperseded { .. } => Self::Unauthorized,
             E::StaleRunnerSnapshot { .. } => Self::conflict("stale_snapshot", message),
             E::ObsoleteInput { .. } => Self::conflict("obsolete_input", message),
-            E::InputAlreadyQueued { .. } => Self::conflict("input_already_queued", message),
+            // The verdict a person gets for an answered episode.
+            E::InputAlreadyQueued { .. } | E::GateExitHeld { .. } => {
+                Self::conflict("input_already_queued", message)
+            }
             E::InputAlreadySettled { .. } => Self::conflict("input_already_settled", message),
             E::TaskNotAcceptingInput { .. } => Self::conflict("task_not_accepting_input", message),
             E::OperatorCommandRefused { .. } => Self::conflict("operator_command_refused", message),

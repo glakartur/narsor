@@ -1,4 +1,4 @@
-//! Entry scripts (`in`) of watched gates (R8, R9, R12, R13, R17, R19).
+//! Entry (`in`) and exit (`out`) scripts of watched gates (R8–R15, R17–R19).
 //!
 //! The task's watched gate holds where the episode stands
 //! ([`crate::orchestration::GateAutomation`]): the snapshot that begins the
@@ -27,6 +27,31 @@
 //!                                         automatic attempts
 //! ```
 //!
+//! Exit scripts (R10, R11, R15, R18):
+//!
+//! ```text
+//! exit      an answer (person, `task decide`) or an operator transition
+//!           or chosen step at a gate whose queue has `out` scripts
+//!                                       → held on the gate (`exiting`), not
+//!                                         delivered; a second exit of the
+//!                                         episode is refused (first wins)
+//!           the task ends at the gate   → `out` once, no hold (R18)
+//!           the runner leaves with no held exit
+//!                                       → `out` after the fact; the gate
+//!                                         moves to the task's exiting gates
+//! claim     a pending `out` of an exiting episode, due, no other hook run
+//!           of the task in progress; `in` of a task's new episode waits
+//!           while an episode it left still runs `out` (AE4)
+//!           its automation left the queue or lost its `out` script
+//!                                       → skipped (history)
+//! result    as for `in`; after the last attempt the failure is in the
+//!           history and the exit goes on
+//! episode   no `out` pending any more   → `released`: the held exit is
+//!                                         delivered at the runner's next poll;
+//!                                         an episode the task left (or of an
+//!                                         ended task) loses its queue entry
+//! ```
+//!
 //! Each end of an attempt is one task event ([`TaskEventKind::GateHookAttempt`]),
 //! so the attempts show in the gate step's history, never as steps. A hook
 //! run never touches the pair's `check` schedule: not its round, its
@@ -50,23 +75,30 @@ use crate::controller_protocol::credentials::BearerToken;
 use crate::controller_protocol::service::ProtocolService;
 use crate::domain::TaskId;
 use crate::observers::{
-    ActiveRun, AutomationKey, AutomationLock, AutomationRecord, LastRun, ObserverError,
-    ObserverMode, QueueEntry, RunEntry, RunFailure, RunId, RunStatus, ScriptInput,
-    RUN_FAILURE_VERSION, SCRIPT_CONTRACT_VERSION,
+    queue_entry_id, ActiveRun, AutomationKey, AutomationLock, AutomationRecord, LastRun,
+    ObserverError, ObserverMode, QueueEntry, RunEntry, RunFailure, RunId, RunStatus, ScriptExit,
+    ScriptInput, RUN_FAILURE_VERSION, SCRIPT_CONTRACT_VERSION,
 };
 use crate::orchestration::{
-    GateAutomationPhase, GateHookOutcome, GateHookStatus, GATE_HOOK_TIMEOUT_SECS,
+    GateAutomationPhase, GateExit, GateExitAuthor, GateHookOutcome, GateHookStatus,
+    GATE_HOOK_TIMEOUT_SECS,
 };
 
-use super::entries::waits_in;
+use super::entries::{exit_scripts_run, waits_in};
 use super::schedule::{
     after, bounded, judge_entry_run, script_entry, ClaimedObserverRun, RunReport, LOST_MESSAGE,
     RUN_DEADLINE_MARGIN_SECS,
 };
 
-/// A hook run that may be claimed: since when it is due, its pair and the
-/// entry it runs for.
-type HookCandidate = (DateTime<Utc>, AutomationKey, QueueEntry);
+/// A hook run that may be claimed: since when it is due, its pair, the
+/// entry it runs for, its script and, for `out`, how the gate was left.
+type HookCandidate = (
+    DateTime<Utc>,
+    AutomationKey,
+    QueueEntry,
+    HookPhase,
+    Option<ScriptExit>,
+);
 
 impl ProtocolService {
     /// Claims the entry script run due the longest, `None` when none is
@@ -106,25 +138,28 @@ impl ProtocolService {
             }
         }
         candidates.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
-        for (_, key, entry) in candidates {
+        for (_, key, entry, hook, exit) in candidates {
             let (Some(queue), Some(automation)) =
                 (pairs.get(&key), catalog.automations.get(&key.automation))
             else {
                 continue;
             };
-            match self.claim_hook_from(&key, queue, automation, &entry, now) {
+            let script = HookScript { hook, exit };
+            match self.claim_hook_from(&key, queue, automation, &entry, script, now) {
                 Ok(Some(claimed)) => return Ok(Some(claimed)),
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(pair = %key, %error, "automations: cannot claim an entry script run");
+                    tracing::warn!(pair = %key, %error, "automations: cannot claim an entry or exit script run");
                 }
             }
         }
         Ok(None)
     }
 
-    /// The first due entry script of `entry`'s episode that may run now;
-    /// skips (with a history event) the ones the catalogue no longer has.
+    /// The first due entry or exit script of `entry`'s episode that may
+    /// run now; skips (with a history event) the ones the catalogue no
+    /// longer has. Exit scripts of an episode the task left come before
+    /// any entry script of its next one (AE4).
     fn hook_candidate(
         &self,
         catalog: &AutomationCatalogLoad,
@@ -136,54 +171,68 @@ impl ProtocolService {
         let task = match self.control.task(&entry.task_id) {
             Ok(task) => task,
             Err(error) => {
-                tracing::debug!(task = %entry.task_id, %error, "automations: cannot read the task of a queue entry for its entry scripts");
+                tracing::debug!(task = %entry.task_id, %error, "automations: cannot read the task of a queue entry for its entry or exit scripts");
                 return None;
             }
         };
-        if !waits_in(&task, &entry.owner, &entry.episode) {
+        let (gate, hook) = if exit_scripts_run(&task, &entry) {
+            (task.exiting_gate(&entry.episode)?, HookPhase::Out)
+        } else if waits_in(&task, &entry.owner, &entry.episode) && task.exiting_gates.is_empty() {
+            (task.watched_gate.as_ref()?, HookPhase::In)
+        } else {
+            return None;
+        };
+        let state = gate.automation.as_ref()?;
+        if hook == HookPhase::In && state.phase != GateAutomationPhase::Entering {
             return None;
         }
-        let gate = task.watched_gate.as_ref()?;
-        let state = gate
-            .automation
-            .as_ref()
-            .filter(|state| state.phase == GateAutomationPhase::Entering)?;
-        for script in state.hooks.iter().filter(|script| {
-            script.hook == HookPhase::In && script.status == GateHookStatus::Pending
-        }) {
+        let exit = (hook == HookPhase::Out).then(|| script_exit(state.exit.as_ref()));
+        let since = state.exit.as_ref().map(|exit| exit.at).or(gate.began_at);
+        for script in state
+            .hooks
+            .iter()
+            .filter(|script| script.hook == hook && script.status == GateHookStatus::Pending)
+        {
             let Ok(key) = AutomationKey::new(entry.queue.clone(), script.automation.clone()) else {
                 continue;
             };
-            if let Some(reason) = no_entry_script(catalog, pairs, &key) {
+            if let Some(reason) = no_hook_script(catalog, pairs, &key, hook) {
                 self.settle_hook(
                     &entry.task_id,
                     &entry.episode,
                     &key.automation,
-                    HookPhase::In,
+                    hook,
                     &GateHookOutcome::Skipped(reason),
                 );
                 continue;
             }
-            let due = script.next_attempt_at.or(gate.began_at).unwrap_or(now);
+            let due = script.next_attempt_at.or(since).unwrap_or(now);
             if due > now || busy_pairs.contains(&key) {
                 continue;
             }
-            return Some((due, key, entry));
+            return Some((due, key, entry, hook, exit));
         }
         None
     }
 
-    /// Starts the `in` run of `entry` on the pair `key`, under the pair's
-    /// lock; `None` when the pair has a hook run in progress, or the script
-    /// could not be read (a failed attempt).
+    /// Starts the `in` or `out` run of `entry` on the pair `key`, under the
+    /// pair's lock; `None` when the pair has a hook run in progress, or the
+    /// script could not be read (a failed attempt).
+    ///
+    /// A pair stopped in `error` or `needs_attention` still runs its hooks,
+    /// on purpose: those states track the health of its `check` runs only,
+    /// and holding hooks back would leave the gate stuck in `entering` or
+    /// `exiting`.
     fn claim_hook_from(
         &self,
         key: &AutomationKey,
         queue: &Queue,
         automation: &Automation,
         entry: &QueueEntry,
+        script: HookScript,
         now: DateTime<Utc>,
     ) -> Result<Option<ClaimedObserverRun>, ObserverError> {
+        let HookScript { hook, exit } = script;
         let lock = self.observers.lock(key)?;
         let mut record = self
             .observers
@@ -201,21 +250,21 @@ impl ProtocolService {
         };
         let AutomationScript { text, digest } = match self
             .launch
-            .automation_script(&key.automation, HookPhase::In)
+            .automation_script(&key.automation, hook)
         {
             Ok(script) => script,
             Err(error) => {
-                let message = format!("the in script could not be read at the claim: {error}");
-                tracing::warn!(pair = %key, %error, "automations: an entry script run could not start");
+                let message = format!("the {hook} script could not be read at the claim: {error}");
+                tracing::warn!(pair = %key, %error, "automations: an entry or exit script run could not start");
                 self.observers.record_failure(
                     &lock,
                     &hook_failure(
                         key,
+                        hook,
                         sequence,
                         "",
                         &run_entry,
-                        now,
-                        now,
+                        (now, now),
                         RunStatus::Failed,
                         None,
                         &message,
@@ -226,7 +275,7 @@ impl ProtocolService {
                     &entry.task_id,
                     &entry.episode,
                     &key.automation,
-                    HookPhase::In,
+                    hook,
                     &GateHookOutcome::Failed(message),
                 );
                 return Ok(None);
@@ -236,13 +285,13 @@ impl ProtocolService {
         let token = BearerToken::issue_observer_run(&run_id.to_string());
         let input = ScriptInput {
             contract_version: SCRIPT_CONTRACT_VERSION,
-            phase: HookPhase::In,
+            phase: hook,
             queue: key.queue.clone(),
             automation: key.automation.clone(),
             condition: queue.condition.clone(),
             state: record.script_state.clone(),
             entry: Some(script_entry(entry)),
-            exit: None,
+            exit,
             first_run: !record.first_run_done,
             import_backlog: false,
         };
@@ -250,7 +299,7 @@ impl ProtocolService {
         record.last_claim_at = Some(now);
         record.active_hook = Some(ActiveRun {
             sequence,
-            phase: HookPhase::In,
+            phase: hook,
             script_digest: digest.clone(),
             definition_digest: pair_definition_digest(queue, automation, &digest),
             claimed_at: now,
@@ -260,10 +309,10 @@ impl ProtocolService {
             entry: Some(run_entry),
         });
         self.observers.save(&lock, &mut record, now)?;
-        tracing::info!(run = %run_id, task = %entry.task_id, episode = %entry.episode, "automations: an entry script run starts");
+        tracing::info!(run = %run_id, task = %entry.task_id, episode = %entry.episode, %hook, "automations: an entry or exit script run starts");
         Ok(Some(ClaimedObserverRun {
             run_id,
-            phase: HookPhase::In,
+            phase: hook,
             token,
             script_digest: digest,
             script: text,
@@ -290,16 +339,15 @@ impl ProtocolService {
         if let (Some(message), Some(entry)) = (&verdict.error, &active.entry) {
             let mut failure = hook_failure(
                 &record.key,
+                active.phase,
                 active.sequence,
                 &active.script_digest,
                 entry,
-                active.claimed_at,
-                now,
+                (active.claimed_at, now),
                 verdict.status,
                 verdict.exit_code,
                 message,
             );
-            failure.phase = active.phase;
             failure.stdout = Some(bounded(&report.stdout));
             failure.stderr = Some(bounded(&report.stderr));
             self.observers.record_failure(lock, &failure)?;
@@ -337,18 +385,17 @@ impl ProtocolService {
         now: DateTime<Utc>,
     ) -> Result<(), ObserverError> {
         if let Some(entry) = &active.entry {
-            let mut failure = hook_failure(
+            let failure = hook_failure(
                 &record.key,
+                active.phase,
                 active.sequence,
                 &active.script_digest,
                 entry,
-                active.claimed_at,
-                now,
+                (active.claimed_at, now),
                 RunStatus::Lost,
                 None,
                 LOST_MESSAGE,
             );
-            failure.phase = active.phase;
             self.observers.record_failure(lock, &failure)?;
         }
         record.active_hook = None;
@@ -363,6 +410,33 @@ impl ProtocolService {
             );
         }
         Ok(())
+    }
+
+    /// Removes the queue entry of `episode` once its exit scripts ended,
+    /// when the task no longer waits there: it left the gate, or ended at
+    /// it. A gate it still waits at keeps its entry until the snapshot
+    /// shows it left (the held exit is on its way).
+    fn drop_left_entry(&self, task_id: &TaskId, episode: &str) {
+        let waits = match self.control.task(task_id) {
+            Ok(task) => waits_in(&task, &task.owner, episode),
+            Err(_) => false,
+        };
+        if waits {
+            return;
+        }
+        let removed = self.observers.lock_queue_entries().and_then(|lock| {
+            self.observers
+                .remove_queue_entry(&lock, &queue_entry_id(task_id, episode))
+        });
+        match removed {
+            Ok(true) => {
+                tracing::info!(task = %task_id, %episode, "automations: the exit scripts of a left episode ended; its queue entry is removed");
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(task = %task_id, %episode, %error, "automations: cannot remove the queue entry of a left episode");
+            }
+        }
     }
 
     /// Writes the end of one attempt to the task (its history, the
@@ -382,24 +456,53 @@ impl ProtocolService {
         {
             Ok(phase) => {
                 if let Some(phase) = phase {
-                    tracing::info!(task = %task_id, %episode, phase = phase.as_str(), "automations: the entry scripts of a gate ended");
+                    tracing::info!(task = %task_id, %episode, phase = phase.as_str(), "automations: the entry or exit scripts of a gate ended");
                 }
+                if phase == Some(GateAutomationPhase::Released) {
+                    self.drop_left_entry(task_id, episode);
+                }
+                // Also wakes the runner's long-poll: a released exit is
+                // delivered at once.
                 self.notify(task_id);
             }
             Err(error) => {
-                tracing::warn!(task = %task_id, %episode, %automation, %error, "automations: cannot record an attempt of an entry script");
+                tracing::warn!(task = %task_id, %episode, %automation, %error, "automations: cannot record an attempt of an entry or exit script");
             }
         }
     }
 }
 
-/// Why the pair `key` runs no entry script for its queue now, `None` when
+/// Which hook script a claim starts, and for `out` how the gate was left.
+struct HookScript {
+    hook: HookPhase,
+    exit: Option<ScriptExit>,
+}
+
+/// How the gate was left, as an `out` script reads it (R11); a gate of a
+/// task that ended there has no exit recorded yet: `task_end`.
+fn script_exit(exit: Option<&GateExit>) -> ScriptExit {
+    match exit {
+        Some(exit) => ScriptExit {
+            choice: exit.choice.clone(),
+            author: exit.author.as_str().to_string(),
+            run_id: exit.run_id.clone(),
+        },
+        None => ScriptExit {
+            choice: None,
+            author: GateExitAuthor::TaskEnd.as_str().to_string(),
+            run_id: None,
+        },
+    }
+}
+
+/// Why the pair `key` runs no `hook` script for its queue now, `None` when
 /// it does: the queue (an `on_episodes` one) still names the automation and
-/// the automation still has an `in` script.
-fn no_entry_script(
+/// the automation still has the script.
+fn no_hook_script(
     catalog: &AutomationCatalogLoad,
     pairs: &BTreeMap<AutomationKey, &Queue>,
     key: &AutomationKey,
+    hook: HookPhase,
 ) -> Option<String> {
     let Some(queue) = pairs.get(key) else {
         return Some(format!(
@@ -413,25 +516,26 @@ fn no_entry_script(
     if !catalog
         .automations
         .get(&key.automation)
-        .is_some_and(|automation| automation.has(HookPhase::In))
+        .is_some_and(|automation| automation.has(hook))
     {
         return Some(format!(
-            "automation '{}' no longer has an in script",
+            "automation '{}' no longer has an {hook} script",
             key.automation
         ));
     }
     None
 }
 
-/// The error file of a hook run for `entry`, with no output.
+/// The error file of the `hook` run for `entry`, with no output; `times`
+/// are when it was claimed and when it ended.
 #[allow(clippy::too_many_arguments)]
 fn hook_failure(
     key: &AutomationKey,
+    hook: HookPhase,
     sequence: u64,
     script_digest: &str,
     entry: &RunEntry,
-    claimed_at: DateTime<Utc>,
-    finished_at: DateTime<Utc>,
+    (claimed_at, finished_at): (DateTime<Utc>, DateTime<Utc>),
     status: RunStatus,
     exit_code: Option<i32>,
     message: &str,
@@ -440,7 +544,7 @@ fn hook_failure(
         record_version: RUN_FAILURE_VERSION,
         key: key.clone(),
         sequence,
-        phase: HookPhase::In,
+        phase: hook,
         script_digest: script_digest.to_string(),
         claimed_at,
         finished_at,

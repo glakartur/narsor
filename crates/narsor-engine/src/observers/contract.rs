@@ -110,14 +110,16 @@ pub struct ScriptVariable {
 }
 
 /// How the gate of an `out` run's entry was left: the choice and who made
-/// it (R11). Reserved for the exit scripts; no run carries it yet.
+/// it (R11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptExit {
     /// The choice the gate exited with; absent when the task ended at the
     /// gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub choice: Option<String>,
-    /// Who chose it: `person`, `automation`, `operator` or `task_end`.
+    /// Who chose it: `person`, `automation`, `operator`, `task_end`, or
+    /// `runner` when the runner left the gate with no exit the control
+    /// plane held.
     pub author: String,
     /// The automation run that answered, for an `automation` author.
     #[serde(default, skip_serializing_if = "Option::is_none")]

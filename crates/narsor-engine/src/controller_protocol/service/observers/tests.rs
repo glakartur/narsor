@@ -719,9 +719,9 @@ fn each_run_checks_one_entry_of_the_queue_with_its_episode() {
 }
 
 #[test]
-fn a_run_whose_phase_is_not_check_answers_no_gate() {
-    // Only `check` decides; `in` and `out` runs come with U4/U5, so the
-    // phase of the run in progress is set by hand here.
+fn a_run_whose_phase_is_not_check_has_no_effect() {
+    // Only `check` answers a gate or creates a task; the phase of the run in
+    // progress is set by hand here.
     let fx = Fixture::new();
     fx.queue("mr-review", "gitlab-mr-label", ObserverMode::OnEpisodes);
     let task = fx.task("task-1");
@@ -739,23 +739,30 @@ fn a_run_whose_phase_is_not_check_answers_no_gate() {
             .unwrap();
     }
 
-    let refused = fx
-        .service
-        .observer_decide(
-            &run.run_id,
-            ObserverDecideRequest {
-                task_id: "task-1".into(),
-                episode: "input-1".into(),
-                choice: "check_feedback".into(),
-                reason: None,
-                variables: Default::default(),
-            },
-        )
-        .unwrap_err();
+    let decided = fx.service.observer_decide(
+        &run.run_id,
+        ObserverDecideRequest {
+            task_id: "task-1".into(),
+            episode: "input-1".into(),
+            choice: "check_feedback".into(),
+            reason: None,
+            variables: Default::default(),
+        },
+    );
+    let created = fx.service.observer_create_task(
+        &run.run_id,
+        crate::controller_protocol::wire::ObserverCreateTaskRequest {
+            data: json!({"title": "From an entry script"}),
+        },
+    );
 
-    match refused {
-        ProtocolError::BadRequest { code, .. } => assert_eq!(code, "not_a_check_run"),
-        other => panic!("{other:?}"),
+    for (effect, refused) in [("decide", decided), ("create task", created)] {
+        match refused.unwrap_err() {
+            ProtocolError::BadRequest { code, .. } => {
+                assert_eq!(code, "not_a_check_run", "{effect}")
+            }
+            other => panic!("{effect}: {other:?}"),
+        }
     }
 }
 
