@@ -42,12 +42,12 @@
 //! ([`EntryWrite::Created`]). A redelivered or a later snapshot of the same
 //! episode finds the episode known and changes nothing.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
-use crate::automations::HookPhase;
+use crate::automations::{AutomationCatalogLoad, HookPhase};
 use crate::controller_protocol::service::ProtocolService;
 use crate::domain::TaskId;
-use crate::observers::{queue_entry_id, EntryWrite, ObserverError, ObserverMode, QueueEntry};
+use crate::observers::{queue_entry_id, EntryWrite, ObserverError, QueueEntriesLock, QueueEntry};
 use crate::orchestration::{
     GateChange, GateScripts, OrchestrationError, OwnerRef, TaskRecord, WatchedGate,
 };
@@ -77,11 +77,19 @@ impl ProtocolService {
     /// episode written to the task's history as a warning, like a queue that
     /// no active `on_episodes` observer serves (R9, R27). The gate waits for
     /// a person either way.
-    pub fn follow_gate_episode(&self, task: &TaskRecord, change: &GateChange) {
+    ///
+    /// `catalog` is the catalogue as the snapshot read it, if it did; it is
+    /// read here when a new episode needs it and none is given.
+    pub fn follow_gate_episode(
+        &self,
+        task: &TaskRecord,
+        change: &GateChange,
+        catalog: Option<&AutomationCatalogLoad>,
+    ) {
         if change.is_empty() {
             return;
         }
-        let warning = match self.swap_queue_entries(task, change) {
+        let warning = match self.swap_queue_entries(task, change, catalog) {
             Ok(warning) => warning,
             Err(error) => {
                 tracing::warn!(task = %task.task_id, %error, "observers: cannot update the queue entries of a gate");
@@ -112,17 +120,60 @@ impl ProtocolService {
         let Some(gate) = &task.watched_gate else {
             return;
         };
-        if task.exiting_gate(&gate.episode).is_some() {
-            tracing::info!(task = %task.task_id, episode = %gate.episode, "automations: the task ended at a gate with exit scripts; its queue entry stays until they ran");
+        self.remove_episode_entry(
+            &task.task_id,
+            Some(task),
+            &gate.episode,
+            "the task ended at the gate",
+        );
+    }
+
+    /// Removes the queue entry of the episode `episode` of the task
+    /// `task_id`, under the lock of the queue entries; see
+    /// [`Self::remove_episode_entry_locked`]. A failure is logged.
+    pub(super) fn remove_episode_entry(
+        &self,
+        task_id: &TaskId,
+        task: Option<&TaskRecord>,
+        episode: &str,
+        why: &str,
+    ) {
+        match self.observers.lock_queue_entries() {
+            Ok(lock) => self.remove_episode_entry_locked(&lock, task_id, task, episode, why),
+            Err(error) => {
+                tracing::warn!(task = %task_id, %episode, %error, "automations: cannot lock the queue entries to remove the entry of an episode");
+            }
+        }
+    }
+
+    /// Removes the queue entry of the episode `episode` of the task
+    /// `task_id` (`why` says why, for the log), `lock` held, unless the
+    /// exit scripts of the episode still run for `task` (the task as last
+    /// read, `None` when it cannot be read): the entry then stays until
+    /// they ended (R18). A failure is logged.
+    pub(super) fn remove_episode_entry_locked(
+        &self,
+        lock: &QueueEntriesLock,
+        task_id: &TaskId,
+        task: Option<&TaskRecord>,
+        episode: &str,
+        why: &str,
+    ) {
+        if task.is_some_and(|task| task.exiting_gate(episode).is_some()) {
+            tracing::info!(task = %task_id, %episode, why, "automations: the exit scripts of an episode still run; its queue entry stays until they ended");
             return;
         }
-        let entry_id = queue_entry_id(&task.task_id, &gate.episode);
-        let removed = self
+        match self
             .observers
-            .lock_queue_entries()
-            .and_then(|lock| self.observers.remove_queue_entry(&lock, &entry_id));
-        if let Err(error) = removed {
-            tracing::warn!(task = %task.task_id, %error, "observers: cannot remove the queue entry of an archived task");
+            .remove_queue_entry(lock, &queue_entry_id(task_id, episode))
+        {
+            Ok(true) => {
+                tracing::info!(task = %task_id, %episode, why, "automations: the queue entry of an episode is removed");
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(task = %task_id, %episode, why, %error, "automations: cannot remove the queue entry of an episode");
+            }
         }
     }
 
@@ -132,7 +183,7 @@ impl ProtocolService {
     /// for an ended or archived task, whose entry is about to go.
     pub fn task_queue_entry(&self, task: &TaskRecord) -> Option<QueueEntry> {
         let gate = task.watched_gate.as_ref()?;
-        if task_ended(task) {
+        if task.has_ended() {
             return None;
         }
         let entry_id = queue_entry_id(&task.task_id, &gate.episode);
@@ -148,22 +199,7 @@ impl ProtocolService {
     /// Whether `entry`'s task still waits in the entry's episode (R18).
     pub(super) fn entry_wait(&self, entry: &QueueEntry) -> EntryWait {
         match self.control.task(&entry.task_id) {
-            Ok(task) => {
-                if exit_scripts_run(&task, entry) {
-                    tracing::debug!(task = %entry.task_id, episode = %entry.episode, "automations: the exit scripts of a queue entry's episode run; the entry is kept, not checked");
-                    EntryWait::Unknown
-                } else if !waits_in(&task, &entry.owner, &entry.episode) {
-                    EntryWait::Gone
-                } else if !gate_ready(&task) {
-                    tracing::debug!(task = %entry.task_id, episode = %entry.episode, "automations: the entry scripts of a waiting task have not all succeeded; its queue entry is not checked");
-                    EntryWait::Unknown
-                } else if gate_takes_answer(&task, &entry.episode) {
-                    EntryWait::Waits
-                } else {
-                    tracing::debug!(task = %entry.task_id, episode = %entry.episode, "observers: the runner of a waiting task cannot take an answer now; its queue entry is not run");
-                    EntryWait::Unknown
-                }
-            }
+            Ok(task) => entry_wait_of(&task, entry),
             Err(OrchestrationError::TaskNotFound(_)) => EntryWait::Gone,
             Err(error) => {
                 tracing::warn!(task = %entry.task_id, %error, "observers: cannot read the task of a queue entry");
@@ -172,30 +208,26 @@ impl ProtocolService {
         }
     }
 
-    /// Adds back the entries of queue `queue` that a task waiting in its
-    /// watched episode has none of, or whose file cannot be parsed; returns
-    /// how many. Called at the tick of a pair of the `on_episodes` queue, so
-    /// its cost (one read of the task records) comes at most once per tick
-    /// and pair.
+    /// Adds back the entries of the queues `queues` that a task of `tasks`
+    /// (every task, as listed) waiting in its watched episode has none of,
+    /// or whose file cannot be parsed; returns how many. Called by the pass
+    /// for the `on_episodes` queues with a pair whose tick came.
     ///
     /// Each entry is added under the lock of the queue entries after the
     /// task is read again, so it never comes back for an episode a snapshot
     /// ended meanwhile. No warning: the snapshot that began the episode
     /// wrote the one there is. Failures are logged; the next tick tries
     /// again.
-    pub(super) fn restore_queue_entries(&self, queue: &str) -> usize {
-        let tasks = match self.control.list_tasks() {
-            Ok(tasks) => tasks,
-            Err(error) => {
-                tracing::warn!(%error, "observers: cannot list the tasks for the queue entries");
-                return 0;
-            }
-        };
-        let missing: Vec<TaskRecord> = tasks
-            .into_iter()
+    pub(super) fn restore_queue_entries(
+        &self,
+        tasks: &[TaskRecord],
+        queues: &BTreeSet<String>,
+    ) -> usize {
+        let missing: Vec<&TaskRecord> = tasks
+            .iter()
             .filter(|task| {
                 task.watched_gate.as_ref().is_some_and(|gate| {
-                    gate.watch.queue == queue && waits_in(task, &task.owner, &gate.episode)
+                    queues.contains(&gate.watch.queue) && waits_in(task, &task.owner, &gate.episode)
                 })
             })
             .filter(|task| self.entry_needs_write(task))
@@ -231,13 +263,18 @@ impl ProtocolService {
     }
 
     /// Removes the unreadable entry files `entry_ids` of the episodes no
-    /// task waits in now; returns how many went. Such a file names no task
-    /// a read can see, so its id is matched against the entry id of the
-    /// episode of every waiting task, of every owner. The file of a task
+    /// task of `tasks` (every task, listed before the lock) waits in; returns
+    /// how many went. Such a file names no task a read can see, so its id is
+    /// matched against the entry id of the episode of every waiting task, of
+    /// every owner. The file of a task
     /// that waits stays ([`Self::restore_queue_entries`] rewrites a corrupt
     /// one; one of a newer version is another build's). Removing one loses
     /// nothing: should its task wait after all, a tick adds its entry back.
-    pub(super) fn prune_unreadable_entries(&self, entry_ids: &[String]) -> usize {
+    pub(super) fn prune_unreadable_entries(
+        &self,
+        tasks: &[TaskRecord],
+        entry_ids: &[String],
+    ) -> usize {
         if entry_ids.is_empty() {
             return 0;
         }
@@ -245,13 +282,6 @@ impl ProtocolService {
             Ok(lock) => lock,
             Err(error) => {
                 tracing::warn!(%error, "observers: cannot lock the queue entries to remove unreadable ones");
-                return 0;
-            }
-        };
-        let tasks = match self.control.list_tasks() {
-            Ok(tasks) => tasks,
-            Err(error) => {
-                tracing::warn!(%error, "observers: cannot list the tasks for the unreadable queue entries");
                 return 0;
             }
         };
@@ -336,27 +366,19 @@ impl ProtocolService {
         &self,
         task: &TaskRecord,
         change: &GateChange,
+        catalog: Option<&AutomationCatalogLoad>,
     ) -> Result<Option<String>, ObserverError> {
         let lock = self.observers.lock_queue_entries()?;
-        // An episode left with exit scripts still to run keeps its entry
-        // until they ended.
-        if let Some(ended) = change
-            .ended
-            .as_ref()
-            .filter(|ended| task.exiting_gate(&ended.episode).is_none())
-        {
-            let entry_id = queue_entry_id(&task.task_id, &ended.episode);
-            match self.observers.remove_queue_entry(&lock, &entry_id) {
-                Ok(true) => {
-                    tracing::info!(task = %task.task_id, queue = %ended.watch.queue, episode = %ended.episode, "observers: the gate exited; its queue entry is removed");
-                }
-                Ok(false) => {}
-                // The new episode's entry is still worth adding: the old
-                // one can never be run, the guard before a run drops it.
-                Err(error) => {
-                    tracing::warn!(task = %task.task_id, %error, "observers: cannot remove the queue entry of an ended episode");
-                }
-            }
+        // A failed removal still adds the new episode's entry: the old one
+        // can never be run, the guard before a run drops it.
+        if let Some(ended) = &change.ended {
+            self.remove_episode_entry_locked(
+                &lock,
+                &task.task_id,
+                Some(task),
+                &ended.episode,
+                "the gate exited",
+            );
         }
         let Some(began) = &change.began else {
             return Ok(None);
@@ -376,83 +398,64 @@ impl ProtocolService {
             EntryWrite::Created => {
                 drop(lock);
                 tracing::info!(task = %task.task_id, queue = %began.watch.queue, episode = %began.episode, "observers: a gate added a queue entry");
-                Ok(self.queue_unserved(began))
+                Ok(self.queue_unserved(began, catalog))
             }
-        }
-    }
-
-    /// The automations of queue `queue` whose entry (`in`) and exit
-    /// (`out`) scripts run for an episode that enters it, in the queue
-    /// file's order (R8, R10). None for a queue the catalogue has no usable
-    /// `on_episodes` queue of: no automation serves it, so nothing holds the
-    /// gate back (R17).
-    pub(crate) fn gate_scripts(&self, queue: &str) -> GateScripts {
-        let catalog = self.automation_catalog();
-        let Some(found) = catalog
-            .queues
-            .get(queue)
-            .filter(|found| found.mode == ObserverMode::OnEpisodes)
-        else {
-            return GateScripts::default();
-        };
-        let with = |hook: HookPhase| -> Vec<String> {
-            found
-                .automations
-                .iter()
-                .filter(|name| {
-                    catalog
-                        .automations
-                        .get(*name)
-                        .is_some_and(|automation| automation.has(hook))
-                })
-                .cloned()
-                .collect()
-        };
-        GateScripts {
-            entry: with(HookPhase::In),
-            exit: with(HookPhase::Out),
         }
     }
 
     /// Why no automation of the queue of `gate` can answer it, `None` when
-    /// the catalogue has a usable `on_episodes` queue of that name (R9,
-    /// R27).
-    fn queue_unserved(&self, gate: &WatchedGate) -> Option<String> {
-        let queue = &gate.watch.queue;
-        let catalog = self.automation_catalog();
-        let reason = match catalog.queues.get(queue) {
-            Some(found) if found.mode == ObserverMode::OnEpisodes => return None,
-            Some(_) => format!(
-                "queue '{queue}' runs its automations in mode always, which cannot answer a \
-                 gate; the gate waits for a person"
-            ),
-            None if catalog
-                .problems
-                .iter()
-                .any(|problem| problem_names_queue(&problem.file, queue)) =>
-            {
-                format!(
-                    "the catalogue file of queue '{queue}' cannot be used; the gate waits for a \
-                     person"
-                )
-            }
-            None => format!("queue '{queue}' is not in the catalogue; the gate waits for a person"),
-        };
-        Some(reason)
+    /// `catalog` (read now when not given) has a usable `on_episodes` queue
+    /// of that name (R9, R27).
+    fn queue_unserved(
+        &self,
+        gate: &WatchedGate,
+        catalog: Option<&AutomationCatalogLoad>,
+    ) -> Option<String> {
+        let unserved =
+            |catalog: &AutomationCatalogLoad| catalog.gate_queue(&gate.watch.queue).err();
+        match catalog {
+            Some(catalog) => unserved(catalog),
+            None => unserved(&self.automation_catalog()),
+        }
     }
 }
 
-/// Whether the catalogue file `file` (relative to the catalogue root) is the
-/// file of queue `queue`.
-pub(super) fn problem_names_queue(file: &std::path::Path, queue: &str) -> bool {
-    file.parent() == Some(std::path::Path::new("queues"))
-        && file.file_stem().and_then(|stem| stem.to_str()) == Some(queue)
+/// The automations of queue `queue` whose entry (`in`) and exit (`out`)
+/// scripts run for an episode that enters it, in the queue file's order
+/// (R8, R10). None for a queue `catalog` has no usable `on_episodes` queue
+/// of: no automation serves it, so nothing holds the gate back (R17).
+pub(crate) fn gate_scripts(catalog: &AutomationCatalogLoad, queue: &str) -> GateScripts {
+    let Ok(found) = catalog.gate_queue(queue) else {
+        return GateScripts::default();
+    };
+    GateScripts {
+        entry: catalog.automations_with(found, HookPhase::In),
+        exit: catalog.automations_with(found, HookPhase::Out),
+    }
+}
+
+/// Whether `entry`'s task `task` still waits in the entry's episode (R18).
+pub(super) fn entry_wait_of(task: &TaskRecord, entry: &QueueEntry) -> EntryWait {
+    if exit_scripts_run(task, entry) {
+        tracing::debug!(task = %entry.task_id, episode = %entry.episode, "automations: the exit scripts of a queue entry's episode run; the entry is kept, not checked");
+        EntryWait::Unknown
+    } else if !waits_in(task, &entry.owner, &entry.episode) {
+        EntryWait::Gone
+    } else if !gate_ready(task) {
+        tracing::debug!(task = %entry.task_id, episode = %entry.episode, "automations: the entry scripts of a waiting task have not all succeeded; its queue entry is not checked");
+        EntryWait::Unknown
+    } else if gate_takes_answer(task, &entry.episode) {
+        EntryWait::Waits
+    } else {
+        tracing::debug!(task = %entry.task_id, episode = %entry.episode, "observers: the runner of a waiting task cannot take an answer now; its queue entry is not run");
+        EntryWait::Unknown
+    }
 }
 
 /// Whether `task` of `owner` still waits at its watched gate in `episode`:
 /// not ended, and the episode is the one its last runner snapshot shows.
 pub(super) fn waits_in(task: &TaskRecord, owner: &OwnerRef, episode: &str) -> bool {
-    !task_ended(task)
+    !task.has_ended()
         && &task.owner == owner
         && task
             .watched_gate
@@ -477,12 +480,6 @@ pub(super) fn gate_ready(task: &TaskRecord) -> bool {
     task.watched_gate
         .as_ref()
         .is_some_and(WatchedGate::automation_ready)
-}
-
-/// Whether `task` can take no more answers: finished, archived (or being
-/// archived).
-pub(super) fn task_ended(task: &TaskRecord) -> bool {
-    task.has_ended()
 }
 
 /// Whether the exit scripts of `entry`'s episode still run for `task`: its

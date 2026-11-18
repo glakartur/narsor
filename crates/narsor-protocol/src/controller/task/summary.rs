@@ -172,9 +172,6 @@ pub struct GateHookView {
     pub attempts: u32,
     /// Most attempts the script gets in the episode.
     pub max_attempts: u32,
-    /// When the next automatic attempt runs, after a failed one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_attempt_at: Option<DateTime<Utc>>,
     /// Why the latest attempt failed (bounded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,

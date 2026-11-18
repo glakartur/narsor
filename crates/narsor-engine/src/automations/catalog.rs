@@ -37,8 +37,9 @@ use narsor_protocol::controller::WorkspaceRequest;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::domain::observer_name::{name_like_problem, queue_name_problem};
+use crate::domain::observer_name::{name_like_problem, param_name_problem, queue_name_problem};
 use crate::domain::WorkflowDefinition;
+use crate::environment::catalog::EXTENSIONS;
 use crate::observers::store::script_digest;
 use crate::observers::{
     CreateTaskEffect, ObserverMode, ScheduleConfig, SecretRef, DEFAULT_TASK_LIMIT_PER_RUN,
@@ -48,9 +49,6 @@ use crate::persistence::CatalogPaths;
 
 /// The definition file inside an automation directory.
 pub const AUTOMATION_FILE: &str = "automation.yaml";
-
-/// Extensions of a queue file, in preference order.
-const QUEUE_EXTENSIONS: [&str; 2] = ["yaml", "yml"];
 
 /// The script phases of an automation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -104,8 +102,8 @@ pub struct Automation {
     pub params: Vec<String>,
     /// The secrets the worker hands to its scripts, by name.
     pub secrets: Vec<SecretRef>,
-    /// The scripts that exist, by phase; `check` is always there.
-    pub scripts: BTreeMap<HookPhase, PathBuf>,
+    /// The phases whose script exists; `check` is always there.
+    pub scripts: BTreeSet<HookPhase>,
     /// `sha256:` digest of `automation.yaml` as it was read: a stopped pair
     /// runs again when it changes.
     pub definition_digest: String,
@@ -114,7 +112,7 @@ pub struct Automation {
 impl Automation {
     /// Whether the automation has a script for `phase`.
     pub fn has(&self, phase: HookPhase) -> bool {
-        self.scripts.contains_key(&phase)
+        self.scripts.contains(&phase)
     }
 }
 
@@ -192,6 +190,56 @@ pub struct AutomationCatalogLoad {
     pub automations: BTreeMap<String, Automation>,
     /// Every file that was not used, in path order.
     pub problems: Vec<CatalogProblem>,
+}
+
+impl AutomationCatalogLoad {
+    /// The `on_episodes` queue `name`, whose automations can answer a gate;
+    /// otherwise why none can (R9, R27): the queue runs in mode `always`,
+    /// its file cannot be used, or it is not in the catalogue.
+    pub fn gate_queue(&self, name: &str) -> Result<&Queue, String> {
+        match self.queues.get(name) {
+            Some(queue) if queue.mode == ObserverMode::OnEpisodes => Ok(queue),
+            Some(_) => Err(format!(
+                "queue '{name}' runs its automations in mode always, which cannot answer a \
+                 gate; the gate waits for a person"
+            )),
+            None if self
+                .problems
+                .iter()
+                .any(|problem| problem_names_queue(&problem.file, name)) =>
+            {
+                Err(format!(
+                    "the catalogue file of queue '{name}' cannot be used; the gate waits for a \
+                     person"
+                ))
+            }
+            None => Err(format!(
+                "queue '{name}' is not in the catalogue; the gate waits for a person"
+            )),
+        }
+    }
+
+    /// The automations of `queue` that have a `hook` script, in the queue
+    /// file's order.
+    pub fn automations_with(&self, queue: &Queue, hook: HookPhase) -> Vec<String> {
+        queue
+            .automations
+            .iter()
+            .filter(|name| {
+                self.automations
+                    .get(*name)
+                    .is_some_and(|automation| automation.has(hook))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// Whether the catalogue file `file` (relative to the catalogue root) is the
+/// file of queue `queue`.
+pub(crate) fn problem_names_queue(file: &Path, queue: &str) -> bool {
+    file.parent() == Some(Path::new("queues"))
+        && file.file_stem().and_then(|stem| stem.to_str()) == Some(queue)
 }
 
 /// Why a script could not be read.
@@ -412,7 +460,7 @@ impl AutomationCatalog {
             validate_params(parsed.params).map_err(|reason| self.problem(&file, reason))?;
         let secrets =
             validate_secrets(parsed.secrets).map_err(|reason| self.problem(&file, reason))?;
-        let mut scripts = BTreeMap::new();
+        let mut scripts = BTreeSet::new();
         for phase in HookPhase::ALL {
             let script = dir.join(phase.script_file());
             match std::fs::metadata(&script) {
@@ -426,7 +474,7 @@ impl AutomationCatalog {
                     ))
                 }
                 Ok(_) => {
-                    scripts.insert(phase, script);
+                    scripts.insert(phase);
                 }
                 Err(error) if error.kind() == ErrorKind::NotFound => {
                     if phase == HookPhase::Check {
@@ -511,7 +559,7 @@ impl AutomationCatalog {
             .into_iter()
             .filter_map(|(file_name, path)| {
                 let (stem, extension) = file_name.rsplit_once('.')?;
-                let rank = QUEUE_EXTENSIONS.iter().position(|ext| *ext == extension)?;
+                let rank = EXTENSIONS.iter().position(|ext| *ext == extension)?;
                 Some((rank, stem.to_string(), path))
             })
             .collect();
@@ -579,10 +627,8 @@ impl AutomationCatalog {
 fn validate_params(params: Vec<String>) -> Result<Vec<String>, String> {
     let mut seen = BTreeSet::new();
     for param in &params {
-        if param.trim().is_empty() || param.contains(char::is_whitespace) {
-            return Err(format!(
-                "param name '{param}' is blank or contains whitespace"
-            ));
+        if let Some(problem) = param_name_problem(param) {
+            return Err(problem);
         }
         if !seen.insert(param.as_str()) {
             return Err(format!("param '{param}' is listed twice"));

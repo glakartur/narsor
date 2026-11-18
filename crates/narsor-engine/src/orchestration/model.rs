@@ -707,7 +707,7 @@ impl TaskRecord {
             .filter(|gate| gate.episode == episode)?;
         let automation = gate.automation.as_ref()?;
         let exiting = automation.phase == GateAutomationPhase::Exiting
-            || (self.has_ended() && automation.exit_pending());
+            || (self.has_ended() && automation.exit_due());
         exiting.then_some(gate)
     }
 
@@ -724,6 +724,24 @@ impl TaskRecord {
             .as_ref()?
             .held
             .as_ref()
+    }
+
+    /// The id of the answer the watched gate holds back from the runner,
+    /// if it holds one ([`Self::held_exit_item`]).
+    pub fn held_input_id(&self) -> Option<&str> {
+        match self.held_exit_item()? {
+            HeldExitItem::Input { input_id } => Some(input_id),
+            HeldExitItem::Command { .. } => None,
+        }
+    }
+
+    /// The id of the operator command the watched gate holds back from the
+    /// runner, if it holds one ([`Self::held_exit_item`]).
+    pub fn held_command_id(&self) -> Option<&str> {
+        match self.held_exit_item()? {
+            HeldExitItem::Command { command_id } => Some(command_id),
+            HeldExitItem::Input { .. } => None,
+        }
     }
 
     /// Finds a queued input by id.
@@ -1143,7 +1161,6 @@ impl GateAutomation {
             .filter(|hook| hook.hook == HookPhase::In && hook.status == GateHookStatus::Pending)
         {
             hook.status = GateHookStatus::Skipped;
-            hook.next_attempt_at = None;
         }
         self.phase = if self.exit_pending() {
             GateAutomationPhase::Exiting
@@ -1153,11 +1170,38 @@ impl GateAutomation {
         self.exit = Some(exit);
     }
 
+    /// Whether the episode is not left yet and an exit script of it has
+    /// not ended: an exit not held by the control plane starts them.
+    pub fn exit_due(&self) -> bool {
+        self.phase.before_exit() && self.exit_pending()
+    }
+
+    /// Leaves the episode by an exit no item waits for (the task ended at
+    /// the gate, or the runner left it by itself), when [`Self::exit_due`]:
+    /// returns whether the exit began.
+    pub fn begin_unheld_exit(&mut self, author: GateExitAuthor, at: DateTime<Utc>) -> bool {
+        if !self.exit_due() {
+            return false;
+        }
+        self.begin_exit(GateExit::unheld(author, at));
+        true
+    }
+
     /// The phase the exit scripts give: `released` once none is pending
     /// (each succeeded, failed its last attempt or was skipped, R15);
     /// `None` while one is.
     pub fn exit_outcome(&self) -> Option<GateAutomationPhase> {
         (!self.exit_pending()).then_some(GateAutomationPhase::Released)
+    }
+
+    /// The phase the scripts of `hook` give once none of them is pending
+    /// ([`Self::exit_outcome`] for `out`, [`Self::entry_outcome`]
+    /// otherwise); `None` while one is.
+    pub fn outcome(&self, hook: HookPhase) -> Option<GateAutomationPhase> {
+        match hook {
+            HookPhase::Out => self.exit_outcome(),
+            HookPhase::In | HookPhase::Check => self.entry_outcome(),
+        }
     }
 
     /// Most attempts of one script of `hook`: one for an exit script of a
@@ -1214,6 +1258,20 @@ pub struct GateExit {
     pub held: Option<HeldExitItem>,
     /// When the exit came.
     pub at: DateTime<Utc>,
+}
+
+impl GateExit {
+    /// An exit by `author` at `at` that holds nothing back and has no
+    /// choice: the task ended at the gate, or the runner left it.
+    pub fn unheld(author: GateExitAuthor, at: DateTime<Utc>) -> Self {
+        Self {
+            choice: None,
+            author,
+            run_id: None,
+            held: None,
+            at,
+        }
+    }
 }
 
 /// Who left a watched gate episode (R11).
@@ -1282,19 +1340,9 @@ pub struct GateHook {
     pub hook: HookPhase,
     /// Where it stands.
     pub status: GateHookStatus,
-    /// Attempts that ended (a lost run counts).
-    #[serde(default)]
-    pub attempts: u32,
-    /// The earliest time of the next attempt, after a failed one; `None`:
-    /// at once.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_attempt_at: Option<DateTime<Utc>>,
-    /// Why the latest attempt failed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
     /// Every attempt that ended, oldest first: what the task view lists
     /// under the gate's step (R20). At most the script's attempts, plus a
-    /// skip. Empty in a record from before it was kept.
+    /// skip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub log: Vec<GateHookAttemptLog>,
 }
@@ -1324,11 +1372,31 @@ impl GateHook {
             automation,
             hook,
             status: GateHookStatus::Pending,
-            attempts: 0,
-            next_attempt_at: None,
-            last_error: None,
             log: Vec::new(),
         }
+    }
+
+    /// Attempts that ended (a lost run counts; a skip does not).
+    pub fn attempts(&self) -> u32 {
+        let attempts = self.log.iter().filter(|entry| entry.skipped.is_none());
+        u32::try_from(attempts.count()).unwrap_or(u32::MAX)
+    }
+
+    /// Why the latest failed attempt failed.
+    pub fn last_error(&self) -> Option<&str> {
+        self.log
+            .iter()
+            .rev()
+            .find_map(|entry| entry.error.as_deref())
+    }
+
+    /// The earliest time of the next attempt of a pending script, after a
+    /// failed one; `None`: at once, or no attempt follows.
+    pub fn next_attempt_at(&self) -> Option<DateTime<Utc>> {
+        if self.status != GateHookStatus::Pending {
+            return None;
+        }
+        self.log.last().and_then(|entry| entry.retry_at)
     }
 }
 

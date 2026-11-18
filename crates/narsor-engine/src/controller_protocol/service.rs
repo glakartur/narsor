@@ -291,9 +291,6 @@ impl ProtocolService {
     pub fn notify(&self, task_id: &TaskId) {
         // No receiver is not an error: nobody is listening right now.
         let _ = self.changes.send(task_id.clone());
-        // A changed task may give the worker an entry or exit script to run:
-        // its gate was entered or left, or the task ended or was archived.
-        self.wake_observer_claims();
     }
 }
 

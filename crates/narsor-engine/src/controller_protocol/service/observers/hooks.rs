@@ -68,16 +68,12 @@ use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
-use crate::automations::{
-    pair_definition_digest, Automation, AutomationCatalogLoad, AutomationScript, HookPhase, Queue,
-};
-use crate::controller_protocol::credentials::BearerToken;
+use crate::automations::{Automation, AutomationCatalogLoad, HookPhase, Queue};
 use crate::controller_protocol::service::ProtocolService;
 use crate::domain::TaskId;
 use crate::observers::{
-    queue_entry_id, ActiveRun, AutomationKey, AutomationLock, AutomationRecord, LastRun,
-    ObserverError, ObserverMode, QueueEntry, RunEntry, RunFailure, RunId, RunStatus, ScriptExit,
-    ScriptInput, RUN_FAILURE_VERSION, SCRIPT_CONTRACT_VERSION,
+    ActiveRun, AutomationKey, AutomationLock, AutomationRecord, LastRun, ObserverError,
+    ObserverMode, QueueEntry, RunFailure, RunStatus, ScriptExit,
 };
 use crate::orchestration::{
     GateAutomationPhase, GateExit, GateExitAuthor, GateHookOutcome, GateHookStatus,
@@ -86,19 +82,22 @@ use crate::orchestration::{
 
 use super::entries::{exit_scripts_run, waits_in};
 use super::schedule::{
-    after, bounded, judge_entry_run, script_entry, ClaimedObserverRun, RunReport, LOST_MESSAGE,
-    RUN_DEADLINE_MARGIN_SECS,
+    bounded, judge_entry_run, ClaimedObserverRun, RunPlan, RunReport, LOST_MESSAGE,
 };
 
-/// A hook run that may be claimed: since when it is due, its pair, the
-/// entry it runs for, its script and, for `out`, how the gate was left.
-type HookCandidate = (
-    DateTime<Utc>,
-    AutomationKey,
-    QueueEntry,
-    HookPhase,
-    Option<ScriptExit>,
-);
+/// A hook run that may be claimed.
+struct HookCandidate {
+    /// Since when it is due.
+    due: DateTime<Utc>,
+    /// Its pair.
+    key: AutomationKey,
+    /// The queue entry it runs for.
+    entry: QueueEntry,
+    /// Its script.
+    hook: HookPhase,
+    /// For `out`, how the gate was left.
+    exit: Option<ScriptExit>,
+}
 
 impl ProtocolService {
     /// Claims the entry script run due the longest, `None` when none is
@@ -137,15 +136,15 @@ impl ProtocolService {
                 candidates.push(candidate);
             }
         }
-        candidates.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
-        for (_, key, entry, hook, exit) in candidates {
+        candidates.sort_by(|left, right| (left.due, &left.key).cmp(&(right.due, &right.key)));
+        for candidate in candidates {
+            let key = candidate.key.clone();
             let (Some(queue), Some(automation)) =
                 (pairs.get(&key), catalog.automations.get(&key.automation))
             else {
                 continue;
             };
-            let script = HookScript { hook, exit };
-            match self.claim_hook_from(&key, queue, automation, &entry, script, now) {
+            match self.claim_hook_from(queue, automation, candidate, now) {
                 Ok(Some(claimed)) => return Ok(Some(claimed)),
                 Ok(None) => {}
                 Err(error) => {
@@ -206,11 +205,17 @@ impl ProtocolService {
                 );
                 continue;
             }
-            let due = script.next_attempt_at.or(since).unwrap_or(now);
+            let due = script.next_attempt_at().or(since).unwrap_or(now);
             if due > now || busy_pairs.contains(&key) {
                 continue;
             }
-            return Some((due, key, entry, hook, exit));
+            return Some(HookCandidate {
+                due,
+                key,
+                entry,
+                hook,
+                exit,
+            });
         }
         None
     }
@@ -225,108 +230,53 @@ impl ProtocolService {
     /// `exiting`.
     fn claim_hook_from(
         &self,
-        key: &AutomationKey,
         queue: &Queue,
         automation: &Automation,
-        entry: &QueueEntry,
-        script: HookScript,
+        candidate: HookCandidate,
         now: DateTime<Utc>,
     ) -> Result<Option<ClaimedObserverRun>, ObserverError> {
-        let HookScript { hook, exit } = script;
-        let lock = self.observers.lock(key)?;
-        let mut record = self
-            .observers
-            .load(key)?
-            .unwrap_or_else(|| AutomationRecord::new(key.clone(), now));
+        let HookCandidate {
+            key,
+            entry,
+            hook,
+            exit,
+            ..
+        } = candidate;
+        let lock = self.observers.lock(&key)?;
+        let mut record = self.observers.load_or_new(&key, now)?;
         if record.active_hook.is_some() {
             return Ok(None);
         }
-        let sequence = record.last_run_sequence + 1;
-        record.last_run_sequence = sequence;
-        let run_entry = RunEntry {
-            entry_id: entry.entry_id.clone(),
-            task_id: entry.task_id.clone(),
-            episode: entry.episode.clone(),
+        let plan = RunPlan {
+            phase: hook,
+            entry: Some(&entry),
+            exit,
         };
-        let AutomationScript { text, digest } = match self
-            .launch
-            .automation_script(&key.automation, hook)
-        {
-            Ok(script) => script,
-            Err(error) => {
-                let message = format!("the {hook} script could not be read at the claim: {error}");
-                tracing::warn!(pair = %key, %error, "automations: an entry or exit script run could not start");
-                self.observers.record_failure(
-                    &lock,
-                    &hook_failure(
-                        key,
-                        hook,
-                        sequence,
-                        "",
-                        &run_entry,
-                        (now, now),
-                        RunStatus::Failed,
-                        None,
-                        &message,
-                    ),
-                )?;
+        match self.start_run(&mut record, queue, automation, plan, now) {
+            Ok((active, claimed)) => {
+                record.active_hook = Some(active);
+                self.observers.save(&lock, &mut record, now)?;
+                tracing::info!(run = %claimed.run_id, task = %entry.task_id, episode = %entry.episode, %hook, "automations: an entry or exit script run starts");
+                Ok(Some(claimed))
+            }
+            Err(failure) => {
+                self.observers.record_failure(&lock, &failure)?;
                 self.observers.save(&lock, &mut record, now)?;
                 self.settle_hook(
                     &entry.task_id,
                     &entry.episode,
                     &key.automation,
                     hook,
-                    &GateHookOutcome::Failed(message),
+                    &GateHookOutcome::Failed(failure.error),
                 );
-                return Ok(None);
+                Ok(None)
             }
-        };
-        let run_id = RunId::new(key.clone(), sequence);
-        let token = BearerToken::issue_observer_run(&run_id.to_string());
-        let input = ScriptInput {
-            contract_version: SCRIPT_CONTRACT_VERSION,
-            phase: hook,
-            queue: key.queue.clone(),
-            automation: key.automation.clone(),
-            condition: queue.condition.clone(),
-            state: record.script_state.clone(),
-            entry: Some(script_entry(entry)),
-            exit,
-            first_run: !record.first_run_done,
-            import_backlog: false,
-        };
-        let deadline = after(now, GATE_HOOK_TIMEOUT_SECS + RUN_DEADLINE_MARGIN_SECS);
-        record.last_claim_at = Some(now);
-        record.active_hook = Some(ActiveRun {
-            sequence,
-            phase: hook,
-            script_digest: digest.clone(),
-            definition_digest: pair_definition_digest(queue, automation, &digest),
-            claimed_at: now,
-            deadline,
-            token_digest: token.digest(),
-            tasks_created: 0,
-            entry: Some(run_entry),
-        });
-        self.observers.save(&lock, &mut record, now)?;
-        tracing::info!(run = %run_id, task = %entry.task_id, episode = %entry.episode, %hook, "automations: an entry or exit script run starts");
-        Ok(Some(ClaimedObserverRun {
-            run_id,
-            phase: hook,
-            token,
-            script_digest: digest,
-            script: text,
-            input,
-            secrets: automation.secrets.clone(),
-            timeout_secs: GATE_HOOK_TIMEOUT_SECS,
-            deadline,
-        }))
+        }
     }
 
     /// Applies the worker's result of the hook run `active` of `record`
     /// (its lock held): exit 0 succeeds, anything else is a failed attempt
-    /// with an error file. The pair's record is saved first, then the
-    /// attempt goes to the task.
+    /// with an error file.
     pub(super) fn finish_hook_run(
         &self,
         lock: &AutomationLock,
@@ -336,37 +286,18 @@ impl ProtocolService {
         now: DateTime<Utc>,
     ) -> Result<LastRun, ObserverError> {
         let verdict = judge_entry_run(report, GATE_HOOK_TIMEOUT_SECS);
-        if let (Some(message), Some(entry)) = (&verdict.error, &active.entry) {
-            let mut failure = hook_failure(
+        let failure = verdict.error.as_ref().map(|message| {
+            RunFailure::for_run(
                 &record.key,
-                active.phase,
-                active.sequence,
-                &active.script_digest,
-                entry,
-                (active.claimed_at, now),
+                active,
+                now,
                 verdict.status,
                 verdict.exit_code,
-                message,
-            );
-            failure.stdout = Some(bounded(&report.stdout));
-            failure.stderr = Some(bounded(&report.stderr));
-            self.observers.record_failure(lock, &failure)?;
-        }
-        record.active_hook = None;
-        self.observers.save(lock, record, now)?;
-        if let Some(entry) = &active.entry {
-            let outcome = match &verdict.error {
-                None => GateHookOutcome::Succeeded,
-                Some(message) => GateHookOutcome::Failed(message.clone()),
-            };
-            self.settle_hook(
-                &entry.task_id,
-                &entry.episode,
-                &record.key.automation,
-                active.phase,
-                &outcome,
-            );
-        }
+                message.clone(),
+            )
+            .with_output(bounded(&report.stdout), bounded(&report.stderr))
+        });
+        self.end_hook(lock, record, active, failure, now)?;
         Ok(LastRun {
             sequence: active.sequence,
             status: verdict.status,
@@ -384,29 +315,45 @@ impl ProtocolService {
         active: &ActiveRun,
         now: DateTime<Utc>,
     ) -> Result<(), ObserverError> {
-        if let Some(entry) = &active.entry {
-            let failure = hook_failure(
-                &record.key,
-                active.phase,
-                active.sequence,
-                &active.script_digest,
-                entry,
-                (active.claimed_at, now),
-                RunStatus::Lost,
-                None,
-                LOST_MESSAGE,
-            );
-            self.observers.record_failure(lock, &failure)?;
+        let failure = RunFailure::for_run(
+            &record.key,
+            active,
+            now,
+            RunStatus::Lost,
+            None,
+            LOST_MESSAGE,
+        );
+        self.end_hook(lock, record, active, Some(failure), now)
+    }
+
+    /// Ends the hook run `active` of `record` (its lock held): its error
+    /// file when it failed, the slot cleared and the pair's record saved
+    /// first, then the attempt (a success with no `failure`) goes to the
+    /// task.
+    fn end_hook(
+        &self,
+        lock: &AutomationLock,
+        record: &mut AutomationRecord,
+        active: &ActiveRun,
+        failure: Option<RunFailure>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ObserverError> {
+        if let (Some(failure), Some(_)) = (&failure, &active.entry) {
+            self.observers.record_failure(lock, failure)?;
         }
         record.active_hook = None;
         self.observers.save(lock, record, now)?;
         if let Some(entry) = &active.entry {
+            let outcome = match failure {
+                None => GateHookOutcome::Succeeded,
+                Some(failure) => GateHookOutcome::Failed(failure.error),
+            };
             self.settle_hook(
                 &entry.task_id,
                 &entry.episode,
                 &record.key.automation,
                 active.phase,
-                &GateHookOutcome::Failed(LOST_MESSAGE.to_string()),
+                &outcome,
             );
         }
         Ok(())
@@ -417,26 +364,19 @@ impl ProtocolService {
     /// it. A gate it still waits at keeps its entry until the snapshot
     /// shows it left (the held exit is on its way).
     fn drop_left_entry(&self, task_id: &TaskId, episode: &str) {
-        let waits = match self.control.task(task_id) {
-            Ok(task) => waits_in(&task, &task.owner, episode),
-            Err(_) => false,
-        };
-        if waits {
+        let task = self.control.task(task_id).ok();
+        if task
+            .as_ref()
+            .is_some_and(|task| waits_in(task, &task.owner, episode))
+        {
             return;
         }
-        let removed = self.observers.lock_queue_entries().and_then(|lock| {
-            self.observers
-                .remove_queue_entry(&lock, &queue_entry_id(task_id, episode))
-        });
-        match removed {
-            Ok(true) => {
-                tracing::info!(task = %task_id, %episode, "automations: the exit scripts of a left episode ended; its queue entry is removed");
-            }
-            Ok(false) => {}
-            Err(error) => {
-                tracing::warn!(task = %task_id, %episode, %error, "automations: cannot remove the queue entry of a left episode");
-            }
-        }
+        self.remove_episode_entry(
+            task_id,
+            task.as_ref(),
+            episode,
+            "the exit scripts of a left episode ended",
+        );
     }
 
     /// Writes the end of one attempt to the task (its history, the
@@ -464,18 +404,14 @@ impl ProtocolService {
                 // Also wakes the runner's long-poll: a released exit is
                 // delivered at once.
                 self.notify(task_id);
+                // The task's next entry or exit script may be due now.
+                self.wake_observer_claims();
             }
             Err(error) => {
                 tracing::warn!(task = %task_id, %episode, %automation, %error, "automations: cannot record an attempt of an entry or exit script");
             }
         }
     }
-}
-
-/// Which hook script a claim starts, and for `out` how the gate was left.
-struct HookScript {
-    hook: HookPhase,
-    exit: Option<ScriptExit>,
 }
 
 /// How the gate was left, as an `out` script reads it (R11); a gate of a
@@ -524,35 +460,4 @@ fn no_hook_script(
         ));
     }
     None
-}
-
-/// The error file of the `hook` run for `entry`, with no output; `times`
-/// are when it was claimed and when it ended.
-#[allow(clippy::too_many_arguments)]
-fn hook_failure(
-    key: &AutomationKey,
-    hook: HookPhase,
-    sequence: u64,
-    script_digest: &str,
-    entry: &RunEntry,
-    (claimed_at, finished_at): (DateTime<Utc>, DateTime<Utc>),
-    status: RunStatus,
-    exit_code: Option<i32>,
-    message: &str,
-) -> RunFailure {
-    RunFailure {
-        record_version: RUN_FAILURE_VERSION,
-        key: key.clone(),
-        sequence,
-        phase: hook,
-        script_digest: script_digest.to_string(),
-        claimed_at,
-        finished_at,
-        status,
-        exit_code,
-        error: message.to_string(),
-        stdout: None,
-        stderr: None,
-        entry_id: Some(entry.entry_id.clone()),
-    }
 }

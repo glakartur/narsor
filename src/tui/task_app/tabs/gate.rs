@@ -10,9 +10,11 @@ use ratatui::text::Line;
 use narsor_protocol::api::{Position, PositionStatus};
 use narsor_protocol::controller::{GateAutomationPhase, GateHookView, TaskGateAutomationView};
 
+use crate::tui::form::field::clip;
 use crate::tui::style::{Role, Styles};
 
 use super::super::super::scroll::one_line;
+use super::progress::clock;
 
 /// Longest error excerpt a line shows, in characters.
 const ERROR_EXCERPT: usize = 120;
@@ -136,11 +138,8 @@ fn hook_lines<'a>(
                 Role::Done
             }
         };
-        if let Some(at) = entry.retry_at {
-            text.push_str(&format!(
-                " · następna próba {}",
-                at.with_timezone(&chrono::Local).format("%H:%M:%S")
-            ));
+        if entry.retry_at.is_some() {
+            text.push_str(&format!(" · następna próba {}", clock(entry.retry_at)));
         }
         Line::styled(text, styles.of(role))
     })
@@ -158,11 +157,5 @@ fn author_word(author: &str) -> &'static str {
 }
 
 fn excerpt(text: &str) -> String {
-    let line = one_line(text);
-    if line.chars().count() > ERROR_EXCERPT {
-        let cut: String = line.chars().take(ERROR_EXCERPT - 1).collect();
-        format!("{cut}…")
-    } else {
-        line
-    }
+    clip(&one_line(text), ERROR_EXCERPT)
 }

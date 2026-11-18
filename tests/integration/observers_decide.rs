@@ -422,8 +422,8 @@ fn an_entry_is_not_run_during_a_runner_problem_and_is_answered_after_it() {
         1,
         "the entry is kept"
     );
-    *fx.clock.0.lock().unwrap() +=
-        chrono::Duration::seconds(narsor_engine::observers::DEFAULT_INTERVAL_SECS as i64);
+    // One interval of the queue: its next tick.
+    *fx.clock.0.lock().unwrap() += chrono::Duration::seconds(300);
     wait_at(&fx.service, &task, "input-1", &review_gate(QUEUE));
 
     let run = fx.claimed_run();

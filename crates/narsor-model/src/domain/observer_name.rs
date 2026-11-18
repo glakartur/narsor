@@ -45,6 +45,13 @@ pub fn observer_name_problem(value: &str) -> Option<String> {
     })
 }
 
+/// Why `name` is not a valid param name of a gate's `watch.params` (and of
+/// an automation's `params`), if it is not: not blank, no whitespace.
+pub fn param_name_problem(name: &str) -> Option<String> {
+    (name.trim().is_empty() || name.contains(char::is_whitespace))
+        .then(|| format!("param name '{name}' is blank or contains whitespace"))
+}
+
 /// Why `value` is not a valid queue name, if it is not: the characters of
 /// an observer name, so an observer's own name is always a valid queue.
 pub fn queue_name_problem(value: &str) -> Option<String> {

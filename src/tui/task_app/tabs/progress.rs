@@ -460,7 +460,7 @@ fn axis_cap(area_width: u16, today: u16) -> usize {
 }
 
 /// When a step started or ended, as the axis shows it.
-fn clock(time: Option<chrono::DateTime<chrono::Utc>>) -> String {
+pub(super) fn clock(time: Option<chrono::DateTime<chrono::Utc>>) -> String {
     time.map_or_else(String::new, |time| {
         time.with_timezone(&chrono::Local)
             .format("%m-%d %H:%M:%S")

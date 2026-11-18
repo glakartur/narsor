@@ -399,7 +399,7 @@ fn a_runner_problem_in_the_same_episode_keeps_the_entry_and_warns_once() {
         .record_runner_snapshot(&task, FIRST_RUNNER, 1, broken)
         .unwrap();
     fx.service
-        .follow_gate_episode(&outcome.task, &outcome.gate_change);
+        .follow_gate_episode(&outcome.task, &outcome.gate_change, None);
 
     assert!(outcome.gate_change.is_empty());
     assert_eq!(fx.entries(QUEUE), before);
@@ -612,7 +612,7 @@ fn a_paused_task_keeps_its_entry() {
         .record_runner_snapshot(&task, FIRST_RUNNER, 1, at_safe_point)
         .unwrap();
     fx.service
-        .follow_gate_episode(&outcome.task, &outcome.gate_change);
+        .follow_gate_episode(&outcome.task, &outcome.gate_change, None);
     let paused = observe(&fx.service, &task, &lease, Observation::PausedAtSafePoint);
 
     assert_eq!(paused.runner_state, RunnerState::Stopped);

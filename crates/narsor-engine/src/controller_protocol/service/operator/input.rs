@@ -42,6 +42,9 @@ impl ProtocolService {
         )?;
         if !outcome.replayed {
             self.notify(&record.task_id);
+            // An answer at a gate with exit scripts holds its exit: they
+            // are due now.
+            self.wake_observer_claims();
         }
         if !outcome.input.status.is_settled() {
             self.resume_for_work(&record, &outcome.input.idempotency_key)?;

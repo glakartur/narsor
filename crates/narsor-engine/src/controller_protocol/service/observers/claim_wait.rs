@@ -9,8 +9,12 @@
 //!                                             then look again
 //!           the limit passed, none due      → nothing
 //!           waiting claims released         → nothing, at once (shutdown)
-//! wake      a task changed (notify)         → its gate was entered or left,
-//!                                             it ended or was archived
+//! wake      a task's gate was entered or    → its entry or exit scripts
+//!           left, an exit was held (an        may be due
+//!           answer, an operator command),
+//!           or it was archived
+//!           an entry or exit script attempt → the task's next one may be due
+//!           ended
 //!           a run's result was recorded     → its pair is free again
 //!           the periodic pass ended         → ticks it flagged, runs it lost,
 //!                                             retry times and deadlines

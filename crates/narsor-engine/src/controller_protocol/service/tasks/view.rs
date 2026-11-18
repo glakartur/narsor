@@ -34,10 +34,9 @@ pub(super) fn gate_automation(record: &TaskRecord) -> Option<TaskGateAutomationV
                 GateHookStatus::Unrecognized => "unrecognized",
             }
             .to_string(),
-            attempts: hook.attempts,
+            attempts: hook.attempts(),
             max_attempts: automation.max_attempts(hook.hook),
-            next_attempt_at: hook.next_attempt_at,
-            last_error: hook.last_error.clone(),
+            last_error: hook.last_error().map(str::to_owned),
             log: hook
                 .log
                 .iter()

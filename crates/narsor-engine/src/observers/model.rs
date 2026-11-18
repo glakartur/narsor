@@ -35,8 +35,6 @@ pub const RUN_FAILURE_VERSION: u32 = 1;
 /// Current schema version of [`QueueEntry`].
 pub const QUEUE_ENTRY_VERSION: u32 = 1;
 
-/// Interval between two scheduled runs when the owner names none (5 min).
-pub const DEFAULT_INTERVAL_SECS: u64 = 300;
 /// Shortest interval a queue may have (R17), and the shortest gap
 /// between two fires of a cron schedule (R28): it protects the API limits
 /// of the source.
@@ -180,15 +178,8 @@ impl fmt::Display for RunId {
 // ---------------------------------------------------------------------------
 
 /// When the automations of a queue run (R28): an interval, or a five-field cron
-/// expression in UTC. Exactly one of the two.
-///
-/// On disk and on the wire `{"interval_secs": 300}` or
-/// `{"cron": "*/10 * * * *"}`: a record written before cron existed holds
-/// only `interval_secs` and reads unchanged. A stored schedule with neither
-/// field reads as the default interval, as it did before; a new observer
-/// must name one ([`ScheduleConfig::from_parts`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "ScheduleFields", into = "ScheduleFields")]
+/// expression in UTC. Exactly one of the two ([`ScheduleConfig::from_parts`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleConfig {
     /// Seconds between two scheduled runs; at least [`MIN_INTERVAL_SECS`].
     Interval {
@@ -197,41 +188,6 @@ pub enum ScheduleConfig {
     },
     /// The fire times of a cron expression.
     Cron(CronSchedule),
-}
-
-/// The stored form of a [`ScheduleConfig`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct ScheduleFields {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    interval_secs: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cron: Option<CronSchedule>,
-}
-
-impl TryFrom<ScheduleFields> for ScheduleConfig {
-    type Error = ObserverError;
-
-    fn try_from(fields: ScheduleFields) -> Result<Self> {
-        match (fields.interval_secs, fields.cron) {
-            (None, None) => Ok(Self::default()),
-            (interval_secs, cron) => Self::from_parts(interval_secs, cron.map(String::from)),
-        }
-    }
-}
-
-impl From<ScheduleConfig> for ScheduleFields {
-    fn from(schedule: ScheduleConfig) -> Self {
-        match schedule {
-            ScheduleConfig::Interval { secs } => Self {
-                interval_secs: Some(secs),
-                cron: None,
-            },
-            ScheduleConfig::Cron(cron) => Self {
-                interval_secs: None,
-                cron: Some(cron),
-            },
-        }
-    }
 }
 
 /// `secs` seconds; a count too large for a duration is the largest one.
@@ -246,14 +202,6 @@ pub fn secs_duration(secs: u64) -> chrono::Duration {
 fn after_secs(at: DateTime<Utc>, secs: u64) -> DateTime<Utc> {
     at.checked_add_signed(secs_duration(secs))
         .unwrap_or(DateTime::<Utc>::MAX_UTC)
-}
-
-impl Default for ScheduleConfig {
-    fn default() -> Self {
-        Self::Interval {
-            secs: DEFAULT_INTERVAL_SECS,
-        }
-    }
 }
 
 impl ScheduleConfig {
@@ -668,6 +616,16 @@ pub struct RunEntry {
     pub episode: String,
 }
 
+impl From<&QueueEntry> for RunEntry {
+    fn from(entry: &QueueEntry) -> Self {
+        Self {
+            entry_id: entry.entry_id.clone(),
+            task_id: entry.task_id.clone(),
+            episode: entry.episode.clone(),
+        }
+    }
+}
+
 impl ActiveRun {
     /// The run's id within `key`.
     pub fn run_id(&self, key: &AutomationKey) -> RunId {
@@ -782,11 +740,16 @@ impl AutomationRecord {
         }
     }
 
-    /// The pair's run in progress with `sequence`, scheduled or hook.
-    pub fn run_in_progress(&self, sequence: u64) -> Option<&ActiveRun> {
+    /// The pair's runs in progress: the scheduled one, then the hook one.
+    pub fn runs_in_progress(&self) -> impl Iterator<Item = &ActiveRun> {
         [self.active_run.as_ref(), self.active_hook.as_ref()]
             .into_iter()
             .flatten()
+    }
+
+    /// The pair's run in progress with `sequence`, scheduled or hook.
+    pub fn run_in_progress(&self, sequence: u64) -> Option<&ActiveRun> {
+        self.runs_in_progress()
             .find(|active| active.sequence == sequence)
     }
 
@@ -894,6 +857,68 @@ impl RunFailure {
     /// The run's id.
     pub fn run_id(&self) -> RunId {
         RunId::new(self.key.clone(), self.sequence)
+    }
+
+    /// The error of the `phase` run `sequence` of `key` whose script could
+    /// not be read at the claim (`at`): a failed run with no script digest
+    /// and no output.
+    pub fn at_claim(
+        key: &AutomationKey,
+        phase: HookPhase,
+        sequence: u64,
+        entry: Option<&RunEntry>,
+        at: DateTime<Utc>,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            record_version: RUN_FAILURE_VERSION,
+            key: key.clone(),
+            sequence,
+            phase,
+            script_digest: String::new(),
+            claimed_at: at,
+            finished_at: at,
+            status: RunStatus::Failed,
+            exit_code: None,
+            error: error.into(),
+            stdout: None,
+            stderr: None,
+            entry_id: entry.map(|entry| entry.entry_id.clone()),
+        }
+    }
+
+    /// The error of the run `active` of `key` that ended at `finished_at`
+    /// with `status`, with no output ([`Self::with_output`] adds it).
+    pub fn for_run(
+        key: &AutomationKey,
+        active: &ActiveRun,
+        finished_at: DateTime<Utc>,
+        status: RunStatus,
+        exit_code: Option<i32>,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            script_digest: active.script_digest.clone(),
+            claimed_at: active.claimed_at,
+            status,
+            exit_code,
+            ..Self::at_claim(
+                key,
+                active.phase,
+                active.sequence,
+                active.entry.as_ref(),
+                finished_at,
+                error,
+            )
+        }
+    }
+
+    /// The error with the script's stdout and stderr as the worker sent
+    /// them.
+    pub fn with_output(mut self, stdout: String, stderr: String) -> Self {
+        self.stdout = Some(stdout);
+        self.stderr = Some(stderr);
+        self
     }
 }
 
@@ -1136,27 +1161,6 @@ mod tests {
                 "{interval:?} {cron:?}"
             );
         }
-    }
-
-    #[test]
-    fn a_stored_schedule_keeps_the_old_interval_field() {
-        let old: ScheduleConfig = serde_json::from_str(r#"{"interval_secs": 600}"#).unwrap();
-        assert_eq!(old, ScheduleConfig::Interval { secs: 600 });
-        assert_eq!(
-            serde_json::to_value(&old).unwrap(),
-            serde_json::json!({"interval_secs": 600})
-        );
-        let empty: ScheduleConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(empty, ScheduleConfig::default());
-        let cron: ScheduleConfig = serde_json::from_str(r#"{"cron": "0 8 * * 1-5"}"#).unwrap();
-        assert_eq!(
-            serde_json::to_value(&cron).unwrap(),
-            serde_json::json!({"cron": "0 8 * * 1-5"})
-        );
-        assert!(serde_json::from_str::<ScheduleConfig>(
-            r#"{"interval_secs": 600, "cron": "* * * * *"}"#
-        )
-        .is_err());
     }
 
     #[test]

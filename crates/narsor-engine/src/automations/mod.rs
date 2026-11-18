@@ -21,6 +21,7 @@
 pub mod catalog;
 
 pub use crate::observers::{CreateTaskEffect, ObserverMode, ScheduleConfig, SecretRef};
+pub(crate) use catalog::problem_names_queue;
 pub use catalog::{
     pair_definition_digest, Automation, AutomationCatalog, AutomationCatalogError,
     AutomationCatalogLoad, AutomationScript, CatalogProblem, HookPhase, Queue, QueueTasks,

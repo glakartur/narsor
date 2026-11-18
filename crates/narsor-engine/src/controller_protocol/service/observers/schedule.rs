@@ -88,15 +88,14 @@
 //! The pass and the claim list the records leniently: a record that cannot
 //! be read is logged and skipped, so it does not stop the others (D7).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
 use narsor_protocol::controller::{ObserverSecretRef, ObserverWorkerRun};
 use serde::Serialize;
 
 use crate::automations::{
-    pair_definition_digest, Automation, AutomationCatalogError, AutomationCatalogLoad,
-    AutomationScript, HookPhase, Queue,
+    pair_definition_digest, Automation, AutomationCatalogLoad, AutomationScript, HookPhase, Queue,
 };
 use crate::controller_protocol::credentials::{
     observer_run_token_id, token_matches_digest, BearerToken,
@@ -106,12 +105,17 @@ use crate::controller_protocol::service::ProtocolService;
 use crate::observers::{
     parse_script_output, secs_duration, ActiveRun, AutomationKey, AutomationLock, AutomationRecord,
     AutomationState, LastRun, ObserverError, ObserverMode, QueueEntry, RunEntry, RunFailure, RunId,
-    RunStatus, ScheduleConfig, ScriptChoice, ScriptEntry, ScriptInput, ScriptOutput,
-    ScriptVariable, SecretRef, ENTRY_DONE_EXIT_CODE, MAX_SCRIPT_OUTPUT_BYTES, RUN_FAILURE_VERSION,
+    RunStatus, ScheduleConfig, ScriptChoice, ScriptEntry, ScriptExit, ScriptInput, ScriptOutput,
+    ScriptVariable, SecretRef, ENTRY_DONE_EXIT_CODE, MAX_SCRIPT_OUTPUT_BYTES,
     SCRIPT_CONTRACT_VERSION,
 };
 
-use super::entries::EntryWait;
+use crate::orchestration::GATE_HOOK_TIMEOUT_SECS;
+
+use crate::domain::TaskId;
+use crate::orchestration::TaskRecord;
+
+use super::entries::{entry_wait_of, EntryWait};
 
 /// Failed runs in a row after which a pair goes to `error` (R16).
 pub const MAX_CONSECUTIVE_FAILURES: u32 = 5;
@@ -437,10 +441,26 @@ fn count_failure(
 /// Whether a run of `record` in progress (scheduled or hook) passed its
 /// deadline at `now`.
 fn has_lost_run(record: &AutomationRecord, now: DateTime<Utc>) -> bool {
-    [record.active_run.as_ref(), record.active_hook.as_ref()]
-        .into_iter()
-        .flatten()
+    record
+        .runs_in_progress()
         .any(|active| active.is_past_deadline(now))
+}
+
+/// The conflict of a result that came after its run's deadline: the run
+/// was recorded as lost.
+fn run_lost(run_id: &RunId) -> ProtocolError {
+    ProtocolError::conflict(
+        "observer_run_lost",
+        format!("run {run_id} passed its deadline and was recorded as lost"),
+    )
+}
+
+/// What a claim starts: the script phase, the queue entry it runs for and,
+/// for `out`, how the gate was left.
+pub(super) struct RunPlan<'a> {
+    pub(super) phase: HookPhase,
+    pub(super) entry: Option<&'a QueueEntry>,
+    pub(super) exit: Option<ScriptExit>,
 }
 
 /// The round's next entry waits for a claim from `now`, not from the claim
@@ -488,9 +508,30 @@ impl ProtocolService {
             };
         let now = self.control.now();
         let mut pass = ObserverPass::default();
+        // The entries of the `on_episodes` queues whose tick came are tidied
+        // once per queue, before any pair's lock.
+        let ticking: BTreeSet<String> = pairs
+            .iter()
+            .filter(|(key, queue)| {
+                queue.mode == ObserverMode::OnEpisodes
+                    && records.get(*key).is_none_or(|record| {
+                        !has_lost_run(record, now) && scheduled_run_due(record, now)
+                    })
+            })
+            .map(|(key, _)| key.queue.clone())
+            .collect();
+        let tidied = if ticking.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.tidy_queue_entries(&ticking, &mut pass)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "automations: cannot tidy the queue entries");
+                    BTreeMap::new()
+                })
+        };
         for (key, queue) in &pairs {
             let result = match records.get(key) {
-                None => self.mark_run_due(key, queue, now, &mut pass),
+                None => self.mark_run_due(key, queue, &tidied, now, &mut pass),
                 Some(record) => {
                     if has_lost_run(record, now) {
                         self.expire_run_if_lost(key, Some(&queue.schedule), now)
@@ -505,7 +546,7 @@ impl ProtocolService {
                     } else if tick_while_busy(record, now) {
                         self.skip_busy_tick(key, &queue.schedule, now, &mut pass)
                     } else if scheduled_run_due(record, now) {
-                        self.mark_run_due(key, queue, now, &mut pass)
+                        self.mark_run_due(key, queue, &tidied, now, &mut pass)
                     } else {
                         Ok(())
                     }
@@ -519,7 +560,7 @@ impl ProtocolService {
             let result = if has_lost_run(record, now) {
                 self.expire_run_if_lost(key, None, now)
                     .map(|lost| pass.lost.extend(lost))
-            } else if record.active_run.is_none() && record.active_hook.is_none() {
+            } else if record.runs_in_progress().next().is_none() {
                 self.remove_record(key, &mut pass)
             } else {
                 Ok(())
@@ -617,6 +658,8 @@ impl ProtocolService {
         report: RunReport,
     ) -> ProtocolResult<LastRun> {
         let key = &run_id.key;
+        // Read before the pair's lock: the catalogue is not the pair's.
+        let schedule = self.queue_schedule(&key.queue);
         let lock = self.observers.lock(key)?;
         let ended = || {
             ProtocolError::conflict(
@@ -625,36 +668,16 @@ impl ProtocolService {
             )
         };
         let mut record = self.observers.load(key)?.ok_or_else(ended)?;
-        if let Some(active) = record
-            .active_hook
-            .clone()
-            .filter(|active| active.sequence == run_id.sequence)
-        {
-            let now = self.control.now();
-            if active.is_past_deadline(now) {
-                self.lose_hook(&lock, &mut record, &active, now)?;
-                return Err(ProtocolError::conflict(
-                    "observer_run_lost",
-                    format!("run {run_id} passed its deadline and was recorded as lost"),
-                ));
-            }
-            return Ok(self.finish_hook_run(&lock, &mut record, &active, &report, now)?);
-        }
-        let Some(active) = record
-            .active_run
-            .clone()
-            .filter(|active| active.sequence == run_id.sequence)
-        else {
+        let Some(active) = record.run_in_progress(run_id.sequence).cloned() else {
             return Err(ended());
         };
         let now = self.control.now();
-        let schedule = self.queue_schedule(&key.queue);
         if active.is_past_deadline(now) {
-            self.lose_run(&lock, &mut record, &active, schedule.as_ref(), now)?;
-            return Err(ProtocolError::conflict(
-                "observer_run_lost",
-                format!("run {run_id} passed its deadline and was recorded as lost"),
-            ));
+            self.lose(&lock, &mut record, &active, schedule.as_ref(), now)?;
+            return Err(run_lost(run_id));
+        }
+        if active.phase != HookPhase::Check {
+            return Ok(self.finish_hook_run(&lock, &mut record, &active, &report, now)?);
         }
         // The next tick was set when this run's tick came; one the run
         // outlasted is skipped, not owed (KTD-3, R29).
@@ -689,24 +712,10 @@ impl ProtocolService {
             }
         };
         if let Some(message) = &error {
-            self.observers.record_failure(
-                &lock,
-                &RunFailure {
-                    record_version: RUN_FAILURE_VERSION,
-                    key: key.clone(),
-                    sequence: active.sequence,
-                    phase: active.phase,
-                    script_digest: active.script_digest.clone(),
-                    claimed_at: active.claimed_at,
-                    finished_at: now,
-                    status,
-                    exit_code,
-                    error: message.clone(),
-                    stdout: Some(bounded(&report.stdout)),
-                    stderr: Some(bounded(&report.stderr)),
-                    entry_id: active.entry.as_ref().map(|entry| entry.entry_id.clone()),
-                },
-            )?;
+            let failure =
+                RunFailure::for_run(key, &active, now, status, exit_code, message.clone())
+                    .with_output(bounded(&report.stdout), bounded(&report.stderr));
+            self.observers.record_failure(&lock, &failure)?;
         }
         record.active_run = None;
         if let Some(entry) = &active.entry {
@@ -765,11 +774,14 @@ impl ProtocolService {
     /// unless the queue is `on_episodes` and empty once the entries of
     /// ended tasks are gone and missing ones are back (R19, R30). An
     /// `on_episodes` pair's round is the entries left; an `always` pair's
-    /// run has no entry (R25).
+    /// run has no entry (R25). `tidied` holds the entries the pass left of
+    /// the queues it tidied ([`Self::tidy_queue_entries`]); a queue it did
+    /// not is tidied here.
     fn mark_run_due(
         &self,
         key: &AutomationKey,
         queue: &Queue,
+        tidied: &BTreeMap<String, Vec<QueueEntry>>,
         now: DateTime<Utc>,
         pass: &mut ObserverPass,
     ) -> Result<(), ObserverError> {
@@ -791,9 +803,13 @@ impl ProtocolService {
         let tick = record.next_run_at.unwrap_or(now);
         record.next_run_at = Some(queue.schedule.next_tick_after(tick, now));
         if queue.mode == ObserverMode::OnEpisodes {
-            pass.entries_restored += self.restore_queue_entries(&key.queue);
-            let (remaining, removed) = self.prune_entries(&key.queue)?;
-            pass.entries_removed += removed;
+            let remaining = match tidied.get(&key.queue) {
+                Some(entries) => entries.clone(),
+                None => self
+                    .tidy_queue_entries(&BTreeSet::from([key.queue.clone()]), pass)?
+                    .remove(&key.queue)
+                    .unwrap_or_default(),
+            };
             // The last runs of entries that left the queue are of no use.
             record
                 .entry_last_runs
@@ -886,7 +902,7 @@ impl ProtocolService {
         if self
             .observers
             .load(key)?
-            .is_some_and(|record| record.active_run.is_some() || record.active_hook.is_some())
+            .is_some_and(|record| record.runs_in_progress().next().is_some())
         {
             return Ok(());
         }
@@ -910,27 +926,36 @@ impl ProtocolService {
         let Some(mut record) = self.observers.load(key)? else {
             return Ok(Vec::new());
         };
+        let expired: Vec<ActiveRun> = record
+            .runs_in_progress()
+            .filter(|active| active.is_past_deadline(now))
+            .cloned()
+            .collect();
         let mut lost = Vec::new();
-        if let Some(active) = record
-            .active_run
-            .clone()
-            .filter(|active| active.is_past_deadline(now))
-        {
-            self.lose_run(&lock, &mut record, &active, schedule, now)?;
-            lost.push(active.run_id(key));
-        }
-        if let Some(active) = record
-            .active_hook
-            .clone()
-            .filter(|active| active.is_past_deadline(now))
-        {
-            self.lose_hook(&lock, &mut record, &active, now)?;
-            lost.push(active.run_id(key));
-        }
-        for run_id in &lost {
+        for active in expired {
+            self.lose(&lock, &mut record, &active, schedule, now)?;
+            let run_id = active.run_id(key);
             tracing::info!(run = %run_id, "automations: run lost by the worker");
+            lost.push(run_id);
         }
         Ok(lost)
+    }
+
+    /// Ends the run `active` of `record` (its lock held) as lost: a hook
+    /// run as a failed attempt ([`Self::lose_hook`]), a scheduled run as
+    /// [`Self::lose_run`] says.
+    fn lose(
+        &self,
+        lock: &AutomationLock,
+        record: &mut AutomationRecord,
+        active: &ActiveRun,
+        schedule: Option<&ScheduleConfig>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ObserverError> {
+        match active.phase {
+            HookPhase::Check => self.lose_run(lock, record, active, schedule, now),
+            HookPhase::In | HookPhase::Out => self.lose_hook(lock, record, active, now),
+        }
     }
 
     /// Ends the run `active` as lost: its error file is written, its token
@@ -947,21 +972,14 @@ impl ProtocolService {
     ) -> Result<(), ObserverError> {
         self.observers.record_failure(
             lock,
-            &RunFailure {
-                record_version: RUN_FAILURE_VERSION,
-                key: record.key.clone(),
-                sequence: active.sequence,
-                phase: active.phase,
-                script_digest: active.script_digest.clone(),
-                claimed_at: active.claimed_at,
-                finished_at: now,
-                status: RunStatus::Lost,
-                exit_code: None,
-                error: LOST_MESSAGE.to_string(),
-                stdout: None,
-                stderr: None,
-                entry_id: active.entry.as_ref().map(|entry| entry.entry_id.clone()),
-            },
+            &RunFailure::for_run(
+                &record.key,
+                active,
+                now,
+                RunStatus::Lost,
+                None,
+                LOST_MESSAGE,
+            ),
         )?;
         record.active_run = None;
         if let Some(entry) = &active.entry {
@@ -1012,58 +1030,92 @@ impl ProtocolService {
                 None
             }
         };
-        let sequence = record.last_run_sequence + 1;
-        record.last_run_sequence = sequence;
         record.last_claim_at = Some(now);
         // Entries left in the round keep the pair due: the next one is
         // claimed once this run has its result.
         record.run_due_since = (!record.entry_round.is_empty()).then_some(now);
-        let run_entry = entry.as_ref().map(|entry| RunEntry {
-            entry_id: entry.entry_id.clone(),
-            task_id: entry.task_id.clone(),
-            episode: entry.episode.clone(),
-        });
-        let script = match self
+        let plan = RunPlan {
+            phase: HookPhase::Check,
+            entry: entry.as_ref(),
+            exit: None,
+        };
+        match self.start_run(&mut record, queue, automation, plan, now) {
+            Ok((active, claimed)) => {
+                record.active_run = Some(active);
+                self.observers.save(&lock, &mut record, now)?;
+                Ok(Some(claimed))
+            }
+            Err(failure) => {
+                self.fail_unreadable_script(&lock, &mut record, queue, automation, failure, now)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Starts the run `plan` of `record`'s pair (its lock held; the record
+    /// is not saved): the next sequence number, the script as the catalogue
+    /// holds it now, the run's token, input and deadline. The caller puts
+    /// the run in its slot of the record.
+    ///
+    /// When the script cannot be read, the run's error comes back, not
+    /// recorded yet; its sequence number stays taken.
+    pub(super) fn start_run(
+        &self,
+        record: &mut AutomationRecord,
+        queue: &Queue,
+        automation: &Automation,
+        plan: RunPlan<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<(ActiveRun, ClaimedObserverRun), Box<RunFailure>> {
+        let RunPlan { phase, entry, exit } = plan;
+        let key = record.key.clone();
+        let sequence = record.last_run_sequence + 1;
+        record.last_run_sequence = sequence;
+        let run_entry = entry.map(RunEntry::from);
+        let AutomationScript { text, digest } = match self
             .launch
-            .automation_script(&key.automation, HookPhase::Check)
+            .automation_script(&key.automation, phase)
         {
             Ok(script) => script,
             Err(error) => {
-                self.fail_unreadable_script(
-                    &lock,
-                    &mut record,
-                    queue,
-                    &pair_definition_digest(queue, automation, ""),
+                tracing::warn!(pair = %key, %phase, %error, "automations: a run could not start");
+                return Err(Box::new(RunFailure::at_claim(
+                    &key,
+                    phase,
                     sequence,
-                    run_entry,
-                    &error,
+                    run_entry.as_ref(),
                     now,
-                )?;
-                return Ok(None);
+                    format!("the {phase} script could not be read at the claim: {error}"),
+                )));
             }
         };
-        let AutomationScript { text, digest } = script;
+        let timeout_secs = match phase {
+            HookPhase::Check => SCRIPT_TIMEOUT_SECS,
+            HookPhase::In | HookPhase::Out => GATE_HOOK_TIMEOUT_SECS,
+        };
         let run_id = RunId::new(key.clone(), sequence);
         let token = BearerToken::issue_observer_run(&run_id.to_string());
         let input = ScriptInput {
             contract_version: SCRIPT_CONTRACT_VERSION,
-            phase: HookPhase::Check,
+            phase,
             queue: key.queue.clone(),
             automation: key.automation.clone(),
             condition: queue.condition.clone(),
             state: record.script_state.clone(),
-            entry: entry.as_ref().map(script_entry),
-            exit: None,
+            entry: entry.map(script_entry),
+            exit,
             first_run: !record.first_run_done,
-            import_backlog: queue
-                .tasks
-                .as_ref()
-                .is_some_and(|tasks| tasks.import_backlog),
+            import_backlog: phase == HookPhase::Check
+                && queue
+                    .tasks
+                    .as_ref()
+                    .is_some_and(|tasks| tasks.import_backlog),
         };
-        let deadline = after(now, SCRIPT_TIMEOUT_SECS + RUN_DEADLINE_MARGIN_SECS);
-        record.active_run = Some(ActiveRun {
+        let deadline = after(now, timeout_secs + RUN_DEADLINE_MARGIN_SECS);
+        record.last_claim_at = Some(now);
+        let active = ActiveRun {
             sequence,
-            phase: HookPhase::Check,
+            phase,
             script_digest: digest.clone(),
             definition_digest: pair_definition_digest(queue, automation, &digest),
             claimed_at: now,
@@ -1071,69 +1123,52 @@ impl ProtocolService {
             token_digest: token.digest(),
             tasks_created: 0,
             entry: run_entry,
-        });
-        self.observers.save(&lock, &mut record, now)?;
-        Ok(Some(ClaimedObserverRun {
+        };
+        let claimed = ClaimedObserverRun {
             run_id,
-            phase: HookPhase::Check,
+            phase,
             token,
             script_digest: digest,
             script: text,
             input,
             secrets: automation.secrets.clone(),
-            timeout_secs: SCRIPT_TIMEOUT_SECS,
+            timeout_secs,
             deadline,
-        }))
+        };
+        Ok((active, claimed))
     }
 
-    /// Ends the run `sequence` that could not start because its script
-    /// could not be read at the claim: a failed run with the reason, as if
-    /// the script had failed (a failure of an `always` pair counts towards
-    /// its backoff; one for an entry is recorded for the entry).
-    #[allow(clippy::too_many_arguments)]
+    /// Ends the `check` run that could not start because its script could
+    /// not be read at the claim (`failure`): a failed run with the reason,
+    /// as if the script had failed (a failure of an `always` pair counts
+    /// towards its backoff; one for an entry is recorded for the entry).
     fn fail_unreadable_script(
         &self,
         lock: &AutomationLock,
         record: &mut AutomationRecord,
         queue: &Queue,
-        definition_digest: &str,
-        sequence: u64,
-        entry: Option<RunEntry>,
-        error: &AutomationCatalogError,
+        automation: &Automation,
+        failure: Box<RunFailure>,
         now: DateTime<Utc>,
     ) -> Result<(), ObserverError> {
-        let message = format!("the check script could not be read at the claim: {error}");
-        tracing::warn!(pair = %record.key, %error, "automations: a run could not start");
-        self.observers.record_failure(
-            lock,
-            &RunFailure {
-                record_version: RUN_FAILURE_VERSION,
-                key: record.key.clone(),
-                sequence,
-                phase: HookPhase::Check,
-                script_digest: String::new(),
-                claimed_at: now,
-                finished_at: now,
-                status: RunStatus::Failed,
-                exit_code: None,
-                error: message.clone(),
-                stdout: None,
-                stderr: None,
-                entry_id: entry.as_ref().map(|entry| entry.entry_id.clone()),
-            },
-        )?;
-        match &entry {
-            Some(entry) => {
-                record.entry_last_runs.insert(entry.entry_id.clone(), now);
+        self.observers.record_failure(lock, &failure)?;
+        match &failure.entry_id {
+            Some(entry_id) => {
+                record.entry_last_runs.insert(entry_id.clone(), now);
                 round_waits_from(record, now);
             }
-            None => count_failure(record, Some(&queue.schedule), definition_digest, now),
+            None => count_failure(
+                record,
+                Some(&queue.schedule),
+                &pair_definition_digest(queue, automation, ""),
+                now,
+            ),
         }
         record.last_run = Some(LastRun {
-            sequence,
+            sequence: failure.sequence,
             status: RunStatus::Failed,
             finished_at: now,
-            error: Some(message),
+            error: Some(failure.error),
         });
         self.observers.save(lock, record, now)
     }
@@ -1179,27 +1214,68 @@ impl ProtocolService {
         Ok(None)
     }
 
-    /// Removes the entries of queue `queue` whose task no longer waits in
+    /// Tidies the entries of the queues `queues`: adds back the missing
+    /// ones of waiting tasks, removes the ones whose task no longer waits in
     /// their episode, ended, was archived or no longer exists (R18, R19),
     /// and the unreadable entry files of episodes no task waits in. Returns
-    /// the entries left and how many went.
-    fn prune_entries(&self, queue: &str) -> Result<(Vec<QueueEntry>, usize), ObserverError> {
+    /// the entries left, by queue; counts what changed in `pass`.
+    ///
+    /// The tasks are listed once. An entry whose task, as listed, no longer
+    /// waits is checked again with a fresh read before it goes: the list
+    /// may be older than the entry.
+    fn tidy_queue_entries(
+        &self,
+        queues: &BTreeSet<String>,
+        pass: &mut ObserverPass,
+    ) -> Result<BTreeMap<String, Vec<QueueEntry>>, ObserverError> {
+        let tasks = self
+            .control
+            .list_tasks()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "observers: cannot list the tasks for the queue entries");
+            })
+            .ok();
+        if let Some(tasks) = &tasks {
+            pass.entries_restored += self.restore_queue_entries(tasks, queues);
+        }
         let scan = self.observers.scan_queue_entries()?;
-        let mut removed = self.prune_unreadable_entries(&scan.unreadable);
-        let (gone, remaining): (Vec<QueueEntry>, Vec<QueueEntry>) = scan
-            .entries
-            .into_iter()
-            .filter(|entry| entry.queue == queue)
-            .partition(|entry| self.entry_wait(entry) == EntryWait::Gone);
+        if let Some(tasks) = &tasks {
+            pass.entries_removed += self.prune_unreadable_entries(tasks, &scan.unreadable);
+        }
+        let listed: HashMap<&TaskId, &TaskRecord> = tasks
+            .iter()
+            .flatten()
+            .map(|task| (&task.task_id, task))
+            .collect();
+        let mut left: BTreeMap<String, Vec<QueueEntry>> = queues
+            .iter()
+            .map(|queue| (queue.clone(), Vec::new()))
+            .collect();
+        let mut gone = Vec::new();
+        for entry in scan.entries {
+            let Some(kept) = left.get_mut(&entry.queue) else {
+                continue;
+            };
+            let wait = listed
+                .get(&entry.task_id)
+                .map(|task| entry_wait_of(task, &entry))
+                .filter(|wait| *wait != EntryWait::Gone)
+                .unwrap_or_else(|| self.entry_wait(&entry));
+            if wait == EntryWait::Gone {
+                gone.push(entry);
+            } else {
+                kept.push(entry);
+            }
+        }
         if !gone.is_empty() {
             let lock = self.observers.lock_queue_entries()?;
             for entry in &gone {
                 if self.observers.remove_queue_entry(&lock, &entry.entry_id)? {
-                    removed += 1;
+                    pass.entries_removed += 1;
                 }
             }
         }
-        Ok((remaining, removed))
+        Ok(left)
     }
 }
 

@@ -26,8 +26,9 @@ use crate::persistence::{write_atomic, CatalogPaths, PersistenceError};
 use super::backend::BackendRecord;
 use super::profile::{ProfileRecord, RuntimeCatalog};
 
-/// File extensions an entry may use, in lookup order.
-const EXTENSIONS: [&str; 2] = ["yaml", "yml"];
+/// File extensions an entry (and a queue file of the automation catalogue)
+/// may use, in lookup order.
+pub(crate) const EXTENSIONS: [&str; 2] = ["yaml", "yml"];
 
 /// A catalogue file that could not be used.
 #[derive(Debug, Error)]

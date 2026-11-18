@@ -232,6 +232,12 @@ impl GateAutomationPhase {
             Self::Unrecognized => "unrecognized",
         }
     }
+
+    /// Whether the episode is not left yet: `entering`, `ready` or
+    /// `entry_failed`.
+    pub fn before_exit(self) -> bool {
+        matches!(self, Self::Entering | Self::Ready | Self::EntryFailed)
+    }
 }
 
 /// Where a task, an event or an answer came from when an observer caused it

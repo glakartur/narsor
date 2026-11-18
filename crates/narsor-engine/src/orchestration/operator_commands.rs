@@ -363,10 +363,7 @@ fn open_commands(record: &TaskRecord) -> Vec<QueuedOperatorCommand> {
 /// accepted for a later launch (a paused task's work) waits for it, and one
 /// a watched gate holds waits for its exit scripts (R10).
 fn commands_for(record: &TaskRecord, launch_generation: u64) -> Vec<QueuedOperatorCommand> {
-    let held = match record.held_exit_item() {
-        Some(HeldExitItem::Command { command_id }) => Some(command_id.as_str()),
-        _ => None,
-    };
+    let held = record.held_command_id();
     open_commands(record)
         .into_iter()
         .filter(|command| {

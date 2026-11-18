@@ -25,6 +25,7 @@ use crate::automations::HookPhase;
 use crate::domain::display::bounded_detail;
 use crate::domain::{one_line_label, without_unsafe_chars, TaskId, GENERATED_TITLE_MAX_CHARS};
 use crate::environment::backend::DEFAULT_SLOT_RELEASE_GRACE_SECS;
+use crate::observers::secs_duration;
 use chrono::{DateTime, Duration, Utc};
 use narsor_protocol::api::{ConversationState, EventLink, Timeline};
 use narsor_protocol::controller::ResumeMessage;
@@ -427,14 +428,11 @@ impl ControlPlane {
             let mut updates = obsolete_undelivered(record, pending_input_id, now);
             // The answer a gate holds waits until its exit scripts ended
             // (R10).
-            let held = match record.held_exit_item() {
-                Some(HeldExitItem::Input { input_id }) => Some(input_id.clone()),
-                _ => None,
-            };
+            let held = record.held_input_id().map(str::to_owned);
             let mut deliverable = Vec::new();
             for input in record.inputs.iter_mut() {
                 if Some(input.pending_input_id.as_str()) != pending_input_id
-                    || held.as_ref() == Some(&input.input_id)
+                    || held.as_deref() == Some(input.input_id.as_str())
                 {
                     continue;
                 }
@@ -591,36 +589,25 @@ impl ControlPlane {
                 return Ok(Mutation::Unchanged(None));
             };
             let (mut error, mut skipped, mut retry_at) = (None, None, None);
+            let mut attempt = script.attempts();
             match outcome {
                 GateHookOutcome::Succeeded => {
-                    script.attempts += 1;
+                    attempt += 1;
                     script.status = GateHookStatus::Succeeded;
-                    script.next_attempt_at = None;
                 }
                 GateHookOutcome::Failed(reason) => {
-                    script.attempts += 1;
-                    let reason = bounded_detail(reason);
-                    script.last_error = Some(reason.clone());
-                    error = Some(reason);
-                    match retry_delay(script.attempts, max_attempts) {
-                        Some(delay) => {
-                            let at = now + delay;
-                            script.next_attempt_at = Some(at);
-                            retry_at = Some(at);
-                        }
-                        None => {
-                            script.status = GateHookStatus::Failed;
-                            script.next_attempt_at = None;
-                        }
+                    attempt += 1;
+                    error = Some(bounded_detail(reason));
+                    match retry_delay(attempt, max_attempts) {
+                        Some(delay) => retry_at = now.checked_add_signed(delay),
+                        None => script.status = GateHookStatus::Failed,
                     }
                 }
                 GateHookOutcome::Skipped(reason) => {
                     script.status = GateHookStatus::Skipped;
-                    script.next_attempt_at = None;
                     skipped = Some(bounded_detail(reason));
                 }
             }
-            let attempt = script.attempts;
             script.log.push(GateHookAttemptLog {
                 attempt,
                 at: now,
@@ -628,10 +615,7 @@ impl ControlPlane {
                 skipped: skipped.clone(),
                 retry_at,
             });
-            let gate_phase = match hook {
-                HookPhase::Out => state.exit_outcome(),
-                _ => state.entry_outcome(),
-            };
+            let gate_phase = state.outcome(hook);
             if let Some(phase) = gate_phase {
                 state.phase = phase;
             }
@@ -689,21 +673,7 @@ fn gate_of_hook<'a>(
     let current = match (hook, state.phase) {
         (HookPhase::In, GateAutomationPhase::Entering)
         | (HookPhase::Out, GateAutomationPhase::Exiting) => true,
-        (
-            HookPhase::Out,
-            GateAutomationPhase::Entering
-            | GateAutomationPhase::Ready
-            | GateAutomationPhase::EntryFailed,
-        ) if ended && state.exit_pending() => {
-            state.begin_exit(GateExit {
-                choice: None,
-                author: GateExitAuthor::TaskEnd,
-                run_id: None,
-                held: None,
-                at: now,
-            });
-            true
-        }
+        (HookPhase::Out, _) if ended => state.begin_unheld_exit(GateExitAuthor::TaskEnd, now),
         _ => false,
     };
     current.then_some(gate)
@@ -756,11 +726,9 @@ pub(super) fn hold_gate_exit(
         return Ok(());
     };
     match state.phase {
-        GateAutomationPhase::Entering
-        | GateAutomationPhase::Ready
-        | GateAutomationPhase::EntryFailed => state.begin_exit(exit),
+        phase if phase.before_exit() => state.begin_exit(exit),
         GateAutomationPhase::Exiting | GateAutomationPhase::Released => state.exit = Some(exit),
-        GateAutomationPhase::Unrecognized => {}
+        _ => {}
     }
     Ok(())
 }
@@ -793,7 +761,7 @@ fn retry_delay(attempts: u32, max_attempts: u32) -> Option<Duration> {
         .or(GATE_HOOK_RETRY_DELAYS_SECS.last())
         .copied()
         .unwrap_or_default();
-    Some(Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX)))
+    Some(secs_duration(secs))
 }
 
 /// Keeps [`TaskRecord::watched_gate`] in step with a snapshot of a runner
@@ -844,24 +812,9 @@ fn follow_watched_gate(
 fn left_with_exit_scripts(gate: Option<WatchedGate>, now: DateTime<Utc>) -> Option<WatchedGate> {
     let mut gate = gate?;
     let state = gate.automation.as_mut()?;
-    match state.phase {
-        GateAutomationPhase::Exiting => {}
-        GateAutomationPhase::Entering
-        | GateAutomationPhase::Ready
-        | GateAutomationPhase::EntryFailed
-            if state.exit_pending() =>
-        {
-            state.begin_exit(GateExit {
-                choice: None,
-                author: GateExitAuthor::Runner,
-                run_id: None,
-                held: None,
-                at: now,
-            });
-        }
-        _ => return None,
-    }
-    Some(gate)
+    let exiting = state.phase == GateAutomationPhase::Exiting
+        || state.begin_unheld_exit(GateExitAuthor::Runner, now);
+    exiting.then_some(gate)
 }
 
 /// The longest step, queue or episode a [`TaskEventKind::GateQueueWarning`]

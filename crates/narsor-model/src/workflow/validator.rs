@@ -26,7 +26,7 @@ use std::path::Path;
 
 use crate::config::{effort_rank, tier_rank, EFFORT_SCALE, MODEL_TIERS};
 use crate::domain::is_usable_directory_name;
-use crate::domain::observer_name::queue_name_problem;
+use crate::domain::observer_name::{param_name_problem, queue_name_problem};
 use crate::domain::{
     ActionConfig, AgentActionConfig, DecisionConfig, DecisionMaker, DefinitionShape,
     GateWatchConfig, ImageSpec, OutputLabel, ProfileActionConfig, PromptPart, PromptText,
@@ -577,12 +577,12 @@ fn validate_gate_watch(
     } else if let Some(reason) = queue_name_problem(&watch.queue) {
         invalid(format!("invalid 'queue': {reason}"));
     }
-    for name in watch.params.keys() {
-        if name.trim().is_empty() || name.contains(char::is_whitespace) {
-            invalid(format!(
-                "param name '{name}' is blank or contains whitespace"
-            ));
-        }
+    for problem in watch
+        .params
+        .keys()
+        .filter_map(|name| param_name_problem(name))
+    {
+        invalid(problem);
     }
 }
 

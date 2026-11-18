@@ -52,8 +52,8 @@ use super::model::{
 };
 use super::{ObserverError, Result};
 use crate::persistence::atomic::{
-    cleanup_orphaned_temp_files, read_json, remove_file_if_exists, write_json_atomic,
-    write_json_atomic_exclusive,
+    cleanup_orphaned_temp_files, read_json, remove_file_if_exists, subdirectories,
+    write_json_atomic, write_json_atomic_exclusive,
 };
 use crate::persistence::lock::{FileLock, FileLockError};
 use crate::persistence::paths::{is_temp_file, parse_event_file_name, StatePaths};
@@ -480,22 +480,10 @@ impl ObserverStore {
 /// The names of the directories directly in `dir`; empty when `dir` does
 /// not exist.
 fn sub_dirs(dir: &Path) -> Result<Vec<String>> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => return Err(PersistenceError::io(dir, source).into()),
-    };
-    let mut names = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| PersistenceError::io(dir, source))?;
-        if !entry.path().is_dir() {
-            continue;
-        }
-        if let Some(name) = entry.file_name().to_str() {
-            names.push(name.to_string());
-        }
-    }
-    Ok(names)
+    Ok(subdirectories(dir)?
+        .iter()
+        .filter_map(|path| path.file_name()?.to_str().map(str::to_string))
+        .collect())
 }
 
 /// `sha256:` digest of a script's bytes, as a run records it.

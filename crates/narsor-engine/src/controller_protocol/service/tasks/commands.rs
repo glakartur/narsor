@@ -64,6 +64,8 @@ impl ProtocolService {
             // says whether its exit scripts still run once (R18): their
             // entry then stays until they did.
             self.drop_queue_entry_of(&outcome.task);
+            // A task archived at a gate with exit scripts runs them once.
+            self.wake_observer_claims();
         }
         let mut task = outcome.task;
         if !outcome.replayed {

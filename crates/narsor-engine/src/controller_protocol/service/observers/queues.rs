@@ -29,7 +29,7 @@ use crate::controller_protocol::wire::*;
 use crate::observers::{AutomationKey, AutomationRecord, AutomationState, QueueEntry, RunFailure};
 use crate::orchestration::OwnerRef;
 
-use super::entries::problem_names_queue;
+use crate::automations::problem_names_queue;
 
 /// Why a queue name that only waiting gates name does not run.
 const NOT_IN_CATALOGUE: &str = "the catalogue has no such queue; its gates wait for a person";

@@ -45,7 +45,9 @@ use crate::controller_protocol::wire::*;
 use crate::domain::TaskId;
 use crate::engine::actions::check_gate_answer;
 use crate::engine::HumanInputDelivery;
-use crate::observers::{ActiveRun, AutomationLock, AutomationRecord, AutomationState, RunId};
+use crate::observers::{
+    ActiveRun, AutomationLock, AutomationRecord, AutomationState, RunEntry, RunId,
+};
 use crate::orchestration::{
     observer_decide_key, InputRequest, OrchestrationError, TaskProvenance, TaskRecord,
 };
@@ -72,11 +74,13 @@ fn require_check_run(active: &ActiveRun, run_id: &RunId) -> ProtocolResult<()> {
 pub const MAX_EFFECT_DATA_BYTES: usize = 64 * 1024;
 
 /// The run an effect belongs to, read under the pair's lock: the pair's
-/// record and its run in progress.
+/// record and its run in progress, a `check` run.
 struct EffectScope {
     lock: AutomationLock,
     record: AutomationRecord,
     run_id: RunId,
+    /// The queue entry the run checks, as the record held it.
+    entry: Option<RunEntry>,
     now: DateTime<Utc>,
 }
 
@@ -115,22 +119,22 @@ impl ProtocolService {
         run_id: &RunId,
         request: ObserverCreateTaskRequest,
     ) -> ProtocolResult<ObserverEffectResponse> {
-        let mut scope = self.effect_scope(run_id)?;
-        require_check_run(scope.active_run()?, run_id)?;
+        // Read before the pair's lock: the catalogue is not the pair's.
         let tasks = self
             .automation_catalog()
             .queues
             .remove(&run_id.key.queue)
-            .and_then(|queue| queue.tasks)
-            .ok_or_else(|| {
-                ProtocolError::bad_request(
-                    "effect_not_allowed",
-                    format!(
-                        "queue '{}' creates no tasks: its file has no `tasks` settings",
-                        run_id.key.queue
-                    ),
-                )
-            })?;
+            .and_then(|queue| queue.tasks);
+        let mut scope = self.effect_scope(run_id)?;
+        let tasks = tasks.ok_or_else(|| {
+            ProtocolError::bad_request(
+                "effect_not_allowed",
+                format!(
+                    "queue '{}' creates no tasks: its file has no `tasks` settings",
+                    run_id.key.queue
+                ),
+            )
+        })?;
         check_size("effect data", &request.data, MAX_EFFECT_DATA_BYTES)?;
         let task_request = tasks
             .effect
@@ -175,12 +179,7 @@ impl ProtocolService {
         request: ObserverDecideRequest,
     ) -> ProtocolResult<ObserverEffectResponse> {
         let scope = self.effect_scope(run_id)?;
-        let active = scope
-            .record
-            .run_in_progress(run_id.sequence)
-            .ok_or(ProtocolError::Unauthorized)?;
-        require_check_run(active, run_id)?;
-        let Some(entry) = active.entry.clone() else {
+        let Some(entry) = scope.entry.clone() else {
             return Err(ProtocolError::bad_request(
                 "no_queue_entry",
                 format!(
@@ -269,6 +268,9 @@ impl ProtocolService {
         )?;
         if !outcome.replayed {
             self.notify(&task.task_id);
+            // An answer at a gate with exit scripts holds its exit: they
+            // are due now.
+            self.wake_observer_claims();
             tracing::info!(run = %run_id, task = %task.task_id, episode = %entry.episode, choice = %request.choice, "automations: a check script answered a gate");
         }
         if !outcome.input.status.is_settled() {
@@ -284,7 +286,8 @@ impl ProtocolService {
 
     /// Takes the pair's lock and reads the pair's record under it,
     /// refusing a run that is no longer the pair's run in progress before
-    /// its deadline: its token stopped working between the gate and now.
+    /// its deadline (its token stopped working between the gate and now),
+    /// and a run that is not a `check` run.
     fn effect_scope(&self, run_id: &RunId) -> ProtocolResult<EffectScope> {
         let lock = self.observers.lock(&run_id.key)?;
         let record = self
@@ -292,16 +295,17 @@ impl ProtocolService {
             .load(&run_id.key)?
             .ok_or(ProtocolError::Unauthorized)?;
         let now = self.control.now();
-        let in_progress = record
+        let active = record
             .run_in_progress(run_id.sequence)
-            .is_some_and(|active| !active.is_past_deadline(now));
-        if !in_progress {
-            return Err(ProtocolError::Unauthorized);
-        }
+            .filter(|active| !active.is_past_deadline(now))
+            .ok_or(ProtocolError::Unauthorized)?;
+        require_check_run(active, run_id)?;
+        let entry = active.entry.clone();
         Ok(EffectScope {
             lock,
             record,
             run_id: run_id.clone(),
+            entry,
             now,
         })
     }
