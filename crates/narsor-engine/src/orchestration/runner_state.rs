@@ -15,11 +15,11 @@
 use super::control_plane::{refresh_slot_release_due, ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    GateAutomation, GateAutomationPhase, GateChange, GateExit, GateExitAuthor, GateHookOutcome,
-    GateHookStatus, GateScripts, HeldExitItem, InputOutcome, InputRequest, InputStatus,
-    InputUpdate, OperatorCommandStatus, QueuedInput, RunnerObservation, RunnerReportOutcome,
-    RunnerSnapshot, RunnerState, TaskEventKind, TaskProvenance, TaskRecord, WatchedGate,
-    GATE_HOOK_RETRY_DELAYS_SECS,
+    GateAutomation, GateAutomationPhase, GateChange, GateExit, GateExitAuthor, GateHookAttemptLog,
+    GateHookOutcome, GateHookStatus, GateScripts, HeldExitItem, InputOutcome, InputRequest,
+    InputStatus, InputUpdate, OperatorCommandStatus, QueuedInput, RunnerObservation,
+    RunnerReportOutcome, RunnerSnapshot, RunnerState, TaskEventKind, TaskProvenance, TaskRecord,
+    WatchedGate, GATE_HOOK_RETRY_DELAYS_SECS,
 };
 use crate::automations::HookPhase;
 use crate::domain::display::bounded_detail;
@@ -621,6 +621,13 @@ impl ControlPlane {
                 }
             }
             let attempt = script.attempts;
+            script.log.push(GateHookAttemptLog {
+                attempt,
+                at: now,
+                error: error.clone(),
+                skipped: skipped.clone(),
+                retry_at,
+            });
             let gate_phase = match hook {
                 HookPhase::Out => state.exit_outcome(),
                 _ => state.entry_outcome(),

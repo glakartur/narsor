@@ -238,6 +238,7 @@ button.link { border: none; background: none; padding: 0 4px; color: var(--accen
 .step-detail { display: flex; flex-direction: column; min-height: 0; }
 .step-detail-head { padding: 8px 14px; border-bottom: 1px solid var(--border); display: flex; gap: 10px; align-items: baseline; }
 .step-detail .conversation { flex: 1; }
+.gate-scripts { list-style: none; margin: 0; padding: 6px 14px; border-bottom: 1px solid var(--border); }
 
 /* Events */
 .events { padding: 8px 14px; }

@@ -423,6 +423,34 @@ fn a_failing_entry_script_is_retried_and_after_the_last_attempt_the_entry_fails(
             "{case}"
         );
         assert_eq!(history.last().unwrap().2, Some(expected), "{case}");
+        // R20: the task view lists every attempt under the gate's step.
+        let record = fx.service.control_plane().task(&task).unwrap();
+        let view = fx.service.summarize(&record).unwrap().gate_automation;
+        let view = view.expect("the gate automation status");
+        assert_eq!(
+            (view.step.as_str(), view.phase),
+            ("review_work", expected),
+            "{case}"
+        );
+        let hook = &view.hooks[0];
+        assert_eq!(
+            (
+                hook.hook.as_str(),
+                hook.attempts,
+                hook.max_attempts,
+                hook.log.len()
+            ),
+            ("in", 3, 3, 3),
+            "{case}"
+        );
+        assert_eq!(
+            hook.log
+                .iter()
+                .filter(|entry| entry.error.is_some())
+                .count(),
+            failed,
+            "{case}"
+        );
         if expected == GateAutomationPhase::EntryFailed {
             // No more automatic attempts, and `check` never runs.
             assert!(

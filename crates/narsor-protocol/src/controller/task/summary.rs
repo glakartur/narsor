@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{ExecutionStatusDto, Timeline};
 use crate::controller::{
-    ArchiveTombstone, ControllerPresence, InputView, ObservationView, OperatorCommandView,
-    PanelOffer, ResumeState, RunnerState, RunnerView, StepView, TaskActionOffer, TransitionOffer,
+    ArchiveTombstone, ControllerPresence, GateAutomationPhase, InputView, ObservationView,
+    OperatorCommandView, PanelOffer, ResumeState, RunnerState, RunnerView, StepView,
+    TaskActionOffer, TransitionOffer,
 };
 use crate::display::WorkspaceHeader;
 
@@ -112,6 +113,13 @@ pub struct TaskSummary {
     /// keeps no entry for its episode, and from a server before the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_entry: Option<TaskQueueEntryView>,
+    /// Where the entry (`in`) and exit (`out`) scripts of the watched gate
+    /// the task waits at stand (R20): a control-plane overlay a client
+    /// applies to the gate's position of the runner timeline. `None` while
+    /// the gate has no such scripts, and from a server before the field: a
+    /// client then shows the runner status unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_automation: Option<TaskGateAutomationView>,
     pub as_of: DateTime<Utc>,
 }
 
@@ -128,6 +136,81 @@ pub struct TaskQueueEntryView {
     pub episode: String,
     /// When the control plane added the entry.
     pub since: DateTime<Utc>,
+}
+
+/// The entry and exit scripts of a task's watched gate in its current wait
+/// episode, as the task view shows them (R20).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskGateAutomationView {
+    /// The workflow state of the gate: the step whose latest position the
+    /// overlay applies to.
+    pub step: String,
+    /// The queue the gate's `watch` names.
+    pub queue: String,
+    /// The wait episode.
+    pub episode: String,
+    /// Where the episode stands; `entry_failed` shows the step as failed.
+    pub phase: GateAutomationPhase,
+    /// The scripts of the episode, `in` first, in the queue file's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<GateHookView>,
+    /// The exit held while the exit scripts run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<GateExitView>,
+}
+
+/// One entry or exit script of one automation in a wait episode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GateHookView {
+    /// The automation.
+    pub automation: String,
+    /// The script phase: `in` or `out`.
+    pub hook: String,
+    /// `pending`, `succeeded`, `failed` or `skipped`.
+    pub status: String,
+    /// Attempts that ended.
+    pub attempts: u32,
+    /// Most attempts the script gets in the episode.
+    pub max_attempts: u32,
+    /// When the next automatic attempt runs, after a failed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    /// Why the latest attempt failed (bounded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Every ended attempt, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log: Vec<GateHookAttemptView>,
+}
+
+/// One ended attempt of an entry or exit script.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GateHookAttemptView {
+    /// The attempt, from 1.
+    pub attempt: u32,
+    /// When it ended.
+    pub at: DateTime<Utc>,
+    /// Why it failed; `None` when it succeeded or was skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Why no script ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+    /// When the next automatic attempt runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<DateTime<Utc>>,
+}
+
+/// The exit a watched gate holds while its exit scripts run (R11).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GateExitView {
+    /// The choice; `None` when the task ended at the gate or the runner
+    /// left it by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<String>,
+    /// Who chose it: `person`, `automation`, `operator`, `task_end`,
+    /// `runner`.
+    pub author: String,
 }
 
 /// `GET /control/v1/tasks` response.

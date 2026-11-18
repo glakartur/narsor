@@ -77,3 +77,38 @@ test('attempts and durations', () => {
   assert.equal(duration(185_000), '3m 05s');
   assert.equal(duration(3_720_000), '1h 02m');
 });
+
+import { gateLines, gateOverlay } from '../ui/js/text.js';
+
+const gatePositions = () => [
+  { label: 'review #1', state_id: 'review', status: 'succeeded' },
+  { label: 'fix #1', state_id: 'fix', status: 'succeeded' },
+  { label: 'review #2', state_id: 'review', status: 'awaiting_decision' },
+];
+
+const failedIn = (at) => ({
+  automation: 'label', hook: 'in', status: 'failed', attempts: 3, max_attempts: 3, last_error: 'api down\ntrace',
+  log: [1, 2, 3].map((attempt) => ({ attempt, at, error: 'api down', ...(attempt < 3 ? { retry_at: at } : {}) })),
+});
+
+test('R20: a failed entry script shows the gate as failed with the attempt count', () => {
+  const gate = { step: 'review', queue: 'mr', episode: 'ep', phase: 'entry_failed', hooks: [failedIn('2026-11-18T10:00:00Z')] };
+  const positions = gateOverlay(gatePositions(), gate);
+  assert.equal(positions.length, 3);
+  assert.equal(positions[0].status, 'succeeded', 'an earlier entry into the gate state stays');
+  assert.equal(positions[2].status, 'failed');
+  assert.equal(positions[2].error, 'skrypt wejścia label: próba 3 z 3 nieudana: api down');
+
+  const lines = gateLines(gate);
+  assert.equal(lines[0].text, 'kolejka mr · ✗ skrypt wejścia nie powiódł się');
+  const attempts = lines.slice(1);
+  assert.equal(attempts.length, 3, 'three attempts are three lines under one step');
+  assert.match(attempts[0].text, /^wejście · label · próba 1 z 3 · ✗ api down · następna próba /);
+  assert.equal(attempts[2].text, 'wejście · label · próba 3 z 3 · ✗ api down');
+});
+
+test('R20: without the overlay, or after a successful retry, the runner status stays', () => {
+  assert.deepEqual(gateOverlay(gatePositions(), undefined), gatePositions());
+  const ready = { step: 'review', queue: 'mr', episode: 'ep', phase: 'ready', hooks: [] };
+  assert.equal(gateOverlay(gatePositions(), ready)[2].status, 'awaiting_decision');
+});

@@ -6,8 +6,63 @@ use crate::domain::{
     GENERATED_TITLE_MAX_CHARS,
 };
 use crate::engine::{manual_override_allowed, PositionStatus, Timeline};
-use crate::orchestration::{AttentionItem, AttentionKind, InputStatus, RunnerState, TaskRecord};
+use crate::orchestration::{
+    AttentionItem, AttentionKind, GateHookStatus, InputStatus, RunnerState, TaskRecord,
+};
 use crate::workspace::state::launch_headers;
+
+/// The entry and exit scripts of the watched gate the task waits at (R20),
+/// from [`crate::orchestration::WatchedGate::automation`]; `None` while the
+/// gate has no script.
+pub(super) fn gate_automation(record: &TaskRecord) -> Option<TaskGateAutomationView> {
+    let gate = record.watched_gate.as_ref()?;
+    let automation = gate.automation.as_ref()?;
+    if automation.hooks.is_empty() {
+        return None;
+    }
+    let hooks = automation
+        .hooks
+        .iter()
+        .map(|hook| GateHookView {
+            automation: hook.automation.clone(),
+            hook: hook.hook.as_str().to_string(),
+            status: match hook.status {
+                GateHookStatus::Pending => "pending",
+                GateHookStatus::Succeeded => "succeeded",
+                GateHookStatus::Failed => "failed",
+                GateHookStatus::Skipped => "skipped",
+                GateHookStatus::Unrecognized => "unrecognized",
+            }
+            .to_string(),
+            attempts: hook.attempts,
+            max_attempts: automation.max_attempts(hook.hook),
+            next_attempt_at: hook.next_attempt_at,
+            last_error: hook.last_error.clone(),
+            log: hook
+                .log
+                .iter()
+                .map(|entry| GateHookAttemptView {
+                    attempt: entry.attempt,
+                    at: entry.at,
+                    error: entry.error.clone(),
+                    skipped: entry.skipped.clone(),
+                    retry_at: entry.retry_at,
+                })
+                .collect(),
+        })
+        .collect();
+    Some(TaskGateAutomationView {
+        step: gate.watch.step.clone(),
+        queue: gate.watch.queue.clone(),
+        episode: gate.episode.clone(),
+        phase: automation.phase,
+        hooks,
+        exit: automation.exit.as_ref().map(|exit| GateExitView {
+            choice: exit.choice.clone(),
+            author: exit.author.as_str().to_string(),
+        }),
+    })
+}
 
 /// What waits on the owner: the runner's last report — minus the requests
 /// the owner has answered since (an answer queued, delivered or consumed)
