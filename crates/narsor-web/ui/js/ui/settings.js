@@ -6,7 +6,7 @@ import { shortIdentifier, stateIcon, titleOf } from '../model.js';
 import { Field } from './fields.js';
 import { Info } from './tabs/info.js';
 
-function Dialog({ title, onClose, children, wide = false }) {
+export function Dialog({ title, onClose, children, wide = false }) {
   const ref = useRef(null);
   useEffect(() => { ref.current?.focus(); }, []);
   return html`<div class="overlay" onClick=${onClose}>

@@ -261,7 +261,7 @@ impl Engine {
                     Err(_) => false,
                 }
             }
-            ActionKind::Human | ActionKind::Wait | ActionKind::Decision => false,
+            ActionKind::Human | ActionKind::Decision => false,
         }
     }
 }

@@ -269,6 +269,8 @@ pub enum Confirmed {
     Answer(Box<AnswerRequest>),
     /// Removing the repository with this id (the repositories, U13).
     RemoveRepository(String),
+    /// Deleting the observer with this name (the queues view, R33).
+    DeleteObserver(String),
 }
 
 // ---------------------------------------------------------------------
@@ -574,9 +576,10 @@ impl Overlay {
     pub fn is_task_bound(&self) -> bool {
         match self {
             Self::Harness(_) | Self::Limit(_) => false,
-            Self::Confirm(confirmation) => {
-                !matches!(confirmation.confirmed, Confirmed::RemoveRepository(_))
-            }
+            Self::Confirm(confirmation) => !matches!(
+                confirmation.confirmed,
+                Confirmed::RemoveRepository(_) | Confirmed::DeleteObserver(_)
+            ),
             _ => true,
         }
     }
@@ -1000,6 +1003,9 @@ impl TaskApp {
                     Confirmed::Act(request) => Request::Act(request),
                     Confirmed::Answer(request) => Request::Answer(request),
                     Confirmed::RemoveRepository(id) => Request::RemoveRepository(id),
+                    Confirmed::DeleteObserver(name) => Request::QueueWrite(Box::new(
+                        super::super::queues::QueueWrite::Delete(name),
+                    )),
                 }
             }
             Some(Action::Cancel) => {

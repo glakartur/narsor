@@ -8,20 +8,25 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::json;
 
 use super::*;
+use crate::controller_protocol::credentials::{RunnerIdentity, RunnerRole};
 use crate::controller_protocol::service::ProtocolService;
+use crate::controller_protocol::wire::ObserverCreateTaskRequest;
+use crate::domain::ExecutionStatus;
 use crate::domain::{
     BackendId, GitIdentity, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec,
     TaskRepository, TaskRepositorySource, TaskWorkspace, WorkflowDefinition,
 };
 use crate::observers::{
-    CreateTaskEffect, LastRun, ObserverConfig, ObserverEffect, ObserverName, RunFailure, RunId,
-    RunStatus, SecretRef, WatchEntry, WatchMode, WatchObjectPolicy, WatchOrigin, KEPT_RUN_FAILURES,
-    OBSERVER_RECORD_VERSION,
+    queue_entry_id, CreateTaskEffect, LastRun, ObserverConfig, ObserverEffect, ObserverMode,
+    ObserverName, QueueEntry, RunFailure, RunId, RunStatus, ScheduleConfig, SecretRef,
+    KEPT_RUN_FAILURES, OBSERVER_RECORD_VERSION,
 };
 use crate::orchestration::{
-    Clock, CommandRequest, ControlPlane, EventWait, NewTask, OwnerCommand, OwnerRef,
+    Clock, CommandRequest, ControlPlane, ExecutionCursor, NewTask, OwnerCommand, OwnerRef,
+    PendingInputRef, RunnerSnapshot,
 };
 use crate::persistence::StatePaths;
+use narsor_protocol::controller::{GateWatch, GateWatchChoice};
 
 /// A clock the test moves by hand.
 #[derive(Debug)]
@@ -74,7 +79,6 @@ impl crate::environment::LaunchResolver for NoLaunches {
 }
 
 const INTERVAL: u64 = 300;
-pub(super) const PREFIX: &str = "https://git.example.com/";
 
 /// A service over a temporary state root and a manual clock.
 pub(super) struct Fixture {
@@ -113,11 +117,24 @@ impl Fixture {
         *self.clock.0.lock().unwrap() += Duration::seconds(secs);
     }
 
-    /// A draft observer with one secret and script version 1.
-    pub(super) fn draft(&self, name: &str, mode: WatchMode) -> ObserverId {
+    /// A draft observer with one secret and script version 1, serving the
+    /// queue of its name: an `on_episodes` one creates no tasks, an
+    /// `always` one creates tasks of `triage`.
+    pub(super) fn draft(&self, name: &str, mode: ObserverMode) -> ObserverId {
+        self.draft_of(owner(), name, name, mode)
+    }
+
+    /// The same, of `owner`, serving `queue`.
+    pub(super) fn draft_of(
+        &self,
+        owner: OwnerRef,
+        name: &str,
+        queue: &str,
+        mode: ObserverMode,
+    ) -> ObserverId {
         let effect = match mode {
-            WatchMode::WatchList => ObserverEffect::DeliverEvent,
-            WatchMode::All => ObserverEffect::CreateTask(CreateTaskEffect {
+            ObserverMode::OnEpisodes => ObserverEffect::None,
+            ObserverMode::Always => ObserverEffect::CreateTask(CreateTaskEffect {
                 workflow_id: "triage".into(),
                 workflow_version: 1,
                 workspaces: Default::default(),
@@ -126,21 +143,18 @@ impl Fixture {
                 mapping: [("ticket".to_string(), "key".to_string())].into(),
             }),
         };
-        let mut config = ObserverConfig::new(ObserverName::parse(name).unwrap(), "jira", effect);
-        config.watch_mode = mode;
+        let mut config =
+            ObserverConfig::new(ObserverName::parse(name).unwrap(), "jira", effect, mode);
+        config.queue = queue.to_string();
         config.condition = json!({"project": "ABC"});
         config.secrets = vec![SecretRef {
             name: "jira-token".into(),
             env: "JIRA_TOKEN".into(),
         }];
-        config.watch_objects = WatchObjectPolicy {
-            allowed_prefixes: vec![PREFIX.into()],
-            ..WatchObjectPolicy::default()
-        };
         let record = self
             .service
             .observers()
-            .create(owner(), config, Some(&triage_workflow()), self.now())
+            .create(owner, config, Some(&triage_workflow()), self.now())
             .unwrap();
         self.service
             .observers()
@@ -150,8 +164,21 @@ impl Fixture {
     }
 
     /// An active observer running version 1, due now.
-    pub(super) fn active(&self, name: &str, mode: WatchMode) -> ObserverId {
+    pub(super) fn active(&self, name: &str, mode: ObserverMode) -> ObserverId {
         let id = self.draft(name, mode);
+        self.service.approve_observer_version(&id, 1).unwrap();
+        id
+    }
+
+    /// The same, of `owner`, serving `queue`.
+    pub(super) fn active_of(
+        &self,
+        owner: OwnerRef,
+        name: &str,
+        queue: &str,
+        mode: ObserverMode,
+    ) -> ObserverId {
+        let id = self.draft_of(owner, name, queue, mode);
         self.service.approve_observer_version(&id, 1).unwrap();
         id
     }
@@ -229,21 +256,114 @@ impl Fixture {
         task_id
     }
 
-    pub(super) fn watch(&self, id: &ObserverId, task_id: &TaskId, object: &str) -> WatchEntry {
-        let entry = WatchEntry::new(
-            task_id.clone(),
-            Some("review".into()),
-            object,
-            vec!["approved".into()],
-            WatchOrigin::Workflow,
-            self.now(),
-        );
-        let lock = self.service.observers().lock(id).unwrap();
+    /// Makes `task_id` wait at the gate `review_work` in episode `episode`,
+    /// its `watch` naming `queue`: the runner's snapshot adds the entry.
+    pub(super) fn entry(&self, queue: &str, task_id: &TaskId, episode: &str) -> QueueEntry {
+        self.report_gate(task_id, Some((episode, review_gate(queue, task_id))));
         self.service
             .observers()
-            .create_watch(&lock, &entry)
+            .queue_entry(&queue_entry_id(task_id, episode))
+            .unwrap()
+            .expect("the snapshot added the entry")
+    }
+
+    /// The task's runner reports a snapshot through the runner channel:
+    /// waiting at `gate` in its episode, or (`None`) past every gate.
+    pub(super) fn report_gate(&self, task_id: &TaskId, gate: Option<(&str, GateWatch)>) {
+        let identity = RunnerIdentity {
+            role: RunnerRole::Worker,
+            task_id: task_id.clone(),
+            launch_generation: 1,
+            incarnation: "pod-1".into(),
+        };
+        self.service
+            .credentials
+            .issue_runner_session(
+                RunnerRole::Worker,
+                task_id,
+                "pod-1",
+                1,
+                0,
+                Duration::hours(1),
+            )
             .unwrap();
-        entry
+        let sequence = self
+            .service
+            .control_plane()
+            .task(task_id)
+            .unwrap()
+            .runner
+            .map_or(1, |runner| runner.snapshot.snapshot_sequence + 1);
+        let (pending_input, gate_watch) = match gate {
+            Some((episode, watch)) => (Some(pending_input(episode)), Some(watch)),
+            None => (None, None),
+        };
+        let snapshot = RunnerSnapshot {
+            snapshot_sequence: sequence,
+            execution_status: if pending_input.is_some() {
+                ExecutionStatus::InputNeeded
+            } else {
+                ExecutionStatus::Running
+            },
+            execution_cursor: ExecutionCursor {
+                execution_id: Some("exec-1".into()),
+                ..Default::default()
+            },
+            event_cursor: sequence,
+            pending_input,
+            gate_watch,
+            conversation: Default::default(),
+            timeline: None,
+            safe_point: false,
+            problem: None,
+            attention: Vec::new(),
+            conductor_available: false,
+            conductor_unavailable_reason: None,
+            default_harness_unavailable: None,
+            workspaces: Vec::new(),
+            generated_title: None,
+            observed_at: self.now(),
+        };
+        let response = self
+            .service
+            .runner_snapshot(&identity, snapshot.to_request().unwrap())
+            .unwrap();
+        assert!(response.applied);
+    }
+}
+
+/// The `watch` of the gate `review_work` of `task_id`, on `queue`.
+pub(super) fn review_gate(queue: &str, task_id: &TaskId) -> GateWatch {
+    GateWatch {
+        step: "review_work".into(),
+        queue: queue.into(),
+        params: [("mr_url".to_string(), format!("https://x/{task_id}"))].into(),
+        choices: vec![GateWatchChoice {
+            name: "check_feedback".into(),
+            description: Some("Read the feedback".into()),
+            requires_variables: Vec::new(),
+        }],
+        variables: Vec::new(),
+    }
+}
+
+/// The pending input request of a gate in `episode`.
+fn pending_input(episode: &str) -> PendingInputRef {
+    let form = serde_json::from_value(json!({
+        "execution_id": "exec-1",
+        "state_id": "review_work",
+        "action_execution_id": "act-1",
+        "instruction": "Review the merge request",
+        "fields": [],
+        "outputs": [],
+        "episode": episode,
+        "requested_at": "2026-11-17T12:00:00Z",
+    }))
+    .unwrap();
+    PendingInputRef {
+        id: episode.to_string(),
+        attempt_id: None,
+        form,
     }
 }
 
@@ -282,10 +402,10 @@ fn the_backoff_doubles_the_interval_up_to_an_hour_and_never_below_it() {
 }
 
 #[test]
-fn a_watch_list_observer_without_entries_does_not_run_and_moves_on() {
-    // Covers AE1 (R6).
+fn an_on_episodes_observer_without_entries_does_not_run_and_moves_on() {
+    // R30.
     let fx = Fixture::new();
-    let id = fx.active("mr-review", WatchMode::WatchList);
+    let id = fx.active("mr-review", ObserverMode::OnEpisodes);
 
     let pass = fx.service.observer_pass();
 
@@ -304,7 +424,7 @@ fn a_watch_list_observer_without_entries_does_not_run_and_moves_on() {
 #[test]
 fn a_due_observer_is_claimed_once_with_a_token_and_its_last_state() {
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
 
     assert_eq!(fx.service.observer_pass().due, vec![id.clone()]);
     let first = fx.claim().expect("a due run");
@@ -352,7 +472,7 @@ fn a_due_observer_is_claimed_once_with_a_token_and_its_last_state() {
 fn an_unapproved_script_version_never_runs_on_schedule() {
     // Covers AE6 (R11).
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
     fx.service
         .observers()
         .add_script(&id, "echo changed\n", fx.now())
@@ -369,7 +489,7 @@ fn an_unapproved_script_version_never_runs_on_schedule() {
 #[test]
 fn a_control_plane_that_stood_still_for_hours_owes_one_run() {
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
     fx.advance(2 * 60 * 60);
 
     fx.service.observer_pass();
@@ -384,13 +504,13 @@ fn a_control_plane_that_stood_still_for_hours_owes_one_run() {
 fn a_successful_run_leaves_no_file_but_the_observers_own() {
     // D15.
     let fx = Fixture::new();
-    let id = fx.active("mr-review", WatchMode::WatchList);
+    let id = fx.active("mr-review", ObserverMode::OnEpisodes);
     let task = fx.task("task-1");
-    let entry = fx.watch(&id, &task, &format!("{PREFIX}a/-/merge_requests/17"));
+    let entry = fx.entry("mr-review", &task, "input-1");
     fx.service.observer_pass();
     let claimed = fx.claim().unwrap();
 
-    fx.finish(&claimed, exited(1, ""));
+    fx.finish(&claimed, exited(0, ""));
 
     assert_eq!(
         fx.observer_files(&id),
@@ -398,17 +518,21 @@ fn a_successful_run_leaves_no_file_but_the_observers_own() {
             "observer.json".to_string(),
             "observer.lock".to_string(),
             "scripts/1.sh".to_string(),
-            format!("watches/{}.json", entry.entry_id),
         ]
     );
     assert!(fx.failures(&id).is_empty());
+    // The entry is the queue's, not the observer's: it stays.
+    assert_eq!(
+        fx.service.observers().queue_entry(&entry.entry_id).unwrap(),
+        Some(entry)
+    );
 }
 
 #[test]
 fn a_failed_run_writes_one_error_file_that_observer_show_lists() {
     // D15.
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
     fx.service.observer_pass();
     let claimed = fx.claim().unwrap();
 
@@ -453,7 +577,7 @@ fn a_failed_run_writes_one_error_file_that_observer_show_lists() {
 #[test]
 fn more_errors_than_the_store_keeps_leave_the_newest() {
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
     let runs = KEPT_RUN_FAILURES as u64 + 3;
     for _ in 0..runs {
         fx.service.observer_pass();
@@ -485,7 +609,7 @@ fn more_errors_than_the_store_keeps_leave_the_newest() {
 fn a_failed_run_keeps_the_state_and_backs_off() {
     // Covers AE3, the observer's part (R14, R16).
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
     fx.service.observer_pass();
     let first = fx.claim().unwrap();
     fx.finish(&first, exited(0, r#"{"state": {"cursor": 5}}"#));
@@ -511,7 +635,7 @@ fn a_failed_run_keeps_the_state_and_backs_off() {
 fn an_exit_code_zero_with_an_invalid_document_keeps_the_state() {
     // R14.
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
     fx.service.observer_pass();
     let claimed = fx.claim().unwrap();
 
@@ -528,7 +652,7 @@ fn an_exit_code_zero_with_an_invalid_document_keeps_the_state() {
 #[test]
 fn five_failures_in_a_row_put_the_observer_in_error_until_its_owner_resumes_it() {
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
     for failure in 1..=MAX_CONSECUTIVE_FAILURES {
         fx.service.observer_pass();
         let claimed = fx.claim().expect("a run after the backoff");
@@ -551,7 +675,7 @@ fn five_failures_in_a_row_put_the_observer_in_error_until_its_owner_resumes_it()
 #[test]
 fn a_run_without_a_result_by_its_deadline_is_lost_without_counting_a_failure() {
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
     // One failure before, which a lost run neither adds to nor clears.
     fx.service.observer_pass();
     let failed = fx.claim().unwrap();
@@ -604,7 +728,7 @@ fn a_run_without_a_result_by_its_deadline_is_lost_without_counting_a_failure() {
 #[test]
 fn a_claim_records_a_run_past_its_deadline_as_lost() {
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
     fx.service.observer_pass();
     let claimed = fx.claim().unwrap();
     fx.advance((SCRIPT_TIMEOUT_SECS + RUN_DEADLINE_MARGIN_SECS) as i64);
@@ -623,7 +747,7 @@ fn a_claim_records_a_run_past_its_deadline_as_lost() {
 #[test]
 fn a_result_after_the_deadline_records_the_run_as_lost() {
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
     fx.service.observer_pass();
     let claimed = fx.claim().unwrap();
     fx.advance((SCRIPT_TIMEOUT_SECS + RUN_DEADLINE_MARGIN_SECS) as i64);
@@ -646,7 +770,7 @@ fn a_result_after_the_deadline_records_the_run_as_lost() {
 #[test]
 fn the_token_works_only_for_its_run_while_it_runs() {
     let fx = Fixture::new();
-    fx.active("jira", WatchMode::All);
+    fx.active("jira", ObserverMode::Always);
     fx.service.observer_pass();
     let claimed = fx.claim().unwrap();
     let token = claimed.token.expose().to_string();
@@ -669,7 +793,7 @@ fn the_token_works_only_for_its_run_while_it_runs() {
 #[test]
 fn a_run_waiting_for_a_claim_longer_than_an_interval_shows_a_missing_worker() {
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
     fx.service.observer_pass();
     assert!(!fx.record(&id).worker_missing(fx.now()));
 
@@ -683,7 +807,7 @@ fn a_run_waiting_for_a_claim_longer_than_an_interval_shows_a_missing_worker() {
 #[test]
 fn approving_a_new_version_of_a_paused_observer_keeps_it_paused() {
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
     fx.service.pause_observer(&id).unwrap();
     fx.service
         .observers()
@@ -700,7 +824,7 @@ fn approving_a_new_version_of_a_paused_observer_keeps_it_paused() {
 #[test]
 fn approving_a_draft_activates_it_and_an_unknown_version_is_refused() {
     let fx = Fixture::new();
-    let id = fx.draft("jira", WatchMode::All);
+    let id = fx.draft("jira", ObserverMode::Always);
     assert!(fx.service.observer_pass().due.is_empty());
 
     assert!(matches!(
@@ -715,90 +839,74 @@ fn approving_a_draft_activates_it_and_an_unknown_version_is_refused() {
 }
 
 #[test]
-fn each_watch_run_checks_one_entry_with_its_tasks_wait_episode() {
-    // D18: one entry per run; the round takes the entries in order.
+fn each_run_checks_one_entry_of_the_queue_with_its_episode() {
+    // R30: one entry per run; the round takes the entries in order.
     let fx = Fixture::new();
-    let id = fx.active("mr-review", WatchMode::WatchList);
-    let waiting = fx.task("task-waiting");
-    let idle = fx.task("task-idle");
-    fx.watch(&id, &waiting, &format!("{PREFIX}a/-/merge_requests/17"));
+    let id = fx.active("mr-review", ObserverMode::OnEpisodes);
+    // The approval's tick: the next one counts from it (KTD-3).
+    let tick = fx.now();
+    let first_task = fx.task("task-first");
+    let second_task = fx.task("task-second");
+    fx.entry("mr-review", &first_task, "input-3");
     fx.advance(1);
-    fx.watch(&id, &idle, &format!("{PREFIX}a/-/merge_requests/18"));
-    let control = fx.service.control_plane();
-    {
-        let _lock = control.store().lock_task(&waiting).unwrap();
-        let mut record = control.task(&waiting).unwrap();
-        record.event_wait = Some(EventWait {
-            episode_id: "episode-3".into(),
-            event_type: "approved".into(),
-            filter: json!({"mr": "17"}),
-            since: fx.now(),
-            watch: None,
-        });
-        control.store().save_task(&mut record).unwrap();
-    }
+    fx.entry("mr-review", &second_task, "input-1");
 
     fx.service.observer_pass();
     let first = fx.claim().unwrap();
     assert!(fx.claim().is_none(), "one run at a time");
-    fx.finish(&first, exited(1, ""));
+    fx.finish(&first, exited(0, ""));
     let second = fx.claim().unwrap();
-    fx.finish(&second, exited(1, ""));
+    fx.finish(&second, exited(0, ""));
 
-    let episodes: Vec<_> = [&first, &second]
+    let entries: Vec<_> = [&first, &second]
         .iter()
         .map(|claimed| {
-            let watch = claimed.input.watch.as_ref().unwrap();
-            (watch.task_id.as_str(), watch.wait_episode.as_deref())
+            let entry = claimed.input.entry.as_ref().unwrap();
+            (entry.task_id.as_str(), entry.episode.as_str())
         })
         .collect();
     assert_eq!(
-        episodes,
-        vec![("task-waiting", Some("episode-3")), ("task-idle", None)]
+        entries,
+        vec![("task-first", "input-3"), ("task-second", "input-1")]
     );
+    let input = first.input.entry.as_ref().unwrap();
+    assert_eq!(input.step, "review_work");
+    assert_eq!(input.params["mr_url"], "https://x/task-first");
+    let last_sequence = fx.record(&id).last_run.map(|run| run.sequence);
+    assert_eq!(last_sequence, Some(2));
     assert!(fx.claim().is_none(), "the round is over");
-    assert_eq!(fx.service.observers().list_watches(&id).unwrap().len(), 2);
+    // No exit code removes an entry: the gate's exit does (R14, R16).
+    assert_eq!(
+        fx.service
+            .observers()
+            .queue_entries(&owner(), "mr-review")
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(
         fx.record(&id).next_run_at,
-        Some(fx.now() + Duration::seconds(INTERVAL as i64))
+        Some(tick + Duration::seconds(INTERVAL as i64))
     );
 }
 
 #[test]
-fn a_watch_run_exit_code_decides_whether_its_entry_stays() {
-    // D18: 0 removes the entry, 1 keeps it, another code is an error that
-    // keeps it and replaces the object's older error.
+fn a_failed_entry_run_keeps_the_entry_and_only_its_newest_error() {
+    // R14, R23: an error is recorded per entry, with no backoff, and a
+    // newer error of the same entry replaces the older one.
     let fx = Fixture::new();
-    let id = fx.active("mr-review", WatchMode::WatchList);
+    let id = fx.active("mr-review", ObserverMode::OnEpisodes);
     let task = fx.task("task-1");
-    let merged = format!("{PREFIX}a/-/merge_requests/17");
-    let open = format!("{PREFIX}a/-/merge_requests/18");
-    fx.watch(&id, &task, &merged);
-    fx.advance(1);
-    fx.watch(&id, &task, &open);
+    let entry = fx.entry("mr-review", &task, "input-1");
     fx.service.observer_pass();
 
     let first = fx.claim().unwrap();
-    assert_eq!(first.input.watch.as_ref().unwrap().object, merged);
-    assert_eq!(
-        fx.finish(&first, exited(0, "")).status,
-        RunStatus::Succeeded
-    );
-    let second = fx.claim().unwrap();
-    assert_eq!(second.input.watch.as_ref().unwrap().object, open);
-    assert_eq!(fx.finish(&second, exited(3, "")).status, RunStatus::Failed);
-
-    let objects: Vec<String> = fx
-        .service
-        .observers()
-        .list_watches(&id)
-        .unwrap()
-        .into_iter()
-        .map(|entry| entry.object)
-        .collect();
-    assert_eq!(objects, vec![open.clone()]);
+    assert_eq!(fx.finish(&first, exited(3, "")).status, RunStatus::Failed);
     let record = fx.record(&id);
-    assert_eq!(record.consecutive_failures, 0, "no backoff for a watch run");
+    assert_eq!(
+        record.consecutive_failures, 0,
+        "no backoff for an entry run"
+    );
     assert_eq!(record.state, ObserverState::Active);
     assert_eq!(
         record.next_run_at,
@@ -806,57 +914,94 @@ fn a_watch_run_exit_code_decides_whether_its_entry_stays() {
     );
     let errors = fx.failures(&id);
     assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].watch_object.as_deref(), Some(open.as_str()));
+    assert_eq!(errors[0].entry_id.as_deref(), Some(entry.entry_id.as_str()));
 
-    // The next round checks the entry again; a new error replaces the old.
     fx.advance(INTERVAL as i64);
     fx.service.observer_pass();
-    let third = fx.claim().unwrap();
-    fx.finish(&third, exited(2, ""));
+    let second = fx.claim().unwrap();
+    fx.finish(&second, exited(2, ""));
     let errors = fx.failures(&id);
     assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].sequence, third.run_id.sequence);
+    assert_eq!(errors[0].sequence, second.run_id.sequence);
     assert_eq!(errors[0].exit_code, Some(2));
+    assert!(fx
+        .service
+        .observers()
+        .queue_entry(&entry.entry_id)
+        .unwrap()
+        .is_some());
+}
 
-    fx.advance(INTERVAL as i64);
-    fx.service.observer_pass();
-    let fourth = fx.claim().unwrap();
-    fx.finish(&fourth, exited(1, ""));
-    assert_eq!(fx.service.observers().list_watches(&id).unwrap().len(), 1);
+#[test]
+fn every_observer_of_a_queue_checks_its_entries_and_no_other_owners() {
+    // R7, R8: two observers of one queue each run for the entry; an
+    // observer of another owner's queue of the same name sees none.
+    let fx = Fixture::new();
+    let gitlab = fx.active_of(owner(), "gitlab-mr", "mr-review", ObserverMode::OnEpisodes);
+    let github = fx.active_of(owner(), "github-pr", "mr-review", ObserverMode::OnEpisodes);
+    let stranger = OwnerRef::new("someone-else");
+    let foreign = fx.active_of(
+        stranger.clone(),
+        "foreign-mr",
+        "mr-review",
+        ObserverMode::OnEpisodes,
+    );
+    let task = fx.task("task-1");
+    fx.entry("mr-review", &task, "input-1");
+
+    let pass = fx.service.observer_pass();
+
+    assert_eq!(pass.skipped, vec![foreign.clone()]);
+    let mut due = pass.due.clone();
+    due.sort();
+    let mut expected = vec![gitlab.clone(), github.clone()];
+    expected.sort();
+    assert_eq!(due, expected);
+    let mut ran = Vec::new();
+    while let Some(claimed) = fx.claim() {
+        let entry = claimed.input.entry.clone().unwrap();
+        assert_eq!(entry.task_id, task);
+        ran.push(claimed.run_id.observer_id.clone());
+        fx.finish(&claimed, exited(0, ""));
+    }
+    ran.sort();
+    assert_eq!(ran, expected);
+    assert!(fx
+        .service
+        .observers()
+        .queue_entries(&stranger, "mr-review")
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
 fn a_round_skips_an_entry_removed_before_its_run() {
     let fx = Fixture::new();
-    let id = fx.active("mr-review", WatchMode::WatchList);
+    let id = fx.active("mr-review", ObserverMode::OnEpisodes);
     let task = fx.task("task-1");
-    let gone = format!("{PREFIX}a/-/merge_requests/17");
-    fx.watch(&id, &task, &gone);
+    let entry = fx.entry("mr-review", &task, "input-1");
     fx.service.observer_pass();
-    let lock = fx.service.observers().lock(&id).unwrap();
-    for entry in fx.service.observers().list_watches(&id).unwrap() {
-        fx.service
-            .observers()
-            .remove_watch(&lock, &entry.entry_id)
-            .unwrap();
-    }
+    let store = fx.service.observers();
+    let lock = store.lock_queue_entries().unwrap();
+    assert!(store.remove_queue_entry(&lock, &entry.entry_id).unwrap());
+    assert!(!store.remove_queue_entry(&lock, &entry.entry_id).unwrap());
     drop(lock);
 
     assert!(fx.claim().is_none());
     let record = fx.record(&id);
-    assert!(record.watch_round.is_empty());
+    assert!(record.entry_round.is_empty());
     assert_eq!(record.run_due_since, None);
 }
 
 #[test]
 fn the_pass_removes_the_entries_of_archived_tasks() {
-    // R7.
+    // R19.
     let fx = Fixture::new();
-    let id = fx.active("mr-review", WatchMode::WatchList);
+    let id = fx.active("mr-review", ObserverMode::OnEpisodes);
     let archived = fx.task("task-archived");
     let live = fx.task("task-live");
-    fx.watch(&id, &archived, &format!("{PREFIX}a/-/merge_requests/1"));
-    fx.watch(&id, &live, &format!("{PREFIX}a/-/merge_requests/2"));
+    fx.entry("mr-review", &archived, "input-1");
+    fx.entry("mr-review", &live, "input-1");
     fx.service
         .control_plane()
         .command(
@@ -867,21 +1012,102 @@ fn the_pass_removes_the_entries_of_archived_tasks() {
 
     let pass = fx.service.observer_pass();
 
-    assert_eq!(pass.watches_removed, 1);
+    assert_eq!(pass.entries_removed, 1);
     assert_eq!(pass.due, vec![id.clone()]);
-    let left = fx.service.observers().list_watches(&id).unwrap();
+    let left = fx
+        .service
+        .observers()
+        .queue_entries(&owner(), "mr-review")
+        .unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].task_id, live);
 }
 
 #[test]
+fn a_cron_schedule_runs_at_its_fire_times_and_backs_off_onto_one() {
+    // R28, R29: the next run is the expression's next fire; a failure waits
+    // twice the gap and lands on a fire time.
+    let fx = Fixture::new();
+    let id = fx.draft("jira", ObserverMode::Always);
+    let mut config = fx.record(&id).config;
+    config.schedule = ScheduleConfig::from_parts(None, Some("*/10 * * * *".into())).unwrap();
+    fx.service
+        .observers()
+        .update_config(&id, config, Some(&triage_workflow()), fx.now())
+        .unwrap();
+    fx.service.approve_observer_version(&id, 1).unwrap();
+    // 12:00:00, due at once as a fresh approval.
+    fx.service.observer_pass();
+    let first = fx.claim().unwrap();
+    fx.advance(65);
+    fx.finish(&first, exited(0, r#"{"state": {}}"#));
+    let fire = |minute| Utc.with_ymd_and_hms(2026, 11, 13, 12, minute, 0).unwrap();
+    assert_eq!(fx.record(&id).next_run_at, Some(fire(10)));
+
+    fx.advance(9 * 60);
+    fx.service.observer_pass();
+    let second = fx.claim().unwrap();
+    fx.finish(&second, exited(4, ""));
+    // At 12:10:05 the gap is 595 s; doubled, 12:29:55, so the 12:30 fire.
+    assert_eq!(fx.record(&id).next_run_at, Some(fire(30)));
+}
+
+#[test]
+fn an_observer_without_a_create_task_effect_creates_no_task() {
+    let fx = Fixture::new();
+    let id = fx.active("mr-review", ObserverMode::OnEpisodes);
+    let task = fx.task("task-1");
+    fx.entry("mr-review", &task, "input-1");
+    fx.service.observer_pass();
+    let claimed = fx.claim().unwrap();
+    assert_eq!(claimed.run_id.observer_id, id);
+
+    let refused = fx
+        .service
+        .observer_create_task(
+            &claimed.run_id,
+            ObserverCreateTaskRequest {
+                data: json!({"key": "ABC-1"}),
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        refused,
+        ProtocolError::BadRequest {
+            code: "effect_not_allowed",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn resuming_an_observer_clears_its_note() {
+    let fx = Fixture::new();
+    let id = fx.active("jira", ObserverMode::Always);
+    fx.service.pause_observer(&id).unwrap();
+    {
+        let store = fx.service.observers();
+        let lock = store.lock(&id).unwrap();
+        let mut record = store.load(&id).unwrap();
+        record.note = Some("paused by an update".into());
+        store.save(&lock, &mut record, fx.now()).unwrap();
+    }
+
+    let record = fx.service.resume_observer(&id).unwrap();
+
+    assert_eq!(record.state, ObserverState::Active);
+    assert_eq!(record.note, None);
+}
+
+#[test]
 fn a_pass_with_nothing_due_writes_nothing() {
     let fx = Fixture::new();
-    let id = fx.active("jira", WatchMode::All);
+    let id = fx.active("jira", ObserverMode::Always);
     fx.service.observer_pass();
     let claimed = fx.claim().unwrap();
     fx.finish(&claimed, exited(0, r#"{"state": {}}"#));
-    let draft = fx.draft("draft", WatchMode::All);
+    let draft = fx.draft("draft", ObserverMode::Always);
     let revisions = (fx.record(&id).revision, fx.record(&draft).revision);
 
     let pass = fx.service.observer_pass();
@@ -897,9 +1123,9 @@ fn a_pass_with_nothing_due_writes_nothing() {
 fn the_pass_and_the_claim_skip_unreadable_records() {
     // D7.
     let fx = Fixture::new();
-    let corrupt = fx.active("broken", WatchMode::All);
-    let newer = fx.active("newer", WatchMode::All);
-    let healthy = fx.active("jira", WatchMode::All);
+    let corrupt = fx.active("broken", ObserverMode::Always);
+    let newer = fx.active("newer", ObserverMode::Always);
+    let healthy = fx.active("jira", ObserverMode::Always);
     let paths = fx.service.observers().paths().clone();
     std::fs::write(paths.observer_record_file(corrupt.as_str()), "{ not json").unwrap();
     let newer_file = paths.observer_record_file(newer.as_str());
@@ -920,7 +1146,7 @@ fn the_pass_and_the_claim_skip_unreadable_records() {
 #[test]
 fn pause_and_resume_refuse_a_draft() {
     let fx = Fixture::new();
-    let id = fx.draft("jira", WatchMode::All);
+    let id = fx.draft("jira", ObserverMode::Always);
 
     for result in [
         fx.service.pause_observer(&id),
@@ -947,7 +1173,7 @@ fn a_worker_outcome_from_a_newer_build_reads_as_a_worker_error() {
 
 fn schedule_judge(report: &RunReport) -> (RunStatus, Option<i32>) {
     let fx = Fixture::new();
-    fx.active("jira", WatchMode::All);
+    fx.active("jira", ObserverMode::Always);
     fx.service.observer_pass();
     let claimed = fx.claim().unwrap();
     let run = fx.finish(&claimed, report.clone());
@@ -956,4 +1182,515 @@ fn schedule_judge(report: &RunReport) -> (RunStatus, Option<i32>) {
         .first()
         .and_then(|failure| failure.exit_code);
     (run.status, exit_code)
+}
+
+#[test]
+fn the_runner_channel_keeps_the_queue_entry_in_step_with_the_gate() {
+    // R16 through the runner's snapshot route: the entry of the episode the
+    // runner waits in, and no other.
+    let fx = Fixture::new();
+    fx.active("mr-review", ObserverMode::OnEpisodes);
+    let task = fx.task("task-1");
+    let first = fx.entry("mr-review", &task, "input-1");
+    assert_eq!(first.episode, "input-1");
+    assert_eq!(first.created_at, fx.now());
+
+    fx.advance(60);
+    fx.report_gate(&task, Some(("input-2", review_gate("mr-review", &task))));
+    let entries = fx
+        .service
+        .observers()
+        .queue_entries(&owner(), "mr-review")
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].episode, "input-2");
+    assert_eq!(entries[0].created_at, fx.now());
+
+    fx.report_gate(&task, None);
+    assert!(fx
+        .service
+        .observers()
+        .list_queue_entries()
+        .unwrap()
+        .is_empty());
+    let record = fx.service.control_plane().task(&task).unwrap();
+    assert_eq!(record.watched_gate, None);
+}
+
+// -- the owner's update and queues (R23, R24, R26, R31–R35) ----------------
+
+fn update(
+    queue: Option<&str>,
+    mode: Option<ObserverMode>,
+    interval_secs: Option<u64>,
+    cron: Option<&str>,
+) -> crate::controller_protocol::wire::UpdateObserverRequest {
+    crate::controller_protocol::wire::UpdateObserverRequest {
+        queue: queue.map(str::to_string),
+        mode,
+        interval_secs,
+        cron: cron.map(str::to_string),
+    }
+}
+
+/// The code and message of a refusal.
+fn refusal(error: ProtocolError) -> (&'static str, String) {
+    match error {
+        ProtocolError::BadRequest { code, message } | ProtocolError::Conflict { code, message } => {
+            (code, message)
+        }
+        other => panic!("not a coded refusal: {other:?}"),
+    }
+}
+
+#[test]
+fn the_queue_list_counts_entries_and_the_queue_shows_observers_and_entries() {
+    // R23, R24: the owner's queues with counts; a queue's observers and
+    // entries, and per entry and observer the last run and newest error.
+    let fx = Fixture::new();
+    let gitlab = fx.active_of(owner(), "gitlab-mr", "mr-review", ObserverMode::OnEpisodes);
+    let github = fx.active_of(owner(), "github-pr", "mr-review", ObserverMode::OnEpisodes);
+    fx.active_of(owner(), "jira-new", "jira-intake", ObserverMode::Always);
+    let task = fx.task("task-1");
+    let entry = fx.entry("mr-review", &task, "input-1");
+
+    let listed = fx.service.observer_queues_of(&owner()).unwrap();
+    let summary: Vec<_> = listed
+        .queues
+        .iter()
+        .map(|queue| {
+            (
+                queue.queue.as_str(),
+                queue.mode.as_deref(),
+                queue.observers,
+                queue.entries,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("jira-intake", Some("always"), 1, 0),
+            ("mr-review", Some("on_episodes"), 2, 1),
+        ]
+    );
+
+    // The pass hands the entry to both observers: GitLab's run fails, the
+    // GitHub one's is still running.
+    fx.service.observer_pass();
+    let mut claims = Vec::new();
+    while let Some(claimed) = fx.claim() {
+        claims.push(claimed);
+    }
+    let gitlab_run = claims
+        .iter()
+        .find(|claimed| claimed.run_id.observer_id == gitlab)
+        .unwrap();
+    assert!(claims
+        .iter()
+        .any(|claimed| claimed.run_id.observer_id == github));
+    fx.advance(30);
+    fx.finish(gitlab_run, exited(2, ""));
+
+    let shown = fx.service.observer_queue(&owner(), "mr-review").unwrap();
+    assert_eq!(shown.queue, "mr-review");
+    assert_eq!(shown.mode.as_deref(), Some("on_episodes"));
+    let names: Vec<_> = shown.observers.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(names, vec!["github-pr", "gitlab-mr"]);
+    assert_eq!(shown.entries.len(), 1);
+    let view = &shown.entries[0];
+    assert_eq!(view.entry_id, entry.entry_id);
+    assert_eq!(view.task_id, "task-1");
+    assert_eq!(view.step, "review_work");
+    assert_eq!(view.episode, "input-1");
+    assert_eq!(view.started_at, entry.created_at);
+    assert_eq!(view.params["mr_url"], "https://x/task-1");
+    let processing: Vec<_> = view
+        .observers
+        .iter()
+        .map(|state| {
+            (
+                state.observer.as_str(),
+                state.running,
+                state.last_run_at,
+                state
+                    .last_error
+                    .as_ref()
+                    .map(|error| (error.status.as_str(), error.exit_code)),
+            )
+        })
+        .collect();
+    assert_eq!(
+        processing,
+        vec![
+            ("github-pr", true, None, None),
+            (
+                "gitlab-mr",
+                false,
+                Some(fx.now()),
+                Some(("failed", Some(2)))
+            ),
+        ]
+    );
+    let gitlab_view = shown
+        .observers
+        .iter()
+        .find(|observer| observer.name == "gitlab-mr")
+        .unwrap();
+    assert_eq!(
+        gitlab_view.last_run.as_ref().unwrap().finished_at,
+        fx.now(),
+        "the observer's last run"
+    );
+}
+
+#[test]
+fn a_queue_view_shows_the_read_only_settings_of_its_observers() {
+    // R34: secret references, the task limit and the mapping are shown.
+    let fx = Fixture::new();
+    fx.active_of(owner(), "jira-new", "jira-intake", ObserverMode::Always);
+
+    let shown = fx.service.observer_queue(&owner(), "jira-intake").unwrap();
+
+    let observer = &shown.observers[0];
+    assert_eq!(observer.secrets.len(), 1);
+    assert_eq!(observer.secrets[0].name, "jira-token");
+    assert_eq!(observer.secrets[0].env, "JIRA_TOKEN");
+    assert_eq!(observer.mapping["ticket"], "key");
+    assert_eq!(observer.workflow_id.as_deref(), Some("triage"));
+    assert!(observer.task_limit_per_run > 0);
+    assert!(shown.entries.is_empty());
+    // The detail shows the same, once.
+    let detail = fx.service.observer_detail(&owner(), "jira-new").unwrap();
+    assert_eq!(detail.observer.secrets, observer.secrets);
+    assert_eq!(detail.observer.mapping, observer.mapping);
+}
+
+#[test]
+fn another_owners_queue_is_not_found_and_not_listed() {
+    // R7: a queue name is the owner's; another owner's queue of the same
+    // name, or a name nothing of the caller's names, is not found.
+    let fx = Fixture::new();
+    fx.active_of(owner(), "gitlab-mr", "mr-review", ObserverMode::OnEpisodes);
+    let task = fx.task("task-1");
+    fx.entry("mr-review", &task, "input-1");
+    let stranger = OwnerRef::new("someone-else");
+    fx.active_of(
+        stranger.clone(),
+        "foreign-jira",
+        "jira-intake",
+        ObserverMode::Always,
+    );
+
+    for queue in ["mr-review", "nothing-here"] {
+        assert!(
+            matches!(
+                fx.service.observer_queue(&stranger, queue),
+                Err(ProtocolError::NotFound)
+            ),
+            "{queue}"
+        );
+    }
+    assert!(matches!(
+        fx.service.observer_queue(&owner(), "jira-intake"),
+        Err(ProtocolError::NotFound)
+    ));
+    let theirs = fx.service.observer_queues_of(&stranger).unwrap();
+    let names: Vec<_> = theirs.queues.iter().map(|q| q.queue.as_str()).collect();
+    assert_eq!(names, vec!["jira-intake"]);
+    assert_eq!(theirs.queues[0].entries, 0);
+    assert!(matches!(
+        fx.service
+            .update_observer(&stranger, "gitlab-mr", update(Some("x"), None, None, None)),
+        Err(ProtocolError::NotFound)
+    ));
+}
+
+#[test]
+fn a_queue_with_entries_and_no_observer_is_listed_without_a_mode() {
+    // The gate names a queue no observer serves (R9): the owner still sees
+    // the waiting episode.
+    let fx = Fixture::new();
+    let task = fx.task("task-1");
+    fx.entry("orphan", &task, "input-1");
+
+    let listed = fx.service.observer_queues_of(&owner()).unwrap();
+    assert_eq!(listed.queues.len(), 1);
+    assert_eq!(listed.queues[0].queue, "orphan");
+    assert_eq!(listed.queues[0].mode, None);
+    assert_eq!(listed.queues[0].observers, 0);
+    assert_eq!(listed.queues[0].entries, 1);
+    let shown = fx.service.observer_queue(&owner(), "orphan").unwrap();
+    assert!(shown.observers.is_empty());
+    assert!(shown.entries[0].observers.is_empty());
+}
+
+#[test]
+fn an_update_changes_queue_mode_and_schedule_and_keeps_the_rest() {
+    // R31, R35: queue, mode and schedule change; state, scripts and
+    // approval stay. The effect is not checked against the catalogue
+    // again: this service has none.
+    let fx = Fixture::new();
+    let id = fx.active("jira-new", ObserverMode::Always);
+    let before = fx.record(&id);
+    fx.advance(5);
+
+    let updated = fx
+        .service
+        .update_observer(
+            &owner(),
+            "jira-new",
+            update(Some("jira-intake"), None, None, Some("*/10 * * * *")),
+        )
+        .unwrap();
+
+    assert_eq!(updated.queue, "jira-intake");
+    assert_eq!(updated.mode, "always");
+    assert_eq!(updated.cron.as_deref(), Some("*/10 * * * *"));
+    assert_eq!(updated.interval_secs, None);
+    assert_eq!(updated.state, "active");
+    assert_eq!(updated.approved_version, Some(1));
+    let record = fx.record(&id);
+    assert_eq!(record.scripts, before.scripts);
+    assert_eq!(record.config.effect, before.config.effect);
+    // A new schedule counts its next tick from the update.
+    assert_eq!(
+        record.next_run_at,
+        Some(Utc.with_ymd_and_hms(2026, 11, 13, 12, 10, 0).unwrap())
+    );
+
+    // The only observer of its queue may change the queue's mode, and by
+    // id as well as by name.
+    let moved = fx
+        .service
+        .update_observer(
+            &owner(),
+            id.as_str(),
+            update(None, Some(ObserverMode::OnEpisodes), Some(600), None),
+        )
+        .unwrap();
+    assert_eq!(moved.mode, "on_episodes");
+    assert_eq!(moved.interval_secs, Some(600));
+    assert_eq!(moved.cron, None);
+}
+
+#[test]
+fn an_update_that_mixes_modes_or_has_a_bad_schedule_is_refused() {
+    // Covers AE8, AE9: the refusal names the queue's mode; a cron with a
+    // seconds field, an alias, a too short interval and two schedules are
+    // refused; nothing changes.
+    let fx = Fixture::new();
+    fx.active_of(owner(), "gitlab-mr", "mr-review", ObserverMode::OnEpisodes);
+    fx.active_of(owner(), "github-pr", "mr-review", ObserverMode::OnEpisodes);
+    let jira = fx.active_of(owner(), "jira-new", "jira-intake", ObserverMode::Always);
+    let before = fx.record(&jira);
+
+    let mixed = fx
+        .service
+        .update_observer(
+            &owner(),
+            "jira-new",
+            update(Some("mr-review"), None, None, None),
+        )
+        .unwrap_err();
+    let (code, message) = refusal(mixed);
+    assert_eq!(code, "queue_mode_mismatch");
+    assert!(message.contains("on_episodes"), "{message}");
+    let mixed = fx
+        .service
+        .update_observer(
+            &owner(),
+            "gitlab-mr",
+            update(None, Some(ObserverMode::Always), None, None),
+        )
+        .unwrap_err();
+    assert_eq!(refusal(mixed).0, "queue_mode_mismatch");
+
+    for (interval, cron) in [
+        (None, Some("* * * * * *")),
+        (None, Some("*/30 * * * * *")),
+        (None, Some("@hourly")),
+        (Some(10), None),
+        (Some(300), Some("*/5 * * * *")),
+    ] {
+        let refused = fx
+            .service
+            .update_observer(&owner(), "jira-new", update(None, None, interval, cron))
+            .unwrap_err();
+        assert_eq!(
+            refusal(refused).0,
+            "invalid_observer",
+            "{interval:?} {cron:?}"
+        );
+    }
+    let refused = fx
+        .service
+        .update_observer(
+            &owner(),
+            "jira-new",
+            update(Some("Not A Queue!"), None, None, None),
+        )
+        .unwrap_err();
+    assert_eq!(refusal(refused).0, "invalid_observer");
+    let empty = fx
+        .service
+        .update_observer(&owner(), "jira-new", update(None, None, None, None))
+        .unwrap_err();
+    assert_eq!(refusal(empty).0, "invalid_request");
+    assert_eq!(fx.record(&jira), before);
+
+    // AE9: a five-field expression is accepted.
+    let accepted = fx
+        .service
+        .update_observer(
+            &owner(),
+            "jira-new",
+            update(None, None, None, Some("* * * * *")),
+        )
+        .unwrap();
+    assert_eq!(accepted.cron.as_deref(), Some("* * * * *"));
+}
+
+#[test]
+fn the_view_reports_the_approved_and_the_newest_version() {
+    // Covers AE10: version 3 saved, version 2 approved; the schedule runs 2.
+    let fx = Fixture::new();
+    let id = fx.active("mr-review", ObserverMode::OnEpisodes);
+    for version in 2..=3 {
+        fx.service
+            .add_observer_script(&owner(), "mr-review", &format!("echo {version}\n"))
+            .unwrap();
+    }
+    fx.service
+        .approve_observer_version_for(&owner(), "mr-review", 2)
+        .unwrap();
+
+    let listed = fx.service.observers_of(&owner()).unwrap();
+    assert_eq!(listed.observers[0].approved_version, Some(2));
+    assert_eq!(listed.observers[0].latest_version, Some(3));
+    let shown = fx.service.observer_queue(&owner(), "mr-review").unwrap();
+    assert_eq!(shown.observers[0].approved_version, Some(2));
+    assert_eq!(shown.observers[0].latest_version, Some(3));
+
+    let task = fx.task("task-1");
+    fx.entry("mr-review", &task, "input-1");
+    fx.advance(INTERVAL as i64);
+    fx.service.observer_pass();
+    let claimed = fx.claim().unwrap();
+    assert_eq!(claimed.run_id.observer_id, id);
+    assert_eq!(claimed.script_version, 2);
+}
+
+#[test]
+fn deleting_the_last_observer_of_a_queue_removes_its_scripts_errors_and_entries() {
+    // R33: the observer's files go at once; the queue's entries go with
+    // the queue's last observer, and come back with a new one.
+    let fx = Fixture::new();
+    let gitlab = fx.active_of(owner(), "gitlab-mr", "mr-review", ObserverMode::OnEpisodes);
+    fx.active_of(owner(), "github-pr", "mr-review", ObserverMode::OnEpisodes);
+    let task = fx.task("task-1");
+    let entry = fx.entry("mr-review", &task, "input-1");
+    fx.service.observer_pass();
+    while let Some(claimed) = fx.claim() {
+        fx.finish(&claimed, exited(2, ""));
+    }
+    assert_eq!(fx.failures(&gitlab).len(), 1);
+    let gitlab_dir = fx.service.observers().paths().observer_dir(gitlab.as_str());
+
+    fx.service.delete_observer(&owner(), "gitlab-mr").unwrap();
+    assert!(!gitlab_dir.exists(), "scripts and errors are gone");
+    assert!(
+        fx.service
+            .observers()
+            .queue_entry(&entry.entry_id)
+            .unwrap()
+            .is_some(),
+        "github-pr still serves the queue"
+    );
+
+    fx.service.delete_observer(&owner(), "github-pr").unwrap();
+    assert!(fx
+        .service
+        .observers()
+        .queue_entries(&owner(), "mr-review")
+        .unwrap()
+        .is_empty());
+    assert!(fx
+        .service
+        .observer_queues_of(&owner())
+        .unwrap()
+        .queues
+        .is_empty());
+    assert!(matches!(
+        fx.service.observer_queue(&owner(), "mr-review"),
+        Err(ProtocolError::NotFound)
+    ));
+
+    // The task still waits at its gate: a new observer's tick adds its
+    // entry back.
+    fx.active_of(
+        owner(),
+        "gitlab-mr-2",
+        "mr-review",
+        ObserverMode::OnEpisodes,
+    );
+    let pass = fx.service.observer_pass();
+    assert_eq!(pass.entries_restored, 1);
+    assert!(fx
+        .service
+        .observers()
+        .queue_entry(&entry.entry_id)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn a_new_round_forgets_the_last_runs_of_entries_that_left_the_queue() {
+    let fx = Fixture::new();
+    let id = fx.active("mr-review", ObserverMode::OnEpisodes);
+    let first = fx.task("task-1");
+    let second = fx.task("task-2");
+    let gone = fx.entry("mr-review", &first, "input-1");
+    let kept = fx.entry("mr-review", &second, "input-1");
+    fx.service.observer_pass();
+    while let Some(claimed) = fx.claim() {
+        fx.finish(&claimed, exited(0, ""));
+    }
+    assert_eq!(fx.record(&id).entry_last_runs.len(), 2);
+
+    // The first task's gate exits: its entry leaves the queue.
+    fx.report_gate(&first, None);
+    fx.advance(INTERVAL as i64);
+    fx.service.observer_pass();
+
+    let runs = fx.record(&id).entry_last_runs;
+    assert!(!runs.contains_key(&gone.entry_id));
+    assert!(runs.contains_key(&kept.entry_id));
+}
+
+#[test]
+fn the_owner_reads_the_text_of_a_script_version_and_no_one_else_does() {
+    // R32: a view shows the script text before the owner approves it.
+    let fx = Fixture::new();
+    fx.draft("jira", ObserverMode::Always);
+    fx.service
+        .add_observer_script(&owner(), "jira", "echo v2\n")
+        .unwrap();
+
+    let second = fx.service.observer_script(&owner(), "jira", 2).unwrap();
+    assert_eq!(second.version, 2);
+    assert_eq!(second.script, "echo v2\n");
+    assert!(second.sha256.starts_with("sha256:"), "{}", second.sha256);
+    let first = fx.service.observer_script(&owner(), "jira", 1).unwrap();
+    assert_eq!(first.script, "echo '{\"state\": {}}'\n");
+
+    assert!(matches!(
+        fx.service.observer_script(&owner(), "jira", 3),
+        Err(ProtocolError::BadRequest { .. })
+    ));
+    assert!(matches!(
+        fx.service
+            .observer_script(&OwnerRef::new("someone-else"), "jira", 1),
+        Err(ProtocolError::NotFound)
+    ));
 }

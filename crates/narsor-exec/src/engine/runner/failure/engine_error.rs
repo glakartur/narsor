@@ -18,10 +18,6 @@ pub enum EngineError {
     #[error(transparent)]
     HumanInput(#[from] HumanActionError),
 
-    /// Ending a `wait` step's wait failed.
-    #[error(transparent)]
-    WaitEvent(#[from] WaitActionError),
-
     /// The state's decision provider cannot be used.
     #[error(transparent)]
     Decision(#[from] DecisionError),

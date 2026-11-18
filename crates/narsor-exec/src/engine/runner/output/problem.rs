@@ -135,6 +135,7 @@ impl Engine {
             agent_session_id: session.and_then(|(_, session)| session),
             prefilled_answer: None,
             permission: None,
+            gate_watch: None,
         };
         let mut pending = PendingHumanInput::for_problem(
             execution.id.clone(),

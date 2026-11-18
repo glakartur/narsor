@@ -19,7 +19,9 @@ pub(crate) struct AgentInput {
 /// The author of the prompt that carries an answer back to the agent.
 pub(crate) fn prompt_author(answered_by: AnsweredBy) -> PromptAuthor {
     match answered_by {
-        AnsweredBy::Operator => PromptAuthor::User,
+        // An observer answers gates only, never an agent's question; its
+        // answer reads as the owner's, whose script it runs.
+        AnsweredBy::Operator | AnsweredBy::Observer => PromptAuthor::User,
         AnsweredBy::Conductor => PromptAuthor::Conductor,
     }
 }

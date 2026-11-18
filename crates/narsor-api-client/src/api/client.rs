@@ -78,16 +78,16 @@ use super::dto::{
 };
 use crate::controller_protocol::ConductorReadResponse;
 use narsor_protocol::controller::{
-    AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest, ObserverDetailView,
-    ObserverListResponse, ObserverScriptView, ObserverView, ObserverWatchListResponse,
-    ObserverWatchView, SetObserverScriptRequest,
+    ApproveObserverRequest, CreateObserverRequest, ObserverDetailView, ObserverListResponse,
+    ObserverQueueListResponse, ObserverQueueView, ObserverScriptTextView, ObserverScriptView,
+    ObserverView, SetObserverScriptRequest, UpdateObserverRequest,
 };
 use narsor_protocol::controller::{
     CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
     ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest,
     CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery,
     ExecutionEventsResponse, HarnessUsageResponse, ObserverClaimResponse,
-    ObserverCreateTaskRequest, ObserverEffectResponse, ObserverEventRequest, ObserverRunReport,
+    ObserverCreateTaskRequest, ObserverDecideRequest, ObserverEffectResponse, ObserverRunReport,
     ObserverRunResultResponse, ObserverWorkerRun, OwnerCommandRequest, RepositoryBranchesResponse,
     RepositoryListResponse, RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest,
     SubmitInputRequest, SubmitOperatorCommandRequest, ValidateWorkflowRequest,
@@ -878,6 +878,32 @@ impl ApiClient {
         self.get_json(&url).await
     }
 
+    /// Changes the queue, mode or schedule of an observer —
+    /// `PATCH /control/v1/observers/{observer}`.
+    pub async fn update_observer(
+        &self,
+        observer: &str,
+        request: &UpdateObserverRequest,
+    ) -> Result<ObserverView, ClientError> {
+        let url = self.observer_url(observer, "")?;
+        self.patch_json(&url, request).await
+    }
+
+    /// The caller's queues with their counts —
+    /// `GET /control/v1/observer-queues`.
+    pub async fn observer_queues(&self) -> Result<ObserverQueueListResponse, ClientError> {
+        let url = format!("{}/control/v1/observer-queues", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// One queue of the caller with its observers and entries —
+    /// `GET /control/v1/observer-queues/{queue}`.
+    pub async fn observer_queue(&self, queue: &str) -> Result<ObserverQueueView, ClientError> {
+        let queue = path_segment("queue", queue)?;
+        let url = format!("{}/control/v1/observer-queues/{queue}", self.base_url);
+        self.get_json(&url).await
+    }
+
     /// Deletes an observer with every file of it.
     pub async fn delete_observer(&self, observer: &str) -> Result<ObserverView, ClientError> {
         let url = self.observer_url(observer, "")?;
@@ -892,6 +918,17 @@ impl ApiClient {
     ) -> Result<ObserverScriptView, ClientError> {
         let url = self.observer_url(observer, "/scripts")?;
         self.post_json(&url, request).await
+    }
+
+    /// One script version of an observer with its text —
+    /// `GET /control/v1/observers/{observer}/scripts/{version}`.
+    pub async fn observer_script(
+        &self,
+        observer: &str,
+        version: u32,
+    ) -> Result<ObserverScriptTextView, ClientError> {
+        let url = self.observer_url(observer, &format!("/scripts/{version}"))?;
+        self.get_json(&url).await
     }
 
     /// Approves a script version: the schedule runs it from now on.
@@ -916,36 +953,6 @@ impl ApiClient {
         self.post_empty(&url).await
     }
 
-    /// The observer's watch entries.
-    pub async fn observer_watches(
-        &self,
-        observer: &str,
-    ) -> Result<ObserverWatchListResponse, ClientError> {
-        let url = self.observer_url(observer, "/watches")?;
-        self.get_json(&url).await
-    }
-
-    /// Adds a watch entry for one of the caller's tasks.
-    pub async fn add_observer_watch(
-        &self,
-        observer: &str,
-        request: &AddObserverWatchRequest,
-    ) -> Result<ObserverWatchView, ClientError> {
-        let url = self.observer_url(observer, "/watches")?;
-        self.post_json(&url, request).await
-    }
-
-    /// Removes a watch entry.
-    pub async fn remove_observer_watch(
-        &self,
-        observer: &str,
-        entry_id: &str,
-    ) -> Result<ObserverWatchView, ClientError> {
-        let entry_id = path_segment("watch entry", entry_id)?;
-        let url = self.observer_url(observer, &format!("/watches/{entry_id}"))?;
-        self.delete_json(&url).await
-    }
-
     /// Creates a task from effect data, for a client holding a run token
     /// — `POST /observer/v1/runs/{run}/tasks`.
     pub async fn observer_create_task(
@@ -958,20 +965,15 @@ impl ApiClient {
         self.post_json(&url, request).await
     }
 
-    /// Delivers an event to a task, for a client holding a run token —
-    /// `POST /observer/v1/runs/{run}/tasks/{task_id}/events`.
-    pub async fn observer_deliver_event(
+    /// Answers the gate of the run's queue entry, for a client holding a
+    /// run token — `POST /observer/v1/runs/{run}/decide`.
+    pub async fn observer_decide(
         &self,
         run_id: &str,
-        task_id: &str,
-        request: &ObserverEventRequest,
+        request: &ObserverDecideRequest,
     ) -> Result<ObserverEffectResponse, ClientError> {
         let run_id = path_segment("run", run_id)?;
-        let task_id = path_segment("task", task_id)?;
-        let url = format!(
-            "{}/observer/v1/runs/{run_id}/tasks/{task_id}/events",
-            self.base_url
-        );
+        let url = format!("{}/observer/v1/runs/{run_id}/decide", self.base_url);
         self.post_json(&url, request).await
     }
 
@@ -1191,6 +1193,20 @@ impl ApiClient {
         let response = self
             .send(&self.http, |http, token| {
                 http.put(url).bearer_auth(token).json(body)
+            })
+            .await?;
+        handle_json_response(response).await
+    }
+
+    /// `PATCH url` with a JSON body, decoding the response as `T`.
+    async fn patch_json<B: Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<T, ClientError> {
+        let response = self
+            .send(&self.http, |http, token| {
+                http.patch(url).bearer_auth(token).json(body)
             })
             .await?;
         handle_json_response(response).await

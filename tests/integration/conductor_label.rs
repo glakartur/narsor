@@ -140,6 +140,7 @@ impl ActionExecutor for ScriptedAgent {
                         agent_session_id: Some("agent-session".to_string()),
                         prefilled_answer: None,
                         permission: None,
+                        gate_watch: None,
                     }),
                 )),
                 Reply::AskPermission => Ok(ActionOutcome::Suspended(
@@ -163,6 +164,7 @@ impl ActionExecutor for ScriptedAgent {
                                 reason: None,
                             }],
                         }),
+                        gate_watch: None,
                     }),
                 )),
                 Reply::Label(label) => Ok(ActionOutcome::Completed(ActionResult {

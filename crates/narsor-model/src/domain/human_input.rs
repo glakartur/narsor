@@ -17,6 +17,7 @@ use super::{
     HumanInputField, OutputLabel, StateId,
 };
 use narsor_protocol::api::RequiredValue;
+use narsor_protocol::controller::{GateWatch, TaskProvenance};
 
 pub use narsor_protocol::api::HumanInputActionDto as HumanInputAction;
 pub use narsor_protocol::api::LocalValue;
@@ -73,6 +74,13 @@ pub struct HumanInputRequest {
     /// pending record so an operator can make a later decision.
     #[serde(default)]
     pub permission: Option<PermissionRequestDetails>,
+
+    /// The `watch` block of a `decision` gate (`by: human`), its `params`
+    /// rendered when the gate started. Set by the engine, never by an
+    /// executor; kept with the request, so a restarted runner reports the
+    /// same values for the same episode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_watch: Option<GateWatch>,
 }
 
 /// Details attached to a permission wait. The tool input is untrusted data;
@@ -616,6 +624,13 @@ pub struct HumanInputDelivery {
     /// the operator, and only in-process callers answer as the conductor.
     #[serde(skip)]
     pub answered_by: AnsweredBy,
+
+    /// The observer and its run, when an observer's script is answering
+    /// (`answered_by: observer`, R15). Never read from the wire either: the
+    /// runner takes it from the control plane's delivery, never from an
+    /// owner's.
+    #[serde(skip)]
+    pub observer: Option<TaskProvenance>,
 }
 
 pub const APPROVE_OUTPUT_LABEL: &str = "__approve_output";

@@ -57,7 +57,6 @@ pub enum StepKind {
     Profile,
     Script,
     Human,
-    Wait,
     Decision,
     Terminal,
     #[serde(other)]
@@ -70,12 +69,9 @@ impl StepKind {
     pub fn runs_agent(self) -> bool {
         match self {
             Self::Agent | Self::Profile => true,
-            Self::Script
-            | Self::Human
-            | Self::Wait
-            | Self::Decision
-            | Self::Terminal
-            | Self::Unrecognized => false,
+            Self::Script | Self::Human | Self::Decision | Self::Terminal | Self::Unrecognized => {
+                false
+            }
         }
     }
 }

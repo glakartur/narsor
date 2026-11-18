@@ -498,7 +498,6 @@ pub enum ActionConfig {
     Agent(AgentActionConfig),
     Script(ScriptActionConfig),
     Human(HumanActionConfig),
-    Wait(WaitActionConfig),
     Decision(DecisionActionConfig),
     Profile(ProfileActionConfig),
 }
@@ -510,7 +509,6 @@ impl ActionConfig {
             Self::Agent(_) => "agent",
             Self::Script(_) => "script",
             Self::Human(_) => "human",
-            Self::Wait(_) => "wait",
             Self::Decision(_) => "decision",
             Self::Profile(_) => "profile",
         }
@@ -522,7 +520,7 @@ impl ActionConfig {
         match self {
             Self::Agent(config) => Some(&config.harness_step),
             Self::Profile(config) => Some(&config.harness_step),
-            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+            Self::Script(_) | Self::Human(_) | Self::Decision(_) => None,
         }
     }
 
@@ -531,7 +529,7 @@ impl ActionConfig {
         match self {
             Self::Agent(config) => Some(&mut config.harness_step),
             Self::Profile(config) => Some(&mut config.harness_step),
-            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+            Self::Script(_) | Self::Human(_) | Self::Decision(_) => None,
         }
     }
 
@@ -541,7 +539,7 @@ impl ActionConfig {
         match self {
             Self::Agent(config) => Some(&config.prompt),
             Self::Profile(config) => Some(&config.prompt),
-            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+            Self::Script(_) | Self::Human(_) | Self::Decision(_) => None,
         }
     }
 
@@ -553,7 +551,7 @@ impl ActionConfig {
         match self {
             Self::Agent(config) => Some((&mut config.harness_step, &mut config.prompt)),
             Self::Profile(config) => Some((&mut config.harness_step, &mut config.prompt)),
-            Self::Script(_) | Self::Human(_) | Self::Wait(_) | Self::Decision(_) => None,
+            Self::Script(_) | Self::Human(_) | Self::Decision(_) => None,
         }
     }
 
@@ -564,11 +562,7 @@ impl ActionConfig {
     pub fn is_profile_candidate(&self) -> bool {
         match self {
             Self::Agent(config) => !config.harness_step.is_pinned(),
-            Self::Profile(_)
-            | Self::Script(_)
-            | Self::Human(_)
-            | Self::Wait(_)
-            | Self::Decision(_) => false,
+            Self::Profile(_) | Self::Script(_) | Self::Human(_) | Self::Decision(_) => false,
         }
     }
 }
@@ -582,6 +576,25 @@ pub struct DecisionActionConfig {
 
     /// What the decider is asked, still templated.
     pub message: PromptText,
+
+    /// The observer queue the gate puts its wait episode on, for a
+    /// `by: human` decision only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<GateWatchConfig>,
+}
+
+/// The `watch` block of a `decision` step (`by: human`): the queue whose
+/// observers may answer the gate, and the params they get. `queue` is a
+/// plain name; each value of `params` is a template, rendered when the gate
+/// starts. Narsor does not interpret any value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateWatchConfig {
+    /// The name of the queue.
+    pub queue: String,
+
+    /// Names to text, flat.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
 }
 
 /// Who decides a [`DecisionActionConfig`] fork.
@@ -876,42 +889,6 @@ pub struct HumanInputField {
 
     #[serde(default)]
     pub description: Option<String>,
-}
-
-/// Wait action configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WaitActionConfig {
-    /// Event type to wait for (`event_type` in YAML)
-    pub event: String,
-
-    /// Filter criteria (optional)
-    #[serde(default)]
-    pub filter: Option<serde_json::Value>,
-
-    /// Timeout in seconds; the validator rejects it, a wait step has no
-    /// timeout
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-
-    /// The watch entry to register while the step waits (optional)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub watch: Option<WaitWatchConfig>,
-}
-
-/// A `wait` step's `watch` block: which observer is to watch which object
-/// while the step waits (§3.3.D). `object` and `event_types` are
-/// templates, rendered when the step starts; `observer` is a plain name.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WaitWatchConfig {
-    /// Name of the observer
-    pub observer: String,
-
-    /// The object to watch (the URL of a merge request, say)
-    pub object: String,
-
-    /// Event types the observer reports for the object; they include the
-    /// step's own event type
-    pub event_types: Vec<String>,
 }
 
 /// Reference to a workspace
@@ -1508,11 +1485,8 @@ pub enum ValidationError {
     #[error("State '{state}' declares a 'timeout' choice, which only agent and script steps can produce")]
     TimeoutChoiceNotAllowed { state: StateId },
 
-    #[error("State '{state}' sets a 'timeout', but a wait step has no timeout")]
-    WaitTimeoutNotAllowed { state: StateId },
-
     #[error("State '{state}' has an invalid 'watch': {reason}")]
-    InvalidWaitWatch { state: StateId, reason: String },
+    InvalidGateWatch { state: StateId, reason: String },
 
     #[error("Choice '{label}' in state '{state}' has invalid approval/resume behavior: {reason}")]
     InvalidChoiceBehavior {
@@ -1552,6 +1526,17 @@ pub enum ValidationError {
         field: String,
         reference: String,
         reason: String,
+    },
+
+    #[error(
+        "State '{state}' references '{reference}' in field '{field}'; 'context.event' was \
+         removed with the 'wait' step type: an observer answers a 'decision' gate with a \
+         choice and variables instead"
+    )]
+    RemovedEventReference {
+        state: StateId,
+        field: String,
+        reference: String,
     },
 
     #[error("Field '{field}' references unknown input '{variable}'")]

@@ -33,6 +33,10 @@ pub enum TaskEventKind {
     InputQueued {
         input_id: String,
         pending_input_id: String,
+        /// The observer and its run, when an observer's script gave the
+        /// answer (`task decide`, R15); `None` for the owner's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observer: Option<TaskProvenance>,
     },
     /// The owner commented on a paused task; the comment waits for the
     /// runner of the next launch.
@@ -143,11 +147,27 @@ pub enum TaskEventKind {
         /// Why no entry was added.
         reason: String,
     },
+    /// A warning about the queue entry of a wait episode at a `decision`
+    /// gate with a `watch` block (R9, R27): no active observer of the queue
+    /// can answer the gate, or the entry could not be stored. Written once
+    /// per episode. The gate keeps waiting for a person. A client from
+    /// before queue entries reads it as [`TaskEventKind::Unrecognized`].
+    GateQueueWarning {
+        /// The workflow state of the gate.
+        step: String,
+        /// The queue its `watch` names.
+        queue: String,
+        /// The wait episode: the id of the gate's pending input request.
+        episode: String,
+        /// What is wrong.
+        reason: String,
+    },
     #[serde(other)]
     Unrecognized,
 }
 
-/// Where a task or an event came from when an observer caused it (R19).
+/// Where a task, an event or an answer came from when an observer caused it
+/// (R15, R19).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskProvenance {
     /// The observer's id, never reused.

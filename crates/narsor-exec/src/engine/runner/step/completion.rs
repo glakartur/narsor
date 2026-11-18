@@ -128,6 +128,7 @@ impl Engine {
                 agent_session_id: agent_session_id.clone(),
                 prefilled_answer: None,
                 permission: None,
+                gate_watch: None,
             };
             let approval = ApprovalCandidate {
                 action_execution_id: pending.action_execution_id,
@@ -173,6 +174,7 @@ impl Engine {
                     agent_session_id: None,
                     prefilled_answer: None,
                     permission: None,
+                    gate_watch: None,
                 };
                 self.suspend_for_input(
                     execution,

@@ -90,11 +90,17 @@ impl Engine {
             .render_action(action, &location)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
         // A decision for the operator is asked as a form: the step's
-        // variables are its fields. One for the conductor is no action to
-        // run: the caller asks the conductor.
+        // variables are its fields, and its `watch` block (rendered above)
+        // goes with the request. One for the conductor is no action to run:
+        // the caller asks the conductor.
+        let mut watched_gate = None;
         if let ActionConfig::Decision(decision) = &rendered {
             match decision.by {
                 DecisionMaker::Human => {
+                    watched_gate = decision
+                        .watch
+                        .as_ref()
+                        .map(|watch| gate_watch(state, watch));
                     rendered = ActionConfig::Human(HumanActionConfig {
                         instruction: decision.message.to_string(),
                         inputs: decision_fields(state),
@@ -169,16 +175,13 @@ impl Engine {
                 }
             }
 
-            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingHumanInput(request))) => {
+            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingHumanInput(mut request))) => {
+                request.gate_watch = watched_gate;
                 Ok(AttemptOutcome::AwaitingHumanInput(request))
             }
 
             Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingAgentInput(request))) => {
                 Ok(AttemptOutcome::AwaitingAgentInput(request))
-            }
-
-            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingExternalEvent(request))) => {
-                Ok(AttemptOutcome::AwaitingExternalEvent(request))
             }
 
             Err(error)
@@ -205,6 +208,7 @@ impl Engine {
                     agent_session_id: None,
                     prefilled_answer: Some(input.answer),
                     permission: None,
+                    gate_watch: None,
                 }))
             }
             Err(error) => match OutputRejection::from_error(state, action_execution_id, &error) {

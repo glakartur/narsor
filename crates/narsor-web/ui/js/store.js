@@ -58,6 +58,35 @@ export function mutationGate(connection, now) {
   return `${state}${age ? ` (${age})` : ''}: akcja zmieniająca stan jest zablokowana`;
 }
 
+/**
+ * The reason a refused write shows in its form: the server's own message
+ * (`queue_mode_mismatch` names the queue's mode, a bad cron says why), or
+ * what failed when the server gave none.
+ */
+export function refusalReason(error) {
+  if (error?.kind === 'unavailable') return 'brak połączenia z serwerem';
+  if (error?.kind === 'not_found') return 'nie znaleziono (usunięte albo nie należy do Ciebie)';
+  const message = String(error?.message ?? '').trim();
+  return message || error?.code || String(error ?? 'nie udało się');
+}
+
+/**
+ * The view an address names: `#/task/<id>/<tab>`, `#/queues` or
+ * `#/queues/<queue>`. `null` for any other address.
+ */
+export function routeOf(hash) {
+  const [, kind, id, tab] = String(hash ?? '').split('/');
+  if (kind === 'task' && id) return { page: 'tasks', taskId: decodeURIComponent(id), tab: tab ?? null };
+  if (kind === 'queues') return { page: 'queues', queue: id ? decodeURIComponent(id) : null };
+  return null;
+}
+
+/** The address of the view in `state`. The token is never in it. */
+export function hashOf(state) {
+  if (state.page === 'queues') return state.queue ? `#/queues/${encodeURIComponent(state.queue)}` : '#/queues';
+  return state.selectedTaskId ? `#/task/${encodeURIComponent(state.selectedTaskId)}/${state.tab}` : '#/';
+}
+
 /** The rows the list shows, in server order. */
 export function shownTasks(tasks, filter, hideDone) {
   return tasks.filter((task) => (!hideDone || !isDone(task)) && matchesFilter(task, filter));
@@ -108,6 +137,8 @@ export class Store {
       filter: '',
       hideDone: false,
       tab: 'conversation',
+      page: 'tasks',
+      queue: null,
       connection: { state: 'connecting', name: connectionName, lastData: null, retryAt: null },
       harness: null,
       harnessPending: null,
@@ -331,6 +362,16 @@ export class Store {
     this.set({ selectedTaskId: settleSelection(before, after, this.state.selectedTaskId) });
   }
 
+  /** Opens the queues page: the list of queues, or one queue. */
+  openQueues(queue = null) {
+    this.set({ page: 'queues', queue });
+  }
+
+  /** Back to the tasks, with `taskId` selected when given. */
+  openTasks(taskId = null) {
+    this.set({ page: 'tasks', ...(taskId ? { selectedTaskId: taskId } : {}) });
+  }
+
   step(delta) {
     const rows = this.shown();
     if (!rows.length) return;
@@ -351,8 +392,10 @@ export class Store {
    * Runs a write when the connection is live. Shows `success` (a text or a
    * function of the result) and reads the list again; on a refusal shows the
    * reason. Resolves to the result, or `undefined` when it did not run.
+   * With `inline`, a refusal is not shown: the form that asked shows it
+   * (`refusalReason`) and keeps its values.
    */
-  async mutate(run, { success, failure = 'nie udało się' } = {}) {
+  async mutate(run, { success, failure = 'nie udało się', inline = false } = {}) {
     const blocked = mutationGate(this.state.connection, this.clock.now());
     if (blocked) {
       this.notify('warning', blocked);
@@ -366,7 +409,7 @@ export class Store {
     } catch (error) {
       if (error?.kind === 'unauthorized' || error?.kind === 'forbidden') {
         this.onFailure(error);
-      } else {
+      } else if (!inline) {
         this.notify('error', `${failure} — ${error?.message ?? error}`);
       }
       throw error;

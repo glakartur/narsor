@@ -55,7 +55,3 @@ pub use actions::{
     ResumedHumanAction, ScriptExecutor, StepContract, StepInWorkflow, StepScope, SuspendedAction,
     TimedOutAction, UsageReporter, ACTION_ID_ENV_VAR,
 };
-pub use actions::{
-    ExternalEventDelivery, ExternalEventRequest, PendingExternalEvent, WaitActionError, WaitEnding,
-    WaitExecutor,
-};

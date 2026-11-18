@@ -1,5 +1,6 @@
 //! The text `narsor task workflows|validate|capabilities|repo` print
-//! (`narsor::cli::control_text`), the text of `narsor-cli usage` and the
+//! (`narsor::cli::control_text`), the text of `narsor-cli usage`, the text
+//! of `narsor-cli observer queue …` (`narsor::cli::observer_text`) and the
 //! typing of `task create --file` inputs.
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -7,12 +8,15 @@ use narsor::cli::control_text::{
     capabilities_lines, repository_row, typed_inputs, usage_lines, validation_lines,
     workflow_lines, NO_USAGE,
 };
+use narsor::cli::observer_text::{queue_list_output, queue_show_output};
 use narsor_engine::controller_protocol::{
     ValidateWorkflowResponse, WorkflowInputView, WorkflowSource,
 };
 use narsor_engine::domain::ParamType;
 use narsor_protocol::controller::{
-    HarnessUsageResponse, HarnessUsageView, UsageLimit, UsageStatus,
+    HarnessUsageResponse, HarnessUsageView, ObserverQueueListResponse, ObserverQueueSummary,
+    ObserverQueueView, ObserverView, QueueEntryErrorView, QueueEntryObserverView, QueueEntryView,
+    UsageLimit, UsageStatus,
 };
 use serde_json::json;
 
@@ -290,4 +294,204 @@ fn usage_text_from_the_server_carries_no_control_characters() {
         );
     }
     assert!(lines[0].contains("claude[2J-code"), "{lines:?}");
+}
+
+// ---------------------------------------------------------------------------
+// `narsor-cli observer queue …` (U10)
+// ---------------------------------------------------------------------------
+
+fn queue_now() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 11, 17, 12, 0, 0).unwrap()
+}
+
+/// An `on_episodes` observer `name` of `queue` on a cron schedule, with
+/// the script versions given.
+fn queue_observer(
+    name: &str,
+    queue: &str,
+    approved: Option<u32>,
+    latest: Option<u32>,
+) -> ObserverView {
+    serde_json::from_value(json!({
+        "observer_id": format!("obs-{name}"),
+        "name": name,
+        "source": "gitlab",
+        "state": if approved.is_some() { "active" } else { "draft" },
+        "effect": "none",
+        "queue": queue,
+        "mode": "on_episodes",
+        "cron": "*/5 * * * *",
+        "task_limit_per_run": 10,
+        "approved_version": approved,
+        "latest_version": latest,
+        "worker_missing": false,
+        "consecutive_failures": 0,
+        "created_at": queue_now(),
+    }))
+    .unwrap()
+}
+
+fn review_entry(observers: Vec<QueueEntryObserverView>) -> QueueEntryView {
+    QueueEntryView {
+        entry_id: "entry-1".into(),
+        task_id: "task-1".into(),
+        step: "review_work".into(),
+        episode: "input-3".into(),
+        started_at: queue_now() - chrono::Duration::minutes(25),
+        params: [
+            ("label".to_string(), "w CR".to_string()),
+            (
+                "mr_url".to_string(),
+                "https://gitlab/a/-/merge_requests/17".to_string(),
+            ),
+        ]
+        .into(),
+        observers,
+    }
+}
+
+#[test]
+fn queue_list_aligns_a_row_per_queue_and_says_when_there_is_none() {
+    let listing = ObserverQueueListResponse {
+        queues: vec![
+            ObserverQueueSummary {
+                queue: "mr-review".into(),
+                mode: Some("on_episodes".into()),
+                observers: 2,
+                entries: 13,
+            },
+            ObserverQueueSummary {
+                queue: "unserved".into(),
+                mode: None,
+                observers: 0,
+                entries: 1,
+            },
+        ],
+    };
+
+    let text = queue_list_output(&listing);
+
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "QUEUE                    MODE         OBSERVERS ENTRIES",
+            "mr-review                on_episodes          2      13",
+            "unserved                 -                    0       1",
+        ]
+    );
+    assert!(queue_list_output(&ObserverQueueListResponse::default()).starts_with("No queues."));
+}
+
+#[test]
+fn queue_show_says_how_each_observer_processed_each_entry() {
+    let view = ObserverQueueView {
+        queue: "mr-review".into(),
+        mode: Some("on_episodes".into()),
+        observers: vec![
+            queue_observer("gitlab-mr", "mr-review", Some(1), Some(2)),
+            queue_observer("gitlab-ci", "mr-review", Some(3), Some(3)),
+        ],
+        entries: vec![review_entry(vec![
+            QueueEntryObserverView {
+                observer: "gitlab-ci".into(),
+                running: true,
+                last_run_at: None,
+                last_error: None,
+            },
+            QueueEntryObserverView {
+                observer: "gitlab-mr".into(),
+                running: false,
+                last_run_at: Some(queue_now() - chrono::Duration::minutes(2)),
+                last_error: Some(QueueEntryErrorView {
+                    run_id: "obs-gitlab-mr.7".into(),
+                    status: "failed".into(),
+                    finished_at: queue_now() - chrono::Duration::minutes(2),
+                    exit_code: Some(3),
+                    error: "the script exited with code 3".into(),
+                }),
+            },
+        ])],
+    };
+
+    let text = queue_show_output(&view, queue_now());
+
+    assert!(
+        text.starts_with("Queue: mr-review\nMode: on_episodes"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "    script: version 2 not approved: approve it with `narsor-cli observer approve \
+             gitlab-mr --version 2`"
+        ),
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("not approved").count(),
+        1,
+        "an approved newest version is not marked: {text}"
+    );
+    assert!(text.contains("cron '*/5 * * * *' (UTC)"), "{text}");
+    assert!(
+        text.contains("  task-1                   review_work          input-3              25m\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("    params: label=w CR, mr_url=https://gitlab/a/-/merge_requests/17\n"),
+        "{text}"
+    );
+    assert!(text.contains("    gitlab-ci: running\n"), "{text}");
+    assert!(
+        text.contains(
+            "    gitlab-mr: last run 2m ago; last error: failed 2m ago, exit 3: the script \
+             exited with code 3\n"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn queue_text_from_the_server_carries_no_control_characters() {
+    let hostile = "x\u{1b}]0;pwned\u{7}y\u{202e}z";
+    let mut entry = review_entry(vec![QueueEntryObserverView {
+        observer: hostile.into(),
+        running: false,
+        last_run_at: None,
+        last_error: Some(QueueEntryErrorView {
+            run_id: hostile.into(),
+            status: hostile.into(),
+            finished_at: queue_now(),
+            exit_code: None,
+            error: hostile.into(),
+        }),
+    }]);
+    entry.task_id = hostile.into();
+    entry.step = hostile.into();
+    entry.episode = hostile.into();
+    entry.params = [(hostile.to_string(), hostile.to_string())].into();
+    let view = ObserverQueueView {
+        queue: hostile.into(),
+        mode: Some(hostile.into()),
+        observers: vec![queue_observer(hostile, hostile, None, Some(1))],
+        entries: vec![entry],
+    };
+    let listing = ObserverQueueListResponse {
+        queues: vec![ObserverQueueSummary {
+            queue: hostile.into(),
+            mode: Some(hostile.into()),
+            observers: 1,
+            entries: 1,
+        }],
+    };
+
+    for text in [
+        queue_show_output(&view, queue_now()),
+        queue_list_output(&listing),
+    ] {
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{7}') && !text.contains('\u{202e}'),
+            "{text:?}"
+        );
+    }
 }

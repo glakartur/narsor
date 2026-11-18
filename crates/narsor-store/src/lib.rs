@@ -11,7 +11,7 @@
 //!     state.json                  -- the serialized WorkflowExecution
 //!     context.json                -- projection of the execution context
 //!     pending_input.json          -- the input request an input-needed execution awaits
-//!     pending_event.json          -- the external event a `wait` step awaits
+//!     pending_event.json          -- left by a removed `wait` step; only removed
 //!     events/{sequence:08}.json   -- append-only event log
 //!     artifacts/{artifact_id}/    -- files produced by actions
 //!     conversations/{attempt_id}.jsonl        -- open attempt, see conversation

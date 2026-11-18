@@ -11,10 +11,13 @@ use serde_json::Value;
 
 use super::task_text::age;
 use crate::controller_protocol::{
-    ObserverDetailView, ObserverEffectResponse, ObserverListResponse, ObserverRunErrorView,
-    ObserverScriptView, ObserverView, ObserverWatchListResponse, ObserverWatchView,
+    ObserverDetailView, ObserverEffectResponse, ObserverListResponse, ObserverQueueListResponse,
+    ObserverQueueView, ObserverRunErrorView, ObserverScriptTextView, ObserverScriptView,
+    ObserverView, QueueEntryView,
 };
-use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
+use crate::domain::{
+    without_unsafe_chars, without_unsafe_chars_json, without_unsafe_chars_multiline,
+};
 
 /// `text` cleaned of what a terminal would act on.
 fn clean(text: &str) -> String {
@@ -48,6 +51,18 @@ fn script_versions(observer: &ObserverView) -> String {
         }
         (Some(approved), _) => format!("v{approved}"),
     }
+}
+
+/// The line under an observer of `observer list` and `observer queue show`
+/// that marks a newest version that is not approved (R32, AE10).
+fn unapproved_line(observer: &ObserverView) -> Option<String> {
+    observer.unapproved_version().map(|version| {
+        format!(
+            "version {version} not approved: approve it with `narsor-cli observer approve {} \
+             --version {version}`",
+            clean(&observer.name)
+        )
+    })
 }
 
 /// The warning `observer list` and `observer show` give when a due run
@@ -115,8 +130,32 @@ pub fn observer_list_output(listing: &ObserverListResponse, now: DateTime<Utc>) 
         if let Some(warning) = worker_warning(observer, now) {
             out.push_str(&format!("  warning: {warning}\n"));
         }
+        if let Some(note) = &observer.note {
+            out.push_str(&format!("  note: {}\n", clean(note)));
+        }
+        if let Some(marker) = unapproved_line(observer) {
+            out.push_str(&format!("  script: {marker}\n"));
+        }
     }
     out
+}
+
+/// `every 300s` or `cron '*/10 * * * *' (UTC)`.
+fn schedule_text(observer: &ObserverView) -> String {
+    match (&observer.cron, observer.interval_secs) {
+        (Some(cron), _) => format!("cron '{}' (UTC)", clean(cron)),
+        (None, Some(secs)) => format!("every {secs}s"),
+        (None, None) => "-".to_string(),
+    }
+}
+
+/// A run mode with what it means.
+fn mode_text(mode: &str) -> String {
+    match mode {
+        "on_episodes" => "on_episodes (runs for the entries of its queue only)".to_string(),
+        "always" => "always (runs on every tick, with no entry)".to_string(),
+        other => clean(other),
+    }
 }
 
 /// `observer show`: everything about one observer the owner may need,
@@ -142,22 +181,14 @@ pub fn observer_show_output(detail: &ObserverDetailView, now: DateTime<Utc>) -> 
             clean(workflow),
             observer.task_limit_per_run
         )),
-        None => line("Effect: delivers events to the tasks on its watch list".to_string()),
+        None => line("Effect: creates no tasks".to_string()),
     }
-    if observer.watch_list {
-        line(format!(
-            "Watches: its watch list (objects under {})",
-            detail
-                .allowed_object_prefixes
-                .iter()
-                .map(|prefix| clean(prefix))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    } else {
-        line("Watches: everything its condition selects".to_string());
+    line(format!("Queue: {}", clean(&observer.queue)));
+    line(format!("Mode: {}", mode_text(&observer.mode)));
+    line(format!("Schedule: {}", schedule_text(observer)));
+    if let Some(note) = &observer.note {
+        line(format!("Note: {}", clean(note)));
     }
-    line(format!("Interval: {}s", observer.interval_secs));
     line(format!("Script: {}", script_line(observer)));
     line(format!("Next run: {}", next_run(observer, now)));
     match &observer.last_run {
@@ -185,10 +216,10 @@ pub fn observer_show_output(detail: &ObserverDetailView, now: DateTime<Utc>) -> 
     if let Some(warning) = worker_warning(observer, now) {
         line(format!("Warning: {warning}"));
     }
-    if !detail.mapping.is_empty() {
+    if !observer.mapping.is_empty() {
         line(format!(
             "Mapping: {}",
-            detail
+            observer
                 .mapping
                 .iter()
                 .map(|(input, field)| format!("{} <- {}", clean(input), clean(field)))
@@ -196,10 +227,10 @@ pub fn observer_show_output(detail: &ObserverDetailView, now: DateTime<Utc>) -> 
                 .join(", ")
         ));
     }
-    if !detail.secrets.is_empty() {
+    if !observer.secrets.is_empty() {
         line(format!(
             "Secrets: {}",
-            detail
+            observer
                 .secrets
                 .iter()
                 .map(|secret| format!("{} (file {})", clean(&secret.env), clean(&secret.name)))
@@ -247,11 +278,9 @@ pub fn observer_show_output(detail: &ObserverDetailView, now: DateTime<Utc>) -> 
 fn script_line(observer: &ObserverView) -> String {
     match (observer.approved_version, observer.latest_version) {
         (None, None) => "none yet; save one with `narsor-cli observer script set`".to_string(),
-        (None, Some(latest)) => {
-            format!("no approved version; draft version {latest} (not approved)")
-        }
-        (Some(approved), Some(latest)) if latest > approved => {
-            format!("approved version {approved}; draft version {latest} (not approved)")
+        (None, Some(latest)) => format!("no approved version; version {latest} not approved"),
+        (Some(approved), Some(latest)) if latest != approved => {
+            format!("approved version {approved}; version {latest} not approved")
         }
         (Some(approved), _) => format!("approved version {approved}"),
     }
@@ -269,8 +298,8 @@ fn error_line(error: &ObserverRunErrorView, now: DateTime<Utc>) -> String {
     if let Some(code) = error.exit_code {
         text.push_str(&format!(", exit {code}"));
     }
-    if let Some(object) = &error.watch_object {
-        text.push_str(&format!(", {}", clean(object)));
+    if let Some(entry) = &error.entry_id {
+        text.push_str(&format!(", entry {}", short_entry(entry)));
     }
     text.push_str(&format!(": {}", clean(&error.error)));
     text
@@ -307,6 +336,32 @@ pub fn script_saved_output(name: &str, script: &ObserverScriptView) -> String {
     )
 }
 
+/// `observer script show`: a header with the version, its digest and
+/// whether the schedule runs it, then the script text. The text is cleaned
+/// of what a terminal would act on (line feeds stay, a tab becomes a
+/// space), so what the owner reads is what the header names.
+pub fn script_text_output(observer: &ObserverView, script: &ObserverScriptTextView) -> String {
+    let name = clean(&observer.name);
+    let status = if observer.approved_version == Some(script.version) {
+        "approved: the schedule runs it".to_string()
+    } else {
+        format!(
+            "not approved: approve it with `narsor-cli observer approve {name} --version {}`",
+            script.version
+        )
+    };
+    let mut text = without_unsafe_chars_multiline(&script.script);
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    format!(
+        "Script version {} of '{name}' ({}), saved {}; {status}.\n---\n{text}",
+        script.version,
+        clean(&script.sha256),
+        script.created_at.format("%Y-%m-%d %H:%M UTC"),
+    )
+}
+
 /// One line about an observer after a command changed it.
 pub fn observer_changed_output(what: &str, observer: &ObserverView) -> String {
     format!(
@@ -317,66 +372,155 @@ pub fn observer_changed_output(what: &str, observer: &ObserverView) -> String {
     )
 }
 
-/// `observer watch list`.
-pub fn watch_list_output(listing: &ObserverWatchListResponse, now: DateTime<Utc>) -> String {
-    if listing.watches.is_empty() {
-        return "No watch entries.\n".to_string();
+/// The answer to `observer update`: where the observer is now, how it
+/// runs and which script version runs.
+pub fn observer_updated_output(observer: &ObserverView) -> String {
+    format!(
+        "Updated observer '{}': queue {}, mode {}, schedule {}; state {}, {}.\n",
+        clean(&observer.name),
+        clean(&observer.queue),
+        clean(&observer.mode),
+        schedule_text(observer),
+        clean(&observer.state),
+        script_line(observer)
+    )
+}
+
+/// `observer queue list`: one line per queue with its mode and counts.
+pub fn queue_list_output(listing: &ObserverQueueListResponse) -> String {
+    if listing.queues.is_empty() {
+        return "No queues. An observer serves the queue of its --queue; a gate with a \
+                `watch` block adds its wait episodes to the queue it names.\n"
+            .to_string();
     }
     let mut out = format!(
-        "{:<16} {:<28} {:<20} {:<9} {}\n",
-        "ENTRY", "TASK", "EVENTS", "ORIGIN", "OBJECT"
+        "{:<24} {:<12} {:>9} {:>7}\n",
+        "QUEUE", "MODE", "OBSERVERS", "ENTRIES"
     );
-    for entry in &listing.watches {
+    for queue in &listing.queues {
         out.push_str(&format!(
-            "{:<16} {:<28} {:<20} {:<9} {}  (added {} ago)\n",
-            short_entry(&entry.entry_id),
-            clean(&entry.task_id),
-            event_types(entry),
-            clean(&entry.origin),
-            clean(&entry.object),
-            age(now, entry.created_at)
+            "{:<24} {:<12} {:>9} {:>7}\n",
+            clean(&queue.queue),
+            queue
+                .mode
+                .as_deref()
+                .map(clean)
+                .unwrap_or_else(|| "-".into()),
+            queue.observers,
+            queue.entries
         ));
     }
     out
 }
 
-/// The answer to `observer watch add`.
-pub fn watch_added_output(entry: &ObserverWatchView) -> String {
-    format!(
-        "Watching {} for task {} ({}); entry {}.\n",
-        clean(&entry.object),
+/// `observer queue show`: the queue's observers with their state, script
+/// versions, schedule and last run, then its entries with how each
+/// observer processed them (R23, R24).
+pub fn queue_show_output(view: &ObserverQueueView, now: DateTime<Utc>) -> String {
+    let mut out = String::new();
+    let mut line = |text: String| {
+        out.push_str(&text);
+        out.push('\n');
+    };
+    line(format!("Queue: {}", clean(&view.queue)));
+    match &view.mode {
+        Some(mode) => line(format!("Mode: {}", mode_text(mode))),
+        None => line("Mode: - (no observer serves it)".to_string()),
+    }
+    if view.observers.is_empty() {
+        line(format!(
+            "Observers: none; its entries wait for a person. Serve it with `narsor-cli \
+             observer create NAME --source TEXT --queue {}`.",
+            clean(&view.queue)
+        ));
+    } else {
+        line("Observers:".to_string());
+        line(format!(
+            "  {:<24} {:<16} {:<16} {:<24} {}",
+            "NAME", "STATE", "SCRIPT", "SCHEDULE", "LAST RUN"
+        ));
+        for observer in &view.observers {
+            line(format!(
+                "  {:<24} {:<16} {:<16} {:<24} {}",
+                clean(&observer.name),
+                clean(&observer.state),
+                script_versions(observer),
+                schedule_text(observer),
+                last_run(observer, now)
+            ));
+            if let Some(marker) = unapproved_line(observer) {
+                line(format!("    script: {marker}"));
+            }
+        }
+    }
+    if view.entries.is_empty() {
+        line("Entries: none".to_string());
+        return out;
+    }
+    line("Entries (oldest first):".to_string());
+    line(format!(
+        "  {:<24} {:<20} {:<20} {}",
+        "TASK", "STEP", "EPISODE", "WAITING"
+    ));
+    for entry in &view.entries {
+        for text in entry_lines(entry, now) {
+            line(text);
+        }
+    }
+    out
+}
+
+/// One entry of `observer queue show`: its row, its params and one line
+/// per observer that processed it.
+fn entry_lines(entry: &QueueEntryView, now: DateTime<Utc>) -> Vec<String> {
+    let mut lines = vec![format!(
+        "  {:<24} {:<20} {:<20} {}",
         clean(&entry.task_id),
-        event_types(entry),
-        clean(&entry.entry_id)
-    )
+        clean(&entry.step),
+        clean(&entry.episode),
+        age(now, entry.started_at)
+    )];
+    if !entry.params.is_empty() {
+        lines.push(format!(
+            "    params: {}",
+            entry
+                .params
+                .iter()
+                .map(|(name, value)| format!("{}={}", clean(name), clean(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    for processed in &entry.observers {
+        let mut text = format!("    {}: ", clean(&processed.observer));
+        text.push_str(&match (processed.running, processed.last_run_at) {
+            (true, _) => "running".to_string(),
+            (false, Some(at)) => format!("last run {} ago", age(now, at)),
+            (false, None) => "no run yet".to_string(),
+        });
+        if let Some(error) = &processed.last_error {
+            text.push_str(&format!(
+                "; last error: {} {} ago",
+                clean(&error.status),
+                age(now, error.finished_at)
+            ));
+            if let Some(code) = error.exit_code {
+                text.push_str(&format!(", exit {code}"));
+            }
+            text.push_str(&format!(": {}", clean(&error.error)));
+        }
+        lines.push(text);
+    }
+    lines
 }
 
-/// The answer to `observer watch remove`.
-pub fn watch_removed_output(entry: &ObserverWatchView) -> String {
-    format!(
-        "Removed watch entry {}: {} for task {}.\n",
-        clean(&entry.entry_id),
-        clean(&entry.object),
-        clean(&entry.task_id)
-    )
-}
-
-fn event_types(entry: &ObserverWatchView) -> String {
-    entry
-        .event_types
-        .iter()
-        .map(|event| clean(event))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// The first characters of an entry id: enough to tell entries apart in a
-/// listing. `watch remove` takes the full id or this prefix.
+/// The first characters of a queue entry id: enough to tell entries apart
+/// in a listing.
 fn short_entry(entry_id: &str) -> String {
     clean(entry_id).chars().take(12).collect()
 }
 
-/// What `task create --data` and `task event` print for the script's log:
+/// What `task create --data` prints for the script's log:
 /// the server's line, cleaned.
 pub fn effect_output(response: &ObserverEffectResponse) -> String {
     format!("{}\n", clean(&response.message))

@@ -24,10 +24,10 @@ use std::path::PathBuf;
 /// why the request lives in its own file rather than inside the execution.
 pub const PENDING_INPUT_FILE: &str = "pending_input.json";
 
-/// File holding the external event a `wait` step is waiting for.
+/// File that held the external event a removed `wait` step waited for.
 ///
-/// A hint like [`PENDING_INPUT_FILE`]: the authority is `status ==
-/// WaitingForEvent` in `state.json`. See `engine::actions::wait`.
+/// Nothing writes it any more; an execution from an older build may still
+/// have one, so a cancel or a manual transition removes it.
 pub const PENDING_EVENT_FILE: &str = "pending_event.json";
 
 /// Filesystem store for workflow executions.
@@ -207,23 +207,8 @@ impl ExecutionStore {
             .join(PENDING_EVENT_FILE)
     }
 
-    /// Persists the external event a `wait` step waits for; generic for the
-    /// same reason as [`Self::save_pending_input`].
-    pub fn save_pending_event<T: Serialize>(&self, execution_id: &str, pending: &T) -> Result<()> {
-        self.create_execution_dirs(execution_id)?;
-        write_json_atomic(&self.pending_event_file(execution_id), pending)
-    }
-
-    /// Loads the awaited event, or `None` when there is none.
-    pub fn load_pending_event<T: DeserializeOwned>(&self, execution_id: &str) -> Result<Option<T>> {
-        let path = self.pending_event_file(execution_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        read_json(&path).map(Some)
-    }
-
-    /// Removes the awaited event. Returns whether there was one to remove.
+    /// Removes the file of an older build's `wait` step. Returns whether
+    /// there was one to remove.
     pub fn clear_pending_event(&self, execution_id: &str) -> Result<bool> {
         remove_file_if_exists(&self.pending_event_file(execution_id))
     }

@@ -27,18 +27,12 @@ use narsor_protocol::chat::PromptAuthor;
 /// refused rather than carried out on whatever came after it.
 ///
 /// * waiting for input: the key of the pending input;
-/// * waiting for an external event: the key of the wait;
 /// * failed on a step the conductor took up: the failure's key;
 /// * otherwise: the last attempt, or — before any — the state.
 pub fn execution_episode(store: &ExecutionStore, execution: &WorkflowExecution) -> Option<String> {
     if execution.status == ExecutionStatus::InputNeeded {
         if let Ok(Some(pending)) = store.load_pending_input::<PendingHumanInput>(&execution.id) {
             return Some(pending.episode_key().to_string());
-        }
-    }
-    if execution.status == ExecutionStatus::WaitingForEvent {
-        if let Ok(Some(pending)) = store.load_pending_event::<PendingExternalEvent>(&execution.id) {
-            return Some(pending.episode);
         }
     }
     if let Ok(Some(failure)) = step_failure(execution) {

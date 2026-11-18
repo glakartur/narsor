@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::domain::{Event, EventData, InputCloseReason};
 use narsor_protocol::chat::SubagentRef;
 use narsor_protocol::display::TRUNCATION_MARKER;
+use narsor_protocol::event::answer_author;
 
 use super::scroll::{one_line, sanitize};
 
@@ -79,15 +80,23 @@ pub fn event_line(event: &Event) -> String {
             answered_by,
             close_reason,
             output_label,
+            comment,
+            observer,
             ..
         } => {
-            let by = answered_by.unwrap_or_default().name();
+            let by = answer_author(*answered_by, observer.as_ref());
+            // An observer's script says why it chose (R22).
+            let reason = comment
+                .as_deref()
+                .filter(|_| observer.is_some())
+                .map(|reason| format!(": {}", first_line(reason)))
+                .unwrap_or_default();
             match (close_reason, output_label) {
                 (Some(reason), _) if *reason != InputCloseReason::Answered => {
                     format!("human_input_received  closed by {} ({by})", reason.name())
                 }
-                (_, Some(label)) => format!("human_input_received  {by} → {label}"),
-                _ => format!("human_input_received  {by}"),
+                (_, Some(label)) => format!("human_input_received  {by} → {label}{reason}"),
+                _ => format!("human_input_received  {by}{reason}"),
             }
         }
         EventData::ProblemRaised {

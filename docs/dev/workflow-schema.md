@@ -7,7 +7,7 @@ This document defines the declarative format of the YAML files used to describe 
 ### 1.1. Design principles
 
 *   **Static Graph:** The workflow definition is immutable during execution. States or transitions cannot be added dynamically.
-*   **One State = One Action:** Each state executes exactly one action (`AgentAction`, `ScriptAction`, `HumanAction`, `WaitAction`).
+*   **One State = One Action:** Each state executes exactly one action (`AgentAction`, `ScriptAction`, `HumanAction`; in the unified shape also `DecisionAction` and `ProfileAction`).
 *   **Deterministic Transitions:** Transitions between states are determined by a static mapping of choice labels (`choices`) to target states. There are no dynamic conditional expressions (e.g. `when: x > 5`). The `when` of a prompt part (§3.7.6) only decides whether a piece of prompt text is sent. It never picks a transition.
 *   **Two State Shapes:** A `schema: v2` file is written in the unified state shape (§3.7). The older shape, with `choices` as a list and a separate `transitions` map, still loads. It is deprecated under `schema: v2` (§3.7.9).
 *   **One Step Contract:** An agent step and a script step define their variables and artifacts once, each with a name and a description. Each choice gives only the names of the variables and artifacts it requires (§3.3).
@@ -59,7 +59,7 @@ states:                     # State graph (required)
   <state_id>:
     description: <string>   # State description (optional)
     action:                 # Definition of the action to execute
-      type: <agent|script|human|wait>
+      type: <agent|script|human>
       # ... configuration specific to the action type
     variables:              # Step variables with a description (optional, agent/script only)
       - name: <string>
@@ -280,7 +280,7 @@ has a different form for the same job.
 <state_id>:
   description: <string>               # Descriptive text
   action:                             # Action configuration
-    type: <agent|script|human|wait>
+    type: <agent|script|human>
     # ... action details
   variables:                          # Step variables (agent and script only)
     - name: blocker                   # Global variable: goes into the context
@@ -357,7 +357,7 @@ A choice object can also express two optional control behaviors:
 
 An `agent` and `script` step may define its variables and artifacts. Each entry
 has two required fields: `name` and `description`. Any other field is a load error.
-A `human` gate, a `wait` step and a terminal state cannot define variables or
+A `human` gate and a terminal state cannot define variables or
 artifacts (§5). In the unified shape a `decision` step may define variables, but not artifacts
 (§3.7.3). The unified shape also has richer variable declarations (§3.7.4).
 
@@ -649,143 +649,94 @@ The engine strips control characters from `reason` and from the values and short
 2 KB. The same fields (`reason`, `required_values`, `answer_tail`) are carried by the event
 `HumanInputRequested`.
 
-##### D. WaitAction
+##### D. Watch block of a human decision (`watch`)
 
-Pauses the workflow until a matching external event occurs. The wait has no time limit.
-An observer of the control plane sends the events.
-
-```yaml
-action:
-  type: wait
-  event_type: review.approved               # Event type
-  filter:                                   # Event filter (optional)
-    mr: "{{ inputs.mr_id }}"                # Templates are rendered when the step starts
-  watch:                                    # Watch entry for an observer (optional)
-    observer: mr-review                     # Observer name, no template
-    object: "{{ inputs.mr_url }}"           # Object to watch, rendered when the step starts
-    event_types: [review.approved]          # Must include event_type
-choices:
-  received:
-    next: merge
-```
-
-**How the step waits.** When the step starts, the engine renders the templates of `event_type` and
-`filter`. Then it records the wait durably (`pending_event.json`) and sets the execution status to
-`waiting_for_event`. The pass stops. Each wait has a new id, the *wait episode*. When the step runs
-again (for example, in a review loop), it starts a new episode. While the task waits:
-
-*   the task state is `running`, not `human_needed`, because the task continues without the
-    operator;
-*   the task frees its slot after the same grace as a task that waits for its owner. A matching
-    event starts the task again;
-*   a restart of the runner does not end the wait. The new runner reads the wait from disk and
-    reports the same episode.
-
-**Which event ends the step.** The control plane writes each external event to the task history
-once. It hands the event to the step only when all of these are true:
-
-*   the task waits in a `wait` step now. An event that came before the step started stays in the
-    history only. The step does not see it;
-*   the event type is equal to `event_type`;
-*   the event data passes the filter. The filter is a flat JSON object. Each key of the filter must
-    have an equal value under the same key in the event data. There are no expressions. A text, a
-    number and a boolean are compared as text on both sides, because a rendered template is always
-    text: the filter `{mr: "17"}` matches the data `{"mr": 17}`. Lists and objects are compared as
-    JSON. A missing or empty filter matches each event of the type.
-
-The engine checks the episode and the filter again. It refuses an event for an earlier episode, so
-an event for a wait that the task left never ends a later wait.
-
-**Result.** A matching event ends the step. The engine writes `ExternalEventReceived` to the
-execution log once. The step ends with the label `received`. When the step declares only one label
-(for example `exit`), the step ends with that label. The engine writes the
-event to the context variable `event`: `{"type": ..., "source": ..., "data": ...}`. A later step
-reads it as `{{ context.event.data.mr }}` or `{{ context.event.source }}`. The next event overwrites
-the variable. The event data comes from outside narsor: treat it as untrusted input in an agent
-prompt.
-
-**No timeout.** A `wait` step waits until a matching event comes. The validator refuses the field
-`timeout` on a `wait` step ("a wait step has no timeout") and a `timeout` choice on a `wait` step
-(§5). The time limit of a state or of the workflow for a running action does not apply to a `wait`
-step.
-
-**Watch entry (`watch`).** A watch-list observer runs its script only for the objects on its
-watch list (for example, merge requests). The optional `watch` block puts the object of the step on
-that list while the step waits:
-
-*   `observer` is the name of the observer. It is a plain name, not a template. It is required;
-*   `object` is the object to watch, for example the URL of a merge request. The engine renders
-    its templates when the step starts;
-*   `event_types` lists the event types that the script reports for the object. The list must
-    include the `event_type` of the step. The engine renders the templates of each type, so a
-    templated `event_type` is written the same way in the list.
-
-When the step starts to wait, the runner reports the rendered `watch` with the wait. The control
-plane adds the watch entry once per wait episode, with the key (task, step, object). When the step
-waits again (for example, in a review loop), the entry stays one entry. The control plane does not
-add the entry when:
-
-*   no observer with this name belongs to the owner of the task. An observer of another owner is
-    reported the same way as a missing observer, because its events can never reach the task;
-*   the observer has no watch list (its watch mode is not `watch_list`);
-*   the object is empty, is longer than the limit of the observer, or does not start with an
-    allowed prefix of the observer. A URL prefix includes the host, so an object on another host is
-    refused. This keeps the token of the source away from other hosts.
-
-Then the control plane writes the warning `watch_refused` (step, observer, object, reason) to the
-task history. The task continues to wait: the owner can add the entry manually. The entry goes away
-when the script of the observer ends with exit code 0 for it, when the task is finished or
-archived, or when the owner removes it. When the script ends an entry while the task waits in the
-same episode, the control plane does not add the entry again.
-
-A workflow that waits for the approval of a merge request and watches it:
+A `decision` step with `by: human` (unified shape, §3.7.3) can put its wait on an observer queue.
+The observers of that queue run a script for the wait and can answer the gate as a person answers
+it. The person can still answer the gate at any time, with every choice.
 
 ```yaml
-schema: v2
-name: review-merge-request
-version: 1
-inputs:
-  - name: mr_url
-    type: string
-    required: true
-states:
-  await_review:
-    action:
-      type: wait
-      event_type: review.approved
-      filter:
-        mr_url: "{{ inputs.mr_url }}"
-      watch:
-        observer: mr-review                 # A watch_list observer of the task's owner
-        object: "{{ inputs.mr_url }}"       # Rendered when the step starts
-        event_types: [review.approved, review.changes_requested]
-    choices:
-      received:
-        next: merge
-  merge:
-    action:
-      type: script
-      command: merge
-      args: ["{{ context.event.data.mr_url }}"]
-    exit:
-      next: done
-  done:
-    description: Merged.
-terminal_states:
-  done: completed
+review_work:
+  action:
+    type: decision
+    by: human
+    message: Review the merge request, then remove the label narsor-review.
+    watch:
+      queue: mr-review                              # Queue name, no template
+      params:                                       # Optional, rendered when the gate starts
+        mr_url: "{{ context.workspace.code.pr_url }}"
+        label: narsor-review
+        choice: check_feedback
+  choices:
+    check_feedback:
+      next: check_work_feedback
+    revise_plan:
+      next: plan
 ```
 
-The validator refuses a `watch` without `observer`, with an observer name that is not valid (for
-example, a template), without `object`, without `event_types`, or with `event_types` that do not
-include the `event_type` of the step. It does not check that the observer exists: the control
-plane checks this when the step waits.
+*   `queue` is required. It is a plain name of a queue of the task's owner. It cannot be a template.
+*   `params` is optional. It is a flat map of names to text. The engine renders the template of each
+    value when the gate starts. A number or a boolean is read as text. A list, a map or an empty
+    value is a load error. Narsor does not interpret a value: not as a URL, a host or an object id.
+    The script checks its params.
+*   The `choices` and `variables` of the gate do not change. `watch` adds no choice.
 
-**Runner and control plane versions.** The runner protocol has a new kind of delivery for the
-`wait` step (`events` in the poll answer, `POST /runner/v1/events/{id}/ack`), and the runner
-snapshot reports the wait (`event_wait`). The reported wait carries the rendered `watch` (`step`,
-`observer`, `object`, `event_types`). An older runner does not know them, and there is no fallback.
-Update the runner and the control plane together, before a workflow uses a `wait` step. A client
-from before watch entries shows the warning `watch_refused` as an unknown event.
+**The wait episode.** Each time the gate starts to wait, the wait gets a new id, the *wait
+episode*. The episode is the id of the gate's pending input request. When the gate runs again (for
+example, in a review loop), it starts a new episode.
+
+**The queue entry.** The runner reports the rendered `watch` block with the pending input in its
+snapshot. The control plane then adds one queue entry for the episode. The entry has the task, the
+episode and its start time, the step, the rendered `params`, and the choices and variables of the
+gate. One episode has at most one entry.
+
+*   **Every exit from the gate removes the entry**: an answer of a script, an answer of the person,
+    or any other exit (for example, a manual transition). The control plane removes the entry while it
+    reads the snapshot that shows the exit. When the same snapshot shows a new watched gate, the
+    control plane removes the old entry first and then adds the new one.
+*   A pause, an `Interrupted` task, an automatic resume and a runner restart do not end the episode.
+    The entry stays.
+*   Before a script runs for an entry, the control plane checks that the task still waits in that
+    episode. When it does not, the control plane removes the entry and does not run the script.
+*   A task that is finished, archived or deleted loses its entry.
+
+**The first answer wins.** An observer script answers with `narsor-cli task decide TASK --episode
+EPISODE` (see [Observers](../user/observers.md)). The control plane checks the answer as it checks
+the answer of a person: the episode is the current episode of the gate, the choice exists, the
+required variables have a value, and every variable is declared by the gate. The first answer of
+the episode exits the gate. A later answer for the same episode is refused. An answer for an
+earlier episode is refused, so an answer for a wait that the task left never ends a later wait. The
+task history records who answered: the person, or the observer and its run, with the reason that
+the script gave.
+
+**Warnings.** The control plane writes the warning `gate_queue_warning` (step, queue, episode,
+reason) to the task history once per episode when:
+
+*   the queue has no observer of the task's owner;
+*   all observers of the queue run in mode `always`. Only an `on_episodes` observer can answer a
+    gate;
+*   no `on_episodes` observer of the queue is active;
+*   the entry could not be stored (for example, the params are over the limit).
+
+The gate then waits for the person. An `on_episodes` observer of the queue that is created or
+resumed later can still answer the gate while the task waits in the same episode: its schedule adds
+the entry back when it is missing.
+
+The validator refuses a `watch` on a decision with `by: conductor` (the conductor decides at once,
+so an entry could never matter), a `watch` without `queue`, a templated or invalid queue name, and
+a param name that is blank or has whitespace. It does not check that the queue has observers: the
+control plane checks this when the gate starts.
+
+**The removed `wait` step.** The step type `wait`, its fields `event_type`, `filter`,
+`watch.observer`, `watch.object` and `watch.event_types`, and the context variable `event`
+(`{{ context.event }}`) are removed. A workflow with `type: wait` does not load. The message tells
+you to put a `watch` block on a `decision` step with `by: human`.
+
+**Runner and control plane versions.** The runner reports the rendered `watch` of the gate in its
+snapshot (`gate_watch`). The runner protocol has no event delivery any more: `events` in the poll
+answer, `POST /runner/v1/events/{id}/ack` and `event_wait` in the snapshot are removed. Update the
+runner and the control plane together. A task that waits in a `wait` step must finish, or be
+cancelled, before the update (see [Updates](../operations/updates.md)).
 
 #### Scope of `{{ }}` templates
 
@@ -991,7 +942,7 @@ The unified shape has no `human` action (use a decision step, §3.7.3). The lega
 <state_id>:
   description: <string>
   action:
-    type: <agent|script|decision|wait>
+    type: <agent|script|decision>
     # ... configuration specific to the action type
   variables: [...]              # §3.7.4 (agent, script and decision steps)
   artifacts: [...]              # agent and script steps only
@@ -1097,6 +1048,9 @@ approval:
     has no value (a blank value is no value). The form also shows the values that the step keeps in
     its `scope: local` variables. `resume_comment_field` names a variable of `type: text` on the
     step. The comment is then required, and the target of that label must be an agent step.
+*   **`watch`** (`by: human` only). The gate puts each wait on an observer queue. An observer
+    script of that queue can answer the gate as the operator answers it. The first answer wins.
+    See §3.3.D.
 *   **`by: conductor`.** The conductor decides, always. `autopilot` does not matter here. The engine
     gives the conductor the rendered message, the choices and what each choice requires. The conductor
     picks a label when it is sure and gives every value the label requires. The engine saves the
@@ -1126,7 +1080,7 @@ An entry of `variables` has these keys:
 | `options` | The only values the variable accepts. Only for `string`, `select` or no `type`. |
 
 *   A step can define variables when it is an agent, a script or a decision step. A local variable is
-    allowed on all three. A `wait` step and a terminal state cannot define variables.
+    allowed on all three. A terminal state cannot define variables.
 *   `options` restrict what a step returns. An agent that returns another value is asked again, in the
     same session. A script that returns another value fails the step. The agent contract lists the
     allowed values. A value that is blank counts as not given.
@@ -1616,21 +1570,20 @@ Before a workflow is run, the definition must pass validation:
     *   There must be terminal states reachable from every other state (no deadlocks).
 
 2.  **Action Correctness:**
-    *   The action type must be supported (`agent`, `script`, `human`, `wait`).
+    *   The action type must be supported (`agent`, `script`, `human`; in the unified shape also `decision` and `profile`). The removed type `wait` is a load error that names its replacement (§3.3.D).
     *   The required fields for a given action type must be present (e.g. `prompt` for an agent, `command` for a script).
         `harness` is **not** required: every setting has a built-in value,
         so "no harness anywhere" cannot occur, and validation
         remains a function of the source alone.
     *   For `AgentAction` and `ScriptAction` the `choices` list must not be empty.
     *   `max_entries` is allowed only for `agent` actions and must be >= 1.
-    *   `variables` and `artifacts` are allowed only on `agent` and `script` steps. A `human` gate, a `wait` step and a terminal state must not have them. A `decision` step may have `variables`, not `artifacts`.
+    *   `variables` and `artifacts` are allowed only on `agent` and `script` steps. A `human` gate and a terminal state must not have them. A `decision` step may have `variables`, not `artifacts`.
     *   A variable named with the `local.` prefix is allowed only on an `agent` step. A variable declared with `scope: local` (unified shape) is allowed on an agent, script or decision step.
     *   A variable name (without the `local.` prefix) and an artifact name contain only letters, digits and `_` and do not start with a digit.
     *   Every name in `requires_variables` must be defined in that step's `variables`, and every name in `requires_artifacts` in that step's `artifacts`.
     *   `requires_human_approval` is allowed only on a choice of an `agent` step.
     *   `resume_comment_field` requires a `text` field of that name in the `inputs` of a `human` gate and a transition to an `agent` step.
-    *   A `wait` step cannot have the field `timeout`: a wait step has no timeout (§3.3.D).
-    *   The `watch` of a `wait` step names an observer (a valid observer name, not a template) and an object, and its `event_types` include the `event_type` of the step (§3.3.D).
+    *   A `watch` block is allowed only on a `decision` step with `by: human`. Its `queue` is a valid queue name, not a template. Its `params` is a flat map of names to text, and a name is not blank and has no whitespace (§3.3.D).
 
 3.  **Decision Correctness:**
     *   The decision provider type must be valid.
@@ -1656,7 +1609,7 @@ Before a workflow is run, the definition must pass validation:
     *   A `decision` step has a non-blank `message` and at least one choice. It may define `variables`, not `artifacts`.
     *   A `profile` step has a non-blank `prompt` and `exit`, never `choices`. It defines no `variables` and no `artifacts`. A `profile` action is not allowed in a legacy file (§3.7.10).
     *   A script step with `exit` cannot have `exit_codes`.
-    *   In the unified shape only an agent or a script step can declare a `timeout` choice; a `decision` or `wait` step cannot. The old shape keeps accepting a `timeout` label on any step, because a human gate may use it as an ordinary choice.
+    *   In the unified shape only an agent or a script step can declare a `timeout` choice; a `decision` step cannot. The old shape keeps accepting a `timeout` label on any step, because a human gate may use it as an ordinary choice.
     *   `resume_comment_field` on a decision step names a variable of `type: text`.
 
 8.  **Variable declarations (§3.7.4):**

@@ -110,6 +110,14 @@ impl ProtocolService {
             actions: None,
             panel: None,
             resume: record.resume.clone(),
+            queue_entry: self
+                .task_queue_entry(record)
+                .map(|entry| TaskQueueEntryView {
+                    queue: entry.queue,
+                    step: entry.step,
+                    episode: entry.episode,
+                    since: entry.created_at,
+                }),
             as_of: now,
         };
         // Last: the offer reads the rest of the summary.

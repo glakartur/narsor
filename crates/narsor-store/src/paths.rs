@@ -23,7 +23,9 @@
 //! {state}/materials/…                 -- bounded task materials (U9): manifests
 //!                                        and blobs, outside any workspace
 //! {state}/observers/{id}/…            -- observers of external sources: record,
-//!                                        script versions, run errors, watches
+//!                                        script versions, run errors
+//! {state}/observer-queues/…           -- entries of observer queues (wait
+//!                                        episodes of decision gates)
 //!
 //! {work}/tasks/{id}/code/…           -- WorkPaths: local scratch, disposable
 //! ```
@@ -266,8 +268,18 @@ pub const OBSERVER_SCRIPTS_DIR: &str = "scripts";
 /// runs only).
 pub const OBSERVER_ERRORS_DIR: &str = "errors";
 
-/// Directory of an observer's watch entries.
-pub const OBSERVER_WATCHES_DIR: &str = "watches";
+/// The entries of observer queues, directly under the state root (see
+/// `narsor_engine::observers::store`). Not inside [`OBSERVERS_DIR`]: an entry
+/// belongs to a queue of an owner, which no single observer owns.
+pub const OBSERVER_QUEUES_DIR: &str = "observer-queues";
+
+/// Directory of the queue entries, one file per entry, inside
+/// [`OBSERVER_QUEUES_DIR`].
+pub const OBSERVER_QUEUE_ENTRIES_DIR: &str = "entries";
+
+/// Advisory lock serializing the additions and removals of queue entries,
+/// inside [`OBSERVER_QUEUES_DIR`].
+pub const OBSERVER_QUEUE_ENTRIES_LOCK_FILE: &str = "entries.lock";
 
 /// Suffix of a not-yet-renamed atomic write. Never a file to read from.
 pub const TEMP_SUFFIX: &str = ".tmp";
@@ -569,15 +581,25 @@ impl StatePaths {
             .join(event_file_name(sequence))
     }
 
-    /// `{root}/observers/{observer_id}/watches`
-    pub fn observer_watches_dir(&self, observer_id: &str) -> PathBuf {
-        self.observer_dir(observer_id).join(OBSERVER_WATCHES_DIR)
+    /// `{root}/observer-queues`
+    pub fn observer_queues_dir(&self) -> PathBuf {
+        self.root.join(OBSERVER_QUEUES_DIR)
     }
 
-    /// `{root}/observers/{observer_id}/watches/{entry_id}.json`
-    pub fn observer_watch_file(&self, observer_id: &str, entry_id: &str) -> PathBuf {
-        self.observer_watches_dir(observer_id)
-            .join(format!("{entry_id}.json"))
+    /// `{root}/observer-queues/entries`
+    pub fn queue_entries_dir(&self) -> PathBuf {
+        self.observer_queues_dir().join(OBSERVER_QUEUE_ENTRIES_DIR)
+    }
+
+    /// `{root}/observer-queues/entries/{entry_id}.json`
+    pub fn queue_entry_file(&self, entry_id: &str) -> PathBuf {
+        self.queue_entries_dir().join(format!("{entry_id}.json"))
+    }
+
+    /// `{root}/observer-queues/entries.lock`
+    pub fn queue_entries_lock_file(&self) -> PathBuf {
+        self.observer_queues_dir()
+            .join(OBSERVER_QUEUE_ENTRIES_LOCK_FILE)
     }
 
     /// `{root}/orchestration/controllers`

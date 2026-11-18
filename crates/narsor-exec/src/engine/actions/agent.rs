@@ -238,6 +238,7 @@ impl AgentExecutor {
                     agent_session_id: run.session_id.clone(),
                     prefilled_answer: None,
                     permission: None,
+                    gate_watch: None,
                 }),
             )),
         }

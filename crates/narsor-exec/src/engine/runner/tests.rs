@@ -60,11 +60,10 @@ fn an_undeclared_terminal_completes_whatever_it_is_called() {
 /// Every action kind, with what the runner checked before it asked the
 /// kind's capabilities: `kind == Agent`, `is_agent`, `has_step_contract`
 /// and `holds_variables_to_declarations` as they were.
-const KINDS: [ActionKind; 6] = [
+const KINDS: [ActionKind; 5] = [
     ActionKind::Agent,
     ActionKind::Script,
     ActionKind::Human,
-    ActionKind::Wait,
     ActionKind::Decision,
     ActionKind::Profile,
 ];

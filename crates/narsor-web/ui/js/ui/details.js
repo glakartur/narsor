@@ -4,7 +4,7 @@
 
 import { html } from '../lib.js';
 import {
-  branchText, notice, pullRequest, queuePositions, queueText, readiness, secondsBetween, shortAge,
+  branchText, notice, pullRequest, queueEntryMark, queuePositions, queueText, readiness, secondsBetween, shortAge,
   shortIdentifier, stateIcon, statusWord, stepIcon, titleOf,
 } from '../model.js';
 import { sumUsage, usageLine } from '../text.js';
@@ -81,9 +81,10 @@ export function Details(props) {
   return html`<${DetailsBody} key=${task.task_id} ...${props} />`;
 }
 
-function DetailsBody({ store, state, task, now, onBack, onActions }) {
+function DetailsBody({ store, state, task, now, onBack, onActions, onQueue }) {
   const api = store.api;
   const icon = stateIcon(task);
+  const mark = queueEntryMark(task);
   const note = notice(task);
   const places = queuePositions(state.tasks ?? []);
   const started = readiness(task) === 'started';
@@ -118,6 +119,8 @@ function DetailsBody({ store, state, task, now, onBack, onActions }) {
           <div class="status-row">
             <span class=${`role-${icon.role}`}><span aria-hidden="true">${icon.glyph}</span> ${statusWord(task)}</span>
             ${statusParts(task, places, timeline).map((part) => html`<span class="muted"> · </span><span class=${`role-${part.role}`}>${part.text}</span>`)}
+            ${mark && html`<span class="muted"> · </span><button class="link queue-mark" title=${`${mark.text} — otwórz kolejkę`}
+              aria-label=${`${mark.text} — otwórz kolejkę`} onClick=${() => onQueue?.(mark.queue)}>${mark.glyph}</button>`}
           </div>
           ${usage && html`<div class="usage-row muted mono">${usage}</div>`}
           ${note && html`<p class=${`notice role-${note.role}`}>${note.text}</p>`}

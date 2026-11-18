@@ -1,30 +1,57 @@
-//! The observers' schedule (R6, R7, R14, R16, R17): which observer is due,
-//! the worker's claim of a run, and what the run's result changes.
+//! The observers' schedule (R6, R7, R14, R16, R17, R25, R29, R30): which
+//! observer is due, the worker's claim of a run, and what the run's result
+//! changes.
 //!
 //! ```text
-//! observer_pass   next_run_at <= now, active, approved  → run_due_since = now
-//!                 watch_list without entries            → next_run_at += interval, no run
-//!                 watch_list with entries               → watch_round = the entries
+//! observer_pass   a tick (next_run_at <= now), active,  → next_run_at = the next tick
+//!                 approved, idle                          after this one (KTD-3)
+//!                   always                              → run_due_since = now: one run,
+//!                                                         no entry
+//!                   on_episodes without entries         → no run, no error
+//!                   on_episodes with entries            → run_due_since = now,
+//!                                                         entry_round = the entries
+//!                   a task of the queue that waits in   → its entry added back
+//!                   its episode with no entry
+//!                   an entry whose task no longer waits → removed (R18, R19)
+//!                   in its episode, ended or is gone
+//!                 a tick while a run is active or a     → skipped, not queued:
+//!                 round goes on                           next_run_at = the next tick
 //!                 run past its deadline                 → lost: error file, token spent
 //! claim           a run past its deadline               → lost (as in the pass)
 //!                 the oldest due                        → active_run + token (once);
-//!                                                         a watch-list observer's run
+//!                                                         an on_episodes observer's run
 //!                                                         takes the round's next entry
+//!                                                         whose task still waits in its
+//!                                                         episode; the others are removed,
+//!                                                         never run (R18)
 //! finish (tasks)  exit 0 + valid output                 → state saved, failures = 0, no file
 //!                 anything else                         → error file, state kept,
 //!                                                         failures + 1, backoff
-//! finish (watch)  exit 0                                → the entry is removed
-//!                 exit 1                                → the entry stays
+//! finish (entry)  exit 0                                → the entry stays on its queue
 //!                 anything else                         → error file (it replaces the
 //!                                                         entry's older error), the entry
 //!                                                         stays; no backoff
+//!                 either way                            → the entry's last run time
+//!                                                         (the queues view, R23)
 //! ```
 //!
-//! A watch-list observer checks one entry per run (D18). A round holds the
-//! entries that were there when the run became due; while entries are left
-//! in it, the observer stays due, so the next entry is claimed as soon as
-//! the run before has its result. The next round comes one interval after
-//! the last run. A failed entry is checked again in the next round.
+//! The next due time counts from the tick, never from the end of a run
+//! (KTD-3): the pass sets it when the tick comes. A tick that finds the
+//! observer's run still active, or its round still going, is skipped, so an
+//! observer owes no run for it (R29). The backoff after failed runs moves
+//! `next_run_at` past the ticks it covers, so a tick in the backoff never
+//! comes; a success or a lost run leaves the next tick as the tick set it,
+//! past any tick the run outlasted.
+//!
+//! An `on_episodes` observer checks one entry of its queue per run (R30).
+//! A round holds the entries that were there at the tick; while entries are
+//! left in it, the observer stays due, so the next entry is claimed as soon
+//! as the run before has its result. The next round comes at the first tick
+//! after the round ends. An entry stays on its queue until its gate exits,
+//! so it is checked again in every round until then. The entries are the
+//! queue's, in the owner's namespace (R7): every observer of the queue
+//! checks them on its own schedule (R8). An `always` observer runs once per
+//! tick, with no entry (R25).
 //!
 //! The pass only flags; the run appears at the claim, as the record's
 //! `active_run`. The flag is one value, not a queue, so a control plane that
@@ -53,15 +80,16 @@ use crate::controller_protocol::credentials::{
 };
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::ProtocolService;
-use crate::domain::TaskId;
 use crate::observers::{
     parse_script_output, secs_duration, ActiveRun, LastRun, ObserverError, ObserverId,
-    ObserverLock, ObserverRecord, ObserverState, RunFailure, RunId, RunStatus, RunWatch,
-    ScriptInput, ScriptObserver, ScriptOutput, ScriptWatch, SecretRef, WatchEntry, WatchMode,
-    MAX_SCRIPT_OUTPUT_BYTES, RUN_FAILURE_VERSION, SCRIPT_CONTRACT_VERSION, WATCH_DONE_EXIT_CODE,
-    WATCH_PENDING_EXIT_CODE,
+    ObserverLock, ObserverMode, ObserverRecord, ObserverState, QueueEntry, RunEntry, RunFailure,
+    RunId, RunStatus, ScriptChoice, ScriptEntry, ScriptInput, ScriptObserver, ScriptOutput,
+    ScriptVariable, SecretRef, ENTRY_DONE_EXIT_CODE, MAX_SCRIPT_OUTPUT_BYTES, RUN_FAILURE_VERSION,
+    SCRIPT_CONTRACT_VERSION,
 };
-use crate::orchestration::{OrchestrationError, OwnerRef, TaskState};
+use crate::orchestration::OwnerRef;
+
+use super::entries::EntryWait;
 
 /// Failed runs in a row after which an observer goes to `error` and waits
 /// for its owner (R16).
@@ -104,13 +132,23 @@ pub fn retry_delay_secs(interval_secs: u64, failures: u32) -> u64 {
 pub struct ObserverPass {
     /// Observers whose scheduled run became due.
     pub due: Vec<ObserverId>,
-    /// Watch-list observers that were due with no watch entry: no run, the
-    /// next deadline moved one interval on (R6).
+    /// `on_episodes` observers that were due with no queue entry: no run,
+    /// the next deadline moved to the schedule's next tick (R30).
     pub skipped: Vec<ObserverId>,
+    /// Observers whose tick came while their run was active or their round
+    /// went on: no run for that tick, the next deadline moved to the
+    /// schedule's next tick (R29).
+    pub busy: Vec<ObserverId>,
     /// Runs that passed their deadline without a result.
     pub lost: Vec<RunId>,
-    /// Watch entries removed because their task ended or was archived (R7).
-    pub watches_removed: usize,
+    /// Queue entries removed because their task no longer waits in their
+    /// episode: the gate exited, or the task ended, was archived or is gone
+    /// (R18, R19).
+    pub entries_removed: usize,
+    /// Queue entries added back for tasks that wait in a watched episode
+    /// with none: the control plane stopped between the task's record and
+    /// the entry.
+    pub entries_restored: usize,
 }
 
 /// A run handed to a worker. The token is in no record: this is the only
@@ -194,6 +232,22 @@ fn scheduled_run_due(record: &ObserverRecord, now: DateTime<Utc>) -> bool {
         && record.next_run_at.is_none_or(|at| at <= now)
 }
 
+/// Whether the observer's tick came while its run is active or its round
+/// goes on: the tick is skipped, not queued (R29).
+fn tick_while_busy(record: &ObserverRecord, now: DateTime<Utc>) -> bool {
+    record.state == ObserverState::Active
+        && (record.active_run.is_some() || record.run_due_since.is_some())
+        && record.next_run_at.is_some_and(|at| at <= now)
+}
+
+/// Moves a tick that passed by `now` to the schedule's next tick after it
+/// (KTD-3); a tick still to come stays.
+fn skip_passed_tick(record: &mut ObserverRecord, now: DateTime<Utc>) {
+    if let Some(at) = record.next_run_at.filter(|at| *at <= now) {
+        record.next_run_at = Some(record.config.schedule.next_tick_after(at, now));
+    }
+}
+
 /// `now` plus `secs` seconds, the latest instant when that is too far.
 fn after(now: DateTime<Utc>, secs: u64) -> DateTime<Utc> {
     now.checked_add_signed(secs_duration(secs))
@@ -212,7 +266,7 @@ fn bounded(text: &str) -> String {
     text[..end].to_string()
 }
 
-/// How a run ended, as [`judge_tasks_run`] and [`judge_watch_run`] read
+/// How a run ended, as [`judge_tasks_run`] and [`judge_entry_run`] read
 /// the worker's report.
 struct Verdict<T> {
     status: RunStatus,
@@ -292,30 +346,26 @@ fn judge_tasks_run(report: &RunReport) -> Verdict<ScriptOutput> {
     }
 }
 
-/// A watch run (D18): exit 0 means the entry is done, exit 1 that it must
-/// be checked again; the success says whether the entry is done. Stdout is
-/// not read.
-fn judge_watch_run(report: &RunReport) -> Verdict<bool> {
+/// A run for a queue entry: exit 0 is the only success, whether the script
+/// answered the gate or had nothing to report (R14). Stdout is not read,
+/// and no exit code removes the entry.
+fn judge_entry_run(report: &RunReport) -> Verdict<()> {
     match exit_code_or_failure(&report.outcome) {
-        Ok(WATCH_DONE_EXIT_CODE) => Verdict::success(WATCH_DONE_EXIT_CODE, true),
-        Ok(WATCH_PENDING_EXIT_CODE) => Verdict::success(WATCH_PENDING_EXIT_CODE, false),
+        Ok(ENTRY_DONE_EXIT_CODE) => Verdict::success(ENTRY_DONE_EXIT_CODE, ()),
         Ok(exit_code) => exited_with(exit_code),
         Err(verdict) => verdict,
     }
 }
 
-/// Counts a failed run of an observer that creates tasks: the next run
-/// waits `interval × 2^failures`, and after [`MAX_CONSECUTIVE_FAILURES`]
-/// the observer goes to `error` (R16).
+/// Counts a failed run of an `always` observer: the next run waits
+/// `period × 2^failures` (the interval, or the gap to the next cron fire;
+/// a cron schedule then waits for its first fire from there on), and after
+/// [`MAX_CONSECUTIVE_FAILURES`] the observer goes to `error` (R16).
 fn count_failure(record: &mut ObserverRecord, now: DateTime<Utc>) {
     record.consecutive_failures = record.consecutive_failures.saturating_add(1);
-    record.next_run_at = Some(after(
-        now,
-        retry_delay_secs(
-            record.config.schedule.interval_secs,
-            record.consecutive_failures,
-        ),
-    ));
+    let schedule = &record.config.schedule;
+    let delay = retry_delay_secs(schedule.period_secs(now), record.consecutive_failures);
+    record.next_run_at = Some(schedule.first_fire_from(now, delay));
     if record.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
         && record.state == ObserverState::Active
     {
@@ -339,13 +389,15 @@ impl ProtocolService {
         let now = self.control.now();
         let mut pass = ObserverPass::default();
         for record in &records {
-            let result = if let Some(active) = &record.active_run {
-                if active.is_past_deadline(now) {
-                    self.expire_run_if_lost(&record.observer_id, now)
-                        .map(|lost| pass.lost.extend(lost))
-                } else {
-                    Ok(())
-                }
+            let lost = record
+                .active_run
+                .as_ref()
+                .is_some_and(|active| active.is_past_deadline(now));
+            let result = if lost {
+                self.expire_run_if_lost(&record.observer_id, now)
+                    .map(|lost| pass.lost.extend(lost))
+            } else if tick_while_busy(record, now) {
+                self.skip_busy_tick(&record.observer_id, now, &mut pass)
             } else if scheduled_run_due(record, now) {
                 self.mark_run_due(&record.observer_id, now, &mut pass)
             } else {
@@ -408,10 +460,11 @@ impl ProtocolService {
     /// `interval × 2^failures` (at most 1 h); after
     /// [`MAX_CONSECUTIVE_FAILURES`] the observer goes to `error` (R14, R16).
     ///
-    /// For a watch run (D18), exit code 0 removes the entry and exit code 1
-    /// keeps it. Any other result writes the run's error file, which
-    /// replaces the older error of the same object, and keeps the entry for
-    /// the next round.
+    /// For a run for a queue entry, exit code 0 is the only success. Any
+    /// other result writes the run's error file, which replaces the older
+    /// error of the same entry (R23), and neither counts a failure nor moves
+    /// the observer to `error` (R14). The entry stays on its queue either
+    /// way.
     ///
     /// The run's token stops working. A run already ended, or past its
     /// deadline (it is then recorded as lost), is refused with a conflict.
@@ -441,26 +494,23 @@ impl ProtocolService {
                 format!("run {run_id} passed its deadline and was recorded as lost"),
             ));
         }
-        let interval = record.config.schedule.interval_secs;
-        let (status, exit_code, error, done_entry) = match &active.watch {
-            Some(watch) => {
-                let verdict = judge_watch_run(&report);
+        // The next tick was set when this run's tick came; one the run
+        // outlasted is skipped, not owed (KTD-3, R29).
+        skip_passed_tick(&mut record, now);
+        let (status, exit_code, error) = match &active.entry {
+            Some(_) => {
+                let verdict = judge_entry_run(&report);
                 if verdict.success.is_some() {
                     record.first_run_done = true;
                 }
                 // A failed entry is checked again in the next round: no
-                // backoff, no count towards the error state (D18).
-                record.next_run_at = Some(after(now, interval));
+                // backoff, no count towards the error state (R14).
                 // The round's next entry waits for a claim from now, not
                 // from this run's claim.
                 if record.run_due_since.is_some() {
                     record.run_due_since = Some(now);
                 }
-                let done = verdict
-                    .success
-                    .unwrap_or(false)
-                    .then(|| watch.entry_id.clone());
-                (verdict.status, verdict.exit_code, verdict.error, done)
+                (verdict.status, verdict.exit_code, verdict.error)
             }
             None => {
                 let verdict = judge_tasks_run(&report);
@@ -469,11 +519,10 @@ impl ProtocolService {
                         record.script_state = Some(output.state);
                         record.first_run_done = true;
                         record.consecutive_failures = 0;
-                        record.next_run_at = Some(after(now, interval));
                     }
                     None => count_failure(&mut record, now),
                 }
-                (verdict.status, verdict.exit_code, verdict.error, None)
+                (verdict.status, verdict.exit_code, verdict.error)
             }
         };
         if let Some(message) = &error {
@@ -491,11 +540,14 @@ impl ProtocolService {
                     error: message.clone(),
                     stdout: Some(bounded(&report.stdout)),
                     stderr: Some(bounded(&report.stderr)),
-                    watch_object: active.watch.as_ref().map(|watch| watch.object.clone()),
+                    entry_id: active.entry.as_ref().map(|entry| entry.entry_id.clone()),
                 },
             )?;
         }
         record.active_run = None;
+        if let Some(entry) = &active.entry {
+            record.entry_last_runs.insert(entry.entry_id.clone(), now);
+        }
         let last_run = LastRun {
             sequence: active.sequence,
             status,
@@ -504,9 +556,6 @@ impl ProtocolService {
         };
         record.last_run = Some(last_run.clone());
         self.observers.save(&lock, &mut record, now)?;
-        if let Some(entry_id) = done_entry {
-            self.observers.remove_watch(&lock, &entry_id)?;
-        }
         Ok(last_run)
     }
 
@@ -539,9 +588,12 @@ impl ProtocolService {
         valid.then_some(run_id)
     }
 
-    /// Flags the observer's scheduled run due, unless it watches a list
-    /// that is empty once the entries of ended tasks are gone (R6, R7). A
-    /// watch-list observer's round is the entries left (D18).
+    /// Takes the observer's tick: the next tick counts from this one
+    /// (KTD-3). Flags the scheduled run due, unless the observer is
+    /// `on_episodes` and its queue is empty once the entries of ended tasks
+    /// are gone and missing ones are back (R19, R30). An `on_episodes`
+    /// observer's round is the entries left; an `always` observer's run has
+    /// no entry (R25).
     fn mark_run_due(
         &self,
         observer_id: &ObserverId,
@@ -553,20 +605,47 @@ impl ProtocolService {
         if !scheduled_run_due(&record, now) {
             return Ok(());
         }
-        if record.config.watch_mode == WatchMode::WatchList {
-            let (remaining, removed) = self.prune_watches(&lock)?;
-            pass.watches_removed += removed;
+        let tick = record.next_run_at.unwrap_or(now);
+        record.next_run_at = Some(record.config.schedule.next_tick_after(tick, now));
+        if record.config.mode == ObserverMode::OnEpisodes {
+            pass.entries_restored +=
+                self.restore_queue_entries(&record.owner, &record.config.queue);
+            let (remaining, removed) = self.prune_entries(&record)?;
+            pass.entries_removed += removed;
+            // The last runs of entries that left the queue are of no use.
+            record
+                .entry_last_runs
+                .retain(|entry_id, _| remaining.iter().any(|entry| &entry.entry_id == entry_id));
             if remaining.is_empty() {
-                record.next_run_at = Some(after(now, record.config.schedule.interval_secs));
                 self.observers.save(&lock, &mut record, now)?;
                 pass.skipped.push(observer_id.clone());
                 return Ok(());
             }
-            record.watch_round = remaining.into_iter().map(|entry| entry.entry_id).collect();
+            record.entry_round = remaining.into_iter().map(|entry| entry.entry_id).collect();
         }
         record.run_due_since = Some(now);
         self.observers.save(&lock, &mut record, now)?;
         pass.due.push(observer_id.clone());
+        Ok(())
+    }
+
+    /// Skips the tick of an observer whose run is active or whose round goes
+    /// on (R29): no run for it, the next tick counts from it.
+    fn skip_busy_tick(
+        &self,
+        observer_id: &ObserverId,
+        now: DateTime<Utc>,
+        pass: &mut ObserverPass,
+    ) -> Result<(), ObserverError> {
+        let lock = self.observers.lock(observer_id)?;
+        let mut record = self.observers.load(observer_id)?;
+        if !tick_while_busy(&record, now) {
+            return Ok(());
+        }
+        skip_passed_tick(&mut record, now);
+        self.observers.save(&lock, &mut record, now)?;
+        tracing::debug!(observer = %observer_id, "observers: a tick came while a run was active; skipped");
+        pass.busy.push(observer_id.clone());
         Ok(())
     }
 
@@ -595,7 +674,7 @@ impl ProtocolService {
     /// Ends the run `active` as lost: its error file is written, its token
     /// stops working, the observer's state and failure count stay as they
     /// are (the cause is the infrastructure, not the script), and a
-    /// scheduled run is next due one interval on.
+    /// scheduled run is next due at the next tick the run did not outlast.
     fn lose_run(
         &self,
         lock: &ObserverLock,
@@ -617,18 +696,21 @@ impl ProtocolService {
                 error: LOST_MESSAGE.to_string(),
                 stdout: None,
                 stderr: None,
-                watch_object: active.watch.as_ref().map(|watch| watch.object.clone()),
+                entry_id: active.entry.as_ref().map(|entry| entry.entry_id.clone()),
             },
         )?;
         record.active_run = None;
+        if let Some(entry) = &active.entry {
+            record.entry_last_runs.insert(entry.entry_id.clone(), now);
+        }
         record.last_run = Some(LastRun {
             sequence: active.sequence,
             status: RunStatus::Lost,
             finished_at: now,
             error: Some(LOST_MESSAGE.to_string()),
         });
-        record.next_run_at = Some(after(now, record.config.schedule.interval_secs));
-        // The round's next entry waits for a claim from now (D18).
+        skip_passed_tick(record, now);
+        // The round's next entry waits for a claim from now (R30).
         if record.run_due_since.is_some() {
             record.run_due_since = Some(now);
         }
@@ -651,19 +733,22 @@ impl ProtocolService {
         let Some(version) = record.approved_version else {
             return Ok(None);
         };
-        let watch = match record.config.watch_mode {
-            WatchMode::WatchList => match self.next_round_entry(&mut record)? {
+        let entry = match record.config.mode {
+            ObserverMode::OnEpisodes => match self.next_round_entry(&mut record)? {
                 Some(entry) => Some(entry),
                 None => {
                     // The round's entries went between the pass and this
-                    // claim (R6).
+                    // claim (R30); the next round comes at the next tick.
                     record.run_due_since = None;
-                    record.next_run_at = Some(after(now, record.config.schedule.interval_secs));
+                    skip_passed_tick(&mut record, now);
                     self.observers.save(&lock, &mut record, now)?;
                     return Ok(None);
                 }
             },
-            WatchMode::All => None,
+            ObserverMode::Always => {
+                record.entry_round.clear();
+                None
+            }
         };
         let script = self.observers.load_script(observer_id, version)?;
         let sequence = record.last_run_sequence + 1;
@@ -678,7 +763,7 @@ impl ProtocolService {
             },
             condition: record.config.condition.clone(),
             state: record.script_state.clone(),
-            watch: watch.as_ref().map(|entry| self.script_watch(entry)),
+            entry: entry.as_ref().map(script_entry),
             first_run: !record.first_run_done,
             import_backlog: record.config.import_backlog,
         };
@@ -690,16 +775,17 @@ impl ProtocolService {
             deadline,
             token_digest: token.digest(),
             tasks_created: 0,
-            watch: watch.map(|entry| RunWatch {
+            entry: entry.map(|entry| RunEntry {
                 entry_id: entry.entry_id,
-                object: entry.object,
+                task_id: entry.task_id,
+                episode: entry.episode,
             }),
         });
         record.last_run_sequence = sequence;
         record.last_claim_at = Some(now);
         // Entries left in the round keep the observer due: the next one is
         // claimed once this run has its result.
-        record.run_due_since = (!record.watch_round.is_empty()).then_some(now);
+        record.run_due_since = (!record.entry_round.is_empty()).then_some(now);
         self.observers.save(&lock, &mut record, now)?;
         Ok(Some(ClaimedObserverRun {
             run_id,
@@ -714,78 +800,100 @@ impl ProtocolService {
         }))
     }
 
-    /// Takes the next entry of the round that is still on the watch list,
-    /// `None` when the round has none left.
+    /// Takes the next entry of the round that is still on the observer's
+    /// queue and whose task still waits in its episode, `None` when the
+    /// round has none left.
+    ///
+    /// The guard before a run (R18): the task is read again, and an entry
+    /// whose gate exited, or whose task ended, was archived or is gone, is
+    /// removed and not run. The runner's snapshot removes it first as a
+    /// rule (R16); this catches a snapshot the control plane did not see
+    /// through. An entry whose task cannot be read is kept, but not run;
+    /// so is an entry whose own file cannot be read.
     fn next_round_entry(
         &self,
         record: &mut ObserverRecord,
-    ) -> Result<Option<WatchEntry>, ObserverError> {
-        let mut watches = self.observers.list_watches(&record.observer_id)?;
-        while !record.watch_round.is_empty() {
-            let entry_id = record.watch_round.remove(0);
-            if let Some(at) = watches.iter().position(|entry| entry.entry_id == entry_id) {
-                return Ok(Some(watches.swap_remove(at)));
+    ) -> Result<Option<QueueEntry>, ObserverError> {
+        while !record.entry_round.is_empty() {
+            let entry_id = record.entry_round.remove(0);
+            let entry = match self.observers.queue_entry(&entry_id) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(entry = %entry_id, %error, "observers: cannot read a queue entry of the round; it is not run");
+                    continue;
+                }
+            };
+            if !entry.is_in(&record.owner, &record.config.queue) {
+                continue;
+            }
+            match self.entry_wait(&entry) {
+                EntryWait::Waits => return Ok(Some(entry)),
+                EntryWait::Gone => {
+                    let lock = self.observers.lock_queue_entries()?;
+                    if self.observers.remove_queue_entry(&lock, &entry.entry_id)? {
+                        tracing::info!(task = %entry.task_id, episode = %entry.episode, "observers: the task no longer waits in the episode of a queue entry; the entry is removed, not run");
+                    }
+                }
+                EntryWait::Unknown => {}
             }
         }
         Ok(None)
     }
 
-    /// A watch entry as its script sees it, with the `wait` episode its
-    /// task is in now (`None` when the task waits for no event or cannot be
-    /// read).
-    fn script_watch(&self, entry: &WatchEntry) -> ScriptWatch {
-        ScriptWatch {
-            object: entry.object.clone(),
-            task_id: entry.task_id.clone(),
-            event_types: entry.event_types.clone(),
-            wait_episode: self.wait_episode(&entry.task_id),
-        }
-    }
-
-    /// The id of the `wait` episode `task_id` is in, from its record.
-    fn wait_episode(&self, task_id: &TaskId) -> Option<String> {
-        self.control
-            .task(task_id)
-            .ok()?
-            .event_wait
-            .map(|wait| wait.episode_id)
-    }
-
-    /// Removes the observer's watch entries whose task ended, was archived
-    /// or no longer exists (R7). Returns the entries left and how many went.
-    fn prune_watches(
+    /// Removes the entries of the observer's queue whose task no longer
+    /// waits in their episode, ended, was archived or no longer exists
+    /// (R18, R19), and the unreadable entry files of episodes no task waits
+    /// in. Returns the entries left and how many went.
+    fn prune_entries(
         &self,
-        lock: &ObserverLock,
-    ) -> Result<(Vec<WatchEntry>, usize), ObserverError> {
-        let mut remaining = Vec::new();
-        let mut removed = 0;
-        for entry in self.observers.list_watches(lock.observer_id())? {
-            if self.watched_task_ended(&entry.task_id) {
-                if self.observers.remove_watch(lock, &entry.entry_id)? {
+        record: &ObserverRecord,
+    ) -> Result<(Vec<QueueEntry>, usize), ObserverError> {
+        let scan = self.observers.scan_queue_entries()?;
+        let mut removed = self.prune_unreadable_entries(&scan.unreadable);
+        let (gone, remaining): (Vec<QueueEntry>, Vec<QueueEntry>) = scan
+            .entries
+            .into_iter()
+            .filter(|entry| entry.is_in(&record.owner, &record.config.queue))
+            .partition(|entry| self.entry_wait(entry) == EntryWait::Gone);
+        if !gone.is_empty() {
+            let lock = self.observers.lock_queue_entries()?;
+            for entry in &gone {
+                if self.observers.remove_queue_entry(&lock, &entry.entry_id)? {
                     removed += 1;
                 }
-            } else {
-                remaining.push(entry);
             }
         }
         Ok((remaining, removed))
     }
+}
 
-    /// Whether a watch entry's task can receive no more events: finished,
-    /// archived (or being archived), or gone. A task that cannot be read
-    /// for another reason keeps its entry.
-    fn watched_task_ended(&self, task_id: &TaskId) -> bool {
-        match self.control.task(task_id) {
-            Ok(task) => {
-                task.archive.is_some()
-                    || task.runner_state.is_archival()
-                    || task.task_state() == TaskState::Finished
-            }
-            Err(OrchestrationError::TaskNotFound(_)) => true,
-            Err(error) => {
-                tracing::warn!(task = %task_id, %error, "observers: cannot read a watched task");
-                false
-            }
-        }
+/// A queue entry as its script sees it (contract version 2, R11).
+fn script_entry(entry: &QueueEntry) -> ScriptEntry {
+    ScriptEntry {
+        task_id: entry.task_id.clone(),
+        episode: entry.episode.clone(),
+        episode_started_at: entry.created_at,
+        step: entry.step.clone(),
+        params: entry.params.clone(),
+        choices: entry
+            .choices
+            .iter()
+            .map(|choice| ScriptChoice {
+                name: choice.name.clone(),
+                description: choice.description.clone(),
+                requires_variables: choice.requires_variables.clone(),
+            })
+            .collect(),
+        variables: entry
+            .variables
+            .iter()
+            .map(|variable| ScriptVariable {
+                name: variable.name.clone(),
+                variable_type: variable.variable_type.clone(),
+                description: variable.description.clone(),
+                options: variable.options.clone(),
+            })
+            .collect(),
     }
 }

@@ -162,6 +162,7 @@ impl Engine {
             agent_session_id: None,
             prefilled_answer: None,
             permission: None,
+            gate_watch: None,
         };
         let requirements = output_requirements(definition, execution, state);
         let problem = OutputProblem {

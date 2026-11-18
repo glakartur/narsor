@@ -33,7 +33,6 @@ impl Engine {
         let mut executors: HashMap<ActionKind, Arc<dyn ActionExecutor>> = HashMap::new();
         executors.insert(ActionKind::Script, Arc::new(ScriptExecutor::new()));
         executors.insert(ActionKind::Human, Arc::new(HumanExecutor::new()));
-        executors.insert(ActionKind::Wait, Arc::new(WaitExecutor::new()));
         executors.insert(ActionKind::Profile, Arc::new(ProfileExecutor::like(&agent)));
         executors.insert(ActionKind::Agent, Arc::new(agent));
 

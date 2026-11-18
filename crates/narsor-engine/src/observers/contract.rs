@@ -2,19 +2,30 @@
 //! what its result is (D18).
 //!
 //! ```text
-//! stdin   one JSON document, ScriptInput
+//! stdin   one JSON document, ScriptInput (contract_version 2)
 //!
-//! an observer that creates tasks (watch mode `all`):
+//! an observer in mode `always`: no `entry` field
 //!   stdout  one JSON document, ScriptOutput: {"state": …}
 //!   exit 0 + a document parse_script_output accepts → the state is saved
 //!   anything else                                   → error, state kept
 //!
-//! an observer with a watch list: one run checks one watch entry
+//! an observer in mode `on_episodes`: one run checks one queue entry,
+//! `entry` holds it (task, episode and its start, step, params, the
+//! gate's choices and variables)
 //!   stdout  not read
-//!   exit 0 (WATCH_DONE_EXIT_CODE)    → done: the entry is removed
-//!   exit 1 (WATCH_PENDING_EXIT_CODE) → check the entry again in the next run
-//!   any other result                 → error, the entry is checked again
+//!   exit 0 (ENTRY_DONE_EXIT_CODE) → the run is done: the script answered
+//!                                   the gate (`narsor-cli task decide`)
+//!                                   or had nothing to report
+//!   any other result              → error, recorded for the entry; the
+//!                                   observer's state does not change
 //! ```
+//!
+//! No exit code removes an entry: the entry goes when its gate exits
+//! (R14, R16), and is checked again in the next round until then.
+//!
+//! Version 2 (R11) replaced the watched object of version 1 with the queue
+//! entry and dropped exit code 1 ("check again"): every run checks again
+//! until the gate exits.
 //!
 //! For an observer that creates tasks, exit code 0 with a valid document is
 //! the only result that changes the remembered state (R14). The output is
@@ -24,20 +35,20 @@
 
 use super::model::{ObserverId, ObserverName};
 use crate::domain::TaskId;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// Version of the contract a [`ScriptInput`] follows.
-pub const SCRIPT_CONTRACT_VERSION: u32 = 1;
+pub const SCRIPT_CONTRACT_VERSION: u32 = 2;
 
 /// Largest stdout document a script may print (1 MiB).
 pub const MAX_SCRIPT_OUTPUT_BYTES: usize = 1024 * 1024;
 
-/// The exit code of a watch run whose entry is done: the engine removes it.
-pub const WATCH_DONE_EXIT_CODE: i32 = 0;
-
-/// The exit code of a watch run whose entry must be checked again.
-pub const WATCH_PENDING_EXIT_CODE: i32 = 1;
+/// The exit code of a run that checked its queue entry: the only exit
+/// code of such a run that is no error (R14).
+pub const ENTRY_DONE_EXIT_CODE: i32 = 0;
 
 /// The observer, as its script sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,20 +61,57 @@ pub struct ScriptObserver {
     pub source: String,
 }
 
-/// One watch entry, as its script sees it.
+/// One queue entry, as its script sees it (R11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScriptWatch {
-    /// The watched object (a PR/MR URL, say).
-    pub object: String,
-    /// The task its events go to.
+pub struct ScriptEntry {
+    /// The task waiting at the gate.
     pub task_id: TaskId,
-    /// The event types to catch.
+    /// The wait episode: an answer names it.
+    pub episode: String,
+    /// When the episode began, as the control plane saw it: when it added
+    /// the entry. Whether and how the script uses it is up to the script.
+    pub episode_started_at: DateTime<Utc>,
+    /// The workflow state of the gate.
+    pub step: String,
+    /// The gate's rendered params.
     #[serde(default)]
-    pub event_types: Vec<String>,
-    /// The id of the `wait` episode the task is in, `None` when the task is
-    /// not waiting: the script sends an event only to a waiting task.
+    pub params: BTreeMap<String, String>,
+    /// The gate's choices, in the workflow's order: an answer names one.
     #[serde(default)]
-    pub wait_episode: Option<String>,
+    pub choices: Vec<ScriptChoice>,
+    /// The variables an answer may give, in the workflow's order.
+    #[serde(default)]
+    pub variables: Vec<ScriptVariable>,
+}
+
+/// One choice of the gate of a queue entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptChoice {
+    /// The label an answer names.
+    pub name: String,
+    /// What the choice means, as the workflow describes it.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The variables an answer with this choice must give.
+    #[serde(default)]
+    pub requires_variables: Vec<String>,
+}
+
+/// One variable an answer to the gate of a queue entry may give.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptVariable {
+    /// Its name.
+    pub name: String,
+    /// The declared type (`string`, `text`, `select`, `integer`,
+    /// `boolean`), when the workflow declares one.
+    #[serde(rename = "type", default)]
+    pub variable_type: Option<String>,
+    /// What it means, as the workflow describes it.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The only values it may take; absent when any value goes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
 }
 
 /// What the script reads on stdin.
@@ -78,10 +126,10 @@ pub struct ScriptInput {
     /// The state the last successful run returned; `None` before the first.
     #[serde(default)]
     pub state: Option<serde_json::Value>,
-    /// The one watch entry this run checks, for a `watch_list` observer;
-    /// `None` for an observer that creates tasks.
-    #[serde(default)]
-    pub watch: Option<ScriptWatch>,
+    /// The one queue entry this run checks, for an `on_episodes` observer;
+    /// absent for an `always` observer (R25).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<ScriptEntry>,
     /// No run of this observer has succeeded yet.
     #[serde(default)]
     pub first_run: bool,

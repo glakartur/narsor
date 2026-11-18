@@ -140,6 +140,7 @@ fn engine_delivery(delivery: narsor_protocol::api::HumanInputDeliveryDto) -> Hum
         episode: delivery.episode,
         permission_decision,
         answered_by: AnsweredBy::Operator,
+        observer: None,
     }
 }
 

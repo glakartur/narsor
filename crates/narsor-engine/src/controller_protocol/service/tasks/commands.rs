@@ -60,6 +60,8 @@ impl ProtocolService {
             // Archive removes the task's materials too (U9) — also on a
             // replay, which finishes a purge a crash may have cut short.
             self.purge_materials(&record.task_id);
+            // Its gate can never be answered now (R19).
+            self.drop_queue_entry_of(&record);
         }
         let mut task = outcome.task;
         if !outcome.replayed {

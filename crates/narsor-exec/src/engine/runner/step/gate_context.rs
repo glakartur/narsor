@@ -6,10 +6,12 @@
 
 use super::*;
 use crate::domain::{
-    HumanInputField, HumanInputType, VariableSource, VariableType, LOCAL_VARIABLE_PREFIX,
+    GateWatchConfig, HumanInputField, HumanInputType, VariableSource, VariableType,
+    LOCAL_VARIABLE_PREFIX,
 };
 use crate::engine::actions::human::{LocalValue, RequiredValue, RequiredValueKind};
 use crate::workflow::template::render_scalar;
+use narsor_protocol::controller::{GateWatch, GateWatchChoice, GateWatchVariable};
 use narsor_protocol::display::{without_unsafe_chars, without_unsafe_chars_multiline, NO_REASON};
 
 /// The longest reason or required value a gate shows, in bytes.
@@ -99,6 +101,49 @@ pub(crate) fn decision_fields(state: &State) -> Vec<HumanInputField> {
             }
         })
         .collect()
+}
+
+/// What a `decision` gate with a `watch` block reports with its wait
+/// episode: the queue, the params `watch` holds (already rendered), and the
+/// choices and variables an answer may use, the same as the person's form
+/// offers ([`decision_fields`]).
+pub(crate) fn gate_watch(state: &State, watch: &GateWatchConfig) -> GateWatch {
+    GateWatch {
+        step: state.id.clone(),
+        queue: watch.queue.clone(),
+        params: watch.params.clone(),
+        choices: decision::permitted_outputs(state)
+            .into_iter()
+            .map(|choice| GateWatchChoice {
+                name: choice.label,
+                description: choice.description,
+                requires_variables: choice.requires_variables,
+            })
+            .collect(),
+        variables: state
+            .variables
+            .iter()
+            .filter(|variable| variable.source == VariableSource::Step)
+            .map(|variable| GateWatchVariable {
+                name: variable.name.clone(),
+                variable_type: variable.variable_type.map(variable_type_name),
+                description: variable.description.clone(),
+                options: variable.options.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// The name of `variable_type` in the YAML contract.
+fn variable_type_name(variable_type: VariableType) -> String {
+    match variable_type {
+        VariableType::String => "string",
+        VariableType::Text => "text",
+        VariableType::Select => "select",
+        VariableType::Integer => "integer",
+        VariableType::Boolean => "boolean",
+    }
+    .to_string()
 }
 
 /// What `state` keeps for itself, as a decision shows it beside its form:

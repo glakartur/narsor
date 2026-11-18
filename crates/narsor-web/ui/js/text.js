@@ -1,7 +1,7 @@
 // Texts the views show that are not about one task's state: harness names,
 // usage limits, the harness of the header. Pure functions, tested in Node.
 
-import { percent, scaled, timeToReset } from './model.js';
+import { percent, scaled, timeToReset, unapprovedVersion } from './model.js';
 
 const HARNESS_SHORT = {
   'claude-code': 'claude',
@@ -237,4 +237,94 @@ export function duration(ms) {
 export function clock(at) {
   const date = new Date(at);
   return Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString('pl-PL', { hour12: false });
+}
+
+// ---------------------------------------------------------------------------
+// Observer queues (U11)
+
+/** A date and time in the browser's zone; `''` for none. */
+export function dateTime(at) {
+  if (!at) return '';
+  const date = new Date(at);
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString('pl-PL', { hour12: false });
+}
+
+/** An interval in the largest whole unit: `co 45s`, `co 5m`, `co 2h`. */
+export function intervalText(seconds) {
+  if (seconds % 3600 === 0) return `co ${seconds / 3600}h`;
+  if (seconds % 60 === 0) return `co ${seconds / 60}m`;
+  return `co ${seconds}s`;
+}
+
+/** The schedule of an observer: `co 5m` or `cron 0 9 * * 1 (UTC)`. */
+export function scheduleText(observer) {
+  if (observer?.cron) return `cron ${observer.cron} (UTC)`;
+  if (typeof observer?.interval_secs === 'number') return intervalText(observer.interval_secs);
+  return '—';
+}
+
+const MODE_TEXT = {
+  on_episodes: 'on_episodes — dla wpisów kolejki',
+  always: 'always — przy każdym uruchomieniu harmonogramu',
+};
+
+/** The run mode with what it means; an unknown mode as it is. */
+export function modeText(mode) {
+  if (!mode) return 'brak obserwatorów';
+  return MODE_TEXT[mode] ?? mode;
+}
+
+const OBSERVER_STATE = {
+  draft: { text: 'szkic', role: 'done' },
+  active: { text: 'aktywny', role: 'live' },
+  paused: { text: 'wstrzymany', role: 'calm' },
+  needs_attention: { text: 'czeka na Ciebie', role: 'attention' },
+  error: { text: 'błąd', role: 'problem' },
+};
+
+/** The state of an observer as `{text, role}`. */
+export function observerState(state) {
+  return OBSERVER_STATE[state] ?? { text: String(state ?? '?'), role: 'done' };
+}
+
+/**
+ * The two labelled rows of the script versions (KTD-10, R32): the version
+ * the schedule runs and the newest saved one.
+ */
+export function versionRows(observer) {
+  const approved = observer?.approved_version;
+  const latest = observer?.latest_version;
+  return [
+    ['wersja zatwierdzona', approved !== undefined && approved !== null ? `v${approved}` : 'brak'],
+    ['wersja najnowsza', latest !== undefined && latest !== null ? `v${latest}` : 'brak skryptu'],
+  ];
+}
+
+/** The mark of a newest version that is not approved (R32, AE10); `null` for none. */
+export function unapprovedText(observer) {
+  const version = unapprovedVersion(observer);
+  return version === null ? null : `wersja ${version} nie zatwierdzona`;
+}
+
+/** The latest finished run: `#4 succeeded · 12.11.2026, 10:05:00`; `null` for none. */
+export function lastRunText(run) {
+  if (!run) return null;
+  return `#${run.sequence} ${run.status} · ${dateTime(run.finished_at)}`;
+}
+
+/**
+ * How one observer processed one queue entry (R23), as `{text, role}`
+ * parts: a run checks it now, the last run time, the newest error.
+ */
+export function entryObserverParts(view) {
+  const parts = [];
+  if (view?.running) parts.push({ text: 'sprawdza teraz', role: 'live' });
+  if (view?.last_run_at) parts.push({ text: `ostatni przebieg ${dateTime(view.last_run_at)}`, role: 'done' });
+  const error = view?.last_error;
+  if (error) {
+    const code = error.exit_code !== undefined && error.exit_code !== null ? `, kod ${error.exit_code}` : '';
+    parts.push({ text: `błąd ${error.status}${code}: ${firstLine(error.error, 160)}`, role: 'problem' });
+  }
+  if (!parts.length) parts.push({ text: 'jeszcze nie sprawdzony', role: 'done' });
+  return parts;
 }

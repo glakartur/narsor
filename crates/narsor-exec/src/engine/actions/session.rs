@@ -479,6 +479,7 @@ impl SessionRunner {
                         })
                         .collect(),
                 }),
+                gate_watch: None,
             }
         });
         let failure = run.failure.as_ref().map(|failure| {

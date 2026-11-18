@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub use narsor_protocol::controller::{
     ArchiveTombstone, AttentionItem, AttentionKind, CommandActor, CommandReceipt,
-    ConversationAttemptSummary, ConversationAvailability, EventWait, EventWatch, ExecutionCursor,
+    ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, GateWatch,
     HarnessUnavailable, InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary,
     OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity,
     ResumeExhaustion, ResumeMessage, ResumeState, RunnerProblem, RunnerState, SlotReleaseReason,
@@ -368,21 +368,19 @@ pub struct TaskRecord {
     /// retry of any of them still reads as a replay.
     #[serde(default)]
     pub resume_message_taken: Vec<String>,
-    /// The external event the task's `wait` step waits for, as its runner
-    /// reported it; `None` while the task waits for none. Observers hand
-    /// [`EventWait::episode_id`] to their scripts, so a script sends an
-    /// event only to a task that waits.
+    /// The wait episode of the `decision` gate with a `watch` block the
+    /// task waits at, as its runner reported it; `None` while it waits at
+    /// no such gate. The control plane keeps one queue entry for it
+    /// (KTD-4): a snapshot that changes it ends the old episode's entry and
+    /// begins the new one's ([`GateChange`]). Only a runner with an
+    /// execution changes it, so a runner that is still starting (after a
+    /// pause, a loss or a restart) does not end the episode (R17).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub event_wait: Option<EventWait>,
+    pub watched_gate: Option<WatchedGate>,
     /// The observer and run that created the task (R19);
     /// `None` for a task its owner created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<TaskProvenance>,
-    /// External events queued for the task's waiting `wait` step, oldest
-    /// first; the audit trail of every such delivery, whose data is dropped
-    /// once it is settled.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub event_inputs: Vec<QueuedEventInput>,
     /// The event of revision [`Self::revision`]: an outbox of one, so a crash
     /// between writing the record and appending the event is repaired from
     /// the record itself (see `OrchestrationStore::publish_last_event`).
@@ -470,10 +468,6 @@ impl TaskRecord {
     pub fn owner_work_pending(&self) -> bool {
         self.inputs.iter().any(|input| !input.status.is_settled())
             || self
-                .event_inputs
-                .iter()
-                .any(|input| !input.status.is_settled())
-            || self
                 .operator_commands
                 .iter()
                 .any(|command| command.status == OperatorCommandStatus::Queued)
@@ -487,12 +481,6 @@ impl TaskRecord {
             .iter()
             .find(|input| !input.status.is_settled())
             .map(|input| input.idempotency_key.as_str())
-            .or_else(|| {
-                self.event_inputs
-                    .iter()
-                    .find(|input| !input.status.is_settled())
-                    .map(|input| input.idempotency_key.as_str())
-            })
             .or_else(|| {
                 self.operator_commands
                     .iter()
@@ -883,6 +871,11 @@ pub struct QueuedInput {
     pub updated_at: DateTime<Utc>,
     /// The runner's reason, when it rejected the input.
     pub detail: Option<String>,
+    /// The observer and its run, when an observer's script gave the answer
+    /// (`task decide`, R15); `None` for the owner's. The runner records it
+    /// in the answer's event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer: Option<TaskProvenance>,
 }
 
 /// An owner input as submitted.
@@ -894,68 +887,6 @@ pub struct InputRequest {
     pub idempotency_key: String,
     /// The answer.
     pub delivery: HumanInputDelivery,
-}
-
-/// What ends the task's waiting `wait` step, queued for its runner: an
-/// external event an observer delivered (U3). The runner's engine
-/// consumes it.
-///
-/// Kept apart from [`QueuedInput`]: an owner answer is bound to the
-/// runner's pending input request and made obsolete by any snapshot that
-/// shows another, while an event is bound to the wait episode
-/// ([`EventWait::episode_id`]) the control plane matched it against.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct QueuedEventInput {
-    /// Control-plane id, unique within the task (`event-<n>`).
-    pub input_id: String,
-    /// [`super::observer_event_key`] the server made for the event.
-    pub idempotency_key: String,
-    /// The wait episode it was matched against; a runner in another
-    /// episode never takes it.
-    pub episode_id: String,
-    /// The event type.
-    pub event_type: String,
-    /// The observer's source.
-    pub source: String,
-    /// The event's data, dropped once settled.
-    #[serde(default)]
-    pub data: Option<serde_json::Value>,
-    /// The observer and run it came from (R19).
-    pub provenance: TaskProvenance,
-    /// Its status, as for an owner answer.
-    pub status: InputStatus,
-    /// When the control plane accepted it.
-    pub submitted_at: DateTime<Utc>,
-    /// When its status last changed.
-    pub updated_at: DateTime<Utc>,
-    /// The runner's reason, when it rejected the event.
-    #[serde(default)]
-    pub detail: Option<String>,
-}
-
-/// An external event as an observer delivers it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ExternalEvent {
-    /// [`super::observer_event_key`]: a new key for every event.
-    pub idempotency_key: String,
-    /// The event type.
-    pub event_type: String,
-    /// The observer's source.
-    pub source: String,
-    /// The event's data.
-    pub data: serde_json::Value,
-    /// The observer and run it came from (R19).
-    pub provenance: TaskProvenance,
-}
-
-/// The result of recording an external event.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ExternalEventOutcome {
-    /// The task as it is now.
-    pub task: TaskRecord,
-    /// The input queued for the waiting step; `None` when the event only
-    /// went to history.
-    pub input: Option<QueuedEventInput>,
 }
 
 /// The result of queueing an owner input.
@@ -1034,10 +965,44 @@ pub struct RunnerReportOutcome {
     pub task: TaskRecord,
     /// False when the snapshot was a duplicate and changed nothing.
     pub applied: bool,
-    /// The `wait` episode this snapshot began: one the record did not hold
-    /// before. `None` when the task waits for no event, or still waits in
-    /// the episode it was already known to wait in.
-    pub began_wait: Option<EventWait>,
+    /// The watched gate episodes this snapshot ended and began; empty when
+    /// the task still waits in the episode it was known to wait in.
+    pub gate_change: GateChange,
+}
+
+/// A wait episode of a `decision` gate with a `watch` block: the episode
+/// (the id of the gate's pending input request) and the gate's rendered
+/// `watch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchedGate {
+    /// The episode: the id of the pending input request.
+    pub episode: String,
+    /// The gate's `watch`, as the runner rendered it.
+    pub watch: GateWatch,
+    /// When the control plane first saw the episode. An entry added back
+    /// later keeps it as its start, so a script still sees what changed
+    /// since the episode began. `None` in a record from before it was
+    /// kept: the time of the restore is used then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub began_at: Option<DateTime<Utc>>,
+}
+
+/// How a runner snapshot moved the task between watched gate episodes
+/// (R16): the episode it left and the one it entered. A snapshot that
+/// leaves one episode and enters the next (a review loop) has both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GateChange {
+    /// The watched episode that ended: its gate exited.
+    pub ended: Option<WatchedGate>,
+    /// The watched episode that began.
+    pub began: Option<WatchedGate>,
+}
+
+impl GateChange {
+    /// Whether the snapshot left the task in the episode it was in.
+    pub fn is_empty(&self) -> bool {
+        self.ended.is_none() && self.began.is_none()
+    }
 }
 
 /// Everything needed to create a task.

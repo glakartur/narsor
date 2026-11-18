@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use narsor_engine::domain::ActionConfig;
+use narsor_engine::domain::{ActionConfig, DecisionMaker};
 use narsor_engine::workflow::{load_from_str, validate_source};
 use narsor_engine::workflows::{
     builtin, builtin_names, WorkflowOrigin, WorkflowResolver, BUILTIN_WORKFLOWS,
@@ -110,11 +110,11 @@ fn the_template_is_the_only_builtin_and_demonstrates_engine_features_safely() {
     assert!(review.choices.iter().any(|choice| choice.label == "finish"));
 
     assert!(
-        definition.states.values().all(|state| !matches!(
-            state.action,
-            Some(ActionConfig::Agent(_) | ActionConfig::Wait(_))
-        )),
-        "the template does not invoke an agent or an external event service"
+        definition
+            .states
+            .values()
+            .all(|state| !matches!(state.action, Some(ActionConfig::Agent(_)))),
+        "the template does not invoke an agent"
     );
 
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/template.yaml");
@@ -152,6 +152,53 @@ fn every_example_workflow_in_the_repository_loads_and_validates() {
     assert!(
         checked.contains(&"compound-engineering-change.yaml".to_string()),
         "the compound engineering example is checked: {checked:?}"
+    );
+}
+
+/// U13: no example workflow has a `wait` step any more, and the review gates
+/// of the compound engineering example put their wait episodes on the queue
+/// `mr-review`, with the params the example observer scripts read.
+#[test]
+fn the_review_gates_of_the_compound_engineering_example_watch_one_queue() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/compound-engineering-change.yaml");
+    let definition = load_from_str(&fs::read_to_string(&path).expect("read the example"))
+        .expect("the example loads");
+
+    for (gate, choice) in [
+        ("requirements_questions", "answered"),
+        ("plan_questions", "answered"),
+        ("review_code", "feedback"),
+    ] {
+        let state = &definition.states[gate];
+        let Some(ActionConfig::Decision(decision)) = &state.action else {
+            panic!("{gate} is a decision");
+        };
+        assert_eq!(decision.by, DecisionMaker::Human, "{gate}");
+        let watch = decision
+            .watch
+            .as_ref()
+            .unwrap_or_else(|| panic!("{gate} watches"));
+        assert_eq!(watch.queue, "mr-review", "{gate}");
+        assert_eq!(
+            watch.params.get("mr_url").map(String::as_str),
+            Some("{{ context.workspace.code.pr_url }}"),
+            "{gate}"
+        );
+        assert_eq!(
+            watch.params.get("label").map(String::as_str),
+            Some("narsor-review")
+        );
+        assert_eq!(watch.params.get("choice").map(String::as_str), Some(choice));
+        assert!(
+            state.choices.iter().any(|known| known.label == choice),
+            "{gate} has the choice {choice}"
+        );
+    }
+    let finalize_blocked = &definition.states["finalize_blocked"];
+    assert!(
+        matches!(&finalize_blocked.action, Some(ActionConfig::Decision(decision)) if decision.watch.is_none()),
+        "finalize_blocked is not a review gate"
     );
 }
 

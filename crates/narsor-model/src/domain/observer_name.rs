@@ -1,5 +1,5 @@
-//! The naming rules of observers, shared by the observer store and the
-//! workflow validator (a `wait` step's `watch.observer`).
+//! The naming rules of observers and their queues, shared by the observer
+//! store and the workflow validator (a `decision` step's `watch.queue`).
 
 /// Longest observer name.
 pub const MAX_OBSERVER_NAME_LEN: usize = 64;
@@ -43,4 +43,10 @@ pub fn observer_name_problem(value: &str) -> Option<String> {
             )
         })
     })
+}
+
+/// Why `value` is not a valid queue name, if it is not: the characters of
+/// an observer name, so an observer's own name is always a valid queue.
+pub fn queue_name_problem(value: &str) -> Option<String> {
+    name_like_problem(value, true)
 }

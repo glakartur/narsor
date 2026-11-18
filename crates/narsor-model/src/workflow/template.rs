@@ -2,9 +2,9 @@
 //!
 //! The scope is deliberately minimal (D6): the only things recognised inside
 //! `{{ }}` are a workflow input (`inputs.NAME`), a context variable
-//! (`context.variables.NAME`, or the shorthand `context.NAME` used by
-//! `docs/dev/workflow-schema.md` §3.3.D) and a field of its value when that is
-//! an object (`context.variables.NAME.field`), a value of a workspace
+//! (`context.variables.NAME`, or the shorthand `context.NAME`) and a field
+//! of its value when that is an object (`context.variables.NAME.field`), a
+//! value of a workspace
 //! (`context.workspace.NAME.field`, [`WorkspaceField`]), a named artifact (`artifacts.NAME`, the path
 //! it was last written to, KTD7), selected step fields (`reply`,
 //! `stdout`, `stderr`), the current step's own memory (`local.NAME`, R13)
@@ -34,9 +34,9 @@ use serde_json::{Map, Value};
 
 use crate::domain::{
     ActionConfig, AgentActionConfig, ArtifactReference, Context, DecisionActionConfig,
-    HumanActionConfig, ProfileActionConfig, PromptPart, PromptText, ScriptActionConfig,
-    VariableDefinition, WaitActionConfig, WaitWatchConfig, WorkflowDefinition, WorkspaceField,
-    WorkspacePr, LOCAL_VARIABLE_PREFIX,
+    GateWatchConfig, HumanActionConfig, ProfileActionConfig, PromptPart, PromptText,
+    ScriptActionConfig, VariableDefinition, WorkflowDefinition, WorkspaceField, WorkspacePr,
+    LOCAL_VARIABLE_PREFIX,
 };
 
 /// Opening delimiter of a template placeholder.
@@ -511,46 +511,27 @@ impl<'a> TemplateScope<'a> {
                 ..config.clone()
             })),
 
-            ActionConfig::Decision(config) => Ok(ActionConfig::Decision(DecisionActionConfig {
-                message: self.render_text(&config.message, &format!("{location}, message"))?,
-                ..config.clone()
-            })),
-
-            ActionConfig::Wait(config) => {
-                let filter = match &config.filter {
-                    Some(filter) => {
-                        Some(self.render_value(filter, &format!("{location}, filter"))?)
-                    }
-                    None => None,
-                };
-
-                // The validator checks `event_type` as a template, so it is
-                // rendered like the filter.
-                let event = self.render(&config.event, &format!("{location}, event_type"))?;
-                // The observer is a plain name; the object and the event
-                // types are templates, so they always name the same thing
-                // as the step's own `event_type`.
+            ActionConfig::Decision(config) => {
+                // The queue is a plain name; each param is a template,
+                // rendered when the gate starts.
                 let watch = match &config.watch {
                     Some(watch) => {
-                        let mut event_types = Vec::with_capacity(watch.event_types.len());
-                        for (index, event_type) in watch.event_types.iter().enumerate() {
-                            event_types.push(self.render(
-                                event_type,
-                                &format!("{location}, watch.event_types[{index}]"),
-                            )?);
+                        let mut params = BTreeMap::new();
+                        for (name, value) in &watch.params {
+                            params.insert(
+                                name.clone(),
+                                self.render(value, &format!("{location}, watch.params.{name}"))?,
+                            );
                         }
-                        Some(WaitWatchConfig {
-                            observer: watch.observer.clone(),
-                            object: self
-                                .render(&watch.object, &format!("{location}, watch.object"))?,
-                            event_types,
+                        Some(GateWatchConfig {
+                            queue: watch.queue.clone(),
+                            params,
                         })
                     }
                     None => None,
                 };
-                Ok(ActionConfig::Wait(WaitActionConfig {
-                    event,
-                    filter,
+                Ok(ActionConfig::Decision(DecisionActionConfig {
+                    message: self.render_text(&config.message, &format!("{location}, message"))?,
                     watch,
                     ..config.clone()
                 }))
@@ -971,10 +952,8 @@ pub fn action_context_references(action: &ActionConfig) -> Vec<String> {
             for piece in config.message.template_pieces() {
                 collect_context_references(&piece, &mut names);
             }
-        }
-        ActionConfig::Wait(config) => {
-            if let Some(filter) = &config.filter {
-                collect_value_references(filter, &mut names);
+            for value in config.watch.iter().flat_map(|watch| watch.params.values()) {
+                collect_context_references(value, &mut names);
             }
         }
     }
@@ -995,24 +974,6 @@ fn collect_context_references(template: &str, names: &mut Vec<String>) {
             }
         }
         rest = &after_open[end + CLOSE.len()..];
-    }
-}
-
-/// [`collect_context_references`] over every string inside a JSON value.
-fn collect_value_references(value: &Value, names: &mut Vec<String>) {
-    match value {
-        Value::String(text) => collect_context_references(text, names),
-        Value::Array(items) => {
-            for item in items {
-                collect_value_references(item, names);
-            }
-        }
-        Value::Object(entries) => {
-            for item in entries.values() {
-                collect_value_references(item, names);
-            }
-        }
-        _ => {}
     }
 }
 

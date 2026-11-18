@@ -422,6 +422,7 @@ impl ActionExecutor for ResumeRejectingAgentExecutor {
                         agent_session_id: Some("gone-session".to_string()),
                         prefilled_answer: None,
                         permission: None,
+                        gate_watch: None,
                     }),
                 )),
                 2 => Err(ActionError {
@@ -519,6 +520,7 @@ impl ActionExecutor for QuestioningAgentExecutor {
                         agent_session_id: session.as_ref().map(|(_, id)| id.clone()),
                         prefilled_answer: None,
                         permission: None,
+                        gate_watch: None,
                     }),
                 ));
             }
@@ -812,6 +814,7 @@ impl ActionExecutor for ScriptedAgentExecutor {
             agent_session_id: Some("agent-session".to_string()),
             prefilled_answer: None,
             permission,
+            gate_watch: None,
         };
         let outcome = match turn {
             AgentTurn::Label {

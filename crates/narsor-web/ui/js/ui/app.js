@@ -1,6 +1,6 @@
-// The shell: header, task list and details, the notification and the help.
-// Keyboard shortcuts follow the TUI where they make sense in a browser;
-// they do nothing while the focus is in a text field.
+// The shell: header, task list and details (or the queues page), the
+// notification and the help. Keyboard shortcuts follow the TUI where they
+// make sense in a browser; they do nothing while the focus is in a text field.
 
 import { html, useEffect, useRef, useState } from '../lib.js';
 import { titleOf } from '../model.js';
@@ -12,6 +12,8 @@ import { NewTask } from './newtask.js';
 import { ArchivedTask, Harness, History, Limit, Repositories } from './settings.js';
 import { Help } from './help.js';
 import { useNow, useStore } from './hooks.js';
+import { Queues, hasUnsavedScript, queuesKeysHeld } from './queues.js';
+import { hashOf, routeOf } from '../store.js';
 import { TaskList } from './tasklist.js';
 import { Toast } from './toast.js';
 
@@ -46,25 +48,33 @@ export function App({ store, onSignOut }) {
     }).catch(() => {});
   };
 
-  // The address mirrors the view (`#/task/<id>/<tab>`), so a reload comes back
-  // to the same place. The token is never in it.
+  // The address mirrors the view (`#/task/<id>/<tab>`, `#/queues/<queue>`),
+  // so a reload comes back to the same place. The token is never in it.
   useEffect(() => {
-    const [, kind, id, tab] = window.location.hash.split('/');
-    if (kind === 'task' && id) {
-      store.set({ selectedTaskId: decodeURIComponent(id), ...(TABS.some(([key]) => key === tab) ? { tab } : {}) });
+    const route = routeOf(window.location.hash);
+    if (route?.page === 'tasks') {
+      store.set({ selectedTaskId: route.taskId, ...(TABS.some(([key]) => key === route.tab) ? { tab: route.tab } : {}) });
       setDetailsOpen(true);
+    } else if (route?.page === 'queues') {
+      store.openQueues(route.queue);
     }
   }, [store]);
   useEffect(() => {
-    if (!state.selectedTaskId) return;
-    const hash = `#/task/${encodeURIComponent(state.selectedTaskId)}/${state.tab}`;
-    if (window.location.hash !== hash) window.history.replaceState(null, '', hash);
-  }, [state.selectedTaskId, state.tab]);
+    const hash = hashOf(state);
+    if (hash && window.location.hash !== hash) window.history.replaceState(null, '', hash);
+  }, [state.page, state.queue, state.selectedTaskId, state.tab]);
 
-  // Ask before the tab closes while a form has text that was not sent.
+  const openTask = (taskId) => {
+    store.openTasks(taskId);
+    setDetailsOpen(true);
+  };
+  const toggleQueues = () => (store.state.page === 'queues' ? store.openTasks() : store.openQueues(null));
+
+  // Ask before the tab closes while a form has text that was not sent, or
+  // a script dialog has text that was not saved.
   useEffect(() => {
     const onUnload = (event) => {
-      if (!hasUnsentDraft()) return;
+      if (!hasUnsentDraft() && !hasUnsavedScript()) return;
       event.preventDefault();
       event.returnValue = '';
     };
@@ -82,6 +92,16 @@ export function App({ store, onSignOut }) {
       if (event.ctrlKey || event.metaKey || event.altKey) return;
       if (typing(event.target) || actionsOpen || newOpen || dialog) return;
       if (help && event.key === 'Escape') { setHelp(false); return; }
+      if (store.state.page === 'queues') {
+        if (queuesKeysHeld(event.target)) return;
+        const back = () => (store.state.queue !== null ? store.openQueues(null) : store.openTasks());
+        const action = { Q: toggleQueues, Escape: back, '?': () => setHelp(true), u: () => store.refresh() }[event.key];
+        if (action) {
+          event.preventDefault();
+          action();
+        }
+        return;
+      }
       const keys = {
         j: () => store.step(1),
         ArrowDown: () => store.step(1),
@@ -101,6 +121,7 @@ export function App({ store, onSignOut }) {
         h: () => setDialog({ kind: 'harness' }),
         L: () => setDialog({ kind: 'limit' }),
         n: () => setNewOpen(true),
+        Q: toggleQueues,
         '.': () => { if (selected) setActionsOpen(true); },
         '[': () => cycleTab(-1),
         ']': () => cycleTab(1),
@@ -119,13 +140,16 @@ export function App({ store, onSignOut }) {
 
   return html`
     <div class=${`shell${detailsOpen ? ' details-open' : ''}`}>
-      <${Header} state=${state} now=${now} onHelp=${() => setHelp(true)} onSignOut=${onSignOut} onDialog=${(kind) => setDialog({ kind })} />
-      <main class="panes">
-        <${TaskList} store=${store} state=${state} rows=${rows} now=${now} filterRef=${filterRef}
-          onOpen=${(id) => { store.select(id); setDetailsOpen(true); }} onMove=${move} onNew=${() => setNewOpen(true)} />
-        <${Details} store=${store} state=${state} task=${selected} now=${now} onBack=${() => setDetailsOpen(false)}
-          onActions=${() => setActionsOpen(true)} />
-      </main>
+      <${Header} state=${state} now=${now} onHelp=${() => setHelp(true)} onSignOut=${onSignOut} onDialog=${(kind) => setDialog({ kind })}
+        onQueues=${toggleQueues} />
+      ${state.page === 'queues'
+        ? html`<${Queues} store=${store} state=${state} onOpenTask=${openTask} />`
+        : html`<main class="panes">
+          <${TaskList} store=${store} state=${state} rows=${rows} now=${now} filterRef=${filterRef}
+            onOpen=${(id) => { store.select(id); setDetailsOpen(true); }} onMove=${move} onNew=${() => setNewOpen(true)} />
+          <${Details} store=${store} state=${state} task=${selected} now=${now} onBack=${() => setDetailsOpen(false)}
+            onActions=${() => setActionsOpen(true)} onQueue=${(queue) => store.openQueues(queue)} />
+        </main>`}
       <${Toast} notification=${state.notification} />
       ${help && html`<${Help} onClose=${() => setHelp(false)} />`}
       ${newOpen && html`<${NewTask} store=${store} onClose=${() => setNewOpen(false)}

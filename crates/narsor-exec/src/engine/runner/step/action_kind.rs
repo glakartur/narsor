@@ -14,8 +14,6 @@ pub enum ActionKind {
     Script,
     /// `HumanAction`.
     Human,
-    /// `WaitAction`: waits for an external event (§3.3.D).
-    Wait,
     /// `DecisionAction` — no executor in this version.
     Decision,
     /// `ProfileAction`: an agent that proposes the step profile.
@@ -29,7 +27,6 @@ impl ActionKind {
             ActionConfig::Agent(_) => Self::Agent,
             ActionConfig::Script(_) => Self::Script,
             ActionConfig::Human(_) => Self::Human,
-            ActionConfig::Wait(_) => Self::Wait,
             ActionConfig::Decision(_) => Self::Decision,
             ActionConfig::Profile(_) => Self::Profile,
         }
@@ -41,7 +38,6 @@ impl ActionKind {
             Self::Agent => "agent",
             Self::Script => "script",
             Self::Human => "human",
-            Self::Wait => "wait",
             Self::Decision => "decision",
             Self::Profile => "profile",
         }
@@ -58,7 +54,7 @@ impl ActionKind {
     pub fn runs_harness(self) -> bool {
         match self {
             Self::Agent | Self::Profile => true,
-            Self::Script | Self::Human | Self::Wait | Self::Decision => false,
+            Self::Script | Self::Human | Self::Decision => false,
         }
     }
 
@@ -70,7 +66,7 @@ impl ActionKind {
         match self {
             Self::Agent => Some(agent::OUTPUT_REPROMPT),
             Self::Profile => Some(profile_action::PROFILE_REPROMPT),
-            Self::Script | Self::Human | Self::Wait | Self::Decision => None,
+            Self::Script | Self::Human | Self::Decision => None,
         }
     }
 
@@ -88,7 +84,7 @@ impl ActionKind {
     pub fn rescues_output_label(self) -> bool {
         match self {
             Self::Agent => true,
-            Self::Profile | Self::Script | Self::Human | Self::Wait | Self::Decision => false,
+            Self::Profile | Self::Script | Self::Human | Self::Decision => false,
         }
     }
 
@@ -99,7 +95,7 @@ impl ActionKind {
     pub fn retries_unrepaired_output(self) -> bool {
         match self {
             Self::Profile => true,
-            Self::Agent | Self::Script | Self::Human | Self::Wait | Self::Decision => false,
+            Self::Agent | Self::Script | Self::Human | Self::Decision => false,
         }
     }
 
@@ -108,7 +104,7 @@ impl ActionKind {
     pub fn answers_with_step_contract(self) -> bool {
         match self {
             Self::Agent | Self::Script => true,
-            Self::Profile | Self::Human | Self::Wait | Self::Decision => false,
+            Self::Profile | Self::Human | Self::Decision => false,
         }
     }
 
@@ -118,7 +114,7 @@ impl ActionKind {
     pub fn holds_variables_to_declarations(self) -> bool {
         match self {
             Self::Agent | Self::Script | Self::Decision => true,
-            Self::Profile | Self::Human | Self::Wait => false,
+            Self::Profile | Self::Human => false,
         }
     }
 }

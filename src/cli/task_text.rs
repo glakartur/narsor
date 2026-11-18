@@ -899,6 +899,14 @@ pub fn event_line(event: &TaskEvent) -> String {
         } => format!(
             "warning: step {step} asked observer {observer} to watch {object}; no watch entry: {reason}"
         ),
+        TaskEventKind::GateQueueWarning {
+            step,
+            queue,
+            episode,
+            reason,
+        } => format!(
+            "warning: step {step} waits on queue {queue} (episode {episode}): {reason}"
+        ),
         TaskEventKind::OwnerCommandAccepted { command, .. } => {
             format!("owner command {command:?}")
         }
@@ -916,6 +924,14 @@ pub fn event_line(event: &TaskEvent) -> String {
             ),
             None => format!("runner reported {}", execution_status.as_str()),
         },
+        TaskEventKind::InputQueued {
+            input_id,
+            observer: Some(observer),
+            ..
+        } => format!(
+            "input {input_id} queued by observer {} (run {})",
+            observer.observer_name, observer.run_id
+        ),
         TaskEventKind::InputQueued { input_id, .. } => format!("input {input_id} queued"),
         TaskEventKind::ResumeMessageStored { .. } => "comment on the pause stored".to_string(),
         TaskEventKind::ResumeMessageTaken { .. } => "comment on the pause taken".to_string(),

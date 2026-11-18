@@ -3,9 +3,10 @@
 //! | command | who | what |
 //! | --- | --- | --- |
 //! | `observer create\|list\|show\|delete` | the owner | manages observers |
+//! | `observer update` | the owner | changes an observer's queue, mode and schedule |
+//! | `observer queue list\|show` | the owner | reads the queues: observers and gate entries |
 //! | `observer script set --file` | the owner | saves the next, immutable script version (never approved by saving) |
 //! | `observer approve --version\|pause\|resume` | the owner | decides what runs on schedule |
-//! | `observer watch add\|list\|remove` | the owner | keeps the watch list of PR/MR objects |
 //!
 //! The owner's commands go through [`ObserverApi`], implemented on the API
 //! client, and print through the pure functions of
@@ -24,16 +25,17 @@ use futures::future::BoxFuture;
 
 use super::commands::{CliError, Result};
 use super::observer_text::{
-    observer_changed_output, observer_list_output, observer_show_output, script_saved_output,
-    watch_added_output, watch_list_output, watch_removed_output,
+    observer_changed_output, observer_list_output, observer_show_output, observer_updated_output,
+    queue_list_output, queue_show_output, script_saved_output, script_text_output,
 };
 use super::remote::{failure, parse_workspaces, split_pair};
 use crate::api::{ApiClient, ClientError, ServerTarget};
 use crate::config::Flags;
 use crate::controller_protocol::{
-    AddObserverWatchRequest, ApproveObserverRequest, CreateObserverRequest, ObserverDetailView,
-    ObserverEffectRequest, ObserverListResponse, ObserverScriptView, ObserverSecretRef,
-    ObserverView, ObserverWatchListResponse, ObserverWatchView, SetObserverScriptRequest,
+    ApproveObserverRequest, CreateObserverRequest, ObserverDetailView, ObserverEffectRequest,
+    ObserverListResponse, ObserverMode, ObserverQueueListResponse, ObserverQueueView,
+    ObserverScriptTextView, ObserverScriptView, ObserverSecretRef, ObserverView,
+    SetObserverScriptRequest, UpdateObserverRequest,
 };
 use crate::domain::without_unsafe_chars;
 
@@ -43,6 +45,10 @@ pub enum ObserverCommand {
     /// Creates a draft observer. Nothing runs until a script version is
     /// saved and approved.
     Create(Box<CreateArgs>),
+
+    /// Changes an observer's queue, mode or schedule; what is left out
+    /// stays. Every observer of a queue keeps the same mode.
+    Update(UpdateArgs),
 
     /// Lists your observers: state, script versions, last and next run,
     /// the last error, and a warning when no worker claims due runs.
@@ -56,7 +62,7 @@ pub enum ObserverCommand {
         observer: String,
     },
 
-    /// Saves script versions.
+    /// Saves and prints script versions.
     Script {
         /// What to do.
         #[command(subcommand)]
@@ -89,19 +95,68 @@ pub enum ObserverCommand {
         observer: String,
     },
 
-    /// Deletes the observer with its scripts, run errors and watch entries. The tasks it created stay. Cannot be undone.
+    /// Deletes the observer with its scripts and run errors. The tasks it created stay. Cannot be undone.
     Delete {
         /// The observer's name or id.
         #[arg(value_name = "OBSERVER")]
         observer: String,
     },
 
-    /// Keeps the watch list: the PR/MR objects whose events go to a task.
-    Watch {
+    /// Reads your queues: the observers that serve them and the gate
+    /// episodes that wait on them.
+    Queue {
         /// What to do.
         #[command(subcommand)]
-        command: WatchCommand,
+        command: QueueCommand,
     },
+}
+
+/// `narsor-cli observer queue …`.
+#[derive(Debug, Subcommand)]
+pub enum QueueCommand {
+    /// Lists your queues with their mode and how many observers serve them
+    /// and how many gate episodes wait on them.
+    List,
+
+    /// Shows one queue: its observers and its entries (task, step,
+    /// episode, start, params) with how each observer processed them.
+    Show {
+        /// The queue's name.
+        #[arg(value_name = "QUEUE")]
+        queue: String,
+    },
+}
+
+/// `narsor-cli observer update`: at least one change.
+#[derive(Debug, clap::Args)]
+#[command(group(
+    clap::ArgGroup::new("change")
+        .required(true)
+        .multiple(true)
+        .args(["queue", "mode", "interval", "cron"])
+))]
+pub struct UpdateArgs {
+    /// The observer's name or id.
+    #[arg(value_name = "OBSERVER")]
+    pub observer: String,
+
+    /// The queue it serves from now on.
+    #[arg(long, value_name = "QUEUE")]
+    pub queue: Option<String>,
+
+    /// Its run mode from now on: `on_episodes` or `always`. It must be the
+    /// mode of the other observers of the queue it then serves.
+    #[arg(long, value_name = "MODE", value_parser = ["on_episodes", "always"])]
+    pub mode: Option<String>,
+
+    /// A new schedule: seconds between runs (at least 60).
+    #[arg(long, value_name = "SECONDS", conflicts_with = "cron")]
+    pub interval: Option<u64>,
+
+    /// A new schedule: a cron expression of five fields, in UTC, like
+    /// '*/10 * * * *'.
+    #[arg(long, value_name = "EXPRESSION")]
+    pub cron: Option<String>,
 }
 
 /// `narsor-cli observer create`.
@@ -115,14 +170,21 @@ pub struct CreateArgs {
     #[arg(long, value_name = "TEXT")]
     pub source: String,
 
+    /// The queue it serves: the `watch.queue` of the gates whose wait
+    /// episodes it checks. Its own name when omitted.
+    #[arg(long, value_name = "QUEUE")]
+    pub queue: Option<String>,
+
+    /// When its script runs: `on_episodes` (for the entries of its queue
+    /// only) or `always` (on every tick). Every observer of a queue has the
+    /// same mode. `always` with --workflow, `on_episodes` without, when
+    /// omitted.
+    #[arg(long, value_name = "MODE", value_parser = ["on_episodes", "always"])]
+    pub mode: Option<String>,
+
     /// Create a task of this catalogue workflow for each `task create` call
     /// of the script.
-    #[arg(
-        long,
-        value_name = "WORKFLOW",
-        required_unless_present = "deliver_events",
-        conflicts_with = "deliver_events"
-    )]
+    #[arg(long, value_name = "WORKFLOW")]
     pub workflow: Option<String>,
 
     /// The workflow's version; the catalogue's when omitted.
@@ -160,28 +222,16 @@ pub struct CreateArgs {
     #[arg(long, value_name = "PROFILE", requires = "workflow")]
     pub profile: Option<String>,
 
-    /// Deliver events to the tasks on its watch list instead of creating
-    /// tasks (implies --watch-list).
-    #[arg(long)]
-    pub deliver_events: bool,
-
-    /// Look only at the objects of its watch entries; no entries, no run.
-    #[arg(long)]
-    pub watch_list: bool,
-
-    /// A watch entry's object must start with this (repeatable): a URL
-    /// prefix ending with the `/` after its host, so the source's token
-    /// never goes to another host.
-    #[arg(long = "allow-prefix", value_name = "PREFIX")]
-    pub allowed_prefixes: Vec<String>,
-
-    /// The longest object of a watch entry.
-    #[arg(long = "max-object-len", value_name = "N")]
-    pub max_object_len: Option<usize>,
-
-    /// Seconds between runs (at least 60).
-    #[arg(long, value_name = "SECONDS")]
+    /// Seconds between runs (at least 60); 300 when neither --interval nor
+    /// --cron is given.
+    #[arg(long, value_name = "SECONDS", conflicts_with = "cron")]
     pub interval: Option<u64>,
+
+    /// A cron expression of five fields (minute hour day-of-month month
+    /// day-of-week), in UTC, like '*/10 * * * *'. No seconds field, no
+    /// aliases.
+    #[arg(long, value_name = "EXPRESSION")]
+    pub cron: Option<String>,
 
     /// Parameters handed to the script as they are: a JSON object.
     #[arg(long, value_name = "JSON")]
@@ -200,6 +250,57 @@ pub struct CreateArgs {
     /// than only remember where to start from.
     #[arg(long)]
     pub import_backlog: bool,
+
+    /// Removed with the watch lists: accepted only to name its replacement.
+    #[arg(long, hide = true)]
+    pub deliver_events: bool,
+
+    /// Removed with the watch lists: accepted only to name its replacement.
+    #[arg(long, hide = true)]
+    pub watch_list: bool,
+
+    /// Removed with the watch lists: accepted only to name its replacement.
+    #[arg(long = "allow-prefix", value_name = "PREFIX", hide = true)]
+    pub allowed_prefixes: Vec<String>,
+
+    /// Removed with the watch lists: accepted only to name its replacement.
+    #[arg(long = "max-object-len", value_name = "N", hide = true)]
+    pub max_object_len: Option<String>,
+}
+
+/// The usage error of a flag of `observer create` that went with the watch
+/// lists, naming what replaces it; `None` when no removed flag is given.
+fn removed_flag(args: &CreateArgs) -> Option<CliError> {
+    let (flag, replacement) = if args.deliver_events {
+        (
+            "--deliver-events",
+            "serve a gate's queue with --queue QUEUE --mode on_episodes; the script answers \
+             the gate with `narsor-cli task decide`",
+        )
+    } else if args.watch_list {
+        (
+            "--watch-list",
+            "use --queue QUEUE --mode on_episodes: the script runs for the gate episodes that \
+             wait on the queue",
+        )
+    } else if !args.allowed_prefixes.is_empty() {
+        (
+            "--allow-prefix",
+            "use --queue QUEUE: the entries of a queue come from gates with a `watch` block, \
+             not from objects you add",
+        )
+    } else if args.max_object_len.is_some() {
+        (
+            "--max-object-len",
+            "use --queue QUEUE: the entries of a queue come from gates with a `watch` block, \
+             not from objects you add",
+        )
+    } else {
+        return None;
+    };
+    Some(CliError::usage(format!(
+        "{flag} was removed with the watch lists — {replacement}."
+    )))
 }
 
 /// `narsor-cli observer script …`.
@@ -215,47 +316,16 @@ pub enum ScriptCommand {
         #[arg(long, value_name = "FILE")]
         file: PathBuf,
     },
-}
 
-/// `narsor-cli observer watch …`.
-#[derive(Debug, Subcommand)]
-pub enum WatchCommand {
-    /// Watches an object (a PR/MR URL) for one of your tasks.
-    Add {
+    /// Prints a script version: a header with the version and whether it
+    /// is approved, then the script text. Read it before you approve it.
+    Show {
         /// The observer's name or id.
         #[arg(value_name = "OBSERVER")]
         observer: String,
-        /// The task its events go to.
-        #[arg(long, value_name = "TASK_ID")]
-        task: String,
-        /// The object, under one of the observer's allowed prefixes.
-        #[arg(long, value_name = "OBJECT")]
-        object: String,
-        /// The event types to catch, comma-separated or repeated.
-        #[arg(
-            long = "events",
-            value_name = "TYPE",
-            value_delimiter = ',',
-            required = true
-        )]
-        events: Vec<String>,
-    },
-
-    /// Lists the observer's watch entries.
-    List {
-        /// The observer's name or id.
-        #[arg(value_name = "OBSERVER")]
-        observer: String,
-    },
-
-    /// Removes a watch entry.
-    Remove {
-        /// The observer's name or id.
-        #[arg(value_name = "OBSERVER")]
-        observer: String,
-        /// The entry's id, or the start of it that `watch list` shows.
-        #[arg(value_name = "ENTRY")]
-        entry: String,
+        /// The script version to print; the newest when left out.
+        #[arg(long, value_name = "N")]
+        version: Option<u32>,
     },
 }
 
@@ -270,6 +340,10 @@ pub async fn observer(
     // control plane.
     let create = match &command {
         ObserverCommand::Create(args) => Some(create_observer_request(args)?),
+        ObserverCommand::Update(args) => {
+            update_observer_request(args)?;
+            None
+        }
         _ => None,
     };
     let client = crate::api::connect(target, state, flags)
@@ -298,11 +372,29 @@ pub trait ObserverApi: Send + Sync {
         observer: &'a str,
     ) -> BoxFuture<'a, std::result::Result<ObserverDetailView, ClientError>>;
 
+    /// Changes an observer's queue, mode or schedule.
+    fn update_observer<'a>(
+        &'a self,
+        observer: &'a str,
+        request: &'a UpdateObserverRequest,
+    ) -> BoxFuture<'a, std::result::Result<ObserverView, ClientError>>;
+
     /// Deletes an observer.
     fn delete_observer<'a>(
         &'a self,
         observer: &'a str,
     ) -> BoxFuture<'a, std::result::Result<ObserverView, ClientError>>;
+
+    /// The caller's queues.
+    fn observer_queues(
+        &self,
+    ) -> BoxFuture<'_, std::result::Result<ObserverQueueListResponse, ClientError>>;
+
+    /// One queue of the caller with its observers and entries.
+    fn observer_queue<'a>(
+        &'a self,
+        queue: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<ObserverQueueView, ClientError>>;
 
     /// Saves the next script version.
     fn set_observer_script<'a>(
@@ -310,6 +402,13 @@ pub trait ObserverApi: Send + Sync {
         observer: &'a str,
         request: &'a SetObserverScriptRequest,
     ) -> BoxFuture<'a, std::result::Result<ObserverScriptView, ClientError>>;
+
+    /// One script version with its text.
+    fn observer_script<'a>(
+        &'a self,
+        observer: &'a str,
+        version: u32,
+    ) -> BoxFuture<'a, std::result::Result<ObserverScriptTextView, ClientError>>;
 
     /// Approves a script version.
     fn approve_observer<'a>(
@@ -329,26 +428,6 @@ pub trait ObserverApi: Send + Sync {
         &'a self,
         observer: &'a str,
     ) -> BoxFuture<'a, std::result::Result<ObserverView, ClientError>>;
-
-    /// The watch entries.
-    fn observer_watches<'a>(
-        &'a self,
-        observer: &'a str,
-    ) -> BoxFuture<'a, std::result::Result<ObserverWatchListResponse, ClientError>>;
-
-    /// Adds a watch entry.
-    fn add_observer_watch<'a>(
-        &'a self,
-        observer: &'a str,
-        request: &'a AddObserverWatchRequest,
-    ) -> BoxFuture<'a, std::result::Result<ObserverWatchView, ClientError>>;
-
-    /// Removes a watch entry.
-    fn remove_observer_watch<'a>(
-        &'a self,
-        observer: &'a str,
-        entry_id: &'a str,
-    ) -> BoxFuture<'a, std::result::Result<ObserverWatchView, ClientError>>;
 }
 
 impl ObserverApi for ApiClient {
@@ -370,11 +449,32 @@ impl ObserverApi for ApiClient {
         Box::pin(ApiClient::observer(self, observer))
     }
 
+    fn update_observer<'a>(
+        &'a self,
+        observer: &'a str,
+        request: &'a UpdateObserverRequest,
+    ) -> BoxFuture<'a, std::result::Result<ObserverView, ClientError>> {
+        Box::pin(ApiClient::update_observer(self, observer, request))
+    }
+
     fn delete_observer<'a>(
         &'a self,
         observer: &'a str,
     ) -> BoxFuture<'a, std::result::Result<ObserverView, ClientError>> {
         Box::pin(ApiClient::delete_observer(self, observer))
+    }
+
+    fn observer_queues(
+        &self,
+    ) -> BoxFuture<'_, std::result::Result<ObserverQueueListResponse, ClientError>> {
+        Box::pin(ApiClient::observer_queues(self))
+    }
+
+    fn observer_queue<'a>(
+        &'a self,
+        queue: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<ObserverQueueView, ClientError>> {
+        Box::pin(ApiClient::observer_queue(self, queue))
     }
 
     fn set_observer_script<'a>(
@@ -383,6 +483,14 @@ impl ObserverApi for ApiClient {
         request: &'a SetObserverScriptRequest,
     ) -> BoxFuture<'a, std::result::Result<ObserverScriptView, ClientError>> {
         Box::pin(ApiClient::set_observer_script(self, observer, request))
+    }
+
+    fn observer_script<'a>(
+        &'a self,
+        observer: &'a str,
+        version: u32,
+    ) -> BoxFuture<'a, std::result::Result<ObserverScriptTextView, ClientError>> {
+        Box::pin(ApiClient::observer_script(self, observer, version))
     }
 
     fn approve_observer<'a>(
@@ -406,35 +514,20 @@ impl ObserverApi for ApiClient {
     ) -> BoxFuture<'a, std::result::Result<ObserverView, ClientError>> {
         Box::pin(ApiClient::resume_observer(self, observer))
     }
-
-    fn observer_watches<'a>(
-        &'a self,
-        observer: &'a str,
-    ) -> BoxFuture<'a, std::result::Result<ObserverWatchListResponse, ClientError>> {
-        Box::pin(ApiClient::observer_watches(self, observer))
-    }
-
-    fn add_observer_watch<'a>(
-        &'a self,
-        observer: &'a str,
-        request: &'a AddObserverWatchRequest,
-    ) -> BoxFuture<'a, std::result::Result<ObserverWatchView, ClientError>> {
-        Box::pin(ApiClient::add_observer_watch(self, observer, request))
-    }
-
-    fn remove_observer_watch<'a>(
-        &'a self,
-        observer: &'a str,
-        entry_id: &'a str,
-    ) -> BoxFuture<'a, std::result::Result<ObserverWatchView, ClientError>> {
-        Box::pin(ApiClient::remove_observer_watch(self, observer, entry_id))
-    }
 }
+
+/// Seconds between runs of an observer created with neither `--interval`
+/// nor `--cron`.
+pub const DEFAULT_INTERVAL_SECS: u64 = 300;
 
 /// The create request of `observer create`, checked locally: a mapping,
 /// workspace, secret or condition that does not parse is a usage error.
 pub fn create_observer_request(args: &CreateArgs) -> Result<CreateObserverRequest> {
+    if let Some(error) = removed_flag(args) {
+        return Err(error);
+    }
     let effect = match &args.workflow {
+        None => None,
         Some(workflow) => {
             let mut mapping = BTreeMap::new();
             for pair in &args.mappings {
@@ -447,21 +540,21 @@ pub fn create_observer_request(args: &CreateArgs) -> Result<CreateObserverReques
                 }
                 mapping.insert(input.to_string(), field.to_string());
             }
-            ObserverEffectRequest::CreateTask {
+            Some(ObserverEffectRequest::CreateTask {
                 workflow_id: workflow.clone(),
                 workflow_version: args.workflow_version,
                 workspaces: parse_workspaces(&args.repositories, &args.branches, &[])?,
                 backend_id: args.backend.clone(),
                 profile: args.profile.clone(),
                 mapping,
-            }
+            })
         }
-        None if args.deliver_events => ObserverEffectRequest::DeliverEvent,
-        None => {
-            return Err(CliError::usage(
-                "narsor-cli observer create needs --workflow WORKFLOW or --deliver-events",
-            ))
-        }
+    };
+    let mode = parse_mode(args.mode.as_deref())?;
+    // The server needs one of the two; the CLI keeps its default interval.
+    let interval_secs = match (&args.interval, &args.cron) {
+        (None, None) => Some(DEFAULT_INTERVAL_SECS),
+        (interval, _) => *interval,
     };
     let condition = args
         .condition
@@ -487,15 +580,50 @@ pub fn create_observer_request(args: &CreateArgs) -> Result<CreateObserverReques
         name: args.name.clone(),
         source: args.source.clone(),
         condition,
-        interval_secs: args.interval,
+        queue: args.queue.clone(),
+        mode,
+        interval_secs,
+        cron: args.cron.clone(),
         effect,
-        watch_list: args.watch_list || args.deliver_events,
         secrets,
         task_limit_per_run: args.task_limit,
-        allowed_object_prefixes: args.allowed_prefixes.clone(),
-        max_object_len: args.max_object_len,
         import_backlog: args.import_backlog,
     })
+}
+
+/// The `--mode` of `create` or `update`.
+fn parse_mode(mode: Option<&str>) -> Result<Option<ObserverMode>> {
+    match mode {
+        None => Ok(None),
+        Some("on_episodes") => Ok(Some(ObserverMode::OnEpisodes)),
+        Some("always") => Ok(Some(ObserverMode::Always)),
+        Some(other) => Err(CliError::usage(format!(
+            "Invalid --mode '{}' — expected on_episodes or always.",
+            without_unsafe_chars(other)
+        ))),
+    }
+}
+
+/// The update request of `observer update`, checked locally: no change, a
+/// mode that is not one, or both schedules are usage errors.
+pub fn update_observer_request(args: &UpdateArgs) -> Result<UpdateObserverRequest> {
+    if args.interval.is_some() && args.cron.is_some() {
+        return Err(CliError::usage(
+            "Give --interval or --cron, not both: each one replaces the schedule.",
+        ));
+    }
+    let request = UpdateObserverRequest {
+        queue: args.queue.clone(),
+        mode: parse_mode(args.mode.as_deref())?,
+        interval_secs: args.interval,
+        cron: args.cron.clone(),
+    };
+    if request.is_empty() {
+        return Err(CliError::usage(
+            "Nothing to change — give --queue, --mode, --interval or --cron.",
+        ));
+    }
+    Ok(request)
 }
 
 /// Runs one of the owner's observer commands on `api` and returns what it
@@ -531,6 +659,34 @@ where
                 name
             ))
         }
+        ObserverCommand::Update(args) => {
+            let request = update_observer_request(&args)?;
+            let updated = api
+                .update_observer(&args.observer, &request)
+                .await
+                .map_err(|error| failure("Could not update the observer", error))?;
+            Ok(observer_updated_output(&updated))
+        }
+        ObserverCommand::Queue {
+            command: QueueCommand::List,
+        } => {
+            let listing = api
+                .observer_queues()
+                .await
+                .map_err(|error| failure("Could not list the queues", error))?;
+            Ok(queue_list_output(&listing))
+        }
+        ObserverCommand::Queue {
+            command: QueueCommand::Show { queue },
+        } => {
+            let view = api.observer_queue(&queue).await.map_err(|error| {
+                failure(
+                    &format!("Could not read queue '{}'", without_unsafe_chars(&queue)),
+                    error,
+                )
+            })?;
+            Ok(queue_show_output(&view, now()))
+        }
         ObserverCommand::List => {
             let listing = api
                 .observers()
@@ -555,6 +711,28 @@ where
                 .await
                 .map_err(|error| failure("Could not save the script", error))?;
             Ok(script_saved_output(&observer, &saved))
+        }
+        ObserverCommand::Script {
+            command: ScriptCommand::Show { observer, version },
+        } => {
+            // The observer says which version is the newest and which one
+            // is approved; the version itself is read after it.
+            let detail = api.observer(&observer).await.map_err(|error| {
+                failure(&format!("Could not read observer '{observer}'"), error)
+            })?;
+            let Some(version) = version.or(detail.observer.latest_version) else {
+                return Err(CliError::failure(format!(
+                    "Observer '{}' has no script version yet. Save one with \
+                     `narsor-cli observer script set {} --file SCRIPT`.",
+                    without_unsafe_chars(&observer),
+                    without_unsafe_chars(&observer)
+                )));
+            };
+            let script = api
+                .observer_script(&observer, version)
+                .await
+                .map_err(|error| failure(&format!("Could not read version {version}"), error))?;
+            Ok(script_text_output(&detail.observer, &script))
         }
         ObserverCommand::Approve { observer, version } => {
             let approved = api
@@ -586,88 +764,10 @@ where
                 .await
                 .map_err(|error| failure("Could not delete the observer", error))?;
             Ok(format!(
-                "Deleted observer '{}' with its scripts, run errors and watch entries; \
+                "Deleted observer '{}' with its scripts and run errors; \
                  the tasks it created stay.\n",
                 without_unsafe_chars(&deleted.name)
             ))
-        }
-        ObserverCommand::Watch { command } => watch(api, command, now()).await,
-    }
-}
-
-async fn watch<A: ObserverApi + ?Sized>(
-    api: &A,
-    command: WatchCommand,
-    now: DateTime<Utc>,
-) -> Result<String> {
-    match command {
-        WatchCommand::Add {
-            observer,
-            task,
-            object,
-            events,
-        } => {
-            let event_types: Vec<String> = events
-                .iter()
-                .map(|event| event.trim().to_string())
-                .filter(|event| !event.is_empty())
-                .collect();
-            if event_types.is_empty() {
-                return Err(CliError::usage(
-                    "narsor-cli observer watch add needs at least one event type (--events)",
-                ));
-            }
-            let entry = api
-                .add_observer_watch(
-                    &observer,
-                    &AddObserverWatchRequest {
-                        task_id: task,
-                        object,
-                        event_types,
-                    },
-                )
-                .await
-                .map_err(|error| failure("Could not add the watch entry", error))?;
-            Ok(watch_added_output(&entry))
-        }
-        WatchCommand::List { observer } => {
-            let listing = api
-                .observer_watches(&observer)
-                .await
-                .map_err(|error| failure("Could not list the watch entries", error))?;
-            Ok(watch_list_output(&listing, now))
-        }
-        WatchCommand::Remove { observer, entry } => {
-            let listing = api
-                .observer_watches(&observer)
-                .await
-                .map_err(|error| failure("Could not list the watch entries", error))?;
-            let matching: Vec<&ObserverWatchView> = listing
-                .watches
-                .iter()
-                .filter(|watch| watch.entry_id.starts_with(entry.as_str()))
-                .collect();
-            let entry_id = match matching.as_slice() {
-                [only] => only.entry_id.clone(),
-                [] => {
-                    return Err(CliError::failure(format!(
-                        "Observer '{}' has no watch entry '{}'",
-                        without_unsafe_chars(&observer),
-                        without_unsafe_chars(&entry)
-                    )))
-                }
-                _ => {
-                    return Err(CliError::usage(format!(
-                        "'{}' starts more than one watch entry; give more of its id",
-                        without_unsafe_chars(&entry)
-                    )))
-                }
-            };
-            let removed = api
-                .remove_observer_watch(&observer, &entry_id)
-                .await
-                .map_err(|error| failure("Could not remove the watch entry", error))?;
-            Ok(watch_removed_output(&removed))
         }
     }
 }

@@ -70,7 +70,7 @@ pub(crate) fn build(
             execution_cursor: ExecutionCursor::default(),
             event_cursor: 0,
             pending_input: None,
-            event_wait: None,
+            gate_watch: None,
             conversation: ConversationAvailability::default(),
             timeline: None,
             safe_point: context.stopping && !context.pass_active,
@@ -103,9 +103,11 @@ pub(crate) fn build(
         context.conductor_unavailable.is_none(),
     )?);
     attention.sort_by_key(|item| item.since);
-    let event_wait = engine
-        .pending_event(execution_id)?
-        .map(|pending| pending.event_wait());
+    // Reported beside the request it belongs to: the request's id is the
+    // gate's episode.
+    let gate_watch = pending
+        .as_ref()
+        .and_then(|pending| pending.request.gate_watch.clone());
     let pending_input = pending.map(|pending| PendingInputRef {
         id: pending.episode_key().to_string(),
         attempt_id: (pending.continuation == InputContinuation::ResumeAgent)
@@ -146,7 +148,7 @@ pub(crate) fn build(
         },
         event_cursor,
         pending_input,
-        event_wait,
+        gate_watch,
         conversation,
         timeline: Some(timeline),
         safe_point: context.stopping && !context.pass_active,

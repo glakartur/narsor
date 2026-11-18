@@ -301,6 +301,53 @@ fn truncated_agent_message_is_flagged_in_the_detail_window() {
     );
 }
 
+/// R22: an observer's answer names the observer, its run and the reason
+/// its script gave; a person's answer reads as before.
+#[test]
+fn an_observers_answer_line_names_the_observer_its_run_and_reason() {
+    let answer = |observer: Option<narsor_protocol::controller::TaskProvenance>| {
+        Event::new(
+            "exec-1".to_string(),
+            EventData::HumanInputReceived {
+                input: json!({}),
+                answered_by: Some(if observer.is_some() {
+                    narsor_protocol::event::AnsweredBy::Observer
+                } else {
+                    narsor_protocol::event::AnsweredBy::Operator
+                }),
+                close_reason: None,
+                episode: Some("input-1".to_string()),
+                output_label: Some("check_feedback".to_string()),
+                artifacts: None,
+                variables: None,
+                comment: Some("label removed\nmore".to_string()),
+                observer,
+            },
+            1,
+        )
+    };
+
+    let by_observer = event_line(&answer(Some(narsor_protocol::controller::TaskProvenance {
+        observer_id: "obs-1".to_string(),
+        observer_name: "gitlab-mr".to_string(),
+        run_id: "obs-1.3".to_string(),
+    })));
+    let by_person = event_line(&answer(None));
+
+    assert!(
+        by_observer.contains(
+            "human_input_received  observer gitlab-mr (run obs-1.3) → check_feedback: label removed"
+        ),
+        "{by_observer}"
+    );
+    assert!(!by_observer.contains("more"), "{by_observer}");
+    assert!(
+        by_person.contains("human_input_received  operator → check_feedback"),
+        "{by_person}"
+    );
+    assert!(!by_person.contains("label removed"), "{by_person}");
+}
+
 // ---------------------------------------------------------------------------
 // U1: shared transcript presentation state
 // ---------------------------------------------------------------------------
@@ -2101,6 +2148,7 @@ mod task_app_list {
                 TaskEventKind::InputQueued {
                     input_id: "in-1".into(),
                     pending_input_id: waiting_id,
+                    observer: None,
                 },
             ));
             assert!(!row(&app, "a").0.needs_operator());

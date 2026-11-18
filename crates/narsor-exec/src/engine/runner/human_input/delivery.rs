@@ -212,7 +212,7 @@ impl Engine {
             let outcome = DecisionOutcome {
                 label: resumed.result.output_label.clone(),
                 provider: match delivery.answered_by {
-                    AnsweredBy::Operator => DecisionProviderType::Human,
+                    AnsweredBy::Operator | AnsweredBy::Observer => DecisionProviderType::Human,
                     AnsweredBy::Conductor => DecisionProviderType::Conductor,
                 },
                 reasoning: delivery
@@ -327,6 +327,7 @@ impl Engine {
                             agent_session_id: None,
                             prefilled_answer: Some(comment),
                             permission: None,
+                            gate_watch: None,
                         };
                         let target_state = self.state_of(definition, &execution, &target)?;
                         self.suspend_for_agent_input(&mut execution, target_state, request)?;

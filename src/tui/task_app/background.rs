@@ -28,7 +28,8 @@ use tokio::task::{AbortHandle, JoinSet};
 use super::TaskApp;
 use crate::api::{ApiClient, ClientError, HarnessSelectionSnapshot};
 use crate::controller_protocol::{
-    CapabilitiesView, RepositoryListResponse, TaskListResponse, WorkflowListResponse,
+    CapabilitiesView, ObserverQueueListResponse, RepositoryListResponse, TaskListResponse,
+    WorkflowListResponse,
 };
 use crate::tui::spinner::Spinner;
 
@@ -65,6 +66,8 @@ pub enum OpeningKind {
     Repositories,
     /// `h`: the default harness.
     Harness,
+    /// `O`: the owner's observer queues.
+    Queues,
 }
 
 impl OpeningKind {
@@ -75,6 +78,7 @@ impl OpeningKind {
             Self::History => " Historia ",
             Self::Repositories => " Repozytoria ",
             Self::Harness => " Domyślny harness ",
+            Self::Queues => " Queues ",
         }
     }
 }
@@ -94,6 +98,7 @@ pub(super) enum OpeningRead {
         repositories: Result<RepositoryListResponse, ClientError>,
     },
     Harness(Result<HarnessSelectionSnapshot, ClientError>),
+    Queues(Result<ObserverQueueListResponse, ClientError>),
 }
 
 /// Reads what the view `kind` opens over. The capabilities are read along
@@ -135,6 +140,7 @@ pub(super) async fn read_for_opening(
             }
         }
         OpeningKind::Harness => OpeningRead::Harness(client.harness_selection().await),
+        OpeningKind::Queues => OpeningRead::Queues(client.observer_queues().await),
     }
 }
 
@@ -152,6 +158,10 @@ pub(super) enum JobKey {
     Branches(String),
     /// The read of the limit of tasks processed at once (`L`).
     Limit,
+    /// The read of one observer queue of the queues view.
+    Queue(String),
+    /// The read of an observer's script text, to approve or to edit it.
+    Script(String),
     /// The read of the usage limits of the harnesses, in the background: no
     /// screen waits for it, so it does not animate the marker.
     Usage,

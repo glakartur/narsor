@@ -59,6 +59,7 @@ impl InputClosure {
             artifacts,
             variables,
             comment,
+            ..
         } = data
         else {
             return None;
@@ -94,6 +95,7 @@ impl InputClosure {
         let by = self.answered_by.map(|by| match by {
             AnsweredBy::Operator => "an operator",
             AnsweredBy::Conductor => "the conductor",
+            AnsweredBy::Observer => "an observer",
         });
         match self.reason {
             Some(InputCloseReason::Transition) => match by {

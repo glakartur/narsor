@@ -1,45 +1,50 @@
 //! The effects an observer's script has in Narsor, through the routes its
-//! run token opens (R4, R15, R19):
+//! run token opens (R12, R13, R15, R19):
 //!
 //! ```text
-//! create task   over limit            → refused; observer needs_attention
+//! create task   no create_task effect → refused
+//!               over limit            → refused; observer needs_attention
 //!               otherwise             → create_task (random id) → created
-//! deliver event task not watched      → refused
-//!               task waits, matches   → history + input queued + resume
-//!               otherwise             → history only
+//! decide        run with no entry (always), or another task or episode
+//!                                     → refused
+//!               task no longer waits in the episode (answered, left, ended)
+//!                                     → refused (stale_episode)
+//!               task waits, its runner reports a problem or is starting
+//!                                     → refused (gate_unavailable)
+//!               choice unknown, required variable missing, variable not
+//!               declared              → refused (invalid_answer)
+//!               another answer for the episode queued or taken
+//!                                     → refused (first wins)
+//!               otherwise             → input queued for the gate, by the
+//!                                       observer and its run; a paused task
+//!                                       resumed → delivered
 //! ```
 //!
-//! The server does not deduplicate effects: every call creates a task or
-//! records an event. The script keeps track in its state of what it already
-//! reported.
+//! The server does not deduplicate tasks: every call creates one. The
+//! script keeps track in its state of what it already reported. An answer
+//! is one per run and episode: a retry of the same answer returns the
+//! input it queued.
 //!
 //! Every effect runs under the observer's lock, so it is serialized with
 //! the other effects of the run and with the run's result: an effect never
-//! lands after the run ended. An event takes the task's lock inside it
-//! (observer, then task: never the other way round).
-//!
-//! An event that matches the task's waiting `wait` step is stored on the
-//! task record as a queued input, as the owner's choice of a step's way out
-//! is (D1). The server makes a new idempotency key for each event
-//! ([`observer_event_key`]), which the queued input and the resume it causes
-//! carry. A task whose runner does not run keeps the input until its runner
-//! polls again.
+//! lands after the run ended.
 
 use chrono::{DateTime, Utc};
 
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
-use crate::controller_protocol::service::{parse_identifier, ProtocolService};
+use crate::controller_protocol::service::ProtocolService;
 use crate::controller_protocol::wire::*;
 use crate::domain::TaskId;
+use crate::engine::actions::check_gate_answer;
+use crate::engine::HumanInputDelivery;
 use crate::observers::{
     ActiveRun, ObserverEffect, ObserverError, ObserverLock, ObserverRecord, ObserverState, RunId,
-    MAX_EVENT_TYPE_LEN,
 };
-use crate::orchestration::{observer_event_key, ExternalEvent, TaskProvenance, TaskRecord};
+use crate::orchestration::{
+    observer_decide_key, InputRequest, OrchestrationError, TaskProvenance, TaskRecord,
+};
 
-/// Most bytes of an event's data, as JSON. The history keeps it, so it is
-/// small: a review state, a URL, a few ids.
-pub const MAX_EVENT_DATA_BYTES: usize = 16 * 1024;
+use super::entries::waits_in;
 
 /// Most bytes of a "create a task" effect's data, as JSON.
 pub const MAX_EFFECT_DATA_BYTES: usize = 64 * 1024;
@@ -109,74 +114,126 @@ impl ProtocolService {
         })
     }
 
-    /// Delivers an external event to the task `task_id` of one of the
-    /// observer's watch entries (R4, R19); see the module
+    /// Answers the gate of the queue entry the run `run_id` was started
+    /// for, as a person answers it (R12, R13, KTD-6); see the module
     /// documentation for the cases.
     ///
-    /// The task must be on the observer's watch list and belong to the
-    /// observer's owner. The event goes to the task's history; when the
-    /// task waits for it, it is also queued for the waiting step and a
-    /// stopped task is resumed to take it.
-    pub fn observer_deliver_event(
+    /// The answer goes the way the owner's goes: the same checks of the
+    /// gate's form ([`check_gate_answer`]), queued for the episode it names
+    /// so the runner refuses it should the episode be gone by then, and a
+    /// paused task resumed to take it (AE5). The input and the answer's
+    /// event name the observer and its run (R15). The reply says the answer
+    /// was queued, not that the runner applied it.
+    pub fn observer_decide(
         &self,
         run_id: &RunId,
-        task_id: &str,
-        request: ObserverEventRequest,
+        request: ObserverDecideRequest,
     ) -> ProtocolResult<ObserverEffectResponse> {
         let scope = self.effect_scope(run_id)?;
-        if scope.record.config.effect != ObserverEffect::DeliverEvent {
-            return Err(effect_not_allowed(&scope.record, "deliver events"));
-        }
-        validate_event_type(&request.event_type)?;
-        check_size("event data", &request.data, MAX_EVENT_DATA_BYTES)?;
-        let task_id = parse_identifier(TaskId::parse(task_id))?;
-        // The watch list first, so a task outside it is refused without
-        // anything about it being read.
-        let watched = self
-            .observers
-            .list_watches(&scope.record.observer_id)?
-            .iter()
-            .any(|entry| entry.task_id == task_id);
-        if !watched {
+        let Some(entry) = scope
+            .record
+            .active_run
+            .as_ref()
+            .and_then(|active| active.entry.clone())
+        else {
             return Err(ProtocolError::bad_request(
-                "task_not_watched",
+                "no_queue_entry",
                 format!(
-                    "task '{task_id}' is not on the watch list of observer '{}'",
+                    "run {run_id} of observer '{}' runs for no queue entry: only a run of an \
+                     on_episodes observer for an entry answers a gate",
                     scope.record.config.name
                 ),
             ));
-        }
-        let task = self.observer_task(&scope.record, &task_id)?;
-        let outcome = self.control.record_external_event(
-            &task.task_id,
-            ExternalEvent {
-                idempotency_key: observer_event_key(&run_id.to_string()),
-                event_type: request.event_type,
-                source: scope.record.config.source.clone(),
-                data: request.data,
-                provenance: scope.provenance(),
-            },
-        )?;
-        self.notify(&task_id);
-        if let Some(input) = &outcome.input {
-            self.resume_for_work(&outcome.task, &input.idempotency_key)?;
-        }
-        let input_id = outcome.input.map(|input| input.input_id);
-        let (outcome, message) = match &input_id {
-            Some(input_id) => (
-                ObserverEffectOutcome::Delivered,
-                format!("delivered to the waiting step of task {task_id} as {input_id}"),
-            ),
-            None => (
-                ObserverEffectOutcome::Recorded,
-                format!("recorded in the history of task {task_id}; it does not wait for it"),
-            ),
         };
+        if request.task_id != entry.task_id.as_str() || request.episode != entry.episode {
+            return Err(ProtocolError::bad_request(
+                "not_the_runs_entry",
+                format!(
+                    "run {run_id} was started for task {} in episode {} and answers that entry only",
+                    entry.task_id, entry.episode
+                ),
+            ));
+        }
+        check_size(
+            "answer",
+            &serde_json::json!({"reason": request.reason, "variables": request.variables}),
+            MAX_EFFECT_DATA_BYTES,
+        )?;
+        let stale = || {
+            ProtocolError::conflict(
+                "stale_episode",
+                format!(
+                    "task {} no longer waits in episode {}: the gate was answered or left",
+                    entry.task_id, entry.episode
+                ),
+            )
+        };
+        let task = match self.control.task(&entry.task_id) {
+            Ok(task) => task,
+            Err(OrchestrationError::TaskNotFound(_)) => return Err(stale()),
+            Err(error) => return Err(error.into()),
+        };
+        if !waits_in(&task, &scope.record.owner, &entry.episode) {
+            return Err(stale());
+        }
+        // The gate waits, but a runner that reports a problem or is still
+        // starting shows no pending input (R17): it cannot take an answer
+        // now, and the gate was neither answered nor left.
+        let pending = task
+            .runner
+            .as_ref()
+            .and_then(|runner| runner.snapshot.pending_input.as_ref())
+            .filter(|pending| pending.id == entry.episode)
+            .ok_or_else(|| {
+                ProtocolError::conflict(
+                    "gate_unavailable",
+                    format!(
+                        "task {} still waits in episode {}, but its runner cannot take an answer \
+                         now (it reports a problem or is starting); a later run can answer",
+                        entry.task_id, entry.episode
+                    ),
+                )
+            })?;
+        let delivery = HumanInputDelivery {
+            values: request.variables,
+            chosen_label: Some(request.choice.clone()),
+            comment: request
+                .reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .map(ToString::to_string),
+            episode: Some(entry.episode.clone()),
+            ..HumanInputDelivery::default()
+        };
+        if let Err(error) = check_gate_answer(&pending.form, &delivery) {
+            return Err(if error.is_stale() {
+                stale()
+            } else {
+                ProtocolError::bad_request("invalid_answer", error.to_string())
+            });
+        }
+        let outcome = self.control.queue_input_from(
+            &task.task_id,
+            InputRequest {
+                pending_input_id: entry.episode.clone(),
+                idempotency_key: observer_decide_key(&run_id.to_string(), &entry.episode),
+                delivery,
+            },
+            Some(scope.provenance()),
+        )?;
+        if !outcome.replayed {
+            self.notify(&task.task_id);
+            tracing::info!(run = %run_id, task = %task.task_id, episode = %entry.episode, choice = %request.choice, "observers: a script answered a gate");
+        }
+        if !outcome.input.status.is_settled() {
+            self.resume_for_work(&task, &outcome.input.idempotency_key)?;
+        }
         Ok(ObserverEffectResponse {
-            outcome,
-            task_id: Some(task_id.to_string()),
-            input_id,
-            message,
+            outcome: ObserverEffectOutcome::Delivered,
+            task_id: Some(task.task_id.to_string()),
+            input_id: Some(outcome.input.input_id.clone()),
+            message: decided_message(&task, &request.choice, &outcome.input.input_id),
         })
     }
 
@@ -224,20 +281,19 @@ impl ProtocolService {
             ),
         ))
     }
+}
 
-    /// The task an event goes to: it must belong to the observer's owner.
-    /// Another owner's task is indistinguishable from none.
-    fn observer_task(
-        &self,
-        record: &ObserverRecord,
-        task_id: &TaskId,
-    ) -> ProtocolResult<TaskRecord> {
-        let task = self.control.task(task_id)?;
-        if task.owner != record.owner {
-            return Err(ProtocolError::NotFound);
-        }
-        Ok(task)
-    }
+/// What `task decide` prints when the answer was queued.
+fn decided_message(task: &TaskRecord, choice: &str, input_id: &str) -> String {
+    let step = task
+        .watched_gate
+        .as_ref()
+        .map_or("the gate", |gate| gate.watch.step.as_str());
+    format!(
+        "answered {step} of task {} with {choice} (input {input_id}); the gate exits with it \
+         unless another answer came first",
+        task.task_id
+    )
 }
 
 /// A run that went away under the caller (its observer deleted): its token
@@ -265,24 +321,6 @@ fn effect_not_allowed(record: &ObserverRecord, what: &str) -> ProtocolError {
         "effect_not_allowed",
         format!("observer '{}' may not {what}", record.config.name),
     )
-}
-
-/// Refuses an empty, overlong, whitespace or control-character event type.
-fn validate_event_type(event_type: &str) -> ProtocolResult<()> {
-    if event_type.is_empty()
-        || event_type.len() > MAX_EVENT_TYPE_LEN
-        || event_type
-            .chars()
-            .any(|c| c.is_control() || c.is_whitespace())
-    {
-        return Err(ProtocolError::bad_request(
-            "invalid_effect_data",
-            format!(
-                "an event type must have 1-{MAX_EVENT_TYPE_LEN} bytes and no whitespace or control characters"
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// Refuses data larger than `limit` bytes as JSON.
