@@ -161,10 +161,9 @@ pub fn observer_item(view: &ObserverView) -> ChooserItem {
 fn observer_description(view: &ObserverView, unapproved: Option<u32>) -> Vec<String> {
     let mut lines = vec![
         format!(
-            "state: {} · mode: {} · source: {}",
+            "state: {} · mode: {}",
             one_line(&view.state),
-            one_line(&view.mode),
-            one_line(&view.source)
+            one_line(&view.mode)
         ),
         versions_text(view),
     ];

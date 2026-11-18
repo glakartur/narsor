@@ -6,6 +6,46 @@ listed here need no special order. The update notes of the remote backends
 (automatic resume, the read-only runner) are in
 [Remote execution backends](remote-backends.md).
 
+## Update that removes the observer source field
+
+This update removes the free-text `source` field of observers. Narsor did
+not use it for anything: the script reads the external system with its
+`condition` and `secrets`. The update is a hard cutover of the observer
+API between the server and its clients.
+
+### What changes
+
+| Part | Before | After |
+|---|---|---|
+| HTTP API | `POST /control/v1/observers` requires `source`; observer views have `source` | A create request with `source` is refused (`400`, `invalid_request`). Observer views have no `source`. |
+| CLI | `observer create NAME --source TEXT …`; `observer show` prints `Source:` | `--source` is an unknown argument (exit code `2`). No `Source:` line. |
+| TUI and web UI | The create form has a source field; the detail shows the source | No source field. |
+| Script input | `observer` has `id`, `name` and `source` | `observer` has `id` and `name`. The contract version stays `2`. |
+| Observer records | `config.source` is stored | Old records load. The next save removes `source`. No migration is necessary. |
+
+### Before the update
+
+Find the approved observer scripts that read `observer.source` (for
+example `jq -r .observer.source`). After the update, such a script gets
+`null` and no error. Change the script to read the value from its
+`condition`, then save it and approve the new version.
+
+### Update order
+
+Update the server and all clients (`narsor`, `narsor-cli`, `narsor-web`)
+in the same maintenance window. Clients of different versions do not work
+with the server:
+
+- An old CLI or TUI cannot read the observer views of a new server:
+  `observer list`, `observer show` and the queues view fail.
+- A new client cannot create an observer on an old server: the old server
+  requires `source`.
+
+### After the update
+
+Reload each open web UI tab. A tab that still has the old page sends
+`source`, and the server refuses each observer that it creates.
+
 ## Update to observer queues (D77)
 
 This update removes the `wait` step and the watch lists of observers. A

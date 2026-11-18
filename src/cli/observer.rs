@@ -166,10 +166,6 @@ pub struct CreateArgs {
     #[arg(value_name = "NAME")]
     pub name: String,
 
-    /// The source it polls (`jira`, `gitlab.example.com`, …), as text.
-    #[arg(long, value_name = "TEXT")]
-    pub source: String,
-
     /// The queue it serves: the `watch.queue` of the gates whose wait
     /// episodes it checks. Its own name when omitted.
     #[arg(long, value_name = "QUEUE")]
@@ -578,7 +574,6 @@ pub fn create_observer_request(args: &CreateArgs) -> Result<CreateObserverReques
         .collect::<Result<Vec<_>>>()?;
     Ok(CreateObserverRequest {
         name: args.name.clone(),
-        source: args.source.clone(),
         condition,
         queue: args.queue.clone(),
         mode,

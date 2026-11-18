@@ -98,7 +98,6 @@ impl Fixture {
     ) -> ObserverId {
         let mut config = ObserverConfig::new(
             ObserverName::parse(name).unwrap(),
-            "gitlab",
             ObserverEffect::None,
             mode,
         );

@@ -360,7 +360,7 @@ An observer is named by its name or its id.
 
 | Command | What it does |
 |---|---|
-| `observer create NAME --source TEXT [--queue QUEUE] [--mode MODE] [--workflow ID [--map INPUT=FIELD]…] [options]` | Creates a draft observer. Nothing runs until a script version is approved. |
+| `observer create NAME [--queue QUEUE] [--mode MODE] [--workflow ID [--map INPUT=FIELD]…] [options]` | Creates a draft observer. Nothing runs until a script version is approved. |
 | `observer update OBSERVER [--queue QUEUE] [--mode MODE] [--interval SECONDS \| --cron EXPRESSION]` | Changes the queue, the mode or the schedule. Give at least one; what you do not give stays. The mode must be the mode of the other observers of the queue. |
 | `observer list` | One line per observer: state, script versions, last run, next run; then the last error, a `no worker` warning, a note, and a mark when the newest script version is not approved. |
 | `observer show OBSERVER` | The queue, the mode, the schedule, the configuration (secret references, never values), script versions, the last run, the next run, a `no worker` warning, and the errors of the 20 newest failed or lost runs (reason, exit code, entry, end of stdout and stderr, masked). A successful run leaves no record. |
@@ -397,7 +397,7 @@ flags are a usage error that names what replaces them. See
 A typical start, all through the CLI:
 
 ```console
-$ narsor-cli observer create jira-new --source jira --mode always --cron '*/10 * * * *' \
+$ narsor-cli observer create jira-new --mode always --cron '*/10 * * * *' \
       --workflow triage --map ticket=key \
       --secret jira-token=JIRA_TOKEN --condition '{"project": "ABC"}'
 $ narsor-cli observer script set jira-new --file jira-new-issues.sh

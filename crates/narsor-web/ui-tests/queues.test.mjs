@@ -19,7 +19,6 @@ function observer(fields = {}) {
   return {
     observer_id: 'obs-1',
     name: 'gitlab-mr',
-    source: 'gitlab.example.com',
     state: 'active',
     effect: 'none',
     queue: 'mr-review',
@@ -120,20 +119,20 @@ test('R21: one mark while the current episode has a queue entry', () => {
   assert.equal(mark.text, 'kolejka mr-review · review_work');
 });
 
-test('the create form asks for a name, a source and one schedule', () => {
+test('the create form asks for a name and one schedule', () => {
   const empty = createRequest({ ...observerForm(), interval: '' });
-  assert.deepEqual(Object.keys(empty.problems).sort(), ['interval', 'name', 'source']);
+  assert.deepEqual(Object.keys(empty.problems).sort(), ['interval', 'name']);
 
-  const interval = createRequest({ ...observerForm(), name: ' gitlab-mr ', source: 'gitlab' });
+  const interval = createRequest({ ...observerForm(), name: ' gitlab-mr ' });
   assert.deepEqual(interval.problems, {});
-  assert.deepEqual(interval.body, { name: 'gitlab-mr', source: 'gitlab', mode: 'on_episodes', interval_secs: 300 });
+  assert.deepEqual(interval.body, { name: 'gitlab-mr', mode: 'on_episodes', interval_secs: 300 });
 
   const cron = createRequest({
     ...observerForm(null, { queue: 'mr-review', mode: 'always' }),
-    name: 'jira-new', source: 'jira', schedule: 'cron', cron: '*/10 * * * *',
+    name: 'jira-new', schedule: 'cron', cron: '*/10 * * * *',
   });
-  assert.deepEqual(cron.body, { name: 'jira-new', source: 'jira', mode: 'always', cron: '*/10 * * * *', queue: 'mr-review' });
-  assert.ok(createRequest({ ...observerForm(), name: 'a', source: 'b', schedule: 'cron', cron: ' ' }).problems.cron);
+  assert.deepEqual(cron.body, { name: 'jira-new', mode: 'always', cron: '*/10 * * * *', queue: 'mr-review' });
+  assert.ok(createRequest({ ...observerForm(), name: 'a', schedule: 'cron', cron: ' ' }).problems.cron);
 });
 
 test('the edit form sends only what changed', () => {

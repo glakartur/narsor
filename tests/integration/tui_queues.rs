@@ -92,7 +92,6 @@ fn observer(name: &str, queue: &str, approved: Option<u32>, latest: Option<u32>)
     serde_json::from_value(json!({
         "observer_id": format!("obs-{name}"),
         "name": name,
-        "source": "gitlab",
         "state": "active",
         "effect": "none",
         "queue": queue,
@@ -367,10 +366,8 @@ fn delete_asks_a_confirmation_that_names_the_observer_and_esc_cancels() {
 
 fn create_request(app: &mut TaskApp) -> Request {
     key(app, 'a');
-    // name, source, queue (filled from the queue), mode, schedule, script
+    // name, queue (filled from the queue), mode, schedule, script
     keys(app, "gitlab-mr");
-    press(app, KeyCode::Enter);
-    keys(app, "gitlab");
     press(app, KeyCode::Enter);
     press(app, KeyCode::Enter);
     press(app, KeyCode::Enter);
@@ -392,7 +389,6 @@ fn a_create_form_sends_what_was_typed_with_the_queue_of_the_open_queue() {
         panic!("a create");
     };
     assert_eq!(request.name, "gitlab-mr");
-    assert_eq!(request.source, "gitlab");
     assert_eq!(request.queue.as_deref(), Some("mr-review"));
     assert_eq!(request.mode, Some(ObserverMode::OnEpisodes));
     assert_eq!(request.cron.as_deref(), Some("* * * * * *"));

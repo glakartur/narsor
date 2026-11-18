@@ -110,7 +110,7 @@ or the WebUI (section 8). A task cannot save or approve a script.
    runs:
 
    ```sh
-   narsor-cli observer create jira-new --source jira \
+   narsor-cli observer create jira-new \
      --queue jira-intake --mode always --cron '*/10 * * * *' \
      --workflow triage --map ticket=key \
      --secret jira-token=JIRA_TOKEN --task-limit 10 \
@@ -118,7 +118,7 @@ or the WebUI (section 8). A task cannot save or approve a script.
    ```
 
    ```sh
-   narsor-cli observer create gitlab-mr --source gitlab.example.com \
+   narsor-cli observer create gitlab-mr \
      --queue mr-review --mode on_episodes --cron '*/5 * * * *' \
      --secret gitlab-token=GITLAB_TOKEN \
      --condition '{"host": "gitlab.example.com"}'
@@ -175,7 +175,7 @@ One JSON document (contract version 2):
 ```json
 {
   "contract_version": 2,
-  "observer": {"id": "obs-…", "name": "github-pr", "source": "github.com"},
+  "observer": {"id": "obs-…", "name": "github-pr"},
   "condition": {"host": "github.com"},
   "state": null,
   "entry": {
@@ -200,7 +200,7 @@ One JSON document (contract version 2):
 | Field | Meaning |
 |---|---|
 | `contract_version` | `2`. Stop with an error when it has a different value. |
-| `observer` | The id, name and source of the observer. |
+| `observer` | The id and name of the observer. Earlier versions also sent `observer.source`. It is removed, and the contract version is still `2`. A script that reads `observer.source` gets no value: use `condition` instead. |
 | `condition` | The JSON object of `--condition`, as the owner gave it. |
 | `state` | What the last successful run printed in `state`. `null` before the first successful run, and always `null` for an `on_episodes` observer. |
 | `entry` | The one queue entry that this run checks. Only for an `on_episodes` observer; an `always` observer gets no `entry` field. |
@@ -536,7 +536,7 @@ mkdir -p fake/bin
 printf '#!/bin/sh\necho "narsor-cli $*" >&2\n' > fake/bin/narsor-cli
 chmod +x fake/bin/narsor-cli
 echo '{"issues": [{"id": "101", "key": "ABC-101", "fields": {}}]}' > fake/search.json
-echo '{"contract_version": 2, "observer": {"id": "o", "name": "jira-new", "source": "jira"},
+echo '{"contract_version": 2, "observer": {"id": "o", "name": "jira-new"},
        "condition": {"base_url": "https://jira.example.com", "jql": "project = ABC"},
        "state": {"last_id": 100},
        "first_run": false, "import_backlog": false}' |

@@ -2,7 +2,7 @@
 //! interface uses (a chooser with one entry and its fields, confirmed before
 //! it sends):
 //!
-//! * **create** — name, source, queue, mode, schedule and the first script
+//! * **create** — name, queue, mode, schedule and the first script
 //!   (R31). The settings the CLI sets are not here (R34).
 //! * **edit** — queue, mode and schedule of an observer; only what changed
 //!   is sent (R35).
@@ -23,8 +23,6 @@ use super::{QueueWrite, CLI_HINT};
 
 /// The observer's name.
 pub const NAME: &str = "name";
-/// The source it polls.
-pub const SOURCE: &str = "source";
 /// The queue it serves.
 pub const QUEUE: &str = "queue";
 /// Its run mode.
@@ -91,11 +89,6 @@ impl ObserverForm {
             ChooserField::text(NAME)
                 .required()
                 .described("unique name of the observer"),
-        )
-        .with_field(
-            ChooserField::text(SOURCE)
-                .required()
-                .described("what it polls: gitlab, jira, a host name, …"),
         )
         .with_field(queue_field)
         .with_field(mode_field(mode))
@@ -211,7 +204,6 @@ impl ObserverForm {
                 let (interval_secs, cron) = schedule_of(&value(SCHEDULE).unwrap_or_default())?;
                 let request = CreateObserverRequest {
                     name: value(NAME).unwrap_or_default(),
-                    source: value(SOURCE).unwrap_or_default(),
                     condition: None,
                     queue: value(QUEUE),
                     mode: value(MODE).as_deref().and_then(mode_of),
@@ -279,7 +271,7 @@ impl ObserverForm {
     /// names none.
     pub fn field_of_refusal(&self, code: &str, message: &str) -> &'static str {
         let fields: &[&'static str] = match self.kind {
-            FormKind::Create => &[NAME, SOURCE, QUEUE, MODE, SCHEDULE, SCRIPT],
+            FormKind::Create => &[NAME, QUEUE, MODE, SCHEDULE, SCRIPT],
             FormKind::Edit { .. } => &[QUEUE, MODE, SCHEDULE],
             FormKind::Script { .. } => &[SCRIPT],
         };
@@ -290,11 +282,10 @@ impl ObserverForm {
             _ => None,
         }
         .or_else(|| {
-            let words: [(&'static str, &[&str]); 6] = [
+            let words: [(&'static str, &[&str]); 5] = [
                 (SCHEDULE, &["cron", "interval", "schedule"]),
                 (MODE, &["mode", "on_episodes", "always"]),
                 (QUEUE, &["queue"]),
-                (SOURCE, &["source"]),
                 (SCRIPT, &["script"]),
                 (NAME, &["name"]),
             ];

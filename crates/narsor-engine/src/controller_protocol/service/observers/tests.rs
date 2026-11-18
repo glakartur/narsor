@@ -143,8 +143,7 @@ impl Fixture {
                 mapping: [("ticket".to_string(), "key".to_string())].into(),
             }),
         };
-        let mut config =
-            ObserverConfig::new(ObserverName::parse(name).unwrap(), "jira", effect, mode);
+        let mut config = ObserverConfig::new(ObserverName::parse(name).unwrap(), effect, mode);
         config.queue = queue.to_string();
         config.condition = json!({"project": "ABC"});
         config.secrets = vec![SecretRef {

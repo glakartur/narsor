@@ -174,7 +174,6 @@ function CliSettings({ observer }) {
   return html`<details class="cli-settings">
     <summary>ustawienia z CLI (tylko do odczytu)</summary>
     <dl class="facts compact">
-      <dt>źródło</dt><dd>${observer.source}</dd>
       <dt>efekt</dt><dd>${observer.effect}${observer.workflow_id ? ` → ${observer.workflow_id}` : ''}</dd>
       <dt>limit zadań na przebieg</dt><dd>${observer.task_limit_per_run}</dd>
       <dt>sekrety</dt><dd class="mono">${secrets.length ? secrets.map((secret) => `${secret.name} → $${secret.env}`).join(', ') : 'brak'}</dd>
@@ -293,7 +292,7 @@ function Refusal({ text }) {
 }
 
 /**
- * Create an observer (name, source, queue, mode, schedule, first script) or,
+ * Create an observer (name, queue, mode, schedule, first script) or,
  * with `observer`, change its queue, mode and schedule. A refusal shows the
  * server's reason above the fields and keeps what the owner typed.
  */
@@ -353,7 +352,6 @@ function ObserverFormDialog({ store, observer = null, defaults = {}, onClose, on
     <form class="answer-form observer-form" onSubmit=${submit} novalidate>
       <${Refusal} text=${refusal} />
       ${!editing && field('name', 'nazwa', 'unikalna, np. gitlab-mr', true)}
-      ${!editing && field('source', 'źródło', 'co obserwuje, np. gitlab.example.com', true)}
       ${field('queue', 'kolejka', editing ? 'watch.queue bramek, które obsługuje' : 'watch.queue bramek; nazwa obserwatora, gdy puste', editing)}
       <${Field} id="observer-mode" name="tryb" kind=${{ type: 'select', options: OBSERVER_MODES }} required
         description="on_episodes: tylko dla wpisów kolejki; always: przy każdym uruchomieniu, bez wpisu. Wszystkie obserwatory kolejki mają ten sam tryb."

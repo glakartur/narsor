@@ -759,7 +759,6 @@ impl ProtocolService {
             observer: ScriptObserver {
                 id: observer_id.clone(),
                 name: record.config.name.clone(),
-                source: record.config.source.clone(),
             },
             condition: record.config.condition.clone(),
             state: record.script_state.clone(),

@@ -52,8 +52,6 @@ pub const DEFAULT_TASK_LIMIT_PER_RUN: u32 = 10;
 /// Highest task limit per run an owner may configure.
 pub const MAX_TASK_LIMIT_PER_RUN: u32 = 1000;
 
-/// Longest `source` text.
-pub const MAX_SOURCE_LEN: usize = 256;
 /// Largest condition, serialized as JSON.
 pub const MAX_CONDITION_BYTES: usize = 64 * 1024;
 /// Most secret references one observer may hold.
@@ -654,8 +652,6 @@ impl SecretRef {
 pub struct ObserverConfig {
     /// Unique name.
     pub name: ObserverName,
-    /// Free text naming the source (`jira`, `gitlab.example.com`, …).
-    pub source: String,
     /// Parameters handed to the script as they are (a JSON object).
     #[serde(default = "empty_object")]
     pub condition: serde_json::Value,
@@ -693,16 +689,10 @@ fn default_task_limit_per_run() -> u32 {
 impl ObserverConfig {
     /// A configuration with every optional part at its default: the queue
     /// named after the observer, the default interval.
-    pub fn new(
-        name: ObserverName,
-        source: impl Into<String>,
-        effect: ObserverEffect,
-        mode: ObserverMode,
-    ) -> Self {
+    pub fn new(name: ObserverName, effect: ObserverEffect, mode: ObserverMode) -> Self {
         Self {
             queue: name.as_str().to_string(),
             name,
-            source: source.into(),
             condition: empty_object(),
             schedule: ScheduleConfig::default(),
             effect,
@@ -715,16 +705,6 @@ impl ObserverConfig {
 
     /// Checks everything that does not need the workflow catalogue.
     pub fn validate(&self) -> Result<()> {
-        let source = self.source.trim();
-        if source.is_empty()
-            || self.source.len() > MAX_SOURCE_LEN
-            || self.source.chars().any(char::is_control)
-        {
-            return Err(ObserverError::invalid(
-                "source",
-                format!("must have 1-{MAX_SOURCE_LEN} characters and no control characters"),
-            ));
-        }
         if !self.condition.is_object() {
             return Err(ObserverError::invalid(
                 "condition",
