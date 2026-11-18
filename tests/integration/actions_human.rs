@@ -1526,3 +1526,95 @@ fn a_delivery_never_reads_who_answers_from_the_wire() {
             .expect("serialize");
     assert!(wire.get("answered_by").is_none(), "{wire}");
 }
+
+// ---------------------------------------------------------------------------
+// Restart of a waiting gate (U7, R16)
+// ---------------------------------------------------------------------------
+
+/// The episodes the log shows the gate asked in, and the reasons they were
+/// closed for, in order.
+fn gate_episodes(events: &[Event]) -> (Vec<String>, Vec<(String, Option<InputCloseReason>)>) {
+    let mut asked = Vec::new();
+    let mut closed = Vec::new();
+    for event in events {
+        match &event.data {
+            EventData::HumanInputRequested {
+                episode: Some(episode),
+                ..
+            } => asked.push(episode.clone()),
+            EventData::HumanInputReceived {
+                episode: Some(episode),
+                close_reason,
+                ..
+            } => closed.push((episode.clone(), *close_reason)),
+            _ => {}
+        }
+    }
+    (asked, closed)
+}
+
+#[tokio::test]
+async fn a_restart_of_a_waiting_gate_closes_its_episode_and_asks_again_in_a_new_one() {
+    use crate::engine_support::{workflow, Harness};
+    use narsor_engine::engine::Recovery;
+    use std::sync::Arc;
+
+    let harness = Harness::new();
+    let engine = Arc::new(harness.engine());
+    let definition = workflow("human_decision");
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run up to the gate");
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    let first = engine
+        .pending_input(&execution.id)
+        .expect("read")
+        .expect("the gate asks");
+
+    let restarted = engine
+        .try_begin_recover_with(&execution.id, Recovery::by_operator(None, None))
+        .expect("a waiting gate can be restarted")
+        .run_to_completion(&definition)
+        .await
+        .expect("the step runs again");
+
+    assert_eq!(restarted.status, ExecutionStatus::InputNeeded);
+    let second = engine
+        .pending_input(&execution.id)
+        .expect("read")
+        .expect("the gate asks again");
+    assert_eq!(second.state_id, first.state_id);
+    assert_ne!(second.episode_key(), first.episode_key(), "a new episode");
+    let (asked, closed) = gate_episodes(&harness.events(&execution.id));
+    assert_eq!(
+        asked,
+        [first.episode_key(), second.episode_key()],
+        "the old episode, then the new one"
+    );
+    assert_eq!(
+        closed,
+        [(
+            first.episode_key().to_string(),
+            Some(InputCloseReason::Recover)
+        )]
+    );
+    // An answer to the old episode is refused; the new one is answered.
+    let stale = engine
+        .deliver_human_input(
+            &definition,
+            &execution.id,
+            &HumanInputDelivery::label("ok").for_episode(first.episode_key()),
+        )
+        .await;
+    assert!(stale.is_err(), "{stale:?}");
+    let finished = engine
+        .deliver_human_input(
+            &definition,
+            &execution.id,
+            &HumanInputDelivery::label("ok").for_episode(second.episode_key()),
+        )
+        .await
+        .expect("the new episode is answered");
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+}

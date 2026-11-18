@@ -6,7 +6,8 @@
 //! runs `in` again (R19). Every exit of the gate is held until `out` ended
 //! (R10, R11, R14, R15, AE1, AE3, AE5), a task that ends at the gate runs
 //! `out` once (R18, AE6), and `out` of an episode ends before `in` of the
-//! next one (AE4).
+//! next one (AE4). A restart of the waiting gate step is an exit too: `out`
+//! of the old episode, then `in` of the new one (U7, R16).
 //!
 //! A real `ProtocolService` over a temporary root (catalogue and state) and
 //! a manual clock; the runner channel is reached through `gate_support`, the
@@ -189,6 +190,7 @@ impl Fixture {
                     .into_iter()
                     .filter_map(|queued| match queued.command {
                         OperatorCommand::Transition { target, .. } => Some(target),
+                        OperatorCommand::RestartStep { .. } => Some("restart".to_string()),
                         _ => None,
                     }),
             )
@@ -239,6 +241,27 @@ impl Fixture {
                 },
             )
             .unwrap();
+    }
+
+    /// The owner restarts the gate step (U7): the command's id, or why the
+    /// control plane refused it.
+    fn operator_restart(&self, task: &TaskId) -> Result<String, String> {
+        self.service
+            .control_plane()
+            .queue_operator_command(
+                task,
+                OperatorCommandRequest {
+                    command: OperatorCommand::RestartStep {
+                        note: None,
+                        failure_key: None,
+                    },
+                    idempotency_key: "restart-1".into(),
+                    expected_generation: None,
+                    requested_by: owner(),
+                },
+            )
+            .map(|outcome| outcome.command.command_id)
+            .map_err(|error| error.to_string())
     }
 
     fn has_entry(&self, task: &TaskId, episode: &str) -> bool {
@@ -706,4 +729,74 @@ fn out_of_a_left_episode_ends_before_in_of_the_next_one() {
 
     assert!(!fx.has_entry(&task, EPISODE));
     fx.claim_hook(HookPhase::In, LABEL, "input-2");
+}
+
+// ---------------------------------------------------------------------------
+// Restart of a waiting gate (U7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_restart_runs_out_of_the_old_episode_then_in_of_the_new_one() {
+    // Covers R16, F2 and the plan's verification: a gate whose `in` failed
+    // is recovered by a restart, with no new task.
+    let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+    let task = fx.waiting_task();
+    for delay in [0, 10, 30] {
+        fx.advance(Duration::seconds(delay));
+        let run = fx.claim_entry_script(LABEL);
+        fx.finish(&run, 1);
+    }
+    assert_eq!(fx.phase(&task), Some(GateAutomationPhase::EntryFailed));
+
+    let restart = fx.operator_restart(&task).expect("the restart is queued");
+    assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Exiting));
+    assert!(
+        fx.runner_gets(&task).is_empty(),
+        "the restart reaches the runner before out ended"
+    );
+    let out = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+    let exit = out.input.exit.clone().unwrap();
+    assert_eq!((exit.choice, exit.author.as_str()), (None, "operator"));
+    fx.finish(&out, 0);
+    assert_eq!(fx.runner_gets(&task), vec!["restart"]);
+
+    // The runner restarts the step: it asks again, in a new episode.
+    fx.service
+        .control_plane()
+        .settle_operator_command(&task, FIRST_RUNNER, 1, &restart, true, None)
+        .unwrap();
+    wait_at(&fx.service, &task, "input-2", &review_gate(QUEUE));
+    assert!(!fx.has_entry(&task, EPISODE), "the old entry is removed");
+    assert!(fx.has_entry(&task, "input-2"), "the new entry is added");
+    assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Entering));
+    // The tick flags the pair while the new `in` runs: no `check` yet.
+    fx.service.observer_pass();
+    let entry = fx.claim_hook(HookPhase::In, LABEL, "input-2");
+    assert!(fx.claim().is_none(), "check before the new in ended");
+    fx.finish(&entry, 0);
+
+    assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Ready));
+    let check = fx.next_tick_run().expect("a check run of the new episode");
+    assert_eq!(check.phase, HookPhase::Check);
+    let checked = check.input.entry.as_ref().unwrap();
+    assert_eq!(
+        (&checked.task_id, checked.episode.as_str()),
+        (&task, "input-2")
+    );
+}
+
+#[test]
+fn a_restart_while_an_exit_is_held_is_refused() {
+    // The first exit wins (R10): the person's answer waits for `out`.
+    let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+    let task = ready_gate(&fx);
+    fx.person_answers(&task, "check_feedback", json!({}))
+        .unwrap();
+
+    let refused = fx.operator_restart(&task).unwrap_err();
+
+    assert!(refused.contains("first exit wins"), "{refused}");
+    let out = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+    fx.finish(&out, 0);
+    assert_eq!(fx.runner_gets(&task), vec!["check_feedback"]);
 }

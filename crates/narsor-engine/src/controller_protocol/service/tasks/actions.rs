@@ -121,6 +121,19 @@ fn describe(task: &TaskSummary, id: TaskActionId) -> TaskActionOffer {
                 failure_key: None,
             }),
         ),
+        // A gate that waits for its answer asks again, in a new episode
+        // (R16): the runner starts the step anew.
+        TaskActionId::Restart if waits_at_gate(task) => leaf(
+            "Uruchom od nowa",
+            "Zamyka bieżące oczekiwanie i uruchamia krok bramki od początku. Bramka pyta \
+             ponownie. Gdy bramkę obserwuje kolejka, najpierw działają skrypty wyjścia, potem \
+             wejścia."
+                .to_string(),
+            TaskActionSend::operator(&OperatorCommand::RestartStep {
+                note: None,
+                failure_key: None,
+            }),
+        ),
         TaskActionId::Restart => leaf(
             "Uruchom od nowa",
             "Uruchamia od nowa przerwane zadanie albo ponawia nieudany provisioning na tym samym \
@@ -349,6 +362,7 @@ pub(super) fn unavailable_reason(task: &TaskSummary, id: TaskActionId) -> Option
                 state_phrase(task)
             )),
             _ if provisioning_failed(task) => None,
+            _ if waits_at_gate(task) => runner_unreachable(task),
             _ if runner_alive(task) => {
                 Some("zadanie działa — jest co zatrzymać, nie ma co uruchamiać od nowa".to_string())
             }
@@ -481,6 +495,17 @@ pub(super) fn waiting(task: &TaskSummary) -> Option<PendingHumanInputView> {
         return None;
     }
     serde_json::from_value(pending.form.clone()).ok()
+}
+
+/// Whether the live runner of `task` waits at a gate (a form or a decision
+/// that completes its step) that a restart starts again as a new episode.
+///
+/// An older runner refuses the restart of a gate; there is no capability
+/// to ask it first, so its refusal comes back as the command's verdict.
+fn waits_at_gate(task: &TaskSummary) -> bool {
+    runner_alive(task)
+        && waiting(task)
+            .is_some_and(|form| form.continuation == InputContinuationView::CompleteStep)
 }
 
 /// Why a decision of the pending request (an answer, an approval, a
@@ -1257,6 +1282,55 @@ mod tests {
                 OwnerCommand::Start
             ))
         );
+    }
+
+    /// A live task that waits on a request with `continuation`.
+    fn waiting_on(continuation: &str) -> TaskSummary {
+        let mut task = summary("running", "human_needed", true);
+        let mut runner = runner("review", "human");
+        runner.pending_input = Some(
+            serde_json::from_value(json!({
+                "id": "episode-1",
+                "attempt_id": null,
+                "form": {
+                    "execution_id": "e",
+                    "state_id": "review",
+                    "action_execution_id": "act-1",
+                    "instruction": "Review it",
+                    "continuation": continuation,
+                    "episode": "episode-1",
+                    "requested_at": "2026-11-11T10:00:00Z"
+                }
+            }))
+            .expect("a pending input"),
+        );
+        task.runner = Some(runner);
+        task.attention = vec![serde_json::from_value(json!({
+            "kind": "question",
+            "since": "2026-11-11T10:00:00Z",
+            "waiting_id": "episode-1"
+        }))
+        .expect("an attention item")];
+        task
+    }
+
+    #[test]
+    fn a_gate_that_waits_is_restarted_by_the_runner_but_an_agent_question_is_not() {
+        // R16: the restart of a waiting gate is the runner's command.
+        let gate = waiting_on("complete_step");
+        let restart = offered(&gate, TaskActionId::Restart).expect("offered");
+        assert_eq!(
+            restart.send.unwrap().resolve(&[]),
+            Ok(narsor_protocol::controller::ResolvedActionSend::Operator(
+                OperatorCommand::RestartStep {
+                    note: None,
+                    failure_key: None
+                }
+            ))
+        );
+
+        let question = waiting_on("resume_agent");
+        assert!(offered(&question, TaskActionId::Restart).is_none());
     }
 
     #[test]
