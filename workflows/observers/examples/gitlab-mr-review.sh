@@ -6,7 +6,7 @@
 # that wait for a review (a `watch` block on a `decision` step with
 # `by: human`, docs/dev/workflow-schema.md):
 #
-#   narsor-cli observer create gitlab-mr --source gitlab.example.com \
+#   narsor-cli observer create gitlab-mr \
 #     --queue mr-review --mode on_episodes --cron '*/5 * * * *' \
 #     --secret gitlab-token=GITLAB_TOKEN \
 #     --condition '{"host": "gitlab.example.com"}'

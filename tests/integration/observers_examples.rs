@@ -144,10 +144,10 @@ impl Drop for Sandbox {
 
 /// The script input; `entry` is `Value::Null` for an `always` run, which
 /// has no `entry` field.
-fn input(source: &str, condition: Value, state: Value, entry: Value) -> Value {
+fn input(condition: Value, state: Value, entry: Value) -> Value {
     let mut input = json!({
         "contract_version": SCRIPT_CONTRACT_VERSION,
-        "observer": {"id": "obs-1", "name": "example", "source": source},
+        "observer": {"id": "obs-1", "name": "example"},
         "condition": condition,
         "state": state,
         "first_run": state.is_null(),
@@ -190,7 +190,7 @@ fn jira_first_run_records_the_newest_issue_and_creates_no_task() {
 
     let run = sandbox.run(
         "jira-new-issues.sh",
-        &input("jira", jira_condition(), Value::Null, Value::Null),
+        &input(jira_condition(), Value::Null, Value::Null),
     );
 
     let output = run.output();
@@ -213,12 +213,7 @@ fn jira_creates_one_task_per_new_issue_with_only_the_mapped_fields() {
 
     let run = sandbox.run(
         "jira-new-issues.sh",
-        &input(
-            "jira",
-            jira_condition(),
-            json!({"last_id": 100}),
-            Value::Null,
-        ),
+        &input(jira_condition(), json!({"last_id": 100}), Value::Null),
     );
 
     let output = run.output();
@@ -256,12 +251,7 @@ fn jira_stops_at_a_task_not_created_and_keeps_the_state_of_the_tasks_before_it()
 
     let run = sandbox.run(
         "jira-new-issues.sh",
-        &input(
-            "jira",
-            jira_condition(),
-            json!({"last_id": 100}),
-            Value::Null,
-        ),
+        &input(jira_condition(), json!({"last_id": 100}), Value::Null),
     );
 
     let output = run.output();
@@ -293,12 +283,7 @@ fn jira_fails_the_run_when_no_task_is_created() {
 
     let run = sandbox.run(
         "jira-new-issues.sh",
-        &input(
-            "jira",
-            jira_condition(),
-            json!({"last_id": 100}),
-            Value::Null,
-        ),
+        &input(jira_condition(), json!({"last_id": 100}), Value::Null),
     );
 
     assert_eq!(run.code, Some(1), "stderr: {}", run.stderr);
@@ -324,12 +309,7 @@ fn jira_keeps_the_old_state_when_the_answer_is_not_a_list_of_issues() {
 
     let run = sandbox.run(
         "jira-new-issues.sh",
-        &input(
-            "jira",
-            jira_condition(),
-            json!({"last_id": 100}),
-            Value::Null,
-        ),
+        &input(jira_condition(), json!({"last_id": 100}), Value::Null),
     );
 
     assert_ne!(run.code, Some(0));
@@ -391,20 +371,16 @@ fn review_entry(url: &str, extra: &[(&str, &str)]) -> Value {
 
 /// The input of an `on_episodes` run for `entry` (`Value::Null`: an
 /// `always` run, with no entry).
-fn review_input(source: &str, condition: Value, entry: Value) -> Value {
-    input(source, condition, Value::Null, entry)
+fn review_input(condition: Value, entry: Value) -> Value {
+    input(condition, Value::Null, entry)
 }
 
 fn gitlab_input(entry: Value) -> Value {
-    review_input(
-        "gitlab.example.com",
-        json!({"host": "gitlab.example.com"}),
-        entry,
-    )
+    review_input(json!({"host": "gitlab.example.com"}), entry)
 }
 
 fn github_input(entry: Value) -> Value {
-    review_input("github.com", json!({}), entry)
+    review_input(json!({}), entry)
 }
 
 /// A GitLab merge request as the REST API gives it.

@@ -87,7 +87,6 @@ impl Fixture {
     fn active(&self, name: &str, mode: ObserverMode, schedule: ScheduleConfig) -> ObserverId {
         let mut config = ObserverConfig::new(
             ObserverName::parse(name).unwrap(),
-            "gitlab",
             ObserverEffect::None,
             mode,
         );

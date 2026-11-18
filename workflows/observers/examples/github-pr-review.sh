@@ -6,7 +6,7 @@
 # that wait for a review (a `watch` block on a `decision` step with
 # `by: human`, docs/dev/workflow-schema.md):
 #
-#   narsor-cli observer create github-pr --source github.com \
+#   narsor-cli observer create github-pr \
 #     --queue mr-review --mode on_episodes --cron '*/5 * * * *' \
 #     --secret github-token=GITHUB_TOKEN \
 #     --condition '{"host": "github.com", "api_url": "https://api.github.com"}'

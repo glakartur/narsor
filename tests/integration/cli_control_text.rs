@@ -315,7 +315,6 @@ fn queue_observer(
     serde_json::from_value(json!({
         "observer_id": format!("obs-{name}"),
         "name": name,
-        "source": "gitlab",
         "state": if approved.is_some() { "active" } else { "draft" },
         "effect": "none",
         "queue": queue,

@@ -87,7 +87,6 @@ impl Fixture {
     fn active(&self, name: &str, queue: &str, mode: ObserverMode) -> ObserverId {
         let mut config = ObserverConfig::new(
             ObserverName::parse(name).unwrap(),
-            "gitlab",
             ObserverEffect::None,
             mode,
         );

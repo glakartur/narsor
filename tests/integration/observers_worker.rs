@@ -119,7 +119,6 @@ impl Fixture {
     fn observer(&self, script: &str, secrets: &[(&str, &str)]) -> ObserverId {
         let mut config = ObserverConfig::new(
             ObserverName::parse("jira-new").unwrap(),
-            "jira",
             ObserverEffect::CreateTask(CreateTaskEffect {
                 workflow_id: "triage".into(),
                 workflow_version: 1,
@@ -164,7 +163,6 @@ impl Fixture {
     fn queue_observer(&self, script: &str) -> (ObserverId, TaskId) {
         let config = ObserverConfig::new(
             ObserverName::parse("mr-review").unwrap(),
-            "gitlab",
             ObserverEffect::None,
             ObserverMode::OnEpisodes,
         );

@@ -417,7 +417,6 @@ export const DEFAULT_INTERVAL_SECS = 300;
 export function observerForm(observer = null, defaults = {}) {
   return {
     name: observer?.name ?? '',
-    source: observer?.source ?? '',
     queue: observer?.queue ?? defaults.queue ?? '',
     mode: observer?.mode ?? defaults.mode ?? 'on_episodes',
     schedule: observer?.cron ? 'cron' : 'interval',
@@ -456,11 +455,9 @@ function modeProblem(form, problems) {
 export function createRequest(form) {
   const problems = {};
   const name = form.name.trim();
-  const source = form.source.trim();
   if (!name) problems.name = 'Nazwa jest wymagana.';
-  if (!source) problems.source = 'Źródło jest wymagane.';
   modeProblem(form, problems);
-  const body = { name, source, mode: form.mode, ...scheduleFields(form, problems) };
+  const body = { name, mode: form.mode, ...scheduleFields(form, problems) };
   const queue = form.queue.trim();
   if (queue) body.queue = queue;
   return { body, problems };

@@ -57,8 +57,6 @@ pub struct ScriptObserver {
     pub id: ObserverId,
     /// Its name.
     pub name: ObserverName,
-    /// The source it watches.
-    pub source: String,
 }
 
 /// One queue entry, as its script sees it (R11).

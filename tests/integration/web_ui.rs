@@ -306,7 +306,7 @@ async fn the_observer_routes_go_through_and_a_refusal_keeps_the_servers_reason()
         .post(control("observers"))
         .bearer_auth(SESSION)
         .json(&serde_json::json!({
-            "name": "gitlab-mr", "source": "gitlab", "queue": "mr-review",
+            "name": "gitlab-mr", "queue": "mr-review",
             "mode": "on_episodes", "interval_secs": 300
         }))
         .send()
@@ -353,7 +353,7 @@ async fn the_observer_routes_go_through_and_a_refusal_keeps_the_servers_reason()
         .post(control("observers"))
         .bearer_auth(SESSION)
         .json(&serde_json::json!({
-            "name": "jira-new", "source": "jira", "queue": "mr-review",
+            "name": "jira-new", "queue": "mr-review",
             "mode": "always", "interval_secs": 300
         }))
         .send()

@@ -281,8 +281,6 @@ impl std::fmt::Display for ObserverMode {
 pub struct CreateObserverRequest {
     /// Unique name.
     pub name: String,
-    /// Free text naming the source (`jira`, `gitlab.example.com`, …).
-    pub source: String,
     /// Parameters handed to the script as they are; a JSON object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<Value>,
@@ -337,8 +335,6 @@ pub struct ObserverView {
     pub observer_id: String,
     /// Unique name.
     pub name: String,
-    /// The source it polls.
-    pub source: String,
     /// `draft`, `active`, `paused`, `needs_attention` or `error`.
     pub state: String,
     /// `create_task` or `none`.

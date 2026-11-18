@@ -91,12 +91,8 @@ fn create_task_effect() -> ObserverEffect {
 }
 
 fn jira_config(observer: &str) -> ObserverConfig {
-    let mut config = ObserverConfig::new(
-        name(observer),
-        "jira",
-        create_task_effect(),
-        ObserverMode::Always,
-    );
+    let mut config =
+        ObserverConfig::new(name(observer), create_task_effect(), ObserverMode::Always);
     config.condition = json!({"jql": "project = ABC AND labels = narsor"});
     config.secrets = vec![SecretRef {
         name: "jira-token".into(),
@@ -109,7 +105,6 @@ fn jira_config(observer: &str) -> ObserverConfig {
 fn review_config(observer: &str, queue: &str) -> ObserverConfig {
     let mut config = ObserverConfig::new(
         name(observer),
-        "gitlab",
         ObserverEffect::None,
         ObserverMode::OnEpisodes,
     );
@@ -147,7 +142,6 @@ fn script_input(record: &ObserverRecord) -> ScriptInput {
         observer: ScriptObserver {
             id: record.observer_id.clone(),
             name: record.config.name.clone(),
-            source: record.config.source.clone(),
         },
         condition: record.config.condition.clone(),
         state: Some(json!({"cursor": 4})),
@@ -843,6 +837,8 @@ fn a_version_one_record_loads_with_its_name_as_queue_and_its_mode_and_interval()
     assert_eq!(raw["record_version"], json!(OBSERVER_RECORD_VERSION));
     assert_eq!(raw["config"]["queue"], "jira-new");
     assert_eq!(raw["config"]["mode"], "always");
+    // The removed `source` label of an older record goes with the next save.
+    assert!(raw["config"].get("source").is_none());
     assert_eq!(raw["config"]["schedule"], json!({"interval_secs": 900}));
     assert!(raw["config"].get("watch_mode").is_none());
     assert!(raw["config"].get("watch_objects").is_none());
@@ -1364,6 +1360,7 @@ fn the_script_input_is_one_json_document_with_the_queue_entry() {
     // gate's choices and variables.
     assert_eq!(value["contract_version"], json!(2));
     assert_eq!(value["observer"]["name"], json!("jira-abc"));
+    assert!(value["observer"].get("source").is_none());
     assert_eq!(value["state"], json!({"cursor": 4}));
     assert_eq!(
         value["entry"],

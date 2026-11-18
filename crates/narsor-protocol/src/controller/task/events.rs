@@ -119,7 +119,8 @@ pub enum TaskEventKind {
     ExternalEventReceived {
         /// The event type (`review.approved`, say).
         event_type: String,
-        /// The observer's source (`gitlab`, say).
+        /// Where the event came from, as its sender named it (`gitlab`,
+        /// say). Observers no longer have a source field of their own.
         source: String,
         /// The observer and its run (R19).
         provenance: TaskProvenance,

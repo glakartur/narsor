@@ -886,7 +886,7 @@ fn an_observer_update_names_only_what_changes_and_refuses_other_fields() {
     );
     assert!(super::UpdateObserverRequest::default().is_empty());
 
-    // The name, the source and the effect are not changed by an update.
+    // The name and the effect are not changed by an update.
     for refused in [
         serde_json::json!({"name": "other"}),
         serde_json::json!({"mode": "sometimes"}),
@@ -899,11 +899,27 @@ fn an_observer_update_names_only_what_changes_and_refuses_other_fields() {
     }
 }
 
+#[test]
+fn a_create_observer_request_refuses_the_removed_source_field() {
+    let request: super::CreateObserverRequest =
+        serde_json::from_value(serde_json::json!({"name": "jira-new"})).unwrap();
+    assert!(serde_json::to_value(&request)
+        .unwrap()
+        .get("source")
+        .is_none());
+
+    let old_client = serde_json::json!({"name": "jira-new", "source": "jira"});
+    let error = serde_json::from_value::<super::CreateObserverRequest>(old_client).unwrap_err();
+    assert!(
+        error.to_string().contains("unknown field `source`"),
+        "{error}"
+    );
+}
+
 fn observer_view_for_queue() -> super::ObserverView {
     super::ObserverView {
         observer_id: "obs-1".into(),
         name: "gitlab-mr".into(),
-        source: "gitlab".into(),
         state: "active".into(),
         effect: "none".into(),
         workflow_id: None,

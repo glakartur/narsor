@@ -5,7 +5,7 @@
 # Create the observer once, as the owner (the workflow `triage` has an input
 # `ticket`; the script sends the issue key in the data field `key`):
 #
-#   narsor-cli observer create jira-new --source jira \
+#   narsor-cli observer create jira-new \
 #     --workflow triage --map ticket=key \
 #     --secret jira-token=JIRA_TOKEN --task-limit 10 \
 #     --condition '{"base_url": "https://jira.example.com",

@@ -599,8 +599,7 @@ mod tests {
             effect: ObserverEffect,
             mode: ObserverMode,
         ) -> ObserverId {
-            let config =
-                ObserverConfig::new(ObserverName::parse(name).unwrap(), "gitlab", effect, mode);
+            let config = ObserverConfig::new(ObserverName::parse(name).unwrap(), effect, mode);
             let workflow = triage();
             let store = self.service.observers();
             let id = store
@@ -1082,7 +1081,6 @@ mod tests {
     fn queue_observer_body(name: &str) -> Value {
         json!({
             "name": name,
-            "source": "gitlab",
             "queue": "mr-review",
             "cron": "*/5 * * * *",
         })
@@ -1203,7 +1201,6 @@ mod tests {
         let body = |workflow: &str| {
             json!({
                 "name": "jira-new",
-                "source": "jira",
                 "interval_secs": 300,
                 "effect": {"kind": "create_task", "workflow_id": workflow, "mapping": {"ticket": "key"}},
             })
@@ -1264,16 +1261,21 @@ mod tests {
         let neither = create(neither).await;
         assert_eq!(json_body(neither).await["code"], "invalid_observer");
         let removed = create(json!({
-            "name": "old", "source": "gitlab", "interval_secs": 300,
+            "name": "old", "interval_secs": 300,
             "watch_list": true, "allowed_object_prefixes": ["https://x/"],
         }))
         .await;
         assert_eq!(json_body(removed).await["code"], "invalid_request");
+        // An older client still sends the removed `source` label.
+        let mut with_source = queue_observer_body("gitlab-mr");
+        with_source["source"] = json!("gitlab");
+        let with_source = create(with_source).await;
+        assert_eq!(with_source.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(with_source).await["code"], "invalid_request");
 
-        assert_eq!(
-            create(queue_observer_body("gitlab-mr")).await.status(),
-            StatusCode::CREATED
-        );
+        let created = create(queue_observer_body("gitlab-mr")).await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert!(json_body(created).await.get("source").is_none());
         let mut always = queue_observer_body("jira-intake");
         always["mode"] = json!("always");
         let mixed = create(always).await;

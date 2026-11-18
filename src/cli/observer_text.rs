@@ -174,7 +174,6 @@ pub fn observer_show_output(detail: &ObserverDetailView, now: DateTime<Utc>) -> 
         clean(&observer.observer_id)
     ));
     line(format!("State: {}", clean(&observer.state)));
-    line(format!("Source: {}", clean(&observer.source)));
     match &observer.workflow_id {
         Some(workflow) => line(format!(
             "Effect: creates tasks of workflow {} (at most {} per run)",
@@ -430,7 +429,7 @@ pub fn queue_show_output(view: &ObserverQueueView, now: DateTime<Utc>) -> String
     if view.observers.is_empty() {
         line(format!(
             "Observers: none; its entries wait for a person. Serve it with `narsor-cli \
-             observer create NAME --source TEXT --queue {}`.",
+             observer create NAME --queue {}`.",
             clean(&view.queue)
         ));
     } else {

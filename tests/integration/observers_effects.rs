@@ -113,7 +113,6 @@ impl Fixture {
     fn observer(&self, name: &str, limit: u32, backend: Option<&str>) -> ObserverId {
         let mut config = ObserverConfig::new(
             ObserverName::parse(name).unwrap(),
-            "jira",
             ObserverEffect::CreateTask(CreateTaskEffect {
                 workflow_id: "triage".into(),
                 workflow_version: 1,

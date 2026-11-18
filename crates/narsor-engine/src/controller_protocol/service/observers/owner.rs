@@ -87,7 +87,7 @@ impl ProtocolService {
             ObserverEffect::CreateTask(_) => ObserverMode::Always,
             ObserverEffect::None => ObserverMode::OnEpisodes,
         });
-        let mut config = ObserverConfig::new(name, request.source, effect, mode);
+        let mut config = ObserverConfig::new(name, effect, mode);
         if let Some(queue) = request.queue {
             config.queue = queue;
         }
@@ -454,7 +454,6 @@ fn observer_view(record: &ObserverRecord, now: DateTime<Utc>) -> ObserverView {
     ObserverView {
         observer_id: record.observer_id.to_string(),
         name: record.config.name.to_string(),
-        source: record.config.source.clone(),
         state: wire_name(&record.state),
         effect: effect.to_string(),
         workflow_id,

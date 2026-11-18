@@ -443,8 +443,6 @@ fn lines_of(lines: &[Vec<String>]) -> Vec<Vec<&str>> {
 const CREATE_JIRA: &[&str] = &[
     "create",
     "jira-new",
-    "--source",
-    "jira",
     "--workflow",
     "triage",
     "--map",
@@ -726,8 +724,6 @@ async fn an_observer_create_with_a_bad_condition_or_mapping_is_a_usage_error() {
         .cli(&[
             "create",
             "jira-new",
-            "--source",
-            "jira",
             "--workflow",
             "triage",
             "--condition",
@@ -742,8 +738,6 @@ async fn an_observer_create_with_a_bad_condition_or_mapping_is_a_usage_error() {
         .cli(&[
             "create",
             "jira-new",
-            "--source",
-            "jira",
             "--workflow",
             "triage",
             "--map",
@@ -789,8 +783,6 @@ async fn another_owners_observer_is_not_found() {
 const CREATE_REVIEW: &[&str] = &[
     "create",
     "gitlab-mr",
-    "--source",
-    "gitlab",
     "--queue",
     "mr-review",
     "--cron",
@@ -811,6 +803,7 @@ async fn an_observer_of_a_queue_shows_its_queue_mode_and_cron() {
         shown.contains("Schedule: cron '*/5 * * * *' (UTC)"),
         "{shown}"
     );
+    assert!(!shown.contains("Source:"), "{shown}");
     let jira = fx.cli(CREATE_JIRA).await.unwrap();
     assert!(jira.contains("Created observer 'jira-new'"), "{jira}");
     let shown = fx.cli(&["show", "jira-new"]).await.unwrap();
@@ -829,8 +822,6 @@ async fn an_observer_of_another_mode_in_a_queue_is_refused_with_the_queues_mode(
         .cli(&[
             "create",
             "jira-new",
-            "--source",
-            "jira",
             "--queue",
             "mr-review",
             "--mode",
@@ -850,14 +841,7 @@ async fn a_cron_with_seconds_is_refused_and_cron_with_interval_does_not_parse() 
     // Covers AE9 by the CLI.
     let fx = Fixture::new();
     let (code, message) = fx
-        .cli(&[
-            "create",
-            "gitlab-mr",
-            "--source",
-            "gitlab",
-            "--cron",
-            "*/30 * * * * *",
-        ])
+        .cli(&["create", "gitlab-mr", "--cron", "*/30 * * * * *"])
         .await
         .unwrap_err();
     assert_eq!(code, 1);
@@ -869,8 +853,6 @@ async fn a_cron_with_seconds_is_refused_and_cron_with_interval_does_not_parse() 
             "observer",
             "create",
             "x",
-            "--source",
-            "s",
             "--cron",
             "* * * * *",
             "--interval",
@@ -881,8 +863,6 @@ async fn a_cron_with_seconds_is_refused_and_cron_with_interval_does_not_parse() 
             "observer",
             "create",
             "x",
-            "--source",
-            "s",
             "--mode",
             "sometimes",
         ][..],
@@ -890,6 +870,22 @@ async fn a_cron_with_seconds_is_refused_and_cron_with_interval_does_not_parse() 
         assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
     }
     assert!(fx.service.observers().list().unwrap().is_empty());
+}
+
+#[test]
+fn the_removed_source_option_of_observer_create_is_an_unknown_argument() {
+    let error = Cli::try_parse_from([
+        "narsor-cli",
+        "observer",
+        "create",
+        "gitlab-mr",
+        "--source",
+        "gitlab",
+    ])
+    .unwrap_err();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert_eq!(error.exit_code(), 2);
 }
 
 #[tokio::test]
@@ -902,7 +898,7 @@ async fn a_removed_flag_of_observer_create_fails_with_a_hint_at_its_replacement(
         ("--allow-prefix", Some("https://gitlab.example.com/")),
         ("--max-object-len", Some("200")),
     ] {
-        let mut args = vec!["create", "gitlab-mr", "--source", "gitlab", flag];
+        let mut args = vec!["create", "gitlab-mr", flag];
         args.extend(value);
         let (code, message) = fx.cli(&args).await.unwrap_err();
         assert_eq!(code, 2, "{flag}: {message}");
