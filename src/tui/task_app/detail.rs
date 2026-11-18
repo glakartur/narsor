@@ -1316,6 +1316,7 @@ pub(super) fn render_view(
                 content,
                 styles,
                 &mut view.detail.progress,
+                view.task.gate_automation.as_ref(),
                 stale,
                 content_keys,
                 glyph,

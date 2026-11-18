@@ -311,3 +311,76 @@ export function entryAutomationParts(view) {
   if (!parts.length) parts.push({ text: 'jeszcze nie sprawdzony', role: 'done' });
   return parts;
 }
+
+// ---------------------------------------------------------------------------
+// Entry and exit scripts of a watched gate (R20): a control-plane overlay on
+// the runner timeline. Without `task.gate_automation` (a server from before
+// it, a gate without scripts) the runner status shows unchanged.
+
+const GATE_PHASE = {
+  entering: { text: '⏳ czeka na skrypty wejścia', role: 'live' },
+  ready: { text: 'wejście gotowe', role: 'done' },
+  entry_failed: { text: '✗ skrypt wejścia nie powiódł się', role: 'problem' },
+  exiting: { text: '⏳ czeka na skrypty wyjścia', role: 'live' },
+  released: { text: 'skrypty wyjścia zakończone', role: 'done' },
+};
+
+const EXIT_AUTHOR = {
+  person: 'osoba', automation: 'automatyzacja', operator: 'operator', task_end: 'koniec zadania', runner: 'runner',
+};
+
+/** The label of the gate's position: the latest entry into its state; `null` for none. */
+export function gatePositionLabel(positions, gate) {
+  if (!gate?.step) return null;
+  const found = [...(positions ?? [])].reverse().find((p) => p.state_id === gate.step);
+  return found?.label ?? null;
+}
+
+/**
+ * `positions` with the gate's overlay: while an entry script failed its last
+ * attempt and the runner still has the gate in progress, the gate shows
+ * `failed`, with the failed script as its error.
+ */
+export function gateOverlay(positions, gate) {
+  const list = positions ?? [];
+  if (gate?.phase !== 'entry_failed') return list;
+  const label = gatePositionLabel(list, gate);
+  return list.map((p) => {
+    if (p.label !== label || !['in_progress', 'awaiting_decision'].includes(p.status)) return p;
+    const hook = (gate.hooks ?? []).find((h) => h.hook === 'in' && h.status === 'failed');
+    const error = hook
+      ? `skrypt wejścia ${hook.automation}: próba ${hook.attempts} z ${hook.max_attempts} nieudana${hook.last_error ? `: ${firstLine(hook.last_error, 120)}` : ''}`
+      : 'skrypt wejścia nie powiódł się';
+    return { ...p, status: 'failed', error };
+  });
+}
+
+/**
+ * The lines under the gate's step, as `{text, role}`: where its scripts
+ * stand, then every ended attempt (never a step of its own).
+ */
+export function gateLines(gate) {
+  if (!gate) return [];
+  const phase = GATE_PHASE[gate.phase] ?? { text: 'stan skryptów nieznany', role: 'done' };
+  let head = `kolejka ${gate.queue} · ${phase.text}`;
+  if (gate.exit) head += ` · wyjście ${gate.exit.choice ?? ''} (${EXIT_AUTHOR[gate.exit.author] ?? 'nieznany autor'})`;
+  const lines = [{ text: head, role: phase.role }];
+  for (const hook of gate.hooks ?? []) {
+    const word = hook.hook === 'out' ? 'wyjście' : 'wejście';
+    for (const entry of hook.log ?? []) {
+      let text = `${word} · ${hook.automation} · próba ${entry.attempt} z ${hook.max_attempts}`;
+      let role = 'done';
+      if (entry.error) {
+        text += ` · ✗ ${firstLine(entry.error, 120)}`;
+        role = 'problem';
+      } else if (entry.skipped) {
+        text += ` · pominięta: ${firstLine(entry.skipped, 120)}`;
+      } else {
+        text += ' · ✓ udana';
+      }
+      if (entry.retry_at) text += ` · następna próba ${clock(entry.retry_at)}`;
+      lines.push({ text, role });
+    }
+  }
+  return lines;
+}

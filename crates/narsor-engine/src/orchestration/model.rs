@@ -1292,6 +1292,29 @@ pub struct GateHook {
     /// Why the latest attempt failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Every attempt that ended, oldest first: what the task view lists
+    /// under the gate's step (R20). At most the script's attempts, plus a
+    /// skip. Empty in a record from before it was kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log: Vec<GateHookAttemptLog>,
+}
+
+/// One ended attempt of an entry or exit script, as the task view shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateHookAttemptLog {
+    /// The attempt, from 1.
+    pub attempt: u32,
+    /// When it ended.
+    pub at: DateTime<Utc>,
+    /// Why it failed; `None` when it succeeded or was skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Why no script ran; `None` when the script ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+    /// When the next automatic attempt runs; `None` when none follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<DateTime<Utc>>,
 }
 
 impl GateHook {
@@ -1304,6 +1327,7 @@ impl GateHook {
             attempts: 0,
             next_attempt_at: None,
             last_error: None,
+            log: Vec::new(),
         }
     }
 }

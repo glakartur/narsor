@@ -3071,12 +3071,21 @@ mod task_app_detail_render {
     }
 
     fn app_with_steps(steps: &[(&str, &str, Option<&str>)]) -> TaskApp {
+        app_at_gate(steps, None)
+    }
+
+    /// [`app_with_steps`] with the task's gate automation overlay (R20).
+    fn app_at_gate(
+        steps: &[(&str, &str, Option<&str>)],
+        gate: Option<serde_json::Value>,
+    ) -> TaskApp {
         let mut app = app();
-        let running = with_runner(
+        let mut running = with_runner(
             with_controller(task("a", "local", "running", 1)),
             ExecutionStatus::Running,
             steps.last().expect("a step").0,
         );
+        running.gate_automation = gate.map(|gate| serde_json::from_value(gate).unwrap());
         app.load(listing(vec![titled(running, "NAR-12")], "c"));
         let positions = steps
             .iter()
@@ -3100,6 +3109,45 @@ mod task_app_detail_render {
         app.detail_mut()
             .set_tab(narsor::tui::task_app::DetailTab::Progress);
         app
+    }
+
+    #[test]
+    fn a_gate_whose_entry_script_failed_shows_failure_and_each_attempt_under_its_step() {
+        let steps = [
+            ("work", "agent", None),
+            ("review", "decision", Some("human")),
+        ];
+        let failed = |attempt: u32| serde_json::json!({"attempt": attempt, "at": "2026-11-18T10:00:00Z", "error": "api down"});
+        let gate = serde_json::json!({
+            "step": "review", "queue": "mr", "episode": "input-1", "phase": "entry_failed",
+            "hooks": [{
+                "automation": "label", "hook": "in", "status": "failed",
+                "attempts": 3, "max_attempts": 3, "last_error": "api down",
+                "log": [failed(1), failed(2), failed(3)],
+            }],
+        });
+        let mut app = app_at_gate(&steps, Some(gate));
+        let on_screen = screen(&render_at(&mut app, &Styles::new(false), 160, 30));
+        assert!(on_screen.contains("✗ 🧑🔀 review #1"), "{on_screen}");
+        assert!(
+            on_screen.contains("skrypt wejścia label: próba 3 z 3 nieudana: api down"),
+            "{on_screen}"
+        );
+        for attempt in 1..=3 {
+            let line = format!("wejście · label · próba {attempt} z 3 · ✗ api down");
+            assert!(on_screen.contains(&line), "{line:?} in\n{on_screen}");
+        }
+        assert_eq!(
+            on_screen.matches("review #").count(),
+            2,
+            "the attempts are lines of one step, not steps (axis and header): {on_screen}"
+        );
+
+        // A server from before the overlay: the runner status, unchanged.
+        let mut app = app_with_steps(&steps);
+        let on_screen = screen(&render_at(&mut app, &Styles::new(false), 160, 30));
+        assert!(on_screen.contains("● 🧑🔀 review #1"), "{on_screen}");
+        assert!(!on_screen.contains("skrypt wejścia"), "{on_screen}");
     }
 
     #[test]
