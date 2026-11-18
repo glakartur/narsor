@@ -18,7 +18,7 @@ use narsor_engine::orchestration::{
     ObservedSummary, OwnerRef, PendingInputRef, RunnerReportOutcome, RunnerSnapshot,
     SchedulingPolicy, TaskRecord,
 };
-use narsor_protocol::controller::{GateWatch, GateWatchChoice, GateWatchVariable};
+use narsor_protocol::controller::{GateWatch, GateWatchChoice, GateWatchVariable, RunnerProblem};
 use serde_json::json;
 
 /// The incarnation of a task's first runner.
@@ -182,6 +182,22 @@ pub fn report(
     let outcome = service
         .control_plane()
         .record_runner_snapshot(task, incarnation, 1, snapshot)
+        .expect("runner snapshot");
+    service.follow_gate_episode(&outcome.task, &outcome.gate_change);
+    outcome
+}
+
+/// The task's first runner reports a problem: its last execution, no
+/// pending input (R17).
+pub fn runner_problem(service: &ProtocolService, task: &TaskId) -> RunnerReportOutcome {
+    let mut broken = snapshot(service, task, FIRST_RUNNER, true, None);
+    broken.problem = Some(RunnerProblem {
+        code: "workspace_unavailable".into(),
+        message: "the workspace cannot be read".into(),
+    });
+    let outcome = service
+        .control_plane()
+        .record_runner_snapshot(task, FIRST_RUNNER, 1, broken)
         .expect("runner snapshot");
     service.follow_gate_episode(&outcome.task, &outcome.gate_change);
     outcome

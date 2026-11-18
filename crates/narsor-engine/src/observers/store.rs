@@ -9,7 +9,8 @@
 //!                                                   replace; the newest 20 kept, the
 //!                                                   newest one per queue entry)
 //! {state}/observer-queues/entries.lock              additions and removals of queue entries
-//! {state}/observer-queues/entries/{entry}.json      QueueEntry (exclusive create, never changed)
+//! {state}/observer-queues/entries/{entry}.json      QueueEntry (exclusive create, never changed
+//!                                                   unless corrupt)
 //! ```
 //!
 //! # Locks and commit protocol
@@ -110,6 +111,17 @@ pub enum EntryWrite {
     Created,
     /// The entry already existed and was left untouched.
     Exists(QueueEntry),
+}
+
+/// The queue entries a scan of the entries directory read, oldest first,
+/// and the ids of the entry files it could not read.
+#[derive(Debug, Clone, Default)]
+pub struct EntryScan {
+    /// The readable entries of every owner, oldest first.
+    pub entries: Vec<QueueEntry>,
+    /// Ids of the entry files that exist but cannot be read: corrupt, of a
+    /// newer version, or unreadable for the filesystem.
+    pub unreadable: Vec<String>,
 }
 
 /// The observers' file store. Holds no state beyond paths, so any number of
@@ -508,6 +520,27 @@ impl ObserverStore {
         Ok(EntryWrite::Exists(read_entry(&path)?))
     }
 
+    /// Replaces the file of `entry` when it cannot be parsed, so a waiting
+    /// task's corrupt entry does not keep its gate from every observer.
+    /// `Ok(false)`, and nothing written, when the file is missing, readable,
+    /// of a newer version (another build's to read) or cannot be read at
+    /// all.
+    pub fn replace_corrupt_queue_entry(
+        &self,
+        _lock: &QueueEntriesLock,
+        entry: &QueueEntry,
+    ) -> Result<bool> {
+        entry.validate()?;
+        let path = self.paths.queue_entry_file(&entry.entry_id);
+        match read_entry(&path) {
+            Err(error) if error.is_corrupt_file() => {
+                write_json_atomic(&path, entry)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Removes a queue entry. `Ok(false)` when there was none.
     pub fn remove_queue_entry(&self, _lock: &QueueEntriesLock, entry_id: &str) -> Result<bool> {
         if !is_entry_id(entry_id) {
@@ -542,23 +575,30 @@ impl ObserverStore {
     /// skipped, as in [`Self::list_readable`]: all owners share the
     /// directory, so one bad file must not stop every queue.
     pub fn list_queue_entries(&self) -> Result<Vec<QueueEntry>> {
+        Ok(self.scan_queue_entries()?.entries)
+    }
+
+    /// [`Self::list_queue_entries`], and the ids of the entry files it
+    /// skipped because they cannot be read.
+    pub fn scan_queue_entries(&self) -> Result<EntryScan> {
         let dir = self.paths.queue_entries_dir();
-        let mut entries = Vec::new();
+        let mut scan = EntryScan::default();
         for stem in json_file_stems(&dir)? {
             match self.queue_entry(&stem) {
-                Ok(Some(entry)) => entries.push(entry),
+                Ok(Some(entry)) => scan.entries.push(entry),
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(entry = %stem, %error, "observers: skipping an unreadable queue entry");
+                    scan.unreadable.push(stem);
                 }
             }
         }
-        entries.sort_by(|left, right| {
+        scan.entries.sort_by(|left, right| {
             left.created_at
                 .cmp(&right.created_at)
                 .then_with(|| left.entry_id.cmp(&right.entry_id))
         });
-        Ok(entries)
+        Ok(scan)
     }
 
     /// The entries of `owner`'s queue `queue`, oldest first (R7): an entry

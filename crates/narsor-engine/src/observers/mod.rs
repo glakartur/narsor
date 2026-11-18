@@ -28,7 +28,9 @@ pub use contract::{
 };
 pub use model::*;
 pub use schedule_expr::{CronSchedule, MAX_CRON_LEN};
-pub use store::{EntryWrite, ObserverLock, ObserverStore, QueueEntriesLock, KEPT_RUN_FAILURES};
+pub use store::{
+    EntryScan, EntryWrite, ObserverLock, ObserverStore, QueueEntriesLock, KEPT_RUN_FAILURES,
+};
 
 use crate::persistence::PersistenceError;
 use std::path::PathBuf;
@@ -137,5 +139,15 @@ impl ObserverError {
             field,
             reason: reason.into(),
         }
+    }
+
+    /// Whether this is a file that exists but cannot be parsed: no build
+    /// can read it, so rewriting it loses nothing. A file of a newer
+    /// version is not corrupt.
+    pub fn is_corrupt_file(&self) -> bool {
+        matches!(
+            self,
+            Self::Persistence(PersistenceError::Deserialize { .. })
+        )
     }
 }

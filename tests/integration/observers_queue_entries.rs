@@ -499,6 +499,74 @@ fn an_entry_of_a_round_that_cannot_be_read_is_skipped_not_fatal() {
 }
 
 #[test]
+fn a_corrupt_entry_of_a_waiting_task_is_rewritten_at_the_next_tick() {
+    // A corrupt entry file of a waiting task kept its gate from every
+    // observer: the tick rewrites it from the task, with the episode's
+    // start, and runs it. The next tick writes nothing.
+    let fx = Fixture::new();
+    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    let task = fx.task("task-1");
+    wait_at(&fx.service, &task, "input-1", &review_gate(QUEUE));
+    let before = fx.entries(QUEUE);
+    corrupt_entry(&fx, &task, "input-1");
+    assert!(fx.entries(QUEUE).is_empty());
+    fx.advance(Duration::hours(1));
+
+    let pass = fx.service.observer_pass();
+
+    assert_eq!(pass.entries_restored, 1);
+    assert_eq!(fx.entries(QUEUE), before, "same entry, same start time");
+    let claimed = fx.service.claim_observer_run().unwrap().expect("a run");
+    assert_eq!(claimed.input.entry.unwrap().task_id, task);
+    fx.advance(Duration::hours(1));
+    assert_eq!(fx.service.observer_pass().entries_restored, 0);
+}
+
+#[test]
+fn an_entry_of_a_newer_version_is_left_as_it_is() {
+    // Another build's file: never rewritten, and not tried at every tick.
+    let fx = Fixture::new();
+    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    let task = fx.task("task-1");
+    wait_at(&fx.service, &task, "input-1", &review_gate(QUEUE));
+    let path = StatePaths::new(&fx.root).queue_entry_file(&queue_entry_id(&task, "input-1"));
+    let mut newer: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    newer["record_version"] = json!(99);
+    let bytes = serde_json::to_vec(&newer).unwrap();
+    fs::write(&path, &bytes).unwrap();
+
+    let pass = fx.service.observer_pass();
+    fx.advance(Duration::hours(1));
+    let again = fx.service.observer_pass();
+
+    assert_eq!((pass.entries_restored, pass.entries_removed), (0, 0));
+    assert_eq!((again.entries_restored, again.entries_removed), (0, 0));
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn an_unreadable_entry_of_an_episode_no_task_waits_in_is_removed() {
+    // A bad entry file whose task left the gate: the next tick of an
+    // on_episodes observer removes it.
+    let fx = Fixture::new();
+    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    let task = fx.task("task-1");
+    wait_at(&fx.service, &task, "input-1", &review_gate(QUEUE));
+    corrupt_entry(&fx, &task, "input-1");
+    let path = StatePaths::new(&fx.root).queue_entry_file(&queue_entry_id(&task, "input-1"));
+    // The snapshot that ends the episode removes the file; one left behind
+    // (a failed removal, a restored backup) is put back here.
+    let bad = fs::read(&path).unwrap();
+    past_gates(&fx.service, &task);
+    fs::write(&path, &bad).unwrap();
+
+    let pass = fx.service.observer_pass();
+
+    assert_eq!(pass.entries_removed, 1);
+    assert!(!path.exists());
+}
+
+#[test]
 fn a_paused_task_keeps_its_entry() {
     // Covers AE5 for the entry: the owner pauses the task waiting at the
     // gate; the runner stops at a safe point in the same episode, and

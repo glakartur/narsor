@@ -843,18 +843,19 @@ impl ProtocolService {
 
     /// Removes the entries of the observer's queue whose task no longer
     /// waits in their episode, ended, was archived or no longer exists
-    /// (R18, R19). Returns the entries left and how many went.
+    /// (R18, R19), and the unreadable entry files of episodes no task waits
+    /// in. Returns the entries left and how many went.
     fn prune_entries(
         &self,
         record: &ObserverRecord,
     ) -> Result<(Vec<QueueEntry>, usize), ObserverError> {
-        let entries = self
-            .observers
-            .queue_entries(&record.owner, &record.config.queue)?;
-        let (gone, remaining): (Vec<QueueEntry>, Vec<QueueEntry>) = entries
+        let scan = self.observers.scan_queue_entries()?;
+        let mut removed = self.prune_unreadable_entries(&scan.unreadable);
+        let (gone, remaining): (Vec<QueueEntry>, Vec<QueueEntry>) = scan
+            .entries
             .into_iter()
+            .filter(|entry| entry.is_in(&record.owner, &record.config.queue))
             .partition(|entry| self.entry_wait(entry) == EntryWait::Gone);
-        let mut removed = 0;
         if !gone.is_empty() {
             let lock = self.observers.lock_queue_entries()?;
             for entry in &gone {

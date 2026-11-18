@@ -9,6 +9,8 @@
 //!                                     → refused
 //!               task no longer waits in the episode (answered, left, ended)
 //!                                     → refused (stale_episode)
+//!               task waits, its runner reports a problem or is starting
+//!                                     → refused (gate_unavailable)
 //!               choice unknown, required variable missing, variable not
 //!               declared              → refused (invalid_answer)
 //!               another answer for the episode queued or taken
@@ -174,12 +176,24 @@ impl ProtocolService {
         if !waits_in(&task, &scope.record.owner, &entry.episode) {
             return Err(stale());
         }
+        // The gate waits, but a runner that reports a problem or is still
+        // starting shows no pending input (R17): it cannot take an answer
+        // now, and the gate was neither answered nor left.
         let pending = task
             .runner
             .as_ref()
             .and_then(|runner| runner.snapshot.pending_input.as_ref())
             .filter(|pending| pending.id == entry.episode)
-            .ok_or_else(stale)?;
+            .ok_or_else(|| {
+                ProtocolError::conflict(
+                    "gate_unavailable",
+                    format!(
+                        "task {} still waits in episode {}, but its runner cannot take an answer \
+                         now (it reports a problem or is starting); a later run can answer",
+                        entry.task_id, entry.episode
+                    ),
+                )
+            })?;
         let delivery = HumanInputDelivery {
             values: request.variables,
             chosen_label: Some(request.choice.clone()),

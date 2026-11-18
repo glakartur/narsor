@@ -14,8 +14,15 @@
 //! owner's archive  the entry of the task's episode removed (R19)
 //! schedule         an entry whose task no longer waits in its episode, or ended,
 //!                  was archived or is gone      → removed, never run (R18, R19)
+//!                  an entry whose task waits, but whose runner reports a problem
+//!                  or is starting (no pending input)
+//!                                               → kept, not run (R17)
 //!                  a task of the queue that waits in its watched episode with
-//!                  no entry                     → entry added back, no warning
+//!                  no entry, or with an entry file that cannot be parsed
+//!                                               → entry added back (or rewritten), no
+//!                                                 warning
+//!                  an unreadable entry file of an episode no task waits in
+//!                                               → removed
 //! ```
 //!
 //! The task's record and the entry are two writes: a control plane that
@@ -28,6 +35,8 @@
 //! episode's, so an entry is created at most once per episode
 //! ([`EntryWrite::Created`]). A redelivered or a later snapshot of the same
 //! episode finds the episode known and changes nothing.
+
+use std::collections::HashSet;
 
 use crate::controller_protocol::service::ProtocolService;
 use crate::domain::TaskId;
@@ -46,7 +55,9 @@ pub(super) enum EntryWait {
     /// It does not: the gate exited, or the task ended, was archived or is
     /// gone. The entry can never matter again.
     Gone,
-    /// The task could not be read: the entry is kept, but not run now.
+    /// The task could not be read, or its runner cannot take an answer now
+    /// (it reports a problem, or is starting): the entry is kept, but not
+    /// run now.
     Unknown,
 }
 
@@ -126,10 +137,13 @@ impl ProtocolService {
     pub(super) fn entry_wait(&self, entry: &QueueEntry) -> EntryWait {
         match self.control.task(&entry.task_id) {
             Ok(task) => {
-                if waits_in(&task, &entry.owner, &entry.episode) {
+                if !waits_in(&task, &entry.owner, &entry.episode) {
+                    EntryWait::Gone
+                } else if gate_takes_answer(&task, &entry.episode) {
                     EntryWait::Waits
                 } else {
-                    EntryWait::Gone
+                    tracing::debug!(task = %entry.task_id, episode = %entry.episode, "observers: the runner of a waiting task cannot take an answer now; its queue entry is not run");
+                    EntryWait::Unknown
                 }
             }
             Err(OrchestrationError::TaskNotFound(_)) => EntryWait::Gone,
@@ -141,7 +155,8 @@ impl ProtocolService {
     }
 
     /// Adds back the entries of `owner`'s queue `queue` that a task waiting
-    /// in its watched episode has none of; returns how many. Called at the
+    /// in its watched episode has none of, or whose file cannot be parsed;
+    /// returns how many. Called at the
     /// tick of an `on_episodes` observer of the queue, so its cost (one read
     /// of the task records) comes at most once per tick.
     ///
@@ -165,7 +180,7 @@ impl ProtocolService {
                     gate.watch.queue == queue && waits_in(task, owner, &gate.episode)
                 })
             })
-            .filter(|task| self.task_queue_entry(task).is_none())
+            .filter(|task| self.entry_needs_write(task))
             .collect();
         let mut restored = 0;
         for task in missing {
@@ -180,8 +195,79 @@ impl ProtocolService {
         restored
     }
 
+    /// Whether the entry of the episode `task` waits in must be written: it
+    /// is missing, or its file cannot be parsed. A file of a newer version,
+    /// or one the filesystem cannot read, is left alone: a write at every
+    /// tick would fail the same way.
+    fn entry_needs_write(&self, task: &TaskRecord) -> bool {
+        let Some(gate) = &task.watched_gate else {
+            return false;
+        };
+        match self
+            .observers
+            .queue_entry(&queue_entry_id(&task.task_id, &gate.episode))
+        {
+            Ok(entry) => entry.is_none(),
+            Err(error) => error.is_corrupt_file(),
+        }
+    }
+
+    /// Removes the unreadable entry files `entry_ids` of the episodes no
+    /// task waits in now; returns how many went. Such a file names no task
+    /// a read can see, so its id is matched against the entry id of the
+    /// episode of every waiting task, of every owner. The file of a task
+    /// that waits stays ([`Self::restore_queue_entries`] rewrites a corrupt
+    /// one; one of a newer version is another build's). Removing one loses
+    /// nothing: should its task wait after all, a tick adds its entry back.
+    pub(super) fn prune_unreadable_entries(&self, entry_ids: &[String]) -> usize {
+        if entry_ids.is_empty() {
+            return 0;
+        }
+        let lock = match self.observers.lock_queue_entries() {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(%error, "observers: cannot lock the queue entries to remove unreadable ones");
+                return 0;
+            }
+        };
+        let tasks = match self.control.list_tasks() {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                tracing::warn!(%error, "observers: cannot list the tasks for the unreadable queue entries");
+                return 0;
+            }
+        };
+        let waiting: HashSet<String> = tasks
+            .iter()
+            .filter_map(|task| {
+                let gate = task.watched_gate.as_ref()?;
+                waits_in(task, &task.owner, &gate.episode)
+                    .then(|| queue_entry_id(&task.task_id, &gate.episode))
+            })
+            .collect();
+        let mut removed = 0;
+        for entry_id in entry_ids.iter().filter(|id| !waiting.contains(*id)) {
+            // Read again under the lock: a file rewritten meanwhile is kept.
+            if self.observers.queue_entry(entry_id).is_ok() {
+                continue;
+            }
+            match self.observers.remove_queue_entry(&lock, entry_id) {
+                Ok(true) => {
+                    removed += 1;
+                    tracing::warn!(entry = %entry_id, "observers: an unreadable queue entry of an episode no task waits in is removed");
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(entry = %entry_id, %error, "observers: cannot remove an unreadable queue entry");
+                }
+            }
+        }
+        removed
+    }
+
     /// Adds the entry of the episode `task_id` waits in now, if it has
-    /// none; `true` when it was added.
+    /// none, or rewrites it if its file cannot be parsed; `true` when it
+    /// was written.
     fn restore_queue_entry(&self, task_id: &TaskId) -> Result<bool, ObserverError> {
         let lock = self.observers.lock_queue_entries()?;
         let task = match self.control.task(task_id) {
@@ -209,14 +295,21 @@ impl ProtocolService {
         if entry.validate().is_err() {
             return Ok(false);
         }
-        let added = matches!(
-            self.observers.add_queue_entry(&lock, &entry)?,
-            EntryWrite::Created
-        );
-        if added {
-            tracing::info!(task = %task.task_id, queue = %gate.watch.queue, episode = %gate.episode, "observers: a waiting task had no queue entry; it is added back");
+        match self.observers.add_queue_entry(&lock, &entry) {
+            Ok(EntryWrite::Created) => {
+                tracing::info!(task = %task.task_id, queue = %gate.watch.queue, episode = %gate.episode, "observers: a waiting task had no queue entry; it is added back");
+                Ok(true)
+            }
+            Ok(EntryWrite::Exists(_)) => Ok(false),
+            Err(error) if error.is_corrupt_file() => {
+                let replaced = self.observers.replace_corrupt_queue_entry(&lock, &entry)?;
+                if replaced {
+                    tracing::warn!(task = %task.task_id, queue = %gate.watch.queue, episode = %gate.episode, %error, "observers: the queue entry of a waiting task could not be parsed; it is replaced by one rebuilt from the task");
+                }
+                Ok(replaced)
+            }
+            Err(error) => Err(error),
         }
-        Ok(added)
     }
 
     /// The removal and the addition of [`Self::follow_gate_episode`];
@@ -302,6 +395,17 @@ pub(super) fn waits_in(task: &TaskRecord, owner: &OwnerRef, episode: &str) -> bo
             .watched_gate
             .as_ref()
             .is_some_and(|gate| gate.episode == episode)
+}
+
+/// Whether the runner of `task` can take an answer in `episode` now: its
+/// last snapshot shows the episode's pending input. A runner that reports
+/// a problem, or that is still starting, shows none while the episode goes
+/// on (R17).
+pub(super) fn gate_takes_answer(task: &TaskRecord, episode: &str) -> bool {
+    task.runner
+        .as_ref()
+        .and_then(|runner| runner.snapshot.pending_input.as_ref())
+        .is_some_and(|pending| pending.id == episode)
 }
 
 /// Whether `task` can take no more answers: finished, archived (or being

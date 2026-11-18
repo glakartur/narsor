@@ -31,7 +31,8 @@ use narsor_protocol::controller::{
 use serde_json::{json, Map, Value};
 
 use crate::gate_support::{
-    observe, past_gates, queued_task, review_gate, running, snapshot, wait_at, FIRST_RUNNER,
+    observe, past_gates, queued_task, review_gate, runner_problem, running, snapshot, wait_at,
+    FIRST_RUNNER,
 };
 
 const QUEUE: &str = "mr-review";
@@ -395,6 +396,60 @@ fn an_answer_the_runner_already_took_ends_the_episode_for_later_answers() {
 
     let (status, code, _) = refusal(late.unwrap_err());
     assert_eq!((status, code), (409, "input_already_queued"));
+}
+
+#[test]
+fn an_answer_while_the_runner_reports_a_problem_is_refused_as_unavailable() {
+    // R17: the gate still waits, so the refusal does not say it was
+    // answered or left.
+    let fx = Fixture::new();
+    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    let task = fx.waiting_task("task-1", "input-1");
+    let run = fx.claimed_run();
+    runner_problem(&fx.service, &task);
+
+    let refused = fx.decide(&run, answer(&run, "check_feedback", None, json!({})));
+
+    let (status, code, message) = refusal(refused.unwrap_err());
+    assert_eq!((status, code), (409, "gate_unavailable"));
+    assert!(message.contains("still waits"), "{message}");
+    assert_eq!(fx.inputs(&task), 0);
+}
+
+#[test]
+fn an_entry_is_not_run_during_a_runner_problem_and_is_answered_after_it() {
+    // R17: the entry stays while the runner reports a problem, but no
+    // script runs for it, since no answer could be taken. Once the runner
+    // is back in the episode, the entry runs and its answer is queued.
+    let fx = Fixture::new();
+    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    let task = fx.waiting_task("task-1", "input-1");
+    runner_problem(&fx.service, &task);
+
+    fx.service.observer_pass();
+    let during = fx.service.claim_observer_run().unwrap();
+
+    assert!(during.is_none(), "{during:?}");
+    assert_eq!(
+        fx.service
+            .observers()
+            .queue_entries(&owner(), QUEUE)
+            .unwrap()
+            .len(),
+        1,
+        "the entry is kept"
+    );
+    *fx.clock.0.lock().unwrap() +=
+        chrono::Duration::seconds(narsor_engine::observers::DEFAULT_INTERVAL_SECS as i64);
+    wait_at(&fx.service, &task, "input-1", &review_gate(QUEUE));
+
+    let run = fx.claimed_run();
+    let taken = fx
+        .decide(&run, answer(&run, "check_feedback", None, json!({})))
+        .unwrap();
+
+    assert_eq!(taken.outcome, ObserverEffectOutcome::Delivered);
+    assert_eq!(fx.inputs(&task), 1);
 }
 
 #[test]
