@@ -979,6 +979,12 @@ pub struct WatchedGate {
     pub episode: String,
     /// The gate's `watch`, as the runner rendered it.
     pub watch: GateWatch,
+    /// When the control plane first saw the episode. An entry added back
+    /// later keeps it as its start, so a script still sees what changed
+    /// since the episode began. `None` in a record from before it was
+    /// kept: the time of the restore is used then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub began_at: Option<DateTime<Utc>>,
 }
 
 /// How a runner snapshot moved the task between watched gate episodes

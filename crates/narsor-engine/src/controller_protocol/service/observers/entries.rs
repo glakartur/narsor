@@ -204,7 +204,7 @@ impl ProtocolService {
             task.task_id.clone(),
             gate.episode.clone(),
             &gate.watch,
-            self.control.now(),
+            gate.began_at.unwrap_or_else(|| self.control.now()),
         );
         if entry.validate().is_err() {
             return Ok(false);
@@ -249,7 +249,7 @@ impl ProtocolService {
             task.task_id.clone(),
             began.episode.clone(),
             &began.watch,
-            self.control.now(),
+            began.began_at.unwrap_or_else(|| self.control.now()),
         );
         if let Err(error) = entry.validate() {
             return Ok(Some(format!("the queue entry was refused: {error}")));

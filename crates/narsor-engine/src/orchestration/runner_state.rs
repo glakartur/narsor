@@ -133,13 +133,17 @@ impl ControlPlane {
             // follow from it are on the record that event points at.
             obsolete_undelivered(record, pending.as_deref(), now);
             // A runner without an execution yet (it is still starting) says
-            // nothing of a gate; one with an execution says where it waits,
-            // or that it waits at no watched gate.
-            let gate_change = if snapshot.execution_cursor.execution_id.is_some() {
-                follow_watched_gate(record, &snapshot)
-            } else {
-                GateChange::default()
-            };
+            // nothing of a gate, and neither does one that reports a
+            // problem: it sends its last execution id with no pending input,
+            // and the episode must outlive the problem (R17). Any other
+            // runner with an execution says where it waits, or that it
+            // waits at no watched gate.
+            let gate_change =
+                if snapshot.execution_cursor.execution_id.is_some() && snapshot.problem.is_none() {
+                    follow_watched_gate(record, &snapshot, now)
+                } else {
+                    GateChange::default()
+                };
             let safe_point_generation = if snapshot.safe_point {
                 if record.runner_state == RunnerState::PauseRequested {
                     Some(record.generation)
@@ -496,11 +500,16 @@ impl ControlPlane {
 /// with an execution, and says which watched episode ended and which
 /// began. The episode is the id of the pending input request; a gate
 /// without `watch` (or no gate) is no watched episode.
-fn follow_watched_gate(record: &mut TaskRecord, snapshot: &RunnerSnapshot) -> GateChange {
+fn follow_watched_gate(
+    record: &mut TaskRecord,
+    snapshot: &RunnerSnapshot,
+    now: DateTime<Utc>,
+) -> GateChange {
     let current = match (&snapshot.pending_input, &snapshot.gate_watch) {
         (Some(pending), Some(watch)) => Some(WatchedGate {
             episode: pending.id.clone(),
             watch: watch.clone(),
+            began_at: Some(now),
         }),
         _ => None,
     };

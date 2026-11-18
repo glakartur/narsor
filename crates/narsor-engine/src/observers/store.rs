@@ -537,13 +537,20 @@ impl ObserverStore {
         }
     }
 
-    /// Every queue entry of every owner, oldest first.
+    /// Every queue entry of every owner, oldest first. An entry file that
+    /// cannot be read (corrupt, or of a newer version) is logged and
+    /// skipped, as in [`Self::list_readable`]: all owners share the
+    /// directory, so one bad file must not stop every queue.
     pub fn list_queue_entries(&self) -> Result<Vec<QueueEntry>> {
         let dir = self.paths.queue_entries_dir();
         let mut entries = Vec::new();
         for stem in json_file_stems(&dir)? {
-            if let Some(entry) = self.queue_entry(&stem)? {
-                entries.push(entry);
+            match self.queue_entry(&stem) {
+                Ok(Some(entry)) => entries.push(entry),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(entry = %stem, %error, "observers: skipping an unreadable queue entry");
+                }
             }
         }
         entries.sort_by(|left, right| {

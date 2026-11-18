@@ -808,15 +808,21 @@ impl ProtocolService {
     /// whose gate exited, or whose task ended, was archived or is gone, is
     /// removed and not run. The runner's snapshot removes it first as a
     /// rule (R16); this catches a snapshot the control plane did not see
-    /// through. An entry whose task cannot be read is kept, but not run.
+    /// through. An entry whose task cannot be read is kept, but not run;
+    /// so is an entry whose own file cannot be read.
     fn next_round_entry(
         &self,
         record: &mut ObserverRecord,
     ) -> Result<Option<QueueEntry>, ObserverError> {
         while !record.entry_round.is_empty() {
             let entry_id = record.entry_round.remove(0);
-            let Some(entry) = self.observers.queue_entry(&entry_id)? else {
-                continue;
+            let entry = match self.observers.queue_entry(&entry_id) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(entry = %entry_id, %error, "observers: cannot read a queue entry of the round; it is not run");
+                    continue;
+                }
             };
             if !entry.is_in(&record.owner, &record.config.queue) {
                 continue;

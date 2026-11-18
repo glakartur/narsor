@@ -24,7 +24,7 @@ use narsor_engine::orchestration::{
     TaskEventKind,
 };
 use narsor_engine::persistence::StatePaths;
-use narsor_protocol::controller::{GateWatch, TaskQueueEntryView};
+use narsor_protocol::controller::{GateWatch, RunnerProblem, TaskQueueEntryView};
 use serde_json::{json, Value};
 
 use crate::gate_support::{
@@ -369,6 +369,133 @@ fn a_runner_restart_in_the_same_episode_keeps_the_entry() {
     assert_eq!(fx.entries(QUEUE), before, "same entry, same start time");
     let watched = fx.service.control_plane().task(&task).unwrap().watched_gate;
     assert_eq!(watched.map(|gate| gate.episode), Some("input-1".into()));
+}
+
+#[test]
+fn a_runner_problem_in_the_same_episode_keeps_the_entry_and_warns_once() {
+    // R17: a runner that cannot start reports its last execution with no
+    // pending input and a problem. That is no exit from the gate: the
+    // episode keeps its entry, its start time and its single warning.
+    let fx = Fixture::new();
+    let task = fx.task("task-1");
+    let gate = review_gate(QUEUE);
+    wait_at(&fx.service, &task, "input-1", &gate);
+    let before = fx.entries(QUEUE);
+    assert_eq!(before.len(), 1);
+    fx.advance(Duration::hours(1));
+
+    let mut broken = snapshot(&fx.service, &task, FIRST_RUNNER, true, None);
+    broken.problem = Some(RunnerProblem {
+        code: "workspace_unavailable".into(),
+        message: "the workspace cannot be read".into(),
+    });
+    let outcome = fx
+        .service
+        .control_plane()
+        .record_runner_snapshot(&task, FIRST_RUNNER, 1, broken)
+        .unwrap();
+    fx.service
+        .follow_gate_episode(&outcome.task, &outcome.gate_change);
+
+    assert!(outcome.gate_change.is_empty());
+    assert_eq!(fx.entries(QUEUE), before);
+    fx.advance(Duration::hours(1));
+
+    let recovered = wait_at(&fx.service, &task, "input-1", &gate);
+
+    assert!(recovered.gate_change.is_empty());
+    assert_eq!(fx.entries(QUEUE), before, "same entry, same start time");
+    assert_eq!(fx.warnings(&task).len(), 1, "one warning for the episode");
+}
+
+#[test]
+fn an_entry_added_back_keeps_the_start_of_its_episode() {
+    // The queue's last observer goes, and its entries with it. A new
+    // observer of the queue adds the entry of the waiting task back; its
+    // start is the episode's, so a script still sees a review done since
+    // the gate began.
+    let fx = Fixture::new();
+    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    let task = fx.task("task-1");
+    wait_at(&fx.service, &task, "input-1", &review_gate(QUEUE));
+    let began = fx.now();
+    fx.service.delete_observer(&owner(), "gitlab-mr").unwrap();
+    assert!(fx.entries(QUEUE).is_empty());
+    fx.advance(Duration::hours(3));
+
+    fx.active("gitlab-mr-2", QUEUE, ObserverMode::OnEpisodes);
+    let pass = fx.service.observer_pass();
+
+    assert_eq!(pass.entries_restored, 1);
+    let entries = fx.entries(QUEUE);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].episode, "input-1");
+    assert_eq!(entries[0].created_at, began, "the episode's start, not now");
+}
+
+/// Overwrites the file of the entry of `task`'s `episode` with bytes no
+/// build can read.
+fn corrupt_entry(fx: &Fixture, task: &TaskId, episode: &str) {
+    let path = StatePaths::new(&fx.root).queue_entry_file(&queue_entry_id(task, episode));
+    fs::write(path, b"{\"entry_id\": ").unwrap();
+}
+
+#[test]
+fn an_unreadable_entry_file_stops_no_queue_and_no_view() {
+    // All owners share the entries directory: one bad file is skipped and
+    // logged, and every other queue still runs and still shows.
+    let fx = Fixture::new();
+    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    let good = fx.task("task-1");
+    wait_at(&fx.service, &good, "input-1", &review_gate(QUEUE));
+    let bad = fx.task("task-2");
+    wait_at(&fx.service, &bad, "input-1", &review_gate("other-queue"));
+    corrupt_entry(&fx, &bad, "input-1");
+
+    let queues = fx.service.observer_queues_of(&owner()).unwrap();
+    assert_eq!(queues.queues.len(), 1, "{queues:?}");
+    assert_eq!(queues.queues[0].queue, QUEUE);
+    let queue = fx.service.observer_queue(&owner(), QUEUE).unwrap();
+    assert_eq!(queue.entries.len(), 1);
+
+    fx.service.observer_pass();
+    let claimed = fx.service.claim_observer_run().unwrap().expect("a run");
+    assert_eq!(claimed.input.entry.unwrap().task_id, good);
+}
+
+#[test]
+fn an_entry_of_a_round_that_cannot_be_read_is_skipped_not_fatal() {
+    let fx = Fixture::new();
+    let observer = fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    let first = fx.task("task-1");
+    wait_at(&fx.service, &first, "input-1", &review_gate(QUEUE));
+    fx.advance(Duration::seconds(1));
+    let second = fx.task("task-2");
+    wait_at(&fx.service, &second, "input-1", &review_gate(QUEUE));
+    fx.service.observer_pass();
+    let claimed = fx.service.claim_observer_run().unwrap().expect("a run");
+    assert_eq!(claimed.input.entry.as_ref().unwrap().task_id, first);
+    fx.service
+        .finish_observer_run(
+            &claimed.run_id,
+            narsor_engine::controller_protocol::RunReport {
+                outcome: narsor_engine::controller_protocol::RunOutcome::Exited { exit_code: 0 },
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        )
+        .unwrap();
+    // The second entry is the rest of the round; its file goes bad.
+    corrupt_entry(&fx, &second, "input-1");
+
+    let next = fx.service.claim_observer_run();
+
+    assert!(matches!(next, Ok(None)), "{next:?}");
+    // The round is over and saved: the observer waits for its next tick
+    // instead of failing on the same entry at every claim.
+    let record = fx.service.observers().load(&observer).unwrap();
+    assert!(record.entry_round.is_empty(), "{:?}", record.entry_round);
+    assert_eq!(record.run_due_since, None);
 }
 
 #[test]
