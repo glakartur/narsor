@@ -13,7 +13,8 @@ use narsor_api_client::api::{ApiClient, ClientError, TokenSource};
 use narsor_protocol::controller::OBSERVER_WORKER_KEY_ENV;
 
 use crate::worker::{
-    check_secrets_dir, current_uid, ProcessRunner, ScriptUser, Worker, WorkerOptions, CLAIM_PAUSE,
+    check_secrets_dir, current_uid, inheritable_environment, ProcessRunner, ScriptUser, Worker,
+    WorkerOptions, CLAIM_PAUSE,
 };
 
 /// The program's exit code on success.
@@ -52,9 +53,11 @@ pub struct WorkerArgs {
     )]
     pub script_user: Option<String>,
 
-    /// Run scripts as the worker's own user. A script can then read the
-    /// worker key and every observer's secrets: for a trial on a
-    /// developer machine only, never in production.
+    /// Run scripts as the worker's own user, with the worker's environment
+    /// (its `HOME`, `PATH` and logins; never a `NARSOR_*` variable), as a
+    /// runner runs its agent. A script can then read the worker key (in
+    /// /proc) and every observer's secrets: for a trial or a single-user
+    /// machine, never in production.
     #[arg(long, conflicts_with = "script_user")]
     pub insecure_same_user: bool,
 
@@ -144,6 +147,10 @@ pub fn worker_options(args: &WorkerArgs) -> Result<WorkerOptions, StartError> {
         }
         options.script_user = Some(user);
     } else if args.insecure_same_user {
+        options.inherited_env =
+            inheritable_environment(std::env::vars_os().filter_map(|(name, value)| {
+                Some((name.into_string().ok()?, value.into_string().ok()?))
+            }));
         tracing::warn!(
             "observer worker: --insecure-same-user: scripts run as the worker's own user and \
              can read the worker key and every observer's secrets; use --script-user outside \
@@ -172,7 +179,7 @@ pub fn worker_options(args: &WorkerArgs) -> Result<WorkerOptions, StartError> {
 
 /// The key `narsor-server` handed the worker in [`OBSERVER_WORKER_KEY_ENV`]
 /// (`value`). A variable, not a flag: an argument would show in `ps`. The
-/// worker never passes it on: a script's environment is an explicit list.
+/// worker never passes it on, not even to a script of its own user.
 pub fn worker_key(value: Option<String>) -> Result<String, StartError> {
     match value {
         Some(key) if !key.trim().is_empty() => Ok(key.trim().to_string()),

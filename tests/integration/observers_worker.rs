@@ -31,9 +31,9 @@ use narsor_engine::observers::{
 use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef};
 use narsor_engine::persistence::StatePaths;
 use narsor_observer_worker::worker::{
-    check_secrets_dir, current_uid, kill_all_processes_of, processes_of, Masker, ProcessRunner,
-    ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, ScriptUser, Worker, WorkerApi, WorkerOptions,
-    WorkerStop, MASK, MAX_STDERR_BYTES, MAX_STDOUT_BYTES, SCRIPT_FILE,
+    check_secrets_dir, current_uid, inheritable_environment, kill_all_processes_of, processes_of,
+    Masker, ProcessRunner, ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, ScriptUser, Worker,
+    WorkerApi, WorkerOptions, WorkerStop, MASK, MAX_STDERR_BYTES, MAX_STDOUT_BYTES, SCRIPT_FILE,
 };
 use narsor_protocol::controller::{
     ObserverRunOutcome, ObserverRunReport, ObserverRunResultResponse, ObserverWorkerRun,
@@ -521,6 +521,51 @@ async fn the_script_gets_the_explicit_list_and_nothing_else() {
     let input: serde_json::Value = serde_json::from_slice(&spec.stdin).unwrap();
     assert_eq!(input["automation"], "jira-new");
     assert_eq!(spec.timeout, StdDuration::from_secs(300));
+}
+
+#[tokio::test]
+async fn a_same_user_script_gets_the_workers_logins_but_never_its_narsor_variables() {
+    // `--insecure-same-user`: like a runner's agent, the script sees the
+    // user's HOME (glab/gh logins) and PATH; the run's own values win.
+    let fx = Fixture::new();
+    let secrets = fx.secrets_dir(&[("gitlab-token", SENTINEL)]);
+    fx.observer("true\n", &[("gitlab-token", "GITLAB_TOKEN")]);
+    let runner = FakeRunner::exiting(0, r#"{"state": {}}"#, "");
+    let mut options = fx.options();
+    options.secrets_dir = Some(secrets);
+    options.inherited_env = inheritable_environment(
+        [
+            ("HOME", "/home/dev"),
+            ("PATH", "/home/dev/.local/bin:/usr/bin"),
+            ("GITLAB_TOKEN", "from-the-shell"),
+            ("XDG_CONFIG_HOME", "/home/dev/.config"),
+            ("NARSOR_OBSERVER_WORKER_KEY", "nsw.key"),
+            ("NARSOR_TOKEN", "owner-token"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string())),
+    );
+    let worker = Worker::new(fx.api(), Arc::clone(&runner), options);
+
+    worker.run_once().await.unwrap().unwrap();
+
+    let specs = runner.specs();
+    let spec = &specs[0];
+    assert_eq!(env_value(spec, "HOME"), Some("/home/dev"));
+    assert_eq!(
+        env_value(spec, "PATH"),
+        Some("/usr/bin:/bin:/home/dev/.local/bin:/usr/bin")
+    );
+    assert_eq!(
+        env_value(spec, "XDG_CONFIG_HOME"),
+        Some("/home/dev/.config")
+    );
+    assert_eq!(env_value(spec, "GITLAB_TOKEN"), Some(SENTINEL));
+    assert!(env_value(spec, "NARSOR_TOKEN").unwrap().starts_with("nso."));
+    assert_eq!(env_value(spec, "NARSOR_OBSERVER_WORKER_KEY"), None);
+    let mut names = env_names(spec);
+    let count = names.len();
+    names.dedup();
+    assert_eq!(names.len(), count, "a variable is set twice: {names:?}");
 }
 
 #[tokio::test]

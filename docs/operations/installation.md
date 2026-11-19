@@ -259,7 +259,7 @@ variables):
 | `observer_script_user` | the system user that runs the scripts; not the server's user, not `root` |
 | `observer_secrets_dir` | the absolute path of the secrets directory; empty: no secrets |
 | `observer_worker_server` | the URL the worker and its scripts use for the API; empty: the server's own address (trusted mode only) |
-| `observer_insecure_same_user` | `true` runs the scripts as the server's own user; for a trial on a developer machine only |
+| `observer_insecure_same_user` | `true` runs the scripts as the server's own user, with the server's environment (as a runner runs its agent); for a trial or a single-user machine only |
 
 ```yaml
 observer_worker: on
@@ -339,6 +339,14 @@ user. A script can then read the worker key, every secret and the server's
 state. The worker writes a warning at start. Do not use it in
 production.
 
+In this mode isolation gains nothing, so the script also gets the
+environment of the server, as an agent of a runner does: the user's
+`HOME`, and with it the logins of `glab`, `gh` and other tools, and the
+user's `PATH` after the worker's own. A script can then use `glab api`
+without a secret. The run's variables in the table below and the declared
+secrets take precedence. Variables named `NARSOR_*` (the worker key among
+them) are never passed on.
+
 **What a script gets.** The worker asks for a due run; the server holds the
 request up to 25 seconds until a run is due, so a script starts soon after
 it is due. After an empty answer that came at once, the worker waits
@@ -355,8 +363,9 @@ exactly these variables:
 | `NARSOR_OBSERVER_RUN` | the run's id |
 | one per secret | the value of a secret that the automation declares |
 
-Nothing of the worker's own environment is passed on, the worker key
-included. The script reads the
+With a script user, nothing of the worker's own environment is passed on,
+the worker key included (for `observer_insecure_same_user: true`, see
+above). The script reads the
 run's input as JSON on stdin and prints its result on stdout. It runs in a
 process group of its own: at its time limit (5 minutes for `check`,
 120 seconds for `in` and `out`) the group gets

@@ -21,12 +21,19 @@
 //!
 //! # What the script gets
 //!
-//! An empty environment plus exactly: `PATH`, `HOME` (the run directory),
-//! `NARSOR_SERVER`, `NARSOR_TOKEN` (the run's token, valid on the effect
-//! routes of this one run only), `NARSOR_OBSERVER_RUN` and one variable per
-//! secret the automation declares. Nothing of the worker's own environment
-//! reaches it — neither the worker key nor a `GH_TOKEN` the worker was
-//! started with.
+//! With a script user: an empty environment plus exactly: `PATH`, `HOME`
+//! (the run directory), `NARSOR_SERVER`, `NARSOR_TOKEN` (the run's token,
+//! valid on the effect routes of this one run only), `NARSOR_OBSERVER_RUN`
+//! and one variable per secret the automation declares. Nothing of the
+//! worker's own environment reaches it — neither the worker key nor a
+//! `GH_TOKEN` the worker was started with.
+//!
+//! With `--insecure-same-user` the script runs as the worker's user anyway,
+//! so isolation gains nothing: like a runner's agent, it also gets the
+//! worker's environment ([`WorkerOptions::inherited_env`]) — the user's
+//! `HOME` (and with it the logins of `glab`, `gh`, …) and the user's `PATH`
+//! after [`WorkerOptions::path`]. Variables named `NARSOR_*`, the worker
+//! key among them, are never passed on.
 //!
 //! # Secrets
 //!
@@ -308,6 +315,9 @@ pub struct WorkerOptions {
     pub secrets_dir: Option<PathBuf>,
     /// The user scripts run as; `None` for the worker's own.
     pub script_user: Option<ScriptUser>,
+    /// The worker's variables the script gets too (see
+    /// [`inheritable_environment`]); empty with a script user.
+    pub inherited_env: Vec<(String, String)>,
     /// Where run directories are made.
     pub work_dir: PathBuf,
     /// The script's `PATH`.
@@ -326,6 +336,7 @@ impl WorkerOptions {
             server: server.into(),
             secrets_dir: None,
             script_user: None,
+            inherited_env: Vec::new(),
             work_dir: std::env::temp_dir(),
             path: default_script_path(),
             shell: PathBuf::from(SHELL),
@@ -347,6 +358,16 @@ pub fn default_script_path() -> String {
             || SYSTEM_PATH.to_string(),
             |dir| format!("{dir}:{SYSTEM_PATH}"),
         )
+}
+
+/// The variables of `vars` a script of the worker's own user may get:
+/// all but the `NARSOR_*` ones (the worker key, the server's settings).
+pub fn inheritable_environment(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    vars.into_iter()
+        .filter(|(name, _)| !name.starts_with("NARSOR_"))
+        .collect()
 }
 
 /// One run the worker handled.
@@ -539,15 +560,40 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
         secrets: Vec<(String, String)>,
         masker: &Masker,
     ) -> ScriptSpec {
-        let home = run_dir.path().to_string_lossy().into_owned();
+        let inherited = |name: &str| {
+            self.options
+                .inherited_env
+                .iter()
+                .find(|(inherited, _)| inherited == name)
+                .map(|(_, value)| value.as_str())
+        };
+        let path = match inherited("PATH") {
+            Some(user_path) if !user_path.is_empty() => {
+                format!("{}:{user_path}", self.options.path)
+            }
+            _ => self.options.path.clone(),
+        };
+        let home = inherited("HOME").map_or_else(
+            || run_dir.path().to_string_lossy().into_owned(),
+            str::to_string,
+        );
         let mut env = vec![
-            ("PATH".to_string(), self.options.path.clone()),
+            ("PATH".to_string(), path),
             ("HOME".to_string(), home),
             ("NARSOR_SERVER".to_string(), self.options.server.clone()),
             ("NARSOR_TOKEN".to_string(), run.token.clone()),
             ("NARSOR_OBSERVER_RUN".to_string(), run.run_id.clone()),
         ];
         env.extend(secrets);
+        // The worker's own variables fill in only what the run does not set.
+        let taken: Vec<String> = env.iter().map(|(name, _)| name.clone()).collect();
+        env.extend(
+            self.options
+                .inherited_env
+                .iter()
+                .filter(|(name, _)| !taken.contains(name))
+                .cloned(),
+        );
         // A secret cut in two by the limit is still masked whole: keep
         // enough beyond it to see the rest.
         let slack = masker.longest();
