@@ -80,7 +80,7 @@ The sign-in form says which token it needs (*Skąd wziąć token?*).
   with the age of the data when not live), the default harness, the slots,
   the counters `?` (tasks that ask) and `!` (tasks with a problem), the usage
   limits of the harnesses, and buttons for history, repositories and the
-  observer queues.
+  automation queues.
 - **Task list:** the queue in server order, with the same state icons as the
   TUI, a text filter, *ukryj ✓* (hide finished tasks) and *następne ?* (the
   next task that waits for you). ▲ ▼ move a queued task.
@@ -97,11 +97,21 @@ The sign-in form says which token it needs (*Skąd wziąć token?*).
   (pause, resume, select a step, archive …). Irreversible actions say so and
   ask for confirmation.
 
-- **Kolejki obserwatorów** (the queues page): the queues of observers with
-  their entries, and in a queue its observers and the tasks that wait on it.
-  You create and edit observers, save script versions, approve a version
-  after you read its text, pause, resume and delete. A task with a queue
-  entry has one mark on its row. See [Observers](observers.md#8-queue-views).
+- **Kolejki automatyzacji** (the queues page, read-only): the queues of the
+  catalogue with their entries and the catalogue files that cannot be used,
+  and in a queue its automations (scripts, state, last run, errors) and the
+  tasks that wait on it. The page has no forms: to change a queue or an
+  automation, change its file in the catalogue. A task with a queue entry
+  has one mark on its row. See
+  [Automations and queues](observers.md#9-queue-views).
+- **A gate that watches a queue:** while a `human` gate waits, *Akcje*
+  offers *Uruchom od nowa*, which closes the wait and asks again in a new
+  episode (the queue's `out` scripts run first, then its `in` scripts; an
+  older runner refuses it, and the refusal is shown). When an entry script
+  of the queue failed after its last retry, the gate step shows the status
+  `failure` on *Przebieg*, and each attempt of an entry or exit script is
+  an event of the step there. You can still answer the gate. See
+  [Automations and queues](observers.md#4-entry-and-exit-scripts).
 
 Below 900 px of width the list and the details are shown one at a time.
 The address follows the selection (`#/task/<id>/<tab>`), so a reload comes
@@ -129,7 +139,7 @@ Shortcuts do nothing while the focus is in a text field. `?` shows them.
 | `R` | repositories |
 | `h` | default harness |
 | `L` | task limit |
-| `Q` | observer queues (`Esc`: back) |
+| `Q` | automation queues (`Esc`: back) |
 | `u` | refresh now |
 | `Ctrl+Enter` | send a message (in a message field) |
 

@@ -191,6 +191,7 @@ into the task's immutable launch spec and never re-read for that task.
 | Repository base image | `{catalog}/repositories/{id}.yaml`, key `base_image` |
 | Workflow image | workflow `globals.image` |
 | Default backend / profile | settings `default_backend` (default `local`), `default_profile` (default `default`); the owner can override the backend at runtime |
+| Automations and queues | `{catalog}/automations/{name}/` (`automation.yaml`, `check.sh`, optional `in.sh`, `out.sh`), `{catalog}/queues/{name}.yaml`; read at every run, not sealed into a task (see [Automations and queues](../user/observers.md#2-the-catalogue-files)) |
 
 ### Backend
 
@@ -264,6 +265,34 @@ images, bundle, tools, profile and harness have the same
 a pin: a running task follows the installation's default harness (see
 "Scheduling").
 
+### The catalogue in a ConfigMap
+
+When the control plane runs in a Pod, the catalogue can come from one
+ConfigMap, copied into `catalog_dir` by an init container at every start of
+the Pod (so the ConfigMap wins). A ConfigMap key cannot hold `/`, so the
+key names the target file:
+
+| ConfigMap key | Catalogue file |
+| --- | --- |
+| `backend-{id}.yaml` | `backends/{id}.yaml` |
+| `profile-{id}.yaml` | `profiles/{id}.yaml` |
+| `workflow-{name}.yaml` | `workflows/{name}.yaml` |
+| `automation-{name}--{file}` | `automations/{name}/{file}`, where `{file}` is `automation.yaml`, `check.sh`, `in.sh` or `out.sh` |
+| `queue-{name}.yaml` | `queues/{name}.yaml` |
+| any other key (`runtime.yaml`) | the same name at the catalogue root |
+
+The init script splits an automation key at its last `--`: the file names
+have no `--`, so an automation name may have one. It empties
+`automations/` and `queues/` before the copy, so an automation or a queue
+removed from the ConfigMap is gone after the next start. A queue is used
+only when every automation it names is complete; the problems are shown in
+the queue views (`narsor-cli queue list`). `deploy/kind/server.yaml` has the
+init script and the commands that make the ConfigMap from
+[`examples/catalog/`](../../examples/catalog/).
+
+The values of the automations' secrets are not in the ConfigMap: see
+"Observer secrets" in §4.
+
 ## 4. Secrets
 
 * The control plane stores **references only** (`name`, `tool`, `key`,
@@ -281,16 +310,26 @@ a pin: a running task follows the installation's default harness (see
   Their validity and rotation are the owner's and the tool provider's
   responsibility.
 
-**Observer secrets are a separate scope.** The secrets of
-[observers](../user/observers.md) are not backend secrets: a task, a backend
-or a profile cannot use them, and an observer cannot use a backend secret.
-An observer keeps only references (`--secret NAME=ENV`) in the control plane.
-The values are files in the secrets directory of the observer worker, in
-the subdirectory of the observer's owner, one file for each name, readable
-by the worker's user only (see
+**Observer secrets are a separate scope.** The secrets of the catalogue's
+[automations](../user/observers.md) are not backend secrets: a task, a
+backend or a profile cannot use them, and an automation cannot use a
+backend secret. An automation names its secrets in `automation.yaml`
+(`secrets: [{name, env}]`). The values are files in the secrets directory
+of the observer worker (`observer_secrets_dir`), one flat directory with
+one file for each name, readable by the server's user only (see
 [installation](installation.md#run-the-observer-worker)). For each run the
-worker gives the script only the secrets of its own observer, as
+worker gives the script only the secrets its automation declares, as
 environment variables, and masks their values in the logs it reports.
+
+On Kubernetes, keep the values in one Secret whose keys are the secret
+names (`kubectl create secret generic narsor-observer-secrets
+--from-file=gitlab-token=…`). Do not point `observer_secrets_dir` at the
+Secret volume: a Secret volume is open to all users of the Pod, and the
+worker refuses such a directory. Copy the files in the init container into
+a `0700` directory on an in-memory `emptyDir` (mode `0600` files), and set
+`observer_secrets_dir` to it, as `deploy/kind/server.yaml` does. Mount the
+Secret with `defaultMode: 0440` so the Pod's user reads it through
+`fsGroup`. A change of the Secret applies at the next start of the Pod.
 
 ## 5. Installing the Kubernetes backend
 

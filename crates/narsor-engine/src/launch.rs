@@ -41,6 +41,9 @@ use tokio::sync::watch;
 pub use narsor_protocol::controller::TaskDefaultHarness;
 pub use narsor_protocol::controller::WorkspaceRequest;
 
+use crate::automations::{
+    AutomationCatalog, AutomationCatalogError, AutomationCatalogLoad, AutomationScript, HookPhase,
+};
 use crate::domain::{
     ActionConfig, BackendId, Context, DecisionConfig, GitIdentity, ImageSource, ImageSpec,
     RefOrigin, RepositoryDefinition, RepositorySource, ResolvedEnvironment, ResolvedImage,
@@ -946,5 +949,20 @@ impl LaunchResolver for CatalogLaunchResolver {
 
     fn workflow_definition(&self, workflow_id: &str) -> Result<WorkflowDefinition, LaunchError> {
         self.catalogue_workflow(workflow_id)
+    }
+
+    fn automation_catalog(&self) -> AutomationCatalogLoad {
+        AutomationCatalog::new(&self.catalog_root).load(|workflow_id| {
+            self.catalogue_workflow(workflow_id)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn automation_script(
+        &self,
+        automation: &str,
+        phase: HookPhase,
+    ) -> Result<AutomationScript, AutomationCatalogError> {
+        AutomationCatalog::new(&self.catalog_root).script(automation, phase)
     }
 }

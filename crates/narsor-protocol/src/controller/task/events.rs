@@ -163,8 +163,81 @@ pub enum TaskEventKind {
         /// What is wrong.
         reason: String,
     },
+    /// One attempt of an entry (`in`) or exit (`out`) script of an
+    /// automation at a watched gate ended (R12, R14). Every attempt is one
+    /// event of the gate's step, never a new step. A client from before
+    /// these scripts reads it as [`TaskEventKind::Unrecognized`].
+    GateHookAttempt {
+        /// The workflow state of the gate.
+        step: String,
+        /// The queue its `watch` names.
+        queue: String,
+        /// The wait episode.
+        episode: String,
+        /// The automation whose script ran.
+        automation: String,
+        /// The script phase: `in` or `out`.
+        hook: String,
+        /// The attempt, from 1.
+        attempt: u32,
+        /// Why it failed; `None` when it succeeded or was skipped.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        /// Why no script ran: the automation no longer has the script in
+        /// the queue. `None` when the script ran.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skipped: Option<String>,
+        /// When the next automatic attempt runs; `None` when none follows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_at: Option<DateTime<Utc>>,
+        /// The gate's new automation phase, when this attempt changed it
+        /// (`ready`, `entry_failed`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gate_phase: Option<GateAutomationPhase>,
+    },
     #[serde(other)]
     Unrecognized,
+}
+
+/// Where the automations of a watched gate's queue stand in one wait
+/// episode: entry scripts (`in`), `check` runs, exit scripts (`out`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateAutomationPhase {
+    /// Entry scripts run or wait for an attempt; no `check` run yet.
+    Entering,
+    /// Every entry script succeeded (or there is none): `check` runs.
+    Ready,
+    /// An entry script failed its last attempt: no `check` run and no
+    /// more automatic attempts; the person chooses an exit.
+    EntryFailed,
+    /// An exit is held while exit scripts run.
+    Exiting,
+    /// Every exit script ended: the held exit goes to the runner.
+    Released,
+    /// A phase from a newer build.
+    #[serde(other)]
+    Unrecognized,
+}
+
+impl GateAutomationPhase {
+    /// The wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Entering => "entering",
+            Self::Ready => "ready",
+            Self::EntryFailed => "entry_failed",
+            Self::Exiting => "exiting",
+            Self::Released => "released",
+            Self::Unrecognized => "unrecognized",
+        }
+    }
+
+    /// Whether the episode is not left yet: `entering`, `ready` or
+    /// `entry_failed`.
+    pub fn before_exit(self) -> bool {
+        matches!(self, Self::Entering | Self::Ready | Self::EntryFailed)
+    }
 }
 
 /// Where a task, an event or an answer came from when an observer caused it

@@ -1,6 +1,7 @@
-//! Integration tests of the observers' schedule through the daemon's
+//! Integration tests of the automations' schedule through the daemon's
 //! periodic pass, without a daemon: `run_periodic_pass` on a real
-//! `ProtocolService` over a temporary state root and a manual clock.
+//! `ProtocolService` over a temporary root (catalogue and state, as an
+//! installation that sets nothing) and a manual clock.
 
 use std::fs;
 use std::path::PathBuf;
@@ -9,10 +10,9 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_engine::controller_protocol::{ProtocolService, RunOutcome, RunReport};
 use narsor_engine::domain::TaskId;
-use narsor_engine::observers::migrate::DELIVER_EVENT_REMOVED_NOTE;
 use narsor_engine::observers::{
-    queue_entry_id, ObserverConfig, ObserverEffect, ObserverId, ObserverMode, ObserverName,
-    ObserverState, RunStatus, ScheduleConfig,
+    queue_entry_id, stored_observers_warning, AutomationKey, AutomationRecord, AutomationState,
+    RunStatus,
 };
 use narsor_engine::orchestration::{Clock, CommandRequest, ControlPlane, OwnerCommand, OwnerRef};
 use narsor_engine::persistence::StatePaths;
@@ -76,31 +76,35 @@ impl Fixture {
         *self.clock.0.lock().unwrap() += by;
     }
 
-    /// An active `on_episodes` observer of the queue of its name, with
-    /// approved script version 1.
-    fn active_on_episodes(&self, name: &str) -> ObserverId {
-        self.active(name, ObserverMode::OnEpisodes, ScheduleConfig::default())
+    /// The `on_episodes` queue `name` served by the automation `name`,
+    /// every 300 s; its first pass makes it due at once.
+    fn active_on_episodes(&self, name: &str) -> AutomationKey {
+        self.active(name, "on_episodes", "{interval_secs: 300}")
     }
 
-    /// An active observer of the queue of its name in `mode` on `schedule`,
-    /// with approved script version 1. It creates no tasks.
-    fn active(&self, name: &str, mode: ObserverMode, schedule: ScheduleConfig) -> ObserverId {
-        let mut config = ObserverConfig::new(
-            ObserverName::parse(name).unwrap(),
-            ObserverEffect::None,
-            mode,
+    /// The queue `name` in `mode` on `schedule` (YAML), served by the
+    /// automation `name`, which creates no tasks.
+    fn active(&self, name: &str, mode: &str, schedule: &str) -> AutomationKey {
+        crate::automation_support::automation(
+            &self.root,
+            name,
+            crate::automation_support::CHECK_SCRIPT,
+            &[],
         );
-        config.schedule = schedule;
-        let store = self.service.observers();
-        let id = store
-            .create(OwnerRef::new("owner"), config, None, self.now())
+        crate::automation_support::write(
+            &self.root,
+            &format!("queues/{name}.yaml"),
+            &format!("automations: [{name}]\nmode: {mode}\nschedule: {schedule}\n"),
+        );
+        AutomationKey::new(name, name).unwrap()
+    }
+
+    fn record(&self, key: &AutomationKey) -> AutomationRecord {
+        self.service
+            .observers()
+            .load(key)
             .unwrap()
-            .observer_id;
-        store
-            .add_script(&id, "echo '{\"state\": {}}'\n", self.now())
-            .unwrap();
-        self.service.approve_observer_version(&id, 1).unwrap();
-        id
+            .expect("the pair has a record")
     }
 
     fn task(&self, id: &str) -> TaskId {
@@ -131,7 +135,7 @@ impl Fixture {
 }
 
 #[test]
-fn the_periodic_pass_runs_the_observers_schedule() {
+fn the_periodic_pass_runs_the_automations_schedule() {
     // R30 through the daemon's tick: an empty queue starts no run of an
     // `on_episodes` observer, and its deadline moves on.
     let fx = Fixture::new();
@@ -139,7 +143,7 @@ fn the_periodic_pass_runs_the_observers_schedule() {
 
     run_periodic_pass(&fx.service);
 
-    let record = fx.service.observers().load(&id).unwrap();
+    let record = fx.record(&id);
     assert_eq!(record.run_due_since, None);
     assert_eq!(record.next_run_at, Some(fx.now() + Duration::seconds(300)));
     assert!(fx.service.claim_observer_run().unwrap().is_none());
@@ -150,10 +154,7 @@ fn the_periodic_pass_runs_the_observers_schedule() {
     fx.entry("mr-review", &task, "input-1");
     fx.advance(Duration::seconds(300));
     run_periodic_pass(&fx.service);
-    assert_eq!(
-        fx.service.observers().load(&id).unwrap().run_due_since,
-        Some(fx.now())
-    );
+    assert_eq!(fx.record(&id).run_due_since, Some(fx.now()));
 }
 
 #[test]
@@ -203,11 +204,11 @@ fn a_restart_after_hours_of_downtime_owes_one_run_and_keeps_the_error() {
     run_periodic_pass(&restarted);
     run_periodic_pass(&restarted);
 
-    let record = restarted.observers().load(&id).unwrap();
+    let record = restarted.observers().load(&id).unwrap().unwrap();
     // A failed run for an entry is not counted (R14): the entry is checked
     // again.
     assert_eq!(record.consecutive_failures, 0);
-    assert_eq!(record.state, ObserverState::Active);
+    assert_eq!(record.state, AutomationState::Active);
     let run = restarted.claim_observer_run().unwrap().expect("one run");
     assert_eq!(run.run_id.sequence, 2);
     assert!(restarted.claim_observer_run().unwrap().is_none());
@@ -219,93 +220,37 @@ fn a_restart_after_hours_of_downtime_owes_one_run_and_keeps_the_error() {
 }
 
 #[test]
-fn an_old_record_with_only_an_interval_runs_unchanged() {
-    // KTD-2: a record written before cron existed keeps its interval.
+fn stored_observers_of_an_older_version_are_reported_and_never_scheduled() {
+    // R22: a hard cutover; the old record is not read, nothing runs.
     let fx = Fixture::new();
-    let id = fx.active("jira-new", ObserverMode::Always, ScheduleConfig::default());
-    let path = fx
-        .service
-        .observers()
-        .paths()
-        .observer_record_file(id.as_str());
-    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    raw["record_version"] = json!(1);
-    raw["config"]["schedule"] = json!({"interval_secs": 600});
-    raw["config"].as_object_mut().unwrap().remove("queue");
-    raw["config"].as_object_mut().unwrap().remove("mode");
-    raw["config"]["watch_mode"] = json!("all");
-    fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    let old = fx.root.join("observers").join("obs-1");
+    fs::create_dir_all(&old).unwrap();
+    fs::write(
+        old.join("observer.json"),
+        serde_json::to_vec(&json!({
+            "record_version": 2,
+            "state": "active",
+            "approved_version": 1,
+            "config": {"name": "jira-new", "queue": "jira-new", "mode": "always"},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
-    run_periodic_pass(&fx.service);
-    let claimed = fx.service.claim_observer_run().unwrap().expect("a run");
-    fx.service
-        .finish_observer_run(
-            &claimed.run_id,
-            RunReport {
-                outcome: RunOutcome::Exited { exit_code: 0 },
-                stdout: "{\"state\": {}}".into(),
-                stderr: String::new(),
-            },
-        )
-        .unwrap();
+    let restarted = Fixture::service_on(&fx.root, &fx.clock);
+    run_periodic_pass(&restarted);
 
-    let record = fx.service.observers().load(&id).unwrap();
-    assert_eq!(
-        record.config.schedule,
-        ScheduleConfig::Interval { secs: 600 }
-    );
-    assert_eq!(record.config.queue, "jira-new");
-    assert_eq!(record.next_run_at, Some(fx.now() + Duration::seconds(600)));
+    assert!(stored_observers_warning(restarted.observers().paths()).is_some());
+    assert!(restarted.claim_observer_run().unwrap().is_none());
+    assert!(restarted.observers().list_readable().unwrap().is_empty());
 }
 
 #[test]
-fn an_old_deliver_event_observer_is_paused_with_its_note_and_not_run() {
-    // KTD-8, U13: an active version 1 observer that delivered events reads
-    // as a paused `on_episodes` observer of the queue of its name. It keeps
-    // its scripts, and a gate entry on its queue starts no run.
-    let fx = Fixture::new();
-    let id = fx.active_on_episodes("mr-review");
-    let path = fx
-        .service
-        .observers()
-        .paths()
-        .observer_record_file(id.as_str());
-    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    raw["record_version"] = json!(1);
-    raw["config"]["effect"] = json!({"kind": "deliver_event"});
-    raw["config"]["watch_mode"] = json!("watch_list");
-    raw["config"]["watch_objects"] =
-        json!({"allowed_prefixes": ["https://gitlab/"], "max_len": 512});
-    raw["config"].as_object_mut().unwrap().remove("queue");
-    raw["config"].as_object_mut().unwrap().remove("mode");
-    fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
-
-    let task = fx.task("task-1");
-    fx.entry("mr-review", &task, "input-1");
-    for _ in 0..3 {
-        run_periodic_pass(&fx.service);
-        assert!(fx.service.claim_observer_run().unwrap().is_none());
-        fx.advance(Duration::seconds(300));
-    }
-
-    let record = fx.service.observers().load(&id).unwrap();
-    assert_eq!(record.state, ObserverState::Paused);
-    assert_eq!(record.note.as_deref(), Some(DELIVER_EVENT_REMOVED_NOTE));
-    assert_eq!(record.config.effect, ObserverEffect::None);
-    assert_eq!(record.config.queue, "mr-review");
-    assert_eq!(record.config.mode, ObserverMode::OnEpisodes);
-    assert_eq!(record.approved_version, Some(1));
-    assert_eq!(record.last_run_sequence, 0);
-    assert_eq!(fx.service.observers().list().unwrap().len(), 1);
-}
-
-#[test]
-fn a_cron_observer_runs_at_every_fire_time() {
+fn a_cron_queue_runs_at_every_fire_time() {
     // Covers AE6 for the schedule: `*/10 * * * *` from 12:00 runs at 12:10
     // and 12:20, never in between.
     let fx = Fixture::new();
-    let cron = ScheduleConfig::from_parts(None, Some("*/10 * * * *".into())).unwrap();
-    let id = fx.active("jira-new", ObserverMode::Always, cron);
+    let id = fx.active("jira-new", "always", "{cron: \"*/10 * * * *\"}");
     let at = |minute| Utc.with_ymd_and_hms(2026, 11, 13, 12, minute, 0).unwrap();
     let mut starts = Vec::new();
     for _ in 0..30 {
@@ -326,12 +271,9 @@ fn a_cron_observer_runs_at_every_fire_time() {
         fx.advance(Duration::seconds(60));
     }
 
-    // The approval makes the first run due at once.
+    // The pair's first pass makes it due at once.
     assert_eq!(starts, vec![at(0), at(10), at(20)]);
-    assert_eq!(
-        fx.service.observers().load(&id).unwrap().next_run_at,
-        Some(at(30))
-    );
+    assert_eq!(fx.record(&id).next_run_at, Some(at(30)));
 }
 
 #[test]
@@ -352,8 +294,8 @@ fn only_exit_code_zero_ends_an_entry_run_without_an_error() {
         run_periodic_pass(&fx.service);
         fx.run_entry(exit_code);
 
-        let record = fx.service.observers().load(&id).unwrap();
-        assert_eq!(record.state, ObserverState::Active, "exit {exit_code}");
+        let record = fx.record(&id);
+        assert_eq!(record.state, AutomationState::Active, "exit {exit_code}");
         assert_eq!(record.consecutive_failures, 0, "exit {exit_code}");
         let expected = if exit_code == 0 {
             RunStatus::Succeeded
@@ -381,7 +323,7 @@ fn only_exit_code_zero_ends_an_entry_run_without_an_error() {
 }
 
 #[test]
-fn an_entry_run_gets_the_whole_gate_in_contract_version_two() {
+fn an_entry_run_gets_the_whole_gate_in_contract_version_three() {
     // R11: task, episode and its start, step, params, choices, variables.
     let fx = Fixture::new();
     fx.active_on_episodes("mr-review");
@@ -394,7 +336,10 @@ fn an_entry_run_gets_the_whole_gate_in_contract_version_two() {
     let claimed = fx.run_entry(0);
 
     let input = serde_json::to_value(&claimed.input).unwrap();
-    assert_eq!(input["contract_version"], json!(2));
+    assert_eq!(input["contract_version"], json!(3));
+    assert_eq!(input["phase"], "check");
+    assert_eq!(input["queue"], "mr-review");
+    assert_eq!(input["automation"], "mr-review");
     let gate = review_gate("mr-review");
     assert_eq!(
         input["entry"],
@@ -450,17 +395,16 @@ impl Fixture {
 }
 
 #[test]
-fn an_on_episodes_observer_runs_only_at_a_tick_with_an_entry() {
+fn an_on_episodes_queue_runs_only_at_a_tick_with_an_entry() {
     // Covers AE7: cron `*/5`; at the first tick the queue is empty, no run
     // and no error; at the next tick one entry, one run for it.
     let fx = Fixture::new();
-    let cron = ScheduleConfig::from_parts(None, Some("*/5 * * * *".into())).unwrap();
-    let id = fx.active("gitlab-mr", ObserverMode::OnEpisodes, cron);
+    let id = fx.active("gitlab-mr", "on_episodes", "{cron: \"*/5 * * * *\"}");
 
     let empty = fx.service.observer_pass();
     assert_eq!(empty.skipped, vec![id.clone()]);
     assert!(fx.claim().is_none());
-    let record = fx.service.observers().load(&id).unwrap();
+    let record = fx.record(&id);
     assert_eq!(record.last_run, None);
     assert_eq!(record.next_run_at, Some(fx.at(5, 0)));
 
@@ -478,12 +422,11 @@ fn an_on_episodes_observer_runs_only_at_a_tick_with_an_entry() {
 }
 
 #[test]
-fn an_always_observer_runs_once_at_every_tick_with_no_entry() {
+fn an_always_queue_runs_once_at_every_tick_with_no_entry() {
     // Covers AE6: no task exists; every tick runs the script once, with no
     // entry in its input.
     let fx = Fixture::new();
-    let cron = ScheduleConfig::from_parts(None, Some("*/10 * * * *".into())).unwrap();
-    fx.active("jira-new", ObserverMode::Always, cron);
+    fx.active("jira-new", "always", "{cron: \"*/10 * * * *\"}");
 
     let mut runs = 0;
     for minute in [0, 3, 10, 10, 15, 20] {
@@ -502,14 +445,14 @@ fn an_always_observer_runs_once_at_every_tick_with_no_entry() {
 #[test]
 fn the_next_tick_counts_from_the_last_tick_not_from_the_end_of_the_run() {
     let fx = Fixture::new();
-    let id = fx.active("jira-new", ObserverMode::Always, ScheduleConfig::default());
+    let id = fx.active("jira-new", "always", "{interval_secs: 300}");
     run_periodic_pass(&fx.service);
-    let run = fx.claim().expect("the approval's tick");
+    let run = fx.claim().expect("the first tick");
 
     fx.set(fx.at(3, 0));
     fx.finish(&run, 0);
 
-    let record = fx.service.observers().load(&id).unwrap();
+    let record = fx.record(&id);
     assert_eq!(record.next_run_at, Some(fx.at(5, 0)));
 }
 
@@ -517,19 +460,16 @@ fn the_next_tick_counts_from_the_last_tick_not_from_the_end_of_the_run() {
 fn a_tick_while_the_run_is_active_starts_nothing_and_is_not_owed() {
     // R29: one run at a time; the tick is skipped, not queued.
     let fx = Fixture::new();
-    let id = fx.active("jira-new", ObserverMode::Always, ScheduleConfig::default());
+    let id = fx.active("jira-new", "always", "{interval_secs: 300}");
     run_periodic_pass(&fx.service);
-    let run = fx.claim().expect("the approval's tick");
+    let run = fx.claim().expect("the first tick");
 
     fx.set(fx.at(5, 0));
     let pass = fx.service.observer_pass();
     assert_eq!(pass.busy, vec![id.clone()]);
     assert!(pass.due.is_empty());
     assert!(fx.claim().is_none());
-    assert_eq!(
-        fx.service.observers().load(&id).unwrap().next_run_at,
-        Some(fx.at(10, 0))
-    );
+    assert_eq!(fx.record(&id).next_run_at, Some(fx.at(10, 0)));
 
     // Within the run's deadline (the script's limit and a minute).
     fx.set(fx.at(5, 40));
@@ -545,19 +485,16 @@ fn a_tick_while_the_run_is_active_starts_nothing_and_is_not_owed() {
 #[test]
 fn a_tick_the_run_outlasted_without_a_pass_is_not_owed_either() {
     let fx = Fixture::new();
-    let id = fx.active("jira-new", ObserverMode::Always, ScheduleConfig::default());
+    let id = fx.active("jira-new", "always", "{interval_secs: 300}");
     run_periodic_pass(&fx.service);
-    let run = fx.claim().expect("the approval's tick");
+    let run = fx.claim().expect("the first tick");
 
     fx.set(fx.at(5, 30));
     fx.finish(&run, 0);
     run_periodic_pass(&fx.service);
 
     assert!(fx.claim().is_none());
-    assert_eq!(
-        fx.service.observers().load(&id).unwrap().next_run_at,
-        Some(fx.at(10, 0))
-    );
+    assert_eq!(fx.record(&id).next_run_at, Some(fx.at(10, 0)));
 }
 
 #[test]
@@ -565,11 +502,11 @@ fn a_tick_during_the_backoff_starts_nothing_and_keeps_the_backoff() {
     // R29: a failed `always` run waits `interval × 2^failures`; the tick in
     // between neither runs nor moves the backoff.
     let fx = Fixture::new();
-    let id = fx.active("jira-new", ObserverMode::Always, ScheduleConfig::default());
+    let id = fx.active("jira-new", "always", "{interval_secs: 300}");
     run_periodic_pass(&fx.service);
-    let run = fx.claim().expect("the approval's tick");
+    let run = fx.claim().expect("the first tick");
     fx.finish(&run, 1);
-    let record = fx.service.observers().load(&id).unwrap();
+    let record = fx.record(&id);
     assert_eq!(record.consecutive_failures, 1);
     assert_eq!(record.next_run_at, Some(fx.at(10, 0)));
 
@@ -578,7 +515,7 @@ fn a_tick_during_the_backoff_starts_nothing_and_keeps_the_backoff() {
 
     assert!(pass.due.is_empty() && pass.busy.is_empty());
     assert!(fx.claim().is_none());
-    let record = fx.service.observers().load(&id).unwrap();
+    let record = fx.record(&id);
     assert_eq!(record.next_run_at, Some(fx.at(10, 0)));
     assert_eq!(record.consecutive_failures, 1);
 
@@ -624,10 +561,7 @@ fn three_entries_at_one_tick_run_one_per_run_over_the_round() {
         .collect();
     episodes.sort();
     assert_eq!(episodes, vec!["input-1", "input-2", "input-3"]);
-    assert_eq!(
-        fx.service.observers().load(&id).unwrap().next_run_at,
-        Some(fx.at(10, 0))
-    );
+    assert_eq!(fx.record(&id).next_run_at, Some(fx.at(10, 0)));
 }
 
 // ---------------------------------------------------------------------------

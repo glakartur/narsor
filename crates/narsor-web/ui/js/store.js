@@ -59,9 +59,8 @@ export function mutationGate(connection, now) {
 }
 
 /**
- * The reason a refused write shows in its form: the server's own message
- * (`queue_mode_mismatch` names the queue's mode, a bad cron says why), or
- * what failed when the server gave none.
+ * The reason a refused request shows on its page: the server's own
+ * message, or what failed when the server gave none.
  */
 export function refusalReason(error) {
   if (error?.kind === 'unavailable') return 'brak połączenia z serwerem';
@@ -392,10 +391,8 @@ export class Store {
    * Runs a write when the connection is live. Shows `success` (a text or a
    * function of the result) and reads the list again; on a refusal shows the
    * reason. Resolves to the result, or `undefined` when it did not run.
-   * With `inline`, a refusal is not shown: the form that asked shows it
-   * (`refusalReason`) and keeps its values.
    */
-  async mutate(run, { success, failure = 'nie udało się', inline = false } = {}) {
+  async mutate(run, { success, failure = 'nie udało się' } = {}) {
     const blocked = mutationGate(this.state.connection, this.clock.now());
     if (blocked) {
       this.notify('warning', blocked);
@@ -409,7 +406,7 @@ export class Store {
     } catch (error) {
       if (error?.kind === 'unauthorized' || error?.kind === 'forbidden') {
         this.onFailure(error);
-      } else if (!inline) {
+      } else {
         this.notify('error', `${failure} — ${error?.message ?? error}`);
       }
       throw error;

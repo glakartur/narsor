@@ -53,7 +53,8 @@ use super::model::{
 };
 use crate::domain::{BackendId, TaskId};
 use crate::persistence::atomic::{
-    cleanup_orphaned_temp_files, read_json, write_json_atomic, write_json_atomic_exclusive,
+    cleanup_orphaned_temp_files, read_json, subdirectories, write_json_atomic,
+    write_json_atomic_exclusive,
 };
 use crate::persistence::lock::FileLock;
 use crate::persistence::paths::{parse_event_file_name, StatePaths};
@@ -574,22 +575,6 @@ fn event_sequences(dir: &Path) -> Result<Vec<u64>> {
     }
     sequences.sort_unstable();
     Ok(sequences)
-}
-
-fn subdirectories(dir: &Path) -> Result<Vec<PathBuf>> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => return Err(PersistenceError::io(dir, source).into()),
-    };
-    let mut dirs = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| PersistenceError::io(dir, source))?;
-        if entry.path().is_dir() {
-            dirs.push(entry.path());
-        }
-    }
-    Ok(dirs)
 }
 
 /// One record as a whole-store scan sees it.

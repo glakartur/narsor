@@ -78,11 +78,6 @@ use super::dto::{
 };
 use crate::controller_protocol::ConductorReadResponse;
 use narsor_protocol::controller::{
-    ApproveObserverRequest, CreateObserverRequest, ObserverDetailView, ObserverListResponse,
-    ObserverQueueListResponse, ObserverQueueView, ObserverScriptTextView, ObserverScriptView,
-    ObserverView, SetObserverScriptRequest, UpdateObserverRequest,
-};
-use narsor_protocol::controller::{
     CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
     ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest,
     CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery,
@@ -93,6 +88,7 @@ use narsor_protocol::controller::{
     SubmitInputRequest, SubmitOperatorCommandRequest, ValidateWorkflowRequest,
     ValidateWorkflowResponse, WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
 };
+use narsor_protocol::controller::{ObserverQueueListResponse, ObserverQueueView};
 
 use super::token::{TokenCell, TokenSource};
 
@@ -116,6 +112,11 @@ const CONVERSATION_PAGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// `git ls-remote` run for 20 seconds, so the client waits a little longer
 /// and the server's own answer is the failure signal.
 const BRANCH_LISTING_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// How long the observer worker's claim may take: the control plane holds
+/// it up to 25 s while no run is due (a long-poll), so the client waits
+/// longer than that.
+const OBSERVER_CLAIM_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// How long one material upload or blob download may take: tens of
 /// megabytes over a real network, far beyond a control request's bound.
@@ -834,11 +835,18 @@ impl ApiClient {
     // -----------------------------------------------------------------
 
     /// Claims the next due observer run, for a client holding the worker
-    /// key — `POST /observer/v1/worker/claim`. `None` when no run is
-    /// due.
+    /// key — `POST /observer/v1/worker/claim`. `None` when no run became
+    /// due while the control plane held the request.
     pub async fn claim_observer_run(&self) -> Result<Option<ObserverWorkerRun>, ClientError> {
         let url = format!("{}/observer/v1/worker/claim", self.base_url);
-        let response: ObserverClaimResponse = self.post_empty(&url).await?;
+        let response = self
+            .send(&self.stream_http, |http, token| {
+                http.post(url.as_str())
+                    .bearer_auth(token)
+                    .timeout(OBSERVER_CLAIM_TIMEOUT)
+            })
+            .await?;
+        let response: ObserverClaimResponse = handle_json_response(response).await?;
         Ok(response.run)
     }
 
@@ -854,103 +862,22 @@ impl ApiClient {
     }
 
     // -----------------------------------------------------------------
-    // Observers (U7): the owner's routes, then a run's effect routes
+    // Queues: the owner's read-only views, then a run's effect routes
     // -----------------------------------------------------------------
 
-    /// The caller's observers — `GET /control/v1/observers`.
-    pub async fn observers(&self) -> Result<ObserverListResponse, ClientError> {
-        let url = format!("{}/control/v1/observers", self.base_url);
-        self.get_json(&url).await
-    }
-
-    /// Creates a draft observer — `POST /control/v1/observers`.
-    pub async fn create_observer(
-        &self,
-        request: &CreateObserverRequest,
-    ) -> Result<ObserverView, ClientError> {
-        let url = format!("{}/control/v1/observers", self.base_url);
-        self.post_json(&url, request).await
-    }
-
-    /// One observer, by name or id, with the errors of its failed or lost runs.
-    pub async fn observer(&self, observer: &str) -> Result<ObserverDetailView, ClientError> {
-        let url = self.observer_url(observer, "")?;
-        self.get_json(&url).await
-    }
-
-    /// Changes the queue, mode or schedule of an observer —
-    /// `PATCH /control/v1/observers/{observer}`.
-    pub async fn update_observer(
-        &self,
-        observer: &str,
-        request: &UpdateObserverRequest,
-    ) -> Result<ObserverView, ClientError> {
-        let url = self.observer_url(observer, "")?;
-        self.patch_json(&url, request).await
-    }
-
-    /// The caller's queues with their counts —
-    /// `GET /control/v1/observer-queues`.
+    /// The catalogue's queues with the caller's entry counts, and the
+    /// catalogue files that failed to load — `GET /control/v1/observer-queues`.
     pub async fn observer_queues(&self) -> Result<ObserverQueueListResponse, ClientError> {
         let url = format!("{}/control/v1/observer-queues", self.base_url);
         self.get_json(&url).await
     }
 
-    /// One queue of the caller with its observers and entries —
-    /// `GET /control/v1/observer-queues/{queue}`.
+    /// One queue with its automations, the caller's entries and the
+    /// problems of its file — `GET /control/v1/observer-queues/{queue}`.
     pub async fn observer_queue(&self, queue: &str) -> Result<ObserverQueueView, ClientError> {
         let queue = path_segment("queue", queue)?;
         let url = format!("{}/control/v1/observer-queues/{queue}", self.base_url);
         self.get_json(&url).await
-    }
-
-    /// Deletes an observer with every file of it.
-    pub async fn delete_observer(&self, observer: &str) -> Result<ObserverView, ClientError> {
-        let url = self.observer_url(observer, "")?;
-        self.delete_json(&url).await
-    }
-
-    /// Saves the observer's next script version; never approves it.
-    pub async fn set_observer_script(
-        &self,
-        observer: &str,
-        request: &SetObserverScriptRequest,
-    ) -> Result<ObserverScriptView, ClientError> {
-        let url = self.observer_url(observer, "/scripts")?;
-        self.post_json(&url, request).await
-    }
-
-    /// One script version of an observer with its text —
-    /// `GET /control/v1/observers/{observer}/scripts/{version}`.
-    pub async fn observer_script(
-        &self,
-        observer: &str,
-        version: u32,
-    ) -> Result<ObserverScriptTextView, ClientError> {
-        let url = self.observer_url(observer, &format!("/scripts/{version}"))?;
-        self.get_json(&url).await
-    }
-
-    /// Approves a script version: the schedule runs it from now on.
-    pub async fn approve_observer(
-        &self,
-        observer: &str,
-        request: &ApproveObserverRequest,
-    ) -> Result<ObserverView, ClientError> {
-        let url = self.observer_url(observer, "/approve")?;
-        self.post_json(&url, request).await
-    }
-
-    /// Stops the observer's schedule.
-    pub async fn pause_observer(&self, observer: &str) -> Result<ObserverView, ClientError> {
-        let url = self.observer_url(observer, "/pause")?;
-        self.post_empty(&url).await
-    }
-
-    /// Puts the observer back on its schedule.
-    pub async fn resume_observer(&self, observer: &str) -> Result<ObserverView, ClientError> {
-        let url = self.observer_url(observer, "/resume")?;
-        self.post_empty(&url).await
     }
 
     /// Creates a task from effect data, for a client holding a run token
@@ -975,15 +902,6 @@ impl ApiClient {
         let run_id = path_segment("run", run_id)?;
         let url = format!("{}/observer/v1/runs/{run_id}/decide", self.base_url);
         self.post_json(&url, request).await
-    }
-
-    /// `/control/v1/observers/{observer}{suffix}`.
-    fn observer_url(&self, observer: &str, suffix: &str) -> Result<String, ClientError> {
-        let observer = path_segment("observer", observer)?;
-        Ok(format!(
-            "{}/control/v1/observers/{observer}{suffix}",
-            self.base_url
-        ))
     }
 
     // -----------------------------------------------------------------
@@ -1193,20 +1111,6 @@ impl ApiClient {
         let response = self
             .send(&self.http, |http, token| {
                 http.put(url).bearer_auth(token).json(body)
-            })
-            .await?;
-        handle_json_response(response).await
-    }
-
-    /// `PATCH url` with a JSON body, decoding the response as `T`.
-    async fn patch_json<B: Serialize, T: DeserializeOwned>(
-        &self,
-        url: &str,
-        body: &B,
-    ) -> Result<T, ClientError> {
-        let response = self
-            .send(&self.http, |http, token| {
-                http.patch(url).bearer_auth(token).json(body)
             })
             .await?;
         handle_json_response(response).await

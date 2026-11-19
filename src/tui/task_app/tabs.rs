@@ -11,6 +11,7 @@
 //! * [`conversation`] — the conversation of one step, picked on a strip of
 //!   steps, and the per-attempt cache the progress tab shares;
 //! * [`events`] — the raw event log with the detail of one event;
+//! * [`gate`] — the entry and exit scripts of a watched gate on *Przebieg*;
 //! * [`conductor`] — the chat with the conductor, its decisions and harness;
 //! * [`info`] — what the control plane knows about the task.
 
@@ -23,5 +24,6 @@ pub const READER_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 pub mod conductor;
 pub mod conversation;
 pub mod events;
+pub mod gate;
 pub mod info;
 pub mod progress;

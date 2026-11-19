@@ -17,6 +17,9 @@ use tokio::sync::watch;
 pub use narsor_protocol::controller::TaskDefaultHarness;
 pub use narsor_protocol::controller::WorkspaceRequest;
 
+use crate::automations::{
+    AutomationCatalogError, AutomationCatalogLoad, AutomationScript, HookPhase,
+};
 use crate::domain::{
     BackendId, GitIdentityError, ImageError, InvalidIdentifier, ResourceProfile, TaskLaunchSpec,
     WorkflowDefinition,
@@ -311,5 +314,24 @@ pub trait LaunchResolver: Send + Sync {
             workflow: workflow_id.to_string(),
             message: "this server has no workflow catalogue".to_string(),
         })
+    }
+
+    /// The catalogue's automations and queues, read now (no cache), with a
+    /// problem for each file that cannot be used. An `always` queue that
+    /// creates tasks is checked against [`Self::workflow_definition`]. A
+    /// resolver without a catalogue has none.
+    fn automation_catalog(&self) -> AutomationCatalogLoad {
+        AutomationCatalogLoad::default()
+    }
+
+    /// The text of `automation`'s `phase` script as the catalogue holds it
+    /// now, read when a run is claimed.
+    fn automation_script(
+        &self,
+        automation: &str,
+        phase: HookPhase,
+    ) -> Result<AutomationScript, AutomationCatalogError> {
+        let _ = (automation, phase);
+        Err(AutomationCatalogError::NoCatalogue)
     }
 }

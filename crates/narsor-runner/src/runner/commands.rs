@@ -1,5 +1,5 @@
 //! Operator commands the control plane hands the runner: interrupt a step,
-//! take a transition, restart a failed step (U3), and the conductor's
+//! take a transition, restart a failed step (U3) or a waiting gate, and the conductor's
 //! chat, proposals, undo and harness (U5, see [`super::conductor`]).
 //!
 //! The runner is the only writer of its execution, so it is also where a
@@ -243,7 +243,8 @@ impl Session {
 
     /// Starts the failed or interrupted step again: a failed or unknown
     /// execution is recovered, a paused one (cut between steps) resumed,
-    /// each with the owner's note for the agent's next attempt.
+    /// each with the owner's note for the agent's next attempt, and a gate
+    /// that waits for its answer asks again in a new episode (U7).
     fn restart_step(
         &mut self,
         execution_id: &str,
@@ -264,6 +265,11 @@ impl Session {
             ExecutionStatus::Failed | ExecutionStatus::Unknown => self
                 .engine
                 .try_begin_recover_with(execution_id, Recovery::by_operator(note, failure_key)),
+            // A gate that waits for its answer: the step starts again and
+            // asks anew, a new episode (R16). No agent reads a note there.
+            ExecutionStatus::InputNeeded => self
+                .engine
+                .try_begin_recover_with(execution_id, Recovery::by_operator(None, failure_key)),
             ExecutionStatus::Running | ExecutionStatus::Paused => {
                 if let Some(note) = &note {
                     self.engine

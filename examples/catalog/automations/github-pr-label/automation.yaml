@@ -1,0 +1,31 @@
+# A review label on a GitHub pull request, for a queue of review gates (mode
+# on_episodes). Read docs/user/observers.md first.
+#
+#   in.sh     adds the label when the gate starts to wait
+#   check.sh  answers the gate when the reviewer removed the label
+#   out.sh    removes the label when the gate exits (if it is still there)
+#
+# The queue's condition (the same object for every automation of the queue):
+#   github.host     the host of the pull request URLs. Default: github.com.
+#   github.api_url  the https:// address of the REST API. Default:
+#                   https://api.github.com (GitHub Enterprise:
+#                   https://HOST/api/v3).
+#   label           the review label. Default: narsor-review.
+#
+# Params of the gate (`watch.params`):
+#   mr_url   the pull request URL:
+#              https://github.com/OWNER/REPO/pull/NUMBER
+#            Required. The name is the one of gitlab-mr-label, so that both
+#            automations can serve one queue.
+#   choice   the choice that check.sh gives the gate. Default:
+#            check_feedback.
+#
+# A URL that is not a pull request URL on github.host is not an entry of this
+# automation: each script exits 0 and sends the token nowhere.
+description: Puts a review label on a GitHub pull request while the gate waits, and answers the gate when the reviewer removes it
+params: [mr_url, choice]
+secrets:
+  # A token that can read the pull request and change its labels (a
+  # fine-grained token with "Pull requests: Read and write"). The value is
+  # the file {observer secrets dir}/github-token.
+  - {name: github-token, env: GITHUB_TOKEN}

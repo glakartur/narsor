@@ -91,8 +91,14 @@ whose token goes to that server (`server` = its own, `passthrough` = the
 browser's).
 
 The `observer_*` settings tell the server whether to start the observer
-worker and how; see
+worker, which runs the scripts of the catalogue's automations, and how; see
 [installation](../operations/installation.md#run-the-observer-worker).
+`observer_secrets_dir` is one flat directory with one file per secret name
+(`{observer_secrets_dir}/{name}`), accessible to its owner only (`0700`). A
+script gets only the secrets its automation declares in `automation.yaml`
+(see [Automations and queues](observers.md#10-secrets)). The automations
+and queues themselves are files of the catalogue (`{catalog_dir}/automations/`,
+`{catalog_dir}/queues/`), not settings.
 
 For Kubernetes runners, put `NARSOR_AGENT_ARGS` in the controller ConfigMap
 (`narsor-controller-config`). The controller forwards this one key to the

@@ -10,6 +10,7 @@
 //! Shared helpers live in the `*_support` modules and are used as
 //! `crate::<name>_support`.
 
+mod automation_support;
 #[macro_use]
 mod backend_contract_support;
 mod engine_support;
@@ -22,13 +23,14 @@ mod actions_agent;
 mod actions_human;
 mod actions_script;
 mod agent_harness_selection;
+mod automations_catalog;
 mod backend_contract;
 mod branches;
 mod builtin_workflows;
 mod claude_code_classification;
 mod cli_control_text;
 mod cli_conversation_text;
-mod cli_observer;
+mod cli_queue;
 mod cli_task_create;
 mod cli_task_text;
 mod conductor_chat;
@@ -61,6 +63,7 @@ mod observers_worker;
 mod orchestration;
 mod persistence;
 mod profile_step_flow;
+mod queue_hooks;
 mod registry;
 mod schema_loading;
 mod step_profile_flow;

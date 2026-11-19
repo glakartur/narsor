@@ -34,7 +34,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::commands::{CliError, Result};
-use super::observer_text::effect_output;
+use super::queue_text::effect_output;
 use super::remote::{failure, split_pair, TaskCommand};
 use crate::api::{ApiClient, ClientError, ServerTarget, TokenSource};
 use crate::controller_protocol::{

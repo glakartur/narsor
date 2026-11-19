@@ -24,6 +24,23 @@ pub fn ensure_dir(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir).map_err(|source| PersistenceError::io(dir, source))
 }
 
+/// The directories directly in `dir`; empty when `dir` does not exist.
+pub fn subdirectories(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(PersistenceError::io(dir, source)),
+    };
+    let mut dirs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| PersistenceError::io(dir, source))?;
+        if entry.path().is_dir() {
+            dirs.push(entry.path());
+        }
+    }
+    Ok(dirs)
+}
+
 /// Writes `bytes` to `path` atomically, creating parent directories as needed.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {

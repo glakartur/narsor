@@ -1,11 +1,14 @@
-//! The example observer scripts against a fake source: each one reads the
-//! answers of its source from `FAKE_SOURCE_DIR` and calls a stand-in
-//! `narsor-cli` that records its arguments. The input follows version 2 of
-//! the script contract. The Jira script (`always`) must print a document
-//! that the contract accepts; a PR/MR script (`on_episodes`) checks one
-//! queue entry and answers its gate with `narsor-cli task decide` (U13).
+//! The example catalogue (`examples/catalog/`): it loads with no problem,
+//! and its scripts work against a fake source. Each script reads the
+//! answers of its source from `FAKE_SOURCE_DIR`, records the changes it would
+//! send in `writes.log` there, and calls a stand-in `narsor-cli` that records
+//! its arguments. The input follows version 3 of the script contract. The
+//! Jira `check` script (`always`) must print a document that the contract
+//! accepts; a PR/MR `check` script (`on_episodes`) checks one queue entry and
+//! answers its gate with `narsor-cli task decide`; its `in` and `out` scripts
+//! add and remove the review label, only when needed (R13).
 //!
-//! These tests run the real scripts with `sh` and `jq`, so they are
+//! The script tests run the real scripts with `sh` and `jq`, so they are
 //! `#[ignore]`d: `cargo test -- --include-ignored` runs them.
 
 use std::collections::BTreeMap;
@@ -15,12 +18,48 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use narsor_engine::automations::{AutomationCatalog, HookPhase};
 use narsor_engine::domain::TaskId;
 use narsor_engine::observers::{
     parse_script_output, ScriptChoice, ScriptEntry, ScriptOutput, ScriptVariable,
     SCRIPT_CONTRACT_VERSION,
 };
+use narsor_engine::workflow::load_from_str;
+use narsor_engine::workflows::builtin;
 use serde_json::{json, Value};
+
+/// The example catalogue of the repository.
+fn example_catalog() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/catalog")
+}
+
+/// A new installation copies `examples/catalog/` into its catalogue: every
+/// file loads, both queues are active, and the review automations have all
+/// three scripts. The Jira queue creates tasks of the built-in `template`.
+#[test]
+fn the_example_catalog_loads_with_no_problems() {
+    let load = AutomationCatalog::new(example_catalog()).load(|id| {
+        let workflow = builtin(id).ok_or_else(|| format!("'{id}' is not built in"))?;
+        load_from_str(workflow.source).map_err(|error| error.to_string())
+    });
+
+    assert_eq!(load.problems, Vec::new());
+    assert_eq!(
+        load.queues["mr-review"].automations,
+        ["gitlab-mr-label", "github-pr-label"]
+    );
+    for review in ["gitlab-mr-label", "github-pr-label"] {
+        assert!(
+            HookPhase::ALL
+                .iter()
+                .all(|phase| load.automations[review].has(*phase)),
+            "{review}"
+        );
+    }
+    let intake = load.queues["jira-intake"].tasks.as_ref().expect("tasks");
+    assert_eq!(intake.effect.workflow_id, "template");
+    assert!(!load.automations["jira-new-issues"].has(HookPhase::In));
+}
 
 /// A temporary directory with a fake source and a stand-in `narsor-cli`.
 struct Sandbox {
@@ -94,10 +133,22 @@ impl Sandbox {
         .expect("write a fake status");
     }
 
-    fn run(&self, example: &str, input: &Value) -> Run {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows/observers/examples")
-            .join(example);
+    /// The changes the scripts sent to the fake source, one line each.
+    fn writes(&self) -> Vec<String> {
+        fs::read_to_string(self.path.join("source/writes.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Runs the `phase` script of `automation`; `input` must name the same
+    /// phase.
+    fn run(&self, automation: &str, phase: HookPhase, input: &Value) -> Run {
+        let script = example_catalog()
+            .join("automations")
+            .join(automation)
+            .join(phase.script_file());
         let path = format!(
             "{}:{}",
             self.path.join("bin").display(),
@@ -142,12 +193,14 @@ impl Drop for Sandbox {
     }
 }
 
-/// The script input; `entry` is `Value::Null` for an `always` run, which
+/// The `check` input; `entry` is `Value::Null` for an `always` run, which
 /// has no `entry` field.
 fn input(condition: Value, state: Value, entry: Value) -> Value {
     let mut input = json!({
         "contract_version": SCRIPT_CONTRACT_VERSION,
-        "observer": {"id": "obs-1", "name": "example"},
+        "phase": "check",
+        "queue": "example-queue",
+        "automation": "example",
         "condition": condition,
         "state": state,
         "first_run": state.is_null(),
@@ -189,7 +242,8 @@ fn jira_first_run_records_the_newest_issue_and_creates_no_task() {
     );
 
     let run = sandbox.run(
-        "jira-new-issues.sh",
+        JIRA,
+        HookPhase::Check,
         &input(jira_condition(), Value::Null, Value::Null),
     );
 
@@ -212,7 +266,8 @@ fn jira_creates_one_task_per_new_issue_with_only_the_mapped_fields() {
     );
 
     let run = sandbox.run(
-        "jira-new-issues.sh",
+        JIRA,
+        HookPhase::Check,
         &input(jira_condition(), json!({"last_id": 100}), Value::Null),
     );
 
@@ -250,7 +305,8 @@ fn jira_stops_at_a_task_not_created_and_keeps_the_state_of_the_tasks_before_it()
     sandbox.fail_from(2);
 
     let run = sandbox.run(
-        "jira-new-issues.sh",
+        JIRA,
+        HookPhase::Check,
         &input(jira_condition(), json!({"last_id": 100}), Value::Null),
     );
 
@@ -282,7 +338,8 @@ fn jira_fails_the_run_when_no_task_is_created() {
     sandbox.fail_from(1);
 
     let run = sandbox.run(
-        "jira-new-issues.sh",
+        JIRA,
+        HookPhase::Check,
         &input(jira_condition(), json!({"last_id": 100}), Value::Null),
     );
 
@@ -308,7 +365,8 @@ fn jira_keeps_the_old_state_when_the_answer_is_not_a_list_of_issues() {
     sandbox.answer("search", &json!({"errorMessages": ["no"]}));
 
     let run = sandbox.run(
-        "jira-new-issues.sh",
+        JIRA,
+        HookPhase::Check,
         &input(jira_condition(), json!({"last_id": 100}), Value::Null),
     );
 
@@ -316,6 +374,10 @@ fn jira_keeps_the_old_state_when_the_answer_is_not_a_list_of_issues() {
     assert!(run.stdout.is_empty(), "{:?}", run.stdout);
     assert!(run.calls.is_empty());
 }
+
+const JIRA: &str = "jira-new-issues";
+const GITLAB: &str = "gitlab-mr-label";
+const GITHUB: &str = "github-pr-label";
 
 const DONE: Option<i32> = Some(0);
 const ERROR: Option<i32> = Some(2);
@@ -325,21 +387,14 @@ const GITHUB_PR: &str = "https://github.com/acme/app/pull/17";
 
 /// When the gate of the entries below began.
 const STARTED: &str = "2026-11-17T10:00:00Z";
-/// A change of the pull or merge request after `STARTED`.
-const LATER: &str = "2026-11-17T10:20:00.123Z";
-/// A change before `STARTED`.
-const EARLIER: &str = "2026-11-17T09:50:00Z";
 
 /// The queue entry of a review gate (`review_work`) for `url`, as the
-/// control plane hands it to the script (contract version 2), with the
-/// params `mr_url`, `label` and the `extra` ones.
+/// control plane hands it to the script (contract version 3), with the
+/// param `mr_url` and the `extra` ones.
 fn review_entry(url: &str, extra: &[(&str, &str)]) -> Value {
-    let mut params: BTreeMap<String, String> = [
-        ("mr_url".to_string(), url.to_string()),
-        ("label".to_string(), "w CR".to_string()),
-    ]
-    .into_iter()
-    .collect();
+    let mut params: BTreeMap<String, String> = [("mr_url".to_string(), url.to_string())]
+        .into_iter()
+        .collect();
     for (name, value) in extra {
         params.insert(name.to_string(), value.to_string());
     }
@@ -375,27 +430,43 @@ fn review_input(condition: Value, entry: Value) -> Value {
     input(condition, Value::Null, entry)
 }
 
+/// The condition of the review queue: the label `w CR` (with a space, as
+/// a label can have) and the GitLab host; GitHub takes its defaults.
+fn review_condition() -> Value {
+    json!({"label": "w CR", "gitlab": {"host": "gitlab.example.com"}})
+}
+
 fn gitlab_input(entry: Value) -> Value {
-    review_input(json!({"host": "gitlab.example.com"}), entry)
+    review_input(review_condition(), entry)
 }
 
 fn github_input(entry: Value) -> Value {
-    review_input(json!({}), entry)
+    review_input(review_condition(), entry)
+}
+
+/// The input of the `phase` script of the review queue for `entry`; an
+/// `out` run also gets how the gate was left.
+fn hook_input(phase: HookPhase, entry: Value) -> Value {
+    let mut input = review_input(review_condition(), entry);
+    input["phase"] = json!(phase.as_str());
+    if phase == HookPhase::Out {
+        input["exit"] = json!({"choice": "check_feedback", "author": "person"});
+    }
+    input
 }
 
 /// A GitLab merge request as the REST API gives it.
-fn merge_request(state: &str, labels: &[&str], updated_at: &str) -> Value {
-    json!({"iid": 7, "state": state, "labels": labels, "updated_at": updated_at})
+fn merge_request(state: &str, labels: &[&str]) -> Value {
+    json!({"iid": 7, "state": state, "labels": labels})
 }
 
 /// A GitHub pull request as the REST API gives it.
-fn pull_request(state: &str, labels: &[&str], updated_at: &str) -> Value {
+fn pull_request(state: &str, labels: &[&str]) -> Value {
     let labels: Vec<Value> = labels
         .iter()
         .map(|name| json!({"id": 1, "name": name}))
         .collect();
-    json!({"number": 17, "state": state, "merged": false, "merged_at": null,
-           "labels": labels, "updated_at": updated_at})
+    json!({"number": 17, "state": state, "merged": false, "merged_at": null, "labels": labels})
 }
 
 /// Asserts a review run's exit code and that it printed nothing on stdout.
@@ -405,7 +476,7 @@ fn assert_exit(run: &Run, code: Option<i32>) {
 }
 
 /// The `narsor-cli` call that answers the gate of `review_entry`.
-fn decide_call(choice: &str, label: &str, url: &str) -> Vec<String> {
+fn decide_call(choice: &str, url: &str) -> Vec<String> {
     [
         "task",
         "decide",
@@ -415,7 +486,7 @@ fn decide_call(choice: &str, label: &str, url: &str) -> Vec<String> {
         "--choice",
         choice,
         "--reason",
-        &format!("the label {label} was removed from {url}"),
+        &format!("the label w CR was removed from {url}"),
     ]
     .map(str::to_string)
     .to_vec()
@@ -425,75 +496,184 @@ fn decide_call(choice: &str, label: &str, url: &str) -> Vec<String> {
 #[ignore = "runs the example scripts with a real sh and jq"]
 fn gitlab_answers_check_feedback_when_the_reviewer_removed_the_label() {
     // Covers AE1: the reviewer removed the label; the script answers the
-    // gate with `task decide`, with no variables and no artifacts (R12).
+    // gate with `task decide`, with no variables and no artifacts.
     let sandbox = Sandbox::new();
-    sandbox.answer(
-        "mr-group-app-7",
-        &merge_request("opened", &["backend"], LATER),
-    );
+    sandbox.answer("mr-group-app-7", &merge_request("opened", &["backend"]));
 
     let run = sandbox.run(
-        "gitlab-mr-review.sh",
+        GITLAB,
+        HookPhase::Check,
         &gitlab_input(review_entry(GITLAB_MR, &[])),
     );
 
     assert_exit(&run, DONE);
-    assert_eq!(
-        run.calls,
-        vec![decide_call("check_feedback", "w CR", GITLAB_MR)]
-    );
+    assert_eq!(run.calls, vec![decide_call("check_feedback", GITLAB_MR)]);
 }
 
 #[test]
 #[ignore = "runs the example scripts with a real sh and jq"]
 fn github_answers_the_choice_of_its_param_when_the_reviewer_removed_the_label() {
     let sandbox = Sandbox::new();
-    sandbox.answer("pr-acme-app-17", &pull_request("open", &[], LATER));
+    sandbox.answer("pr-acme-app-17", &pull_request("open", &[]));
 
     let run = sandbox.run(
-        "github-pr-review.sh",
+        GITHUB,
+        HookPhase::Check,
         &github_input(review_entry(GITHUB_PR, &[("choice", "abandon")])),
     );
 
     assert_exit(&run, DONE);
-    assert_eq!(run.calls, vec![decide_call("abandon", "w CR", GITHUB_PR)]);
+    assert_eq!(run.calls, vec![decide_call("abandon", GITHUB_PR)]);
+}
+
+/// R13: `in` adds the label only when it is missing and `out` removes it
+/// only when it is there, so a retry or a label the reviewer already
+/// removed changes nothing. Both automations, both phases.
+#[test]
+#[ignore = "runs the example scripts with a real sh and jq"]
+fn entry_and_exit_scripts_change_the_label_only_when_needed() {
+    let gitlab_path = "projects/group%2Fapp/merge_requests/7";
+    let github_path = "repos/acme/app/issues/17";
+    for (automation, url, source, with_label, without_label, add, remove) in [
+        (
+            GITLAB,
+            GITLAB_MR,
+            "mr-group-app-7",
+            merge_request("opened", &["backend", "w CR"]),
+            merge_request("opened", &["backend"]),
+            format!("PUT {gitlab_path} add_labels=w CR"),
+            format!("PUT {gitlab_path} remove_labels=w CR"),
+        ),
+        (
+            GITHUB,
+            GITHUB_PR,
+            "pr-acme-app-17",
+            pull_request("open", &["w CR"]),
+            pull_request("open", &[]),
+            format!(r#"POST {github_path}/labels {{"labels":["w CR"]}}"#),
+            format!("DELETE {github_path}/labels/w%20CR "),
+        ),
+    ] {
+        for (phase, request, expected) in [
+            (HookPhase::In, &without_label, Some(add.as_str())),
+            (HookPhase::In, &with_label, None),
+            (HookPhase::Out, &with_label, Some(remove.as_str())),
+            (HookPhase::Out, &without_label, None),
+        ] {
+            let sandbox = Sandbox::new();
+            sandbox.answer(source, request);
+
+            let run = sandbox.run(
+                automation,
+                phase,
+                &hook_input(phase, review_entry(url, &[])),
+            );
+
+            assert_exit(&run, DONE);
+            assert_eq!(
+                sandbox.writes(),
+                expected.map(str::to_string).into_iter().collect::<Vec<_>>(),
+                "{automation} {phase}"
+            );
+            assert!(
+                run.calls.is_empty(),
+                "{automation} {phase}: {:?}",
+                run.calls
+            );
+        }
+    }
 }
 
 #[test]
 #[ignore = "runs the example scripts with a real sh and jq"]
-fn two_example_observers_of_one_queue_answer_only_their_own_urls() {
-    // Covers AE4: the GitLab and the GitHub observer serve the queue
-    // `mr-review`. For each entry only the script of its host answers; the
-    // other exits 0 with no answer and fetches nothing (no fake answer
-    // exists for it, so a fetch would fail the run).
-    for (url, owner, other) in [
-        (GITHUB_PR, "github-pr-review.sh", "gitlab-mr-review.sh"),
-        (GITLAB_MR, "gitlab-mr-review.sh", "github-pr-review.sh"),
-    ] {
+fn a_refused_label_change_is_an_error_of_the_entry_or_exit_script() {
+    // A failed attempt: Narsor retries it, and after the last one a failed
+    // `in` fails the gate step and a failed `out` is logged.
+    let sandbox = Sandbox::new();
+    sandbox.answer("mr-group-app-7", &merge_request("opened", &[]));
+    sandbox.answer("pr-acme-app-17", &pull_request("open", &["w CR"]));
+    fs::write(sandbox.path.join("source/writes.status"), "403").unwrap();
+
+    let entry = sandbox.run(
+        GITLAB,
+        HookPhase::In,
+        &hook_input(HookPhase::In, review_entry(GITLAB_MR, &[])),
+    );
+    let exit = sandbox.run(
+        GITHUB,
+        HookPhase::Out,
+        &hook_input(HookPhase::Out, review_entry(GITHUB_PR, &[])),
+    );
+
+    for run in [&entry, &exit] {
+        assert_exit(run, ERROR);
+        assert!(run.stderr.contains("HTTP 403"), "{}", run.stderr);
+    }
+}
+
+#[test]
+#[ignore = "runs the example scripts with a real sh and jq"]
+fn two_example_automations_of_one_queue_handle_only_their_own_urls() {
+    // Covers AE4 of the queue: the GitLab and the GitHub automation serve
+    // the queue `mr-review`. For each entry only the scripts of its host
+    // act; the others exit 0 with no answer and no change, and fetch
+    // nothing (no fake answer exists for them, so a fetch would fail the
+    // run).
+    for (url, owner, other) in [(GITHUB_PR, GITHUB, GITLAB), (GITLAB_MR, GITLAB, GITHUB)] {
         let sandbox = Sandbox::new();
-        sandbox.answer("pr-acme-app-17", &pull_request("open", &[], LATER));
-        sandbox.answer("mr-group-app-7", &merge_request("opened", &[], LATER));
-        let input_for = |script: &str| {
-            let entry = review_entry(url, &[]);
-            if script.starts_with("gitlab") {
-                gitlab_input(entry)
-            } else {
-                github_input(entry)
-            }
-        };
+        sandbox.answer("pr-acme-app-17", &pull_request("open", &[]));
+        sandbox.answer("mr-group-app-7", &merge_request("opened", &[]));
 
-        let skipped = sandbox.run(other, &input_for(other));
-        assert_exit(&skipped, DONE);
-        assert!(skipped.calls.is_empty(), "{other}: {:?}", skipped.calls);
-        assert!(skipped.stderr.contains("not mine"), "{}", skipped.stderr);
+        for phase in HookPhase::ALL {
+            let skipped = sandbox.run(other, phase, &hook_input(phase, review_entry(url, &[])));
+            assert_exit(&skipped, DONE);
+            assert!(skipped.calls.is_empty(), "{other}: {:?}", skipped.calls);
+            assert!(skipped.stderr.contains("not mine"), "{}", skipped.stderr);
+        }
+        assert!(sandbox.writes().is_empty(), "{:?}", sandbox.writes());
 
-        let answered = sandbox.run(owner, &input_for(owner));
+        let answered = sandbox.run(
+            owner,
+            HookPhase::Check,
+            &hook_input(HookPhase::Check, review_entry(url, &[])),
+        );
         assert_exit(&answered, DONE);
         assert_eq!(
             answered.calls,
-            vec![decide_call("check_feedback", "w CR", url)],
+            vec![decide_call("check_feedback", url)],
             "{owner}"
         );
+    }
+}
+
+/// `mr_url` comes from the workflow (an agent can write it), so with an
+/// allowlist in the condition a URL of another project on the same host is
+/// not the automation's entry: no fetch, no write, no answer, in any phase.
+#[test]
+#[ignore = "runs the example scripts with a real sh and jq"]
+fn a_url_outside_the_allowlist_is_not_touched() {
+    let condition = json!({
+        "label": "w CR",
+        "gitlab": {"host": "gitlab.example.com", "projects": ["group/other"]},
+        "github": {"repos": ["acme/other"]},
+    });
+    for (automation, url) in [(GITLAB, GITLAB_MR), (GITHUB, GITHUB_PR)] {
+        let sandbox = Sandbox::new();
+        for phase in HookPhase::ALL {
+            let mut input = review_input(condition.clone(), review_entry(url, &[]));
+            input["phase"] = json!(phase.as_str());
+
+            let run = sandbox.run(automation, phase, &input);
+
+            assert_exit(&run, DONE);
+            assert!(
+                run.calls.is_empty(),
+                "{automation} {phase}: {:?}",
+                run.calls
+            );
+            assert!(run.stderr.contains("not mine"), "{}", run.stderr);
+        }
+        assert!(sandbox.writes().is_empty(), "{:?}", sandbox.writes());
     }
 }
 
@@ -503,12 +683,13 @@ fn no_answer_while_the_label_is_on_or_the_request_is_not_open() {
     let sandbox = Sandbox::new();
     sandbox.answer(
         "mr-group-app-7",
-        &merge_request("opened", &["backend", "w CR"], LATER),
+        &merge_request("opened", &["backend", "w CR"]),
     );
-    sandbox.answer("pr-acme-app-17", &pull_request("closed", &[], LATER));
+    sandbox.answer("pr-acme-app-17", &pull_request("closed", &[]));
 
     let gitlab = sandbox.run(
-        "gitlab-mr-review.sh",
+        GITLAB,
+        HookPhase::Check,
         &gitlab_input(review_entry(GITLAB_MR, &[])),
     );
     assert_exit(&gitlab, DONE);
@@ -519,51 +700,32 @@ fn no_answer_while_the_label_is_on_or_the_request_is_not_open() {
     );
 
     let github = sandbox.run(
-        "github-pr-review.sh",
+        GITHUB,
+        HookPhase::Check,
         &github_input(review_entry(GITHUB_PR, &[])),
     );
     assert_exit(&github, DONE);
     assert!(github.stderr.contains("is closed"), "{}", github.stderr);
 
-    sandbox.answer("mr-group-app-7", &merge_request("merged", &[], LATER));
+    // GitHub matches label names without case: `W cr` is the label `w CR`,
+    // so it must not look like the reviewer removed it.
+    sandbox.answer("pr-acme-app-17", &pull_request("open", &["W cr"]));
+    let other_case = sandbox.run(
+        GITHUB,
+        HookPhase::Check,
+        &github_input(review_entry(GITHUB_PR, &[])),
+    );
+    assert_exit(&other_case, DONE);
+    assert!(other_case.calls.is_empty(), "{:?}", other_case.calls);
+
+    sandbox.answer("mr-group-app-7", &merge_request("merged", &[]));
     let merged = sandbox.run(
-        "gitlab-mr-review.sh",
+        GITLAB,
+        HookPhase::Check,
         &gitlab_input(review_entry(GITLAB_MR, &[])),
     );
     assert_exit(&merged, DONE);
-    assert!(sandbox
-        .run(
-            "gitlab-mr-review.sh",
-            &gitlab_input(review_entry(GITLAB_MR, &[]))
-        )
-        .calls
-        .is_empty());
-}
-
-#[test]
-#[ignore = "runs the example scripts with a real sh and jq"]
-fn no_answer_for_a_label_that_was_gone_before_the_gate_started() {
-    // The workflow did not put the label on the request: nothing changed
-    // since the gate started, so the script does not answer at once.
-    let sandbox = Sandbox::new();
-    sandbox.answer("mr-group-app-7", &merge_request("opened", &[], EARLIER));
-    sandbox.answer("pr-acme-app-17", &pull_request("open", &[], EARLIER));
-
-    for (script, input) in [
-        (
-            "gitlab-mr-review.sh",
-            gitlab_input(review_entry(GITLAB_MR, &[])),
-        ),
-        (
-            "github-pr-review.sh",
-            github_input(review_entry(GITHUB_PR, &[])),
-        ),
-    ] {
-        let run = sandbox.run(script, &input);
-        assert_exit(&run, DONE);
-        assert!(run.calls.is_empty(), "{script}: {:?}", run.calls);
-        assert!(run.stderr.contains("did not change"), "{}", run.stderr);
-    }
+    assert!(merged.calls.is_empty(), "{:?}", merged.calls);
 }
 
 #[test]
@@ -576,7 +738,11 @@ fn gitlab_does_not_fetch_a_url_that_is_not_a_merge_request_on_its_host() {
         "https://evil.example.com/group/app/-/merge_requests/7",
         "",
     ] {
-        let run = sandbox.run("gitlab-mr-review.sh", &gitlab_input(review_entry(url, &[])));
+        let run = sandbox.run(
+            GITLAB,
+            HookPhase::Check,
+            &gitlab_input(review_entry(url, &[])),
+        );
         assert_exit(&run, DONE);
         assert!(
             run.stderr.contains("not mine, not fetched"),
@@ -589,42 +755,35 @@ fn gitlab_does_not_fetch_a_url_that_is_not_a_merge_request_on_its_host() {
 
 #[test]
 #[ignore = "runs the example scripts with a real sh and jq"]
-fn a_bad_input_or_param_is_an_error_of_the_run() {
-    // R14: any exit code but 0 is an error, recorded for the entry.
+fn a_bad_input_condition_or_param_is_an_error_of_the_run() {
+    // Any exit code but 0 is an error, recorded for the entry.
     let sandbox = Sandbox::new();
-    sandbox.answer("mr-group-app-7", &merge_request("opened", &[], LATER));
-    sandbox.answer("pr-acme-app-17", &pull_request("open", &[], LATER));
-    let mut no_label = review_entry(GITLAB_MR, &[]);
-    no_label["params"].as_object_mut().unwrap().remove("label");
+    sandbox.answer("mr-group-app-7", &merge_request("opened", &[]));
+    sandbox.answer("pr-acme-app-17", &pull_request("open", &[]));
     let mut version_one = gitlab_input(review_entry(GITLAB_MR, &[]));
     version_one["contract_version"] = json!(1);
+    let mut no_host = gitlab_input(review_entry(GITLAB_MR, &[]));
+    no_host["condition"]
+        .as_object_mut()
+        .unwrap()
+        .remove("gitlab");
+    let in_input_to_check = hook_input(HookPhase::In, review_entry(GITLAB_MR, &[]));
 
-    for (script, input, reason) in [
+    for (automation, input, reason) in [
+        (GITLAB, gitlab_input(Value::Null), "no queue entry"),
+        (GITHUB, github_input(Value::Null), "no queue entry"),
+        (GITLAB, version_one, "not version 3"),
+        (GITLAB, in_input_to_check, "for the phase check"),
+        (GITLAB, no_host, "condition.gitlab.host"),
         (
-            "gitlab-mr-review.sh",
-            gitlab_input(Value::Null),
-            "no queue entry",
-        ),
-        (
-            "github-pr-review.sh",
-            github_input(Value::Null),
-            "no queue entry",
-        ),
-        ("gitlab-mr-review.sh", version_one, "not version 2"),
-        (
-            "gitlab-mr-review.sh",
-            gitlab_input(no_label),
-            "no param label",
-        ),
-        (
-            "github-pr-review.sh",
+            GITHUB,
             github_input(review_entry(GITHUB_PR, &[("choice", "approve")])),
             "has no choice approve",
         ),
     ] {
-        let run = sandbox.run(script, &input);
+        let run = sandbox.run(automation, HookPhase::Check, &input);
         assert_exit(&run, ERROR);
-        assert!(run.stderr.contains(reason), "{script}: {}", run.stderr);
+        assert!(run.stderr.contains(reason), "{automation}: {}", run.stderr);
         assert!(run.calls.is_empty(), "{:?}", run.calls);
     }
 }
@@ -639,7 +798,8 @@ fn a_source_that_fails_or_a_refused_answer_is_an_error_of_the_run() {
     );
     sandbox.status("pr-acme-app-17", 403);
     let run = sandbox.run(
-        "github-pr-review.sh",
+        GITHUB,
+        HookPhase::Check,
         &github_input(review_entry(GITHUB_PR, &[])),
     );
     assert_exit(&run, ERROR);
@@ -648,7 +808,8 @@ fn a_source_that_fails_or_a_refused_answer_is_an_error_of_the_run() {
 
     sandbox.status("mr-group-app-7", 404);
     let run = sandbox.run(
-        "gitlab-mr-review.sh",
+        GITLAB,
+        HookPhase::Check,
         &gitlab_input(review_entry(GITLAB_MR, &[])),
     );
     assert_exit(&run, ERROR);
@@ -656,10 +817,11 @@ fn a_source_that_fails_or_a_refused_answer_is_an_error_of_the_run() {
 
     // A stale episode or another answer first: narsor-cli exits 1.
     fs::remove_file(sandbox.path.join("source/mr-group-app-7.status")).unwrap();
-    sandbox.answer("mr-group-app-7", &merge_request("opened", &[], LATER));
+    sandbox.answer("mr-group-app-7", &merge_request("opened", &[]));
     sandbox.fail_from(1);
     let run = sandbox.run(
-        "gitlab-mr-review.sh",
+        GITLAB,
+        HookPhase::Check,
         &gitlab_input(review_entry(GITLAB_MR, &[])),
     );
     assert_exit(&run, ERROR);

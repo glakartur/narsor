@@ -248,8 +248,9 @@ pub enum SettingKey {
     /// server's own listening address, which network mode cannot use (its
     /// requests must come through the TLS proxy).
     ObserverWorkerServer,
-    /// The observer worker's secrets directory: one subdirectory per
-    /// observer owner, one file per secret name in it. Empty: no secrets.
+    /// The observer worker's secrets directory: one file per secret name,
+    /// flat; an automation's script gets only the secrets the automation
+    /// declares. Empty: no secrets.
     ObserverSecretsDir,
     /// The system user observer scripts run as; must not be the server's.
     ObserverScriptUser,

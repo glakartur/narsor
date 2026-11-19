@@ -85,17 +85,15 @@ pub enum Context {
     Reading,
     /// A layer over either details: the task-wide agent conversation.
     AgentConversation,
-    /// The list of the owner's observer queues has the focus.
+    /// The list of the queues (read only) has the focus.
     Queues,
-    /// One queue: its observers and its entries.
+    /// One queue: its automations and its entries.
     QueueDetail,
-    /// The text of a script version shown before it is approved.
-    QueueApprove,
 }
 
 impl Context {
     /// Every context, in the order help and tests walk them.
-    pub const ALL: [Context; 20] = [
+    pub const ALL: [Context; 19] = [
         Context::Global,
         Context::List,
         Context::Details,
@@ -115,7 +113,6 @@ impl Context {
         Context::AgentConversation,
         Context::Queues,
         Context::QueueDetail,
-        Context::QueueApprove,
     ];
 
     /// The name help uses.
@@ -139,7 +136,6 @@ impl Context {
             Self::AgentConversation => "rozmowa",
             Self::Queues => "queues",
             Self::QueueDetail => "queue",
-            Self::QueueApprove => "approve script",
         }
     }
 
@@ -334,23 +330,8 @@ pub enum Action {
     AddRepository,
     /// Remove the selected repository.
     RemoveRepository,
-    /// Open the observer queues.
+    /// Open the queues view (read only).
     Queues,
-    /// Create an observer.
-    AddObserver,
-    /// Edit the queue, mode and schedule of the selected observer.
-    EditObserver,
-    /// Edit the script of the selected observer: a new version.
-    EditScript,
-    /// Show the newest script version of the selected observer and approve
-    /// it.
-    ApproveScript,
-    /// Pause the selected observer.
-    PauseObserver,
-    /// Resume the selected observer.
-    ResumeObserver,
-    /// Delete the selected observer.
-    DeleteObserver,
 }
 
 /// A key a binding listens to.
@@ -637,7 +618,7 @@ pub static BINDINGS: &[Binding] = &[
         Key::char('O'),
         Action::Queues,
         "queues",
-        "observer queues: the observers that answer decision gates, and the tasks that wait",
+        "queues (read only): the automations that answer decision gates, and the tasks that wait",
     ),
     bind(
         Context::List,
@@ -1728,7 +1709,7 @@ pub static BINDINGS: &[Binding] = &[
         "",
         CHOOSE_HARNESS,
     ),
-    // The observer queues: the list, then one queue with its observers.
+    // The queues (read only): the list, then one queue with its automations.
     bind(
         Context::Queues,
         Key::code(KeyCode::Esc),
@@ -1741,14 +1722,7 @@ pub static BINDINGS: &[Binding] = &[
         Key::code(KeyCode::Enter),
         Action::Open,
         "open",
-        "open the selected queue: its observers and its entries",
-    ),
-    bind(
-        Context::Queues,
-        Key::char('a'),
-        Action::AddObserver,
-        "new observer",
-        "create an observer",
+        "open the selected queue: its automations and its entries",
     ),
     bind(
         Context::Queues,
@@ -1808,87 +1782,38 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::QueueDetail,
-        Key::char('a'),
-        Action::AddObserver,
-        "new",
-        "create an observer of this queue",
-    ),
-    bind(
-        Context::QueueDetail,
-        Key::char('e'),
-        Action::EditObserver,
-        "edit",
-        "edit the queue, the mode and the schedule of the selected observer",
-    ),
-    bind(
-        Context::QueueDetail,
-        Key::char('s'),
-        Action::EditScript,
-        "script",
-        "edit the script in $EDITOR (or paste it): saving makes a new version, never approved",
-    ),
-    bind(
-        Context::QueueDetail,
-        Key::char('v'),
-        Action::ApproveScript,
-        "approve",
-        "show the newest script version, then approve it",
-    ),
-    bind(
-        Context::QueueDetail,
-        Key::char('p'),
-        Action::PauseObserver,
-        "pause",
-        "pause the selected observer",
-    ),
-    bind(
-        Context::QueueDetail,
-        Key::char('r'),
-        Action::ResumeObserver,
-        "resume",
-        "resume the selected observer",
-    ),
-    bind(
-        Context::QueueDetail,
-        Key::char('d'),
-        Action::DeleteObserver,
-        "delete",
-        "delete the selected observer (asks for a confirmation)",
-    ),
-    bind(
-        Context::QueueDetail,
         Key::char('j'),
         Action::Down,
         "",
-        "next observer",
+        "next automation",
     ),
     bind(
         Context::QueueDetail,
         Key::code(KeyCode::Down),
         Action::Down,
         "",
-        "next observer",
+        "next automation",
     ),
     bind(
         Context::QueueDetail,
         Key::char('k'),
         Action::Up,
         "",
-        "previous observer",
+        "previous automation",
     ),
     bind(
         Context::QueueDetail,
         Key::code(KeyCode::Up),
         Action::Up,
         "",
-        "previous observer",
+        "previous automation",
     ),
     bind(
         Context::QueueDetail,
         Key::Digit,
         Action::Pick,
         "",
-        "pick an observer by its number",
+        "pick an automation by its number",
     ),
     bind(
         Context::QueueDetail,
@@ -1903,70 +1828,6 @@ pub static BINDINGS: &[Binding] = &[
         Action::PageUp,
         "",
         "scroll the entries up",
-    ),
-    // The text of a script version before it is approved: only these keys.
-    bind(
-        Context::QueueApprove,
-        Key::char('y'),
-        Action::Accept,
-        "approve",
-        "approve the version shown: the schedule runs it from now on",
-    ),
-    bind(
-        Context::QueueApprove,
-        Key::char('n'),
-        Action::Cancel,
-        "back",
-        "go back without approving",
-    ),
-    bind(
-        Context::QueueApprove,
-        Key::code(KeyCode::Esc),
-        Action::Cancel,
-        "",
-        "go back without approving",
-    ),
-    bind(
-        Context::QueueApprove,
-        Key::char('j'),
-        Action::Down,
-        "",
-        "scroll the script down",
-    ),
-    bind(
-        Context::QueueApprove,
-        Key::code(KeyCode::Down),
-        Action::Down,
-        "",
-        "scroll the script down",
-    ),
-    bind(
-        Context::QueueApprove,
-        Key::char('k'),
-        Action::Up,
-        "",
-        "scroll the script up",
-    ),
-    bind(
-        Context::QueueApprove,
-        Key::code(KeyCode::Up),
-        Action::Up,
-        "",
-        "scroll the script up",
-    ),
-    bind(
-        Context::QueueApprove,
-        Key::code(KeyCode::PageDown),
-        Action::PageDown,
-        "",
-        "scroll the script a page down",
-    ),
-    bind(
-        Context::QueueApprove,
-        Key::code(KeyCode::PageUp),
-        Action::PageUp,
-        "",
-        "scroll the script a page up",
     ),
 ];
 

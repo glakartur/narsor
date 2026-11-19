@@ -230,7 +230,7 @@ where
             "/controller/v1/tasks/{task_id}/reader-credentials",
             post(post_reader_credential),
         )
-        .layer(middleware::from_fn_with_state(
+        .route_layer(middleware::from_fn_with_state(
             Arc::clone(&service),
             require_controller,
         ));
@@ -286,7 +286,7 @@ where
             "/runner/v1/materials/{material_id}/ack",
             post(post_runner_material_ack),
         )
-        .layer(middleware::from_fn_with_state(
+        .route_layer(middleware::from_fn_with_state(
             Arc::clone(&service),
             require_runner,
         ))
@@ -294,7 +294,7 @@ where
             // Its own gate: a credential that ran out may still renew.
             Router::new()
                 .route("/runner/v1/renew", post(post_renew))
-                .layer(middleware::from_fn_with_state(
+                .route_layer(middleware::from_fn_with_state(
                     Arc::clone(&service),
                     require_runner_renewal,
                 )),

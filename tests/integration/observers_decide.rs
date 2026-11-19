@@ -1,10 +1,11 @@
-//! Integration tests of the answer route of an observer's script (U6,
-//! KTD-6): `task decide` answers the gate of the queue entry its run was
-//! started for, with the validation of a person's answer (R13), as the
-//! observer and its run (R15), and the first answer of an episode wins.
+//! Integration tests of the answer route of an automation's `check` script
+//! (U6, KTD-6): `task decide` answers the gate of the queue entry its run
+//! was started for, with the validation of a person's answer (R13), as the
+//! automation and its run (R15), and the first answer of an episode wins.
 //!
-//! A real `ProtocolService` over a temporary state root and a manual clock;
-//! the runner channel is reached through its seam (`gate_support`).
+//! A real `ProtocolService` over a seeded catalogue (the `on_episodes` queue
+//! `mr-review`) and a manual clock; the runner channel is reached through
+//! its seam (`gate_support`).
 
 use std::fs;
 use std::path::PathBuf;
@@ -16,9 +17,6 @@ use narsor_engine::controller_protocol::{
     SubmitInputRequest,
 };
 use narsor_engine::domain::TaskId;
-use narsor_engine::observers::{
-    ObserverConfig, ObserverEffect, ObserverId, ObserverMode, ObserverName,
-};
 use narsor_engine::orchestration::{
     Clock, CommandRequest, ControlPlane, Observation, OwnerCommand, OwnerRef, RunnerState,
     TaskEventKind,
@@ -30,6 +28,7 @@ use narsor_protocol::controller::{
 };
 use serde_json::{json, Map, Value};
 
+use crate::automation_support::{always_queue, automation, on_episodes_queue, CHECK_SCRIPT};
 use crate::gate_support::{
     observe, past_gates, queued_task, review_gate, runner_problem, running, snapshot, wait_at,
     FIRST_RUNNER,
@@ -47,7 +46,7 @@ impl Clock for ManualClock {
     }
 }
 
-/// A state root, a clock, and a service over both.
+/// A catalogue and state root, a clock, and a service over both.
 struct Fixture {
     root: PathBuf,
     clock: Arc<ManualClock>,
@@ -82,25 +81,12 @@ impl Fixture {
         }
     }
 
-    /// An active observer of `queue` in `mode` with approved script
-    /// version 1. It creates no tasks.
-    fn active(&self, name: &str, queue: &str, mode: ObserverMode) -> ObserverId {
-        let mut config = ObserverConfig::new(
-            ObserverName::parse(name).unwrap(),
-            ObserverEffect::None,
-            mode,
-        );
-        config.queue = queue.to_string();
-        let store = self.service.observers();
-        let id = store
-            .create(owner(), config, None, self.clock.now())
-            .unwrap()
-            .observer_id;
-        store
-            .add_script(&id, "echo '{\"state\": {}}'\n", self.clock.now())
-            .unwrap();
-        self.service.approve_observer_version(&id, 1).unwrap();
-        id
+    /// [`QUEUE`] (`on_episodes`, every 300 s) served by `automations`.
+    fn served_by(&self, automations: &[&str]) {
+        for name in automations {
+            automation(&self.root, name, CHECK_SCRIPT, &[]);
+        }
+        on_episodes_queue(&self.root, QUEUE, automations, "{interval_secs: 300}");
     }
 
     /// A running task waiting at the `review_work` gate on [`QUEUE`] in
@@ -120,7 +106,7 @@ impl Fixture {
             .expect("a run is due")
     }
 
-    /// A run for the entry of each waiting task, one per observer.
+    /// A run for the entry of a waiting task.
     fn claimed_run(&self) -> ClaimedObserverRun {
         self.service.observer_pass();
         self.claim()
@@ -199,11 +185,11 @@ fn person_answers(fx: &Fixture, task: &TaskId, episode: &str, choice: &str, valu
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_script_answer_is_queued_as_the_observers_and_its_reason_is_kept() {
+fn a_script_answer_is_queued_as_the_automations_and_its_reason_is_kept() {
     // Covers AE1 up to the runner: the script chooses `check_feedback` with
-    // a reason; the input names the observer and its run.
+    // a reason; the input names the queue, the automation and its run.
     let fx = Fixture::new();
-    let observer = fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    fx.served_by(&["gitlab-mr"]);
     let task = fx.waiting_task("task-1", "input-1");
     let run = fx.claimed_run();
 
@@ -222,7 +208,7 @@ fn a_script_answer_is_queued_as_the_observers_and_its_reason_is_kept() {
         response.message
     );
     let provenance = TaskProvenance {
-        observer_id: observer.to_string(),
+        observer_id: QUEUE.to_string(),
         observer_name: "gitlab-mr".to_string(),
         run_id: run.run_id.to_string(),
     };
@@ -270,7 +256,7 @@ fn a_script_answer_is_queued_as_the_observers_and_its_reason_is_kept() {
 #[test]
 fn a_choice_with_its_required_variable_is_taken() {
     let fx = Fixture::new();
-    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    fx.served_by(&["gitlab-mr"]);
     let task = fx.waiting_task("task-1", "input-1");
     let run = fx.claimed_run();
 
@@ -296,7 +282,7 @@ fn a_choice_with_its_required_variable_is_taken() {
 #[test]
 fn a_retry_of_the_same_answer_returns_its_input_and_another_answer_is_refused() {
     let fx = Fixture::new();
-    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    fx.served_by(&["gitlab-mr"]);
     let task = fx.waiting_task("task-1", "input-1");
     let run = fx.claimed_run();
     let first = answer(&run, "check_feedback", Some("label removed"), json!({}));
@@ -323,7 +309,7 @@ fn a_script_answer_after_the_persons_answer_is_refused() {
     // Covers AE2: the person chooses first; the script's answer for the
     // same episode is refused, before and after the gate exits.
     let fx = Fixture::new();
-    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    fx.served_by(&["gitlab-mr"]);
     let task = fx.waiting_task("task-1", "input-1");
     let run = fx.claimed_run();
     person_answers(&fx, &task, "input-1", "revise_plan", json!({"note": "x"}));
@@ -342,16 +328,15 @@ fn a_script_answer_after_the_persons_answer_is_refused() {
 
 #[test]
 fn of_two_scripts_answering_one_episode_the_first_wins() {
-    // R8, R12: two observers of the queue run for the same entry; the
+    // R8, R12: two automations of the queue run for the same entry; the
     // second answer is refused.
     let fx = Fixture::new();
-    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
-    fx.active("github-pr", QUEUE, ObserverMode::OnEpisodes);
+    fx.served_by(&["gitlab-mr", "github-pr"]);
     let task = fx.waiting_task("task-1", "input-1");
     fx.service.observer_pass();
     let first = fx.claim();
     let second = fx.claim();
-    assert_ne!(first.run_id.observer_id, second.run_id.observer_id);
+    assert_ne!(first.run_id.key.automation, second.run_id.key.automation);
 
     let taken = fx.decide(&first, answer(&first, "check_feedback", None, json!({})));
     let refused = fx.decide(&second, answer(&second, "check_feedback", None, json!({})));
@@ -367,8 +352,7 @@ fn an_answer_the_runner_already_took_ends_the_episode_for_later_answers() {
     // First wins also between the runner taking an answer and its next
     // snapshot: a consumed input closes the episode.
     let fx = Fixture::new();
-    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
-    fx.active("github-pr", QUEUE, ObserverMode::OnEpisodes);
+    fx.served_by(&["gitlab-mr", "github-pr"]);
     let task = fx.waiting_task("task-1", "input-1");
     fx.service.observer_pass();
     let first = fx.claim();
@@ -381,7 +365,7 @@ fn an_answer_the_runner_already_took_ends_the_episode_for_later_answers() {
     let (delivered, _) = control
         .deliver_inputs(&task, FIRST_RUNNER, 1, Some("input-1"))
         .expect("the runner polls");
-    // What the runner gets names the observer (R15).
+    // What the runner gets names the automation's run (R15).
     assert_eq!(delivered.len(), 1);
     assert_eq!(
         delivered[0].observer.as_ref().map(|by| by.run_id.clone()),
@@ -402,7 +386,7 @@ fn an_answer_while_the_runner_reports_a_problem_is_refused_as_unavailable() {
     // R17: the gate still waits, so the refusal does not say it was
     // answered or left.
     let fx = Fixture::new();
-    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    fx.served_by(&["gitlab-mr"]);
     let task = fx.waiting_task("task-1", "input-1");
     let run = fx.claimed_run();
     runner_problem(&fx.service, &task);
@@ -421,7 +405,7 @@ fn an_entry_is_not_run_during_a_runner_problem_and_is_answered_after_it() {
     // script runs for it, since no answer could be taken. Once the runner
     // is back in the episode, the entry runs and its answer is queued.
     let fx = Fixture::new();
-    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    fx.served_by(&["gitlab-mr"]);
     let task = fx.waiting_task("task-1", "input-1");
     runner_problem(&fx.service, &task);
 
@@ -438,8 +422,8 @@ fn an_entry_is_not_run_during_a_runner_problem_and_is_answered_after_it() {
         1,
         "the entry is kept"
     );
-    *fx.clock.0.lock().unwrap() +=
-        chrono::Duration::seconds(narsor_engine::observers::DEFAULT_INTERVAL_SECS as i64);
+    // One interval of the queue: its next tick.
+    *fx.clock.0.lock().unwrap() += chrono::Duration::seconds(300);
     wait_at(&fx.service, &task, "input-1", &review_gate(QUEUE));
 
     let run = fx.claimed_run();
@@ -454,7 +438,7 @@ fn an_entry_is_not_run_during_a_runner_problem_and_is_answered_after_it() {
 #[test]
 fn an_answer_for_an_archived_task_is_refused_as_stale() {
     let fx = Fixture::new();
-    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    fx.served_by(&["gitlab-mr"]);
     let task = fx.waiting_task("task-1", "input-1");
     let run = fx.claimed_run();
     fx.service
@@ -475,7 +459,7 @@ fn an_answer_for_an_archived_task_is_refused_as_stale() {
 #[test]
 fn an_answer_the_gate_does_not_accept_is_refused_and_queues_nothing() {
     let fx = Fixture::new();
-    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    fx.served_by(&["gitlab-mr"]);
     let task = fx.waiting_task("task-1", "input-1");
     let run = fx.claimed_run();
 
@@ -515,7 +499,7 @@ fn an_answer_the_gate_does_not_accept_is_refused_and_queues_nothing() {
 #[test]
 fn a_run_answers_only_the_entry_it_was_started_for() {
     let fx = Fixture::new();
-    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    fx.served_by(&["gitlab-mr"]);
     let first = fx.waiting_task("task-1", "input-1");
     let second = fx.waiting_task("task-2", "input-7");
     let run = fx.claimed_run();
@@ -538,7 +522,14 @@ fn a_run_answers_only_the_entry_it_was_started_for() {
 fn an_always_run_answers_no_gate() {
     // R27: an `always` run has no entry.
     let fx = Fixture::new();
-    fx.active("jira-new", "jira-intake", ObserverMode::Always);
+    automation(&fx.root, "jira-new", CHECK_SCRIPT, &[]);
+    always_queue(
+        &fx.root,
+        "jira-intake",
+        "jira-new",
+        "{interval_secs: 300}",
+        "",
+    );
     let task = fx.waiting_task("task-1", "input-1");
     let run = fx.claimed_run();
     assert!(run.input.entry.is_none());
@@ -562,7 +553,7 @@ fn an_always_run_answers_no_gate() {
 #[test]
 fn a_run_that_ended_can_answer_no_more() {
     let fx = Fixture::new();
-    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    fx.served_by(&["gitlab-mr"]);
     let task = fx.waiting_task("task-1", "input-1");
     let run = fx.claimed_run();
     fx.service
@@ -591,7 +582,7 @@ fn a_script_answer_resumes_a_paused_task() {
     // Covers AE5: the task was paused at the gate; the answer waits on the
     // record and the task is resumed to take it, as after a person's answer.
     let fx = Fixture::new();
-    fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
+    fx.served_by(&["gitlab-mr"]);
     let task = queued_task(&fx.service, "task-1", &owner());
     let lease = running(&fx.service, &task);
     let gate = review_gate(QUEUE);

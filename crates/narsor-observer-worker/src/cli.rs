@@ -13,7 +13,7 @@ use narsor_api_client::api::{ApiClient, ClientError, TokenSource};
 use narsor_protocol::controller::OBSERVER_WORKER_KEY_ENV;
 
 use crate::worker::{
-    check_secrets_dir, current_uid, ProcessRunner, ScriptUser, Worker, WorkerOptions, POLL_INTERVAL,
+    check_secrets_dir, current_uid, ProcessRunner, ScriptUser, Worker, WorkerOptions, CLAIM_PAUSE,
 };
 
 /// The program's exit code on success.
@@ -37,9 +37,8 @@ pub struct WorkerArgs {
     #[arg(long, value_name = "URL")]
     pub server: String,
 
-    /// The directory of the observers' secrets: one subdirectory per
-    /// observer owner, one file per secret reference name in it. Must be
-    /// accessible to its owner only.
+    /// The directory of the automations' secrets: one file per secret name,
+    /// flat. Must be accessible to its owner only.
     #[arg(long, value_name = "DIRECTORY")]
     pub secrets_dir: Option<PathBuf>,
 
@@ -120,7 +119,7 @@ async fn serve(args: WorkerArgs) -> Result<(), StartError> {
     let worker = Worker::new(client, ProcessRunner, options);
     tracing::info!(server = %args.server, "observer worker: started");
     worker
-        .serve(args.once, POLL_INTERVAL, shutdown_signal())
+        .serve(args.once, CLAIM_PAUSE, shutdown_signal())
         .await
         .map_err(|stop| StartError::Failure(stop.to_string()))
 }

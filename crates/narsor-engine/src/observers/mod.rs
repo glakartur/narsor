@@ -1,14 +1,18 @@
-//! Observers of external sources: named automations whose shell script
-//! polls a source (Jira, GitHub, GitLab) on a schedule and creates tasks or
-//! answers the decision gates of their queue through `narsor-cli`.
+//! The runtime side of catalogue automations: the shell scripts of the
+//! automations of a queue poll a source (Jira, GitHub, GitLab) on the
+//! queue's schedule and create tasks or answer the decision gates of the
+//! queue through `narsor-cli`. What a queue or an automation does is a
+//! catalogue file ([`crate::automations`]); this module keeps what happens
+//! at run time.
 //!
-//! * [`model`] — the observer record (with its run in progress), the
-//!   execution errors of runs and the entries of observer queues, and the
-//!   validation of what an owner may configure;
+//! * [`model`] — the runtime record of a (queue, automation) pair (with its
+//!   run in progress), the execution errors of runs, the entries of
+//!   queues, and the schedule and task-creation types the catalogue uses;
 //! * [`schedule_expr`] — five-field cron expressions of schedules;
-//! * [`store`] — the file layout under `{state}/observers/` and
+//! * [`store`] — the file layout under
 //!   `{state}/observer-queues/`, and its locks;
-//! * [`migrate`] — reading a record of an older version;
+//! * [`migrate`] — the startup warning about stored observers of older
+//!   versions, which nothing reads;
 //! * [`contract`] — what a script reads on stdin and must print on stdout.
 //!
 //! The control plane owns the schedule and the effect routes; the worker
@@ -22,24 +26,25 @@ pub mod schedule_expr;
 pub mod store;
 
 pub use contract::{
-    parse_script_output, ContractError, ScriptChoice, ScriptEntry, ScriptInput, ScriptObserver,
+    parse_script_output, ContractError, ScriptChoice, ScriptEntry, ScriptExit, ScriptInput,
     ScriptOutput, ScriptVariable, ENTRY_DONE_EXIT_CODE, MAX_SCRIPT_OUTPUT_BYTES,
     SCRIPT_CONTRACT_VERSION,
 };
+pub use migrate::stored_observers_warning;
 pub use model::*;
 pub use schedule_expr::{CronSchedule, MAX_CRON_LEN};
 pub use store::{
-    EntryScan, EntryWrite, ObserverLock, ObserverStore, QueueEntriesLock, KEPT_RUN_FAILURES,
+    AutomationLock, EntryScan, EntryWrite, ObserverStore, QueueEntriesLock, KEPT_RUN_FAILURES,
 };
 
 use crate::persistence::PersistenceError;
 use std::path::PathBuf;
 use thiserror::Error;
 
-/// Result alias of observer operations.
+/// Result alias of automation runtime operations.
 pub type Result<T> = std::result::Result<T, ObserverError>;
 
-/// Why an observer operation was refused or failed.
+/// Why an operation on the automations' runtime state was refused or failed.
 ///
 /// Every refusal leaves the stored files untouched: the store validates
 /// before it writes.
@@ -59,57 +64,13 @@ pub enum ObserverError {
         source: std::io::Error,
     },
 
-    /// A value the owner or a caller gave is not acceptable.
+    /// A value a catalogue file or a caller gave is not acceptable.
     #[error("invalid {field}: {reason}")]
     Invalid {
         /// What was refused.
         field: &'static str,
         /// Why.
         reason: String,
-    },
-
-    /// No observer with this id exists.
-    #[error("observer '{0}' does not exist")]
-    NotFound(ObserverId),
-
-    /// Another observer already has this name.
-    #[error("an observer named '{0}' already exists")]
-    NameTaken(ObserverName),
-
-    /// Another observer of the owner's queue runs in another mode: every
-    /// observer of a queue has the same mode (R26).
-    #[error(
-        "queue '{queue}' runs its observers {mode} (observer '{observer}'): every observer of a queue has the same mode"
-    )]
-    QueueModeMismatch {
-        /// The queue.
-        queue: String,
-        /// The mode of the queue's observers.
-        mode: ObserverMode,
-        /// One observer of the queue in that mode.
-        observer: ObserverName,
-    },
-
-    /// The workflow of a "create a task" effect is not in the catalogue.
-    #[error("workflow '{0}' does not exist")]
-    WorkflowNotFound(String),
-
-    /// The observer has no such script version.
-    #[error("observer '{observer_id}' has no script version {version}")]
-    ScriptNotFound {
-        /// The observer.
-        observer_id: ObserverId,
-        /// The version asked for.
-        version: u32,
-    },
-
-    /// A script version on disk does not match the digest its record holds.
-    #[error("script version {version} of observer '{observer_id}' does not match its digest")]
-    ScriptCorrupt {
-        /// The observer.
-        observer_id: ObserverId,
-        /// The version.
-        version: u32,
     },
 
     /// A stored record has a schema version this build does not understand.
@@ -121,14 +82,15 @@ pub enum ObserverError {
         version: u32,
     },
 
-    /// A record was handed to the store under another observer's lock or
-    /// with an id that is not its own: a bug of the caller.
-    #[error("record of observer '{record}' used under the lock of observer '{lock}'")]
+    /// A record was handed to the store under another pair's lock, or a
+    /// record names another pair than its file: a bug, or a file moved by
+    /// hand.
+    #[error("record of '{record}' used under the lock of '{lock}'")]
     LockMismatch {
-        /// The observer the lock is for.
-        lock: ObserverId,
-        /// The observer the record names.
-        record: ObserverId,
+        /// The pair the lock is for.
+        lock: AutomationKey,
+        /// The pair the record names.
+        record: AutomationKey,
     },
 }
 

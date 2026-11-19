@@ -1,7 +1,9 @@
-//! Integration tests of the observers' effect routes (U3) on the service:
-//! "create a task" (no deduplication on the server), the task limit of a
-//! run and the provenance of what an observer creates. A real `ProtocolService` over a seeded catalogue and a manual clock; no
-//! daemon, no network.
+//! Integration tests of the effect routes of an automation's run (U3) on
+//! the service: "create a task" (no deduplication on the server), the task
+//! limit of a run and the provenance of what a queue creates. A real
+//! `ProtocolService` over a seeded catalogue (the `always` queue
+//! `jira-intake` served by `jira-new`, creating `triage` tasks) and a
+//! manual clock; no daemon, no network.
 
 use std::fs;
 use std::path::PathBuf;
@@ -11,12 +13,9 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_engine::controller_protocol::{
     ClaimedObserverRun, ProtocolError, ProtocolService, RunOutcome, RunReport,
 };
-use narsor_engine::domain::{TaskId, WorkflowDefinition};
+use narsor_engine::domain::TaskId;
 use narsor_engine::environment::EnvironmentCatalog;
-use narsor_engine::observers::{
-    CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverId, ObserverMode, ObserverName,
-    ObserverState, RunStatus,
-};
+use narsor_engine::observers::{AutomationKey, AutomationRecord, AutomationState, RunStatus};
 use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef, TaskEventKind};
 use narsor_engine::persistence::StatePaths;
 use narsor_protocol::controller::{
@@ -24,6 +23,11 @@ use narsor_protocol::controller::{
     OwnerCommandRequest,
 };
 use serde_json::{json, Value};
+
+use crate::automation_support::{always_queue, automation, write, CHECK_SCRIPT};
+
+const QUEUE: &str = "jira-intake";
+const AUTOMATION: &str = "jira-new";
 
 /// A clock the test moves by hand.
 #[derive(Debug)]
@@ -35,7 +39,8 @@ impl Clock for ManualClock {
     }
 }
 
-/// A seeded catalogue with a `triage` workflow, a clock, and a service.
+/// A seeded catalogue with a `triage` workflow and the queue
+/// [`QUEUE`], a clock, and a service.
 struct Fixture {
     root: PathBuf,
     clock: Arc<ManualClock>,
@@ -48,27 +53,12 @@ impl Drop for Fixture {
     }
 }
 
-fn owner() -> OwnerRef {
-    OwnerRef::new("owner")
+/// The owner of the installation the tests' service names.
+fn installation_owner() -> OwnerRef {
+    OwnerRef::new("installation-owner")
 }
 
-/// The `triage` workflow as the observer validates its mapping against.
-fn triage_definition() -> WorkflowDefinition {
-    serde_json::from_value(json!({
-        "id": "triage",
-        "name": "triage",
-        "version": 1,
-        "inputs": [
-            {"name": "ticket", "required": true},
-            {"name": "summary", "required": false},
-        ],
-        "states": {},
-        "initial_state": "start",
-    }))
-    .unwrap()
-}
-
-/// The `triage` workflow as the catalogue serves it to the launch resolver.
+/// The `triage` workflow as the catalogue serves it.
 fn triage_yaml() -> String {
     format!(
         "name: triage\nversion: 1\ninputs:\n  - name: ticket\n    type: string\n    \
@@ -80,20 +70,48 @@ fn triage_yaml() -> String {
     )
 }
 
+/// The `tasks:` settings of [`QUEUE`]: `triage` tasks, at most `limit` per
+/// run, on `backend` when given.
+fn tasks_settings(limit: u32, backend: Option<&str>) -> String {
+    let mut tasks = format!(
+        "  workflow_id: triage\n  mapping: {{ticket: key, summary: summary}}\n  \
+         task_limit_per_run: {limit}\n"
+    );
+    if let Some(backend) = backend {
+        tasks.push_str(&format!("  backend_id: {backend}\n"));
+    }
+    tasks
+}
+
 impl Fixture {
-    fn new() -> Self {
+    /// [`QUEUE`] creating at most `limit` tasks per run, on `backend`, in
+    /// an installation owned by [`installation_owner`].
+    fn new(limit: u32, backend: Option<&str>) -> Self {
+        Self::owned_by(limit, backend, Some(installation_owner()))
+    }
+
+    fn owned_by(limit: u32, backend: Option<&str>, owner: Option<OwnerRef>) -> Self {
         let root =
             std::env::temp_dir().join(format!("narsor-obs-effects-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let resolver = crate::environment_support::seeded_resolver(&root);
-        fs::write(root.join("workflows").join("triage.yaml"), triage_yaml()).unwrap();
+        write(&root, "workflows/triage.yaml", &triage_yaml());
+        automation(&root, AUTOMATION, CHECK_SCRIPT, &[]);
+        always_queue(
+            &root,
+            QUEUE,
+            AUTOMATION,
+            "{interval_secs: 300}",
+            &tasks_settings(limit, backend),
+        );
         let clock = Arc::new(ManualClock(Mutex::new(
             Utc.with_ymd_and_hms(2026, 11, 13, 12, 0, 0).unwrap(),
         )));
         let service = ProtocolService::new(
             ControlPlane::with_clock(StatePaths::new(&root), clock.clone()),
             resolver,
-        );
+        )
+        .with_installation_owner(Arc::new(move || owner.clone()));
         Self {
             root,
             clock,
@@ -101,43 +119,12 @@ impl Fixture {
         }
     }
 
-    fn now(&self) -> DateTime<Utc> {
-        self.clock.now()
+    fn key() -> AutomationKey {
+        AutomationKey::new(QUEUE, AUTOMATION).unwrap()
     }
 
     fn advance(&self, by: Duration) {
         *self.clock.0.lock().unwrap() += by;
-    }
-
-    /// An active "create a task" observer running approved version 1.
-    fn observer(&self, name: &str, limit: u32, backend: Option<&str>) -> ObserverId {
-        let mut config = ObserverConfig::new(
-            ObserverName::parse(name).unwrap(),
-            ObserverEffect::CreateTask(CreateTaskEffect {
-                workflow_id: "triage".into(),
-                workflow_version: 1,
-                workspaces: Default::default(),
-                backend_id: backend.map(str::to_string),
-                profile: None,
-                mapping: [
-                    ("ticket".to_string(), "key".to_string()),
-                    ("summary".to_string(), "summary".to_string()),
-                ]
-                .into(),
-            }),
-            ObserverMode::Always,
-        );
-        config.task_limit_per_run = limit;
-        let store = self.service.observers();
-        let id = store
-            .create(owner(), config, Some(&triage_definition()), self.now())
-            .unwrap()
-            .observer_id;
-        store
-            .add_script(&id, "echo '{\"state\": {}}'\n", self.now())
-            .unwrap();
-        self.service.approve_observer_version(&id, 1).unwrap();
-        id
     }
 
     /// Flags the due runs and claims one.
@@ -158,18 +145,34 @@ impl Fixture {
             .observer_create_task(&run.run_id, ObserverCreateTaskRequest { data })
     }
 
+    fn finish(&self, run: &ClaimedObserverRun) {
+        self.service
+            .finish_observer_run(
+                &run.run_id,
+                RunReport {
+                    outcome: RunOutcome::Exited { exit_code: 0 },
+                    stdout: r#"{"state": {}}"#.into(),
+                    stderr: String::new(),
+                },
+            )
+            .unwrap();
+    }
+
+    fn record(&self) -> AutomationRecord {
+        self.service
+            .observers()
+            .load(&Self::key())
+            .unwrap()
+            .expect("the pair's record")
+    }
+
     fn tasks(&self) -> usize {
         self.service.control_plane().list_tasks().unwrap().len()
     }
 
-    /// The tasks the run in progress created, from the observer's record.
+    /// The tasks the run in progress created, from the pair's record.
     fn tasks_created(&self, run: &ClaimedObserverRun) -> u32 {
-        let record = self
-            .service
-            .observers()
-            .load(&run.run_id.observer_id)
-            .unwrap();
-        let active = record.active_run.expect("the run is in progress");
+        let active = self.record().active_run.expect("the run is in progress");
         assert_eq!(active.sequence, run.run_id.sequence);
         active.tasks_created
     }
@@ -190,8 +193,7 @@ fn conflict_code(error: &ProtocolError) -> &str {
 fn every_call_creates_a_new_task_with_a_random_id() {
     // D17: the server does not deduplicate; the script keeps track in its
     // state of what it already reported.
-    let fx = Fixture::new();
-    let id = fx.observer("jira-new", 10, None);
+    let fx = Fixture::new(10, None);
     let run = fx.claim();
 
     let first = fx.create(&run, issue("ABC-123")).unwrap();
@@ -202,17 +204,16 @@ fn every_call_creates_a_new_task_with_a_random_id() {
     let first_id = first.task_id.expect("a task id");
     let again_id = again.task_id.expect("a task id");
     assert_ne!(first_id, again_id);
-    assert!(!first_id.starts_with(id.as_str()), "{first_id}");
+    assert!(!first_id.starts_with(QUEUE), "{first_id}");
     assert!(first.message.contains(&first_id), "{}", first.message);
     assert_eq!(fx.tasks(), 2);
     assert_eq!(fx.tasks_created(&run), 2);
 }
 
 #[test]
-fn a_run_over_its_task_limit_is_refused_and_the_observer_waits_for_its_owner() {
+fn a_run_over_its_task_limit_is_refused_and_the_pair_waits_for_a_new_check_script() {
     // Covers AE4: a wrong query yields 250 issues; the limit is 10.
-    let fx = Fixture::new();
-    let id = fx.observer("jira-new", 10, None);
+    let fx = Fixture::new(10, None);
     let run = fx.claim();
 
     let mut created = 0;
@@ -233,38 +234,39 @@ fn a_run_over_its_task_limit_is_refused_and_the_observer_waits_for_its_owner() {
 
     assert_eq!((created, refused), (10, 240));
     assert_eq!(fx.tasks(), 10);
-    let record = fx.service.observers().load(&id).unwrap();
-    assert_eq!(record.state, ObserverState::NeedsAttention);
-    // Nothing runs on schedule until the owner resumes it.
-    fx.service
-        .finish_observer_run(
-            &run.run_id,
-            RunReport {
-                outcome: RunOutcome::Exited { exit_code: 0 },
-                stdout: r#"{"state": {}}"#.into(),
-                stderr: String::new(),
-            },
-        )
-        .unwrap();
+    assert_eq!(fx.record().state, AutomationState::NeedsAttention);
+    // Nothing runs on schedule while the check script stays the same...
+    fx.finish(&run);
     fx.advance(Duration::hours(1));
     fx.service.observer_pass();
     assert!(fx.service.claim_observer_run().unwrap().is_none());
+    // ...and a fixed check script puts the pair back on its schedule.
+    write(
+        &fx.root,
+        &format!("automations/{AUTOMATION}/check.sh"),
+        "echo '{\"state\": {\"fixed\": true}}'\n",
+    );
+    fx.advance(Duration::hours(1));
+    let restarted = fx.service.observer_pass();
+    assert_eq!(restarted.restarted, vec![Fixture::key()]);
+    // The restarted pair is due at once: the next pass flags its run.
+    fx.service.observer_pass();
+    assert!(fx.service.claim_observer_run().unwrap().is_some());
 }
 
 #[test]
-fn an_observer_task_carries_its_provenance_and_belongs_to_the_observer_owner() {
-    // R19, and the owner sees it in the task list.
-    let fx = Fixture::new();
-    let id = fx.observer("jira-new", 10, None);
+fn a_queue_task_carries_its_provenance_and_belongs_to_the_installation_owner() {
+    // R19, A4: the owner sees it in the task list.
+    let fx = Fixture::new(10, None);
     let run = fx.claim();
     let response = fx.create(&run, issue("ABC-7")).unwrap();
     let task_id = TaskId::parse(response.task_id.unwrap()).unwrap();
 
     let record = fx.service.control_plane().task(&task_id).unwrap();
-    assert_eq!(record.owner, owner());
+    assert_eq!(record.owner, installation_owner());
     let provenance = record.provenance.clone().expect("provenance");
-    assert_eq!(provenance.observer_id, id.to_string());
-    assert_eq!(provenance.observer_name, "jira-new");
+    assert_eq!(provenance.observer_id, QUEUE);
+    assert_eq!(provenance.observer_name, AUTOMATION);
     assert_eq!(provenance.run_id, run.run_id.to_string());
     assert_eq!(
         record.launch_spec.inputs,
@@ -280,7 +282,10 @@ fn an_observer_task_carries_its_provenance_and_belongs_to_the_observer_owner() {
         TaskEventKind::CreatedByObserver { provenance }
     );
 
-    let listed = fx.service.list_tasks_where(&owner(), None).unwrap();
+    let listed = fx
+        .service
+        .list_tasks_where(&installation_owner(), None)
+        .unwrap();
     assert!(listed
         .tasks
         .iter()
@@ -288,10 +293,21 @@ fn an_observer_task_carries_its_provenance_and_belongs_to_the_observer_owner() {
 }
 
 #[test]
+fn an_installation_with_no_owner_yet_creates_no_task() {
+    let fx = Fixture::owned_by(10, None, None);
+    let run = fx.claim();
+
+    let refused = fx.create(&run, issue("ABC-1")).unwrap_err();
+
+    assert_eq!(conflict_code(&refused), "no_installation_owner");
+    assert_eq!(fx.tasks(), 0);
+    assert_eq!(fx.tasks_created(&run), 0);
+}
+
+#[test]
 fn a_refused_task_does_not_count_and_a_later_call_tries_again() {
-    // The observer pins a backend the catalogue does not have (yet).
-    let fx = Fixture::new();
-    let _id = fx.observer("jira-new", 10, Some("later-backend"));
+    // The queue pins a backend the catalogue does not have (yet).
+    let fx = Fixture::new(10, Some("later-backend"));
     let run = fx.claim();
 
     let refused = fx.create(&run, issue("ABC-1")).unwrap_err();
@@ -312,8 +328,7 @@ fn a_refused_task_does_not_count_and_a_later_call_tries_again() {
 
 #[test]
 fn effect_data_outside_the_mapping_is_refused_and_records_nothing() {
-    let fx = Fixture::new();
-    let _id = fx.observer("jira-new", 10, None);
+    let fx = Fixture::new(10, None);
     let run = fx.claim();
 
     let refused = fx
@@ -327,19 +342,9 @@ fn effect_data_outside_the_mapping_is_refused_and_records_nothing() {
 
 #[test]
 fn a_run_that_ended_can_have_no_more_effects() {
-    let fx = Fixture::new();
-    let _id = fx.observer("jira-new", 10, None);
+    let fx = Fixture::new(10, None);
     let run = fx.claim();
-    fx.service
-        .finish_observer_run(
-            &run.run_id,
-            RunReport {
-                outcome: RunOutcome::Exited { exit_code: 0 },
-                stdout: r#"{"state": {}}"#.into(),
-                stderr: String::new(),
-            },
-        )
-        .unwrap();
+    fx.finish(&run);
 
     let refused = fx.create(&run, issue("ABC-1")).unwrap_err();
     assert!(
@@ -351,30 +356,25 @@ fn a_run_that_ended_can_have_no_more_effects() {
         .authenticate_observer_run(run.token.expose())
         .is_none());
     assert_eq!(fx.tasks(), 0);
-    let record = fx
-        .service
-        .observers()
-        .load(&run.run_id.observer_id)
-        .unwrap();
+    let record = fx.record();
     assert_eq!(record.active_run, None);
     assert_eq!(record.last_run.unwrap().status, RunStatus::Succeeded);
 }
 
 #[test]
 fn an_owner_key_with_the_observer_prefix_is_refused() {
-    let fx = Fixture::new();
-    let _id = fx.observer("jira-new", 10, None);
+    let fx = Fixture::new(10, None);
     let run = fx.claim();
     let task_id = fx.create(&run, issue("ABC-1")).unwrap().task_id.unwrap();
 
     let refused = fx
         .service
         .command(
-            &owner(),
+            &installation_owner(),
             &task_id,
             OwnerCommandRequest {
                 command: OwnerCommand::Pause,
-                idempotency_key: "observer:obs-x:ABC-1".into(),
+                idempotency_key: "observer:jira-intake~jira-new~1:ABC-1".into(),
                 expected_generation: None,
             },
         )

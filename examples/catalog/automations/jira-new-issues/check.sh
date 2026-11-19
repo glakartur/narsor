@@ -1,34 +1,24 @@
 #!/bin/sh
-# Narsor observer example: one task for every new Jira issue that a JQL
-# query selects. Read docs/user/observers.md first.
+# jira-new-issues, phase `check`: one task for every new Jira issue that a
+# JQL query selects. It serves a queue of mode `always` with `tasks` (see
+# queues/jira-intake.yaml). Read docs/user/observers.md first.
 #
-# Create the observer once, as the owner (the workflow `triage` has an input
-# `ticket`; the script sends the issue key in the data field `key`):
-#
-#   narsor-cli observer create jira-new \
-#     --workflow triage --map ticket=key \
-#     --secret jira-token=JIRA_TOKEN --task-limit 10 \
-#     --condition '{"base_url": "https://jira.example.com",
-#                   "jql": "project = ABC AND issuetype = Bug",
-#                   "fields": ["key"]}'
-#   narsor-cli observer script set jira-new --file jira-new-issues.sh
-#   narsor-cli observer approve jira-new --version 1
-#
-# Condition (a JSON object, given to the script as it is):
+# The queue's condition (a JSON object, given to the script as it is):
 #   base_url     https:// address of the Jira server. Required.
 #   jql          the query, without ORDER BY. Required.
 #   fields       the data fields sent for each issue. Each one must be a
-#                field that the observer maps (--map INPUT=FIELD): the
-#                control plane refuses a field it does not map. Available:
-#                key, summary, issue_type, priority, status, labels, url,
-#                description. Default: ["key"].
+#                field that the queue maps (`tasks.mapping`, input: field):
+#                the control plane refuses a field it does not map.
+#                Available: key, summary, issue_type, priority, status,
+#                labels, url, description. Default: ["key"].
 #   max_results  the most issues one run looks at, 1-100. Default: 10. Keep
-#                it at or below the observer's --task-limit.
+#                it at or below the queue's `tasks.task_limit_per_run`.
 #   api_path     the search endpoint. Default: /rest/api/2/search.
 #
 # Secrets: JIRA_TOKEN, a personal access token sent as a Bearer token. When
-# the secret JIRA_USER is also given, the script sends JIRA_USER:JIRA_TOKEN
-# as basic authentication instead (Jira Cloud).
+# JIRA_USER is also set (declare `{name: jira-user, env: JIRA_USER}` in
+# automation.yaml), the script sends JIRA_USER:JIRA_TOKEN as basic
+# authentication instead (Jira Cloud).
 #
 # Personal data: Jira issues can hold data of customers and other people.
 # The script sends to Narsor only the fields in `fields`, never the
@@ -37,23 +27,23 @@
 # people: send them only when the workflow needs them, and only when you
 # know what they hold.
 #
-# State: {"last_id": N}, the highest Jira issue id the observer handled.
-#  * First run without --import-backlog: the script only records the
+# State: {"last_id": N}, the highest Jira issue id the automation handled.
+#  * First run without `tasks.import_backlog`: the script only records the
 #    newest matching issue as the starting point and creates no task.
-#  * First run with --import-backlog, and every later run: one task for
-#    each matching issue with an id above last_id, oldest first, at most
-#    max_results per run; the next run continues from there.
+#  * First run with `tasks.import_backlog: true`, and every later run: one
+#    task for each matching issue with an id above last_id, oldest first, at
+#    most max_results per run; the next run continues from there.
 # Narsor does not stop a second task for the same issue: the state does.
 # When a task is not created, the script stops creating tasks and logs the
 # reason on stderr. When the run created a task before that, it prints the
 # state up to the last task it created and exits 0, so the next run
 # continues from there and repeats no task. When the run created no task,
-# it exits 1: Narsor records the error, the observer counts it, and a
-# refusal that does not go away (an unmapped field, a limit, a policy)
-# brings the observer to error (5 failed runs in a row) instead of
-# repeating the same issue for ever. The run created nothing, so its
-# failure gives no second task. Only when the state of a successful run is
-# not saved can an issue get a second task (docs/user/observers.md).
+# it exits 1: Narsor records the error and counts it, and a refusal that
+# does not go away (an unmapped field, a limit, a policy) stops the
+# automation (`error`, 5 failed runs in a row) instead of repeating the same
+# issue for ever. The run created nothing, so its failure gives no second
+# task. Only when the state of a successful run is not saved can an issue
+# get a second task (docs/user/observers.md).
 #
 # Tests: when FAKE_SOURCE_DIR is set, the script reads the answer of Jira
 # from "$FAKE_SOURCE_DIR/search.json" and does not use the network.
@@ -70,8 +60,10 @@ fail() {
 command -v jq >/dev/null 2>&1 || fail "jq is not installed"
 
 input=$(cat)
-printf '%s' "$input" | jq -e '.contract_version == 2' >/dev/null ||
-    fail "the input is not version 2 of the script contract"
+printf '%s' "$input" | jq -e '.contract_version == 3' >/dev/null ||
+    fail "the input is not version 3 of the script contract"
+printf '%s' "$input" | jq -e '.phase == "check"' >/dev/null ||
+    fail "the script runs as the check script of its automation only"
 
 # read_input FILTER: the value of a jq filter over the input, as text.
 read_input() {
@@ -138,7 +130,7 @@ search() {
         cat "$FAKE_SOURCE_DIR/search.json"
         return
     fi
-    [ -n "${JIRA_TOKEN:-}" ] || fail "JIRA_TOKEN is not set: give the observer the secret"
+    [ -n "${JIRA_TOKEN:-}" ] || fail "JIRA_TOKEN is not set: put the secret jira-token in the secrets directory"
     curl_config | curl --silent --show-error --fail --proto =https \
         --max-time 60 --config - --get \
         --header 'Accept: application/json' \

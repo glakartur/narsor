@@ -4,7 +4,7 @@
 
 import { html, useEffect, useState } from '../../lib.js';
 import { scaled, stepIcon } from '../../model.js';
-import { clock, duration, positionGlyph, positionRole } from '../../text.js';
+import { clock, duration, gateLines, gateOverlay, gatePositionLabel, positionGlyph, positionRole } from '../../text.js';
 import { Conversation } from './conversation.js';
 
 function tokens(usage) {
@@ -38,8 +38,16 @@ function Step({ position, selected, now, onSelect }) {
     </li>`;
 }
 
+/** The entry and exit scripts of the gate under its step (R20). */
+export function GateScripts({ gate }) {
+  return html`<ul class="gate-scripts small-text" aria-label="Skrypty kolejki">
+    ${gateLines(gate).map((line) => html`<li class=${`role-${line.role}`}>${line.text}</li>`)}
+  </ul>`;
+}
+
 export function Progress({ api, task, timeline, now }) {
-  const positions = timeline?.positions ?? [];
+  const gate = task.gate_automation ?? null;
+  const positions = gateOverlay(timeline?.positions, gate);
   const current = timeline?.default_position ?? positions[positions.length - 1]?.label ?? null;
   const [chosen, setChosen] = useState(null);
   useEffect(() => setChosen(null), [task.task_id]);
@@ -57,6 +65,7 @@ export function Progress({ api, task, timeline, now }) {
           <strong>${position?.label}</strong>
           <span class=${chosen ? 'muted' : 'role-live'}>${chosen ? html`· ręcznie <button class="link" onClick=${() => setChosen(null)}>podążaj</button>` : '↧ podąża'}</span>
         </div>
+        ${gate && position && position.label === gatePositionLabel(positions, gate) && html`<${GateScripts} gate=${gate} />`}
         ${position && html`<${Conversation} api=${api} task=${task} positions=${[position]}
           emptyText=${position.conversation?.state === 'not_created' ? `rozmowa nie powstała: ${position.conversation.reason ?? ''}` : 'ten krok nie ma rozmowy'} />`}
       </div>

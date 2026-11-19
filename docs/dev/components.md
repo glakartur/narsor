@@ -21,7 +21,7 @@ decisions behind this structure, see `architecture.md`.
 | `narsor-server` | The daemon (control plane): the API server, its lifecycle and the child processes it supervises. |
 | `narsor-runner` | The isolated task runner: the Engine run against one portable task storage. |
 | `narsor-controller` | The environment controller process: `narsor-controller local` and `narsor-controller kubernetes`. |
-| `narsor-observer-worker` | The observer worker: claims due observer runs and executes their scripts. |
+| `narsor-observer-worker` | The observer worker: claims the due runs of the catalogue's automations (`in`, `check`, `out`) and executes their scripts. |
 | `narsor-web` | The browser interface: serves the single-page application and proxies `/control/v1` to a `narsor-server`. |
 
 ## Build-time dependencies
@@ -119,7 +119,7 @@ graph TD
   pod -- "workflow actions" --> agent
 
   obs -. "/observer/v1/worker: claim, result" .-> server
-  obs -- "runs" --> script[observer script]
+  obs -- "runs" --> script[automation script]
   script -. "polls" .-> ext([Jira / GitHub / GitLab])
   script -- "calls" --> cli2[narsor-cli]
   cli2 -. "/observer/v1/runs: tasks, decide" .-> server
@@ -137,8 +137,8 @@ graph TD
 | `narsor-controller kubernetes` | Kubernetes | One Pod (command `narsor-runner`) and one PVC per task | Kubernetes API (`controller/src/kubernetes/manifest.rs`) |
 | `narsor-runner` | `narsor-server` | Poll, renew, snapshots, usage, materials | HTTP, `/runner/v1` |
 | `narsor-runner` | agent harness, scripts, git | Execute workflow actions | process (`engine/src/engine/actions/`) |
-| `narsor-observer-worker` | `narsor-server` | Claim due runs, report results | HTTP, `/observer/v1/worker` |
-| Observer script | `narsor-cli` → `narsor-server` | Create tasks (`task create --data`); answer the decision gate of its queue entry (`task decide`, `POST /observer/v1/runs/{run}/decide`) | process, then HTTP `/observer/v1/runs` |
+| `narsor-observer-worker` | `narsor-server` | Claim due runs (the server holds the claim up to 25 s), report results | HTTP, `/observer/v1/worker` |
+| Automation script (`check` only) | `narsor-cli` → `narsor-server` | Create tasks (`task create --data`); answer the decision gate of its queue entry (`task decide`, `POST /observer/v1/runs/{run}/decide`) | process, then HTTP `/observer/v1/runs` |
 
 Properties of the runtime:
 
@@ -148,13 +148,19 @@ Properties of the runtime:
 - The `local` backend works like the `kubernetes` backend: its controller is
   a separate process that enrolls through the same `/controller/v1`
   protocol.
-- Observer queues live in the control plane only (`narsor-engine`,
-  `observers/` and `controller_protocol/service/observers/`). A runner
+- Automations and queues are catalogue files (`{catalog}/automations/`,
+  `{catalog}/queues/`), read by `narsor-engine` (`automations/`) at every
+  load, with no cache. Their scheduling lives in the control plane only
+  (`observers/` and `controller_protocol/service/observers/`), per (queue,
+  automation) pair, with the runtime state in
+  `{state}/observer-queues/automations/{queue}/{automation}/`. A runner
   reports the rendered `watch` of a waiting `decision` gate in its snapshot
   (`gate_watch`). The control plane keeps one queue entry per wait episode
-  in `{state}/observer-queues/entries/` and removes it when the gate exits.
-  A runner gets an observer's answer as a queued input, as a person's
-  answer. The runner protocol has no event delivery (D77).
+  in `{state}/observer-queues/entries/`, runs the `in` scripts when the
+  episode begins, holds every exit on the task record until the `out`
+  scripts ended, and then removes the entry. A runner gets an automation's
+  answer as a queued input, as a person's answer; a held exit reaches it at
+  its next poll. The runner protocol has no event delivery (D77, D78).
 - Only `narsor-runner` executes workflows. The daemon drives no execution:
   its `/executions` routes read what runners keep and hand answers to the
   task of the execution.

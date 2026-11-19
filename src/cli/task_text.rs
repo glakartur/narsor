@@ -22,8 +22,9 @@ use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
 use crate::tui::task_app::list::{attention_of, Attention};
 use narsor_protocol::controller::PendingInputRefView;
 use narsor_protocol::controller::{
-    AttentionItem, AttentionKind, ConversationAttemptSummary, InputStatus, OperatorCommand,
-    OwnerCommand, QueueReason, RunnerState, SlotReleaseReason, TaskEvent, TaskEventKind, TaskState,
+    AttentionItem, AttentionKind, ConversationAttemptSummary, GateAutomationPhase, GateHookView,
+    InputStatus, OperatorCommand, OwnerCommand, QueueReason, RunnerState, SlotReleaseReason,
+    TaskEvent, TaskEventKind, TaskState,
 };
 use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, WorkspaceHeader};
 
@@ -455,6 +456,9 @@ fn is_live(task: &TaskSummary) -> bool {
 
 /// What the owner can do about the task now, in words.
 pub fn state_hint(task: &TaskSummary) -> Option<ToneLine> {
+    if let Some(hint) = gate_hint(task) {
+        return Some(hint);
+    }
     let hint = match task.state {
         TaskState::Queued => {
             let queue = task.queue.as_ref()?;
@@ -519,6 +523,102 @@ pub fn state_hint(task: &TaskSummary) -> Option<ToneLine> {
         TaskState::Unrecognized => return None,
     };
     Some(hint)
+}
+
+/// What the gate's entry or exit scripts mean for the owner, while they
+/// hold the gate of a task that still waits there (running, or waiting
+/// for an answer, not interrupted): an entry script failed for good, or an
+/// exit is held. A task that ended, paused or lost its workload gets the
+/// hint of its state.
+fn gate_hint(task: &TaskSummary) -> Option<ToneLine> {
+    let waits = matches!(task.state, TaskState::Running | TaskState::HumanNeeded)
+        && task.runner_state != RunnerState::Interrupted;
+    if !waits {
+        return None;
+    }
+    match task.gate_automation.as_ref()?.phase {
+        GateAutomationPhase::EntryFailed => Some(ToneLine::new(
+            "the entry script failed: answer the gate or restart the step (narsor-cli task \
+             restart-step)",
+            Tone::Error,
+        )),
+        GateAutomationPhase::Exiting => Some(ToneLine::new(
+            "the exit is held while the exit scripts run; it reaches the runner once they end",
+            Tone::Normal,
+        )),
+        _ => None,
+    }
+}
+
+/// Longest error excerpt a gate script line shows, in characters.
+const GATE_ERROR_EXCERPT: usize = 120;
+
+/// Where the entry (`in`) and exit (`out`) scripts of the task's watched
+/// gate stand: the phase, one line per script (status, attempts, the last
+/// error, the next attempt) and the held exit. Empty without them.
+pub fn gate_lines(task: &TaskSummary) -> Vec<ToneLine> {
+    let Some(gate) = &task.gate_automation else {
+        return Vec::new();
+    };
+    let (phase, tone) = match gate.phase {
+        GateAutomationPhase::Entering => ("waiting for the entry scripts", Tone::Normal),
+        GateAutomationPhase::Ready => ("ready", Tone::Good),
+        GateAutomationPhase::EntryFailed => ("entry failed", Tone::Error),
+        GateAutomationPhase::Exiting => ("exiting", Tone::Normal),
+        GateAutomationPhase::Released => ("exit scripts ended", Tone::Good),
+        GateAutomationPhase::Unrecognized => ("unknown", Tone::Muted),
+    };
+    let mut lines = vec![ToneLine::new(
+        format!("Gate       scripts of queue {}: {phase}", gate.queue),
+        tone,
+    )];
+    for hook in &gate.hooks {
+        lines.push(gate_hook_line(hook, task.as_of));
+    }
+    if let Some(exit) = &gate.exit {
+        let choice = exit.choice.as_deref().unwrap_or("an exit");
+        let held = if gate.phase == GateAutomationPhase::Exiting {
+            "exit held"
+        } else {
+            "exit"
+        };
+        lines.push(ToneLine::new(
+            format!("  {held}: {choice} by {}", exit.author),
+            Tone::Normal,
+        ));
+    }
+    lines
+}
+
+fn gate_hook_line(hook: &GateHookView, now: DateTime<Utc>) -> ToneLine {
+    let mut text = format!(
+        "  {:<3} {}: {}, attempt {} of {}",
+        hook.hook, hook.automation, hook.status, hook.attempts, hook.max_attempts
+    );
+    if let Some(error) = &hook.last_error {
+        let line = error.split_whitespace().collect::<Vec<_>>().join(" ");
+        let excerpt: String = line.chars().take(GATE_ERROR_EXCERPT).collect();
+        text.push_str(&format!(" · {excerpt}"));
+    }
+    let retry_at = (hook.status == "pending")
+        .then(|| hook.log.last().and_then(|entry| entry.retry_at))
+        .flatten();
+    if let Some(retry_at) = retry_at {
+        let seconds = (retry_at - now).num_seconds().max(0);
+        text.push_str(&format!(" · next attempt in {}", short_age(seconds)));
+    }
+    if let Some(file) = &hook.waiting_for {
+        text.push_str(&format!(
+            " · waits for the catalogue file {file}: an operator fixes or removes it, or restart \
+             the step"
+        ));
+    }
+    let tone = match hook.status.as_str() {
+        "failed" => Tone::Error,
+        "pending" if hook.last_error.is_some() || hook.waiting_for.is_some() => Tone::Warning,
+        _ => Tone::Normal,
+    };
+    ToneLine::new(text, tone)
 }
 
 /// What an interrupted task waits for — the automatic resume or its owner —
@@ -604,6 +704,7 @@ pub fn detail_lines(
         lines.push(hint);
     }
     lines.extend(attention_lines(task));
+    lines.extend(gate_lines(task));
 
     match &task.controller {
         Some(controller) if controller.freshness == Freshness::Live => lines.push(ToneLine::new(
@@ -907,6 +1008,29 @@ pub fn event_line(event: &TaskEvent) -> String {
         } => format!(
             "warning: step {step} waits on queue {queue} (episode {episode}): {reason}"
         ),
+        TaskEventKind::GateHookAttempt {
+            step,
+            automation,
+            hook,
+            attempt,
+            error,
+            skipped,
+            retry_at,
+            gate_phase,
+            ..
+        } => {
+            let result = match (error, skipped) {
+                (Some(error), _) => format!("attempt {attempt} failed: {error}"),
+                (None, Some(reason)) => format!("skipped: {reason}"),
+                (None, None) => format!("attempt {attempt} succeeded"),
+            };
+            let next = match (retry_at, gate_phase) {
+                (Some(at), _) => format!("; next attempt at {}", at.to_rfc3339()),
+                (None, Some(phase)) => format!("; gate automations {}", phase.as_str()),
+                (None, None) => String::new(),
+            };
+            format!("step {step}: {hook} script of automation {automation}, {result}{next}")
+        }
         TaskEventKind::OwnerCommandAccepted { command, .. } => {
             format!("owner command {command:?}")
         }

@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 
 use crate::controller_protocol::credentials::{RunnerIdentity, RunnerRole};
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
+use crate::controller_protocol::service::observers::gate_scripts;
 use crate::controller_protocol::service::operator::protocol_delivery;
 use crate::controller_protocol::service::{chrono_duration, ProtocolService};
 use crate::controller_protocol::wire::*;
@@ -40,18 +41,15 @@ impl ProtocolService {
                 self.notify(&identity.task_id);
             }
         }
-        let outcome = self.control.record_runner_snapshot_with(
-            &identity.task_id,
+        // Before the session check, so a refusal there cannot leave the
+        // queue entries behind the record.
+        let outcome = self.record_runner_snapshot_of(
+            &current,
             &identity.incarnation,
             identity.launch_generation,
             snapshot,
             chrono_duration(grace),
         )?;
-        // The queue entries follow the gate's episodes the record now holds:
-        // the ended one's entry goes before the new one's is added (R16,
-        // KTD-5). Before the session check, so a refusal there cannot leave
-        // the entries behind the record.
-        self.follow_gate_episode(&outcome.task, &outcome.gate_change);
         self.credentials
             .touch_runner(identity, None)?
             .ok_or(ProtocolError::Unauthorized)?;
@@ -72,6 +70,67 @@ impl ProtocolService {
             launch: launch_view(identity, &task),
             default_harness: self.default_harness_of(&task),
         })
+    }
+
+    /// Records a runner snapshot of `task_id` (see
+    /// [`crate::orchestration::ControlPlane::record_runner_snapshot_with`])
+    /// and follows the watched gate episodes it ended and began: a new
+    /// episode gets its entry scripts from the catalogue as it is now, in
+    /// the same write (R8, R17), and the queue entries follow the record —
+    /// the ended episode's entry goes before the new one's is added (R16,
+    /// KTD-5).
+    ///
+    /// The runner channel's snapshot route without its credential checks.
+    pub fn record_runner_snapshot(
+        &self,
+        task_id: &crate::domain::TaskId,
+        incarnation: &str,
+        launch_generation: u64,
+        snapshot: crate::orchestration::RunnerSnapshot,
+        grace: chrono::Duration,
+    ) -> Result<crate::orchestration::RunnerReportOutcome, crate::orchestration::OrchestrationError>
+    {
+        let known = self.control.task(task_id)?;
+        self.record_runner_snapshot_of(&known, incarnation, launch_generation, snapshot, grace)
+    }
+
+    /// [`Self::record_runner_snapshot`] of the task `known`, as read just
+    /// before. The catalogue is read once, before the task's write, when
+    /// the snapshot begins a watched episode `known` does not have; should
+    /// the task change meanwhile, the write reads it itself.
+    fn record_runner_snapshot_of(
+        &self,
+        known: &TaskRecord,
+        incarnation: &str,
+        launch_generation: u64,
+        snapshot: crate::orchestration::RunnerSnapshot,
+        grace: chrono::Duration,
+    ) -> Result<crate::orchestration::RunnerReportOutcome, crate::orchestration::OrchestrationError>
+    {
+        let known_episode = known
+            .watched_gate
+            .as_ref()
+            .map(|gate| gate.episode.as_str());
+        let begins_episode = snapshot.gate_watch.is_some()
+            && snapshot
+                .pending_input
+                .as_ref()
+                .is_some_and(|pending| Some(pending.id.as_str()) != known_episode);
+        let catalog = begins_episode.then(|| self.automation_catalog());
+        let entry_scripts = |queue: &str| match &catalog {
+            Some(catalog) => gate_scripts(catalog, queue),
+            None => gate_scripts(&self.automation_catalog(), queue),
+        };
+        let outcome = self.control.record_runner_snapshot_with(
+            &known.task_id,
+            incarnation,
+            launch_generation,
+            snapshot,
+            grace,
+            Some(&entry_scripts),
+        )?;
+        self.follow_gate_episode(&outcome.task, &outcome.gate_change, catalog.as_ref());
+        Ok(outcome)
     }
 
     /// The installation's default harness as it applies to the task of

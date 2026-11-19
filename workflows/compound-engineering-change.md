@@ -64,22 +64,31 @@ flowchart TD
 | `review_code` | Always, after a clean code review. | Chooses `approve` for the whole code, or writes questions and notes in threads and chooses `feedback`. |
 | `finalize_blocked` | Only when `finalize` could not take the pull request out of Draft. | Fixes the cause and chooses `retry`, or takes it out of Draft and chooses `done`. |
 
-## An observer at the gates
+## A queue at the gates
 
 The gates `requirements_questions`, `plan_questions` and `review_code` have a
 `watch` block on the queue `mr-review`, with the params `mr_url` (the pull
-request), `label` (`narsor-review`) and `choice` (`answered`, or `feedback` at
-`review_code`). Before each of these gates the agent puts the label
-`narsor-review` on the pull request. The person removes it when their answers
-or notes are on the pull request.
+request) and `choice` (`answered`, or `feedback` at `review_code`). The
+workflow has no step for the review label: the queue does that work.
 
-An `on_episodes` observer of the queue `mr-review` with the script
-[`gitlab-mr-review.sh`](observers/examples/gitlab-mr-review.sh) or
-[`github-pr-review.sh`](observers/examples/github-pr-review.sh) then answers
-the gate with that choice, so the person does not go back to Narsor for it.
-Both scripts can serve the queue at the same time: each one answers only for
-a URL of its own host. Without an observer, the person chooses at the gate as
-before; `approve` and `abandon` are always the person's choices.
+With the queue [`mr-review`](../examples/catalog/queues/mr-review.yaml) of
+the example catalogue in the catalogue, its automations
+[`gitlab-mr-label`](../examples/catalog/automations/gitlab-mr-label/) and
+[`github-pr-label`](../examples/catalog/automations/github-pr-label/) do
+this for each wait episode of a gate:
+
+1. When the gate starts to wait, `in` puts the label `narsor-review` on the
+   pull request. The gate is in progress when `in` succeeded.
+2. The person answers in the threads and removes the label. `check` sees
+   that and answers the gate with the gate's `choice`, so the person does
+   not go back to Narsor for it.
+3. When the gate exits (an answer of `check`, a choice of the person, or a
+   restart of the step), `out` removes the label if it is still there. The
+   next step starts when `out` ended.
+
+Each automation handles only a URL of its own host. Without the queue in the
+catalogue, the person chooses at the gate as before; `approve` and `abandon`
+are always the person's choices.
 
 Every question and every answer is in an open thread of the pull request. An
 agent question starts with `✨ [NARSOR] [Q<n>]`. The agent resolves a thread only

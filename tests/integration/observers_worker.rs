@@ -1,6 +1,7 @@
 //! Integration tests of the observer worker (U6): `narsor-observer-worker`'s
 //! claim, script execution and result, against a real
-//! `ProtocolService` over a temporary state root, without a server.
+//! `ProtocolService` over a temporary catalogue and state root, without a
+//! server.
 //!
 //! The control plane is reached through the worker's [`WorkerApi`] seam,
 //! implemented here on the service itself. Where the process is not the
@@ -12,6 +13,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -22,24 +24,24 @@ use narsor_engine::controller_protocol::error::ProtocolError;
 use narsor_engine::controller_protocol::service::MAX_STORED_LOG_BYTES;
 use narsor_engine::controller_protocol::ProtocolService;
 use narsor_engine::domain::TaskId;
-use narsor_engine::domain::WorkflowDefinition;
 use narsor_engine::observers::{
-    queue_entry_id, CreateTaskEffect, ObserverConfig, ObserverEffect, ObserverId, ObserverMode,
-    ObserverName, RunId, RunStatus, SecretRef, MAX_SCRIPT_OUTPUT_BYTES,
+    queue_entry_id, AutomationKey, AutomationRecord, AutomationState, RunId, RunStatus,
+    MAX_SCRIPT_OUTPUT_BYTES,
 };
 use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef};
 use narsor_engine::persistence::StatePaths;
 use narsor_observer_worker::worker::{
-    check_secrets_dir, current_uid, kill_all_processes_of, owner_secrets_dir_name, processes_of,
-    Masker, ProcessRunner, ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, ScriptUser, Worker,
-    WorkerApi, WorkerOptions, WorkerStop, MASK, MAX_STDERR_BYTES, MAX_STDOUT_BYTES, SCRIPT_FILE,
+    check_secrets_dir, current_uid, kill_all_processes_of, processes_of, Masker, ProcessRunner,
+    ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, ScriptUser, Worker, WorkerApi, WorkerOptions,
+    WorkerStop, MASK, MAX_STDERR_BYTES, MAX_STDOUT_BYTES, SCRIPT_FILE,
 };
 use narsor_protocol::controller::{
-    ObserverRunOutcome, ObserverRunReport, ObserverRunResultResponse, ObserverSecretRef,
-    ObserverWorkerRun, OBSERVER_WORKER_KEY_ENV,
+    ObserverRunOutcome, ObserverRunReport, ObserverRunResultResponse, ObserverWorkerRun,
+    OBSERVER_WORKER_KEY_ENV,
 };
 use serde_json::json;
 
+use crate::automation_support::{always_queue, automation, on_episodes_queue};
 use crate::gate_support::{queued_task, review_gate, wait_at};
 
 const SENTINEL: &str = "s3cr3t-SENTINEL-4f1c9a";
@@ -55,7 +57,8 @@ impl Clock for ManualClock {
     }
 }
 
-/// A state root, a service on it, and a directory for the worker's files.
+/// A catalogue and state root, a service on it, and a directory for the
+/// worker's files.
 struct Fixture {
     root: PathBuf,
     service: Arc<ProtocolService>,
@@ -88,20 +91,13 @@ impl Fixture {
         self.root.join("state")
     }
 
-    /// A secrets directory (0700) holding `files` in the subdirectory of
-    /// the observers' owner.
+    /// A flat secrets directory (0700) holding `files`.
     fn secrets_dir(&self, files: &[(&str, &str)]) -> PathBuf {
-        self.secrets_dir_of(owner().0.as_str(), files)
-    }
-
-    /// A secrets directory (0700) holding `files` in the subdirectory
-    /// `owner_dir`.
-    fn secrets_dir_of(&self, owner_dir: &str, files: &[(&str, &str)]) -> PathBuf {
         let dir = self.root.join("secrets");
-        fs::create_dir_all(dir.join(owner_dir)).unwrap();
+        fs::create_dir_all(&dir).unwrap();
         set_mode(&dir, 0o700);
         for (name, value) in files {
-            fs::write(dir.join(owner_dir).join(name), format!("{value}\n")).unwrap();
+            fs::write(dir.join(name), format!("{value}\n")).unwrap();
         }
         dir
     }
@@ -114,70 +110,50 @@ impl Fixture {
         options
     }
 
-    /// An active "create a task" observer running `script`, with the
-    /// secret references `secrets`, its first run due.
-    fn observer(&self, script: &str, secrets: &[(&str, &str)]) -> ObserverId {
-        let mut config = ObserverConfig::new(
-            ObserverName::parse("jira-new").unwrap(),
-            ObserverEffect::CreateTask(CreateTaskEffect {
-                workflow_id: "triage".into(),
-                workflow_version: 1,
-                workspaces: Default::default(),
-                backend_id: None,
-                profile: None,
-                mapping: [("ticket".to_string(), "key".to_string())].into(),
-            }),
-            ObserverMode::Always,
+    /// The `always` queue `jira-intake` served by the automation
+    /// `jira-new`, whose check script is `script` and which declares
+    /// `secrets` (`(name, env)`); its first run is due.
+    fn observer(&self, script: &str, secrets: &[(&str, &str)]) -> AutomationKey {
+        automation(&self.state_root(), "jira-new", script, secrets);
+        always_queue(
+            &self.state_root(),
+            "jira-intake",
+            "jira-new",
+            "{interval_secs: 300}",
+            "",
         );
-        config.secrets = secrets
-            .iter()
-            .map(|(name, env)| SecretRef {
-                name: (*name).to_string(),
-                env: (*env).to_string(),
-            })
-            .collect();
-        let workflow: WorkflowDefinition = serde_json::from_value(json!({
-            "id": "triage",
-            "name": "triage",
-            "version": 1,
-            "inputs": [{"name": "ticket", "required": true}],
-            "states": {},
-            "initial_state": "start",
-        }))
-        .unwrap();
-        let store = self.service.observers();
-        let now = self.service.control_plane().now();
-        let id = store
-            .create(owner(), config, Some(&workflow), now)
-            .unwrap()
-            .observer_id;
-        store.add_script(&id, script, now).unwrap();
-        self.service.approve_observer_version(&id, 1).unwrap();
         self.service.observer_pass();
-        id
+        AutomationKey::new("jira-intake", "jira-new").unwrap()
     }
 
-    /// An active `on_episodes` observer of the queue `mr-review` running
-    /// `script`, and a task waiting at a gate on that queue in episode
-    /// `input-1`: the observer's run for the entry is due.
-    fn queue_observer(&self, script: &str) -> (ObserverId, TaskId) {
-        let config = ObserverConfig::new(
-            ObserverName::parse("mr-review").unwrap(),
-            ObserverEffect::None,
-            ObserverMode::OnEpisodes,
+    /// The `on_episodes` queue `mr-review` served by the automation
+    /// `gitlab-mr-label`, whose check script is `script`, and a task waiting
+    /// at a gate on that queue in episode `input-1`: the pair's run for the
+    /// entry is due.
+    fn queue_observer(&self, script: &str) -> (AutomationKey, TaskId) {
+        automation(&self.state_root(), "gitlab-mr-label", script, &[]);
+        on_episodes_queue(
+            &self.state_root(),
+            "mr-review",
+            &["gitlab-mr-label"],
+            "{interval_secs: 300}",
         );
-        let store = self.service.observers();
-        let now = self.service.control_plane().now();
-        let id = store
-            .create(owner(), config, None, now)
-            .unwrap()
-            .observer_id;
-        store.add_script(&id, script, now).unwrap();
-        self.service.approve_observer_version(&id, 1).unwrap();
         let task = queued_task(&self.service, "task-1", &owner());
         wait_at(&self.service, &task, "input-1", &review_gate("mr-review"));
         self.service.observer_pass();
-        (id, task)
+        (
+            AutomationKey::new("mr-review", "gitlab-mr-label").unwrap(),
+            task,
+        )
+    }
+
+    /// The runtime record of the pair `key`.
+    fn record(&self, key: &AutomationKey) -> AutomationRecord {
+        self.service
+            .observers()
+            .load(key)
+            .unwrap()
+            .expect("the pair's record")
     }
 
     fn api(&self) -> Arc<ServiceApi> {
@@ -186,16 +162,10 @@ impl Fixture {
         })
     }
 
-    /// How the run `handled_run` ended, from its observer's record.
+    /// How the run `handled_run` ended, from its pair's record.
     fn status_of(&self, handled_run: &str) -> RunStatus {
         let run_id = RunId::parse(handled_run).unwrap();
-        let last_run = self
-            .service
-            .observers()
-            .load(&run_id.observer_id)
-            .unwrap()
-            .last_run
-            .expect("a finished run");
+        let last_run = self.record(&run_id.key).last_run.expect("a finished run");
         assert_eq!(last_run.sequence, run_id.sequence);
         last_run.status
     }
@@ -205,7 +175,7 @@ impl Fixture {
         let run_id = RunId::parse(handled_run).unwrap();
         self.service
             .observers()
-            .list_failures(&run_id.observer_id)
+            .list_failures(&run_id.key)
             .unwrap()
             .into_iter()
             .find(|failure| failure.sequence == run_id.sequence)
@@ -280,6 +250,31 @@ impl WorkerApi for ServiceApi {
             })
             .map_err(client_error);
         Box::pin(async move { result })
+    }
+}
+
+/// A control plane with no run due: it holds each claim for `hold`, as
+/// its long-poll does, and counts them.
+struct NoRunApi {
+    hold: StdDuration,
+    claims: AtomicUsize,
+}
+
+impl WorkerApi for NoRunApi {
+    fn claim(&self) -> BoxFuture<'_, Result<Option<ObserverWorkerRun>, ClientError>> {
+        self.claims.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            tokio::time::sleep(self.hold).await;
+            Ok(None)
+        })
+    }
+
+    fn report<'a>(
+        &'a self,
+        _run_id: &'a str,
+        _report: &'a ObserverRunReport,
+    ) -> BoxFuture<'a, Result<ObserverRunResultResponse, ClientError>> {
+        Box::pin(async { Err(ClientError::NotFound) })
     }
 }
 
@@ -381,7 +376,7 @@ async fn a_script_reading_its_input_saves_the_state_it_prints() {
     // Exits 3 unless its stdin is the claim's input document.
     let id = fx.observer(
         "input=$(cat)\n\
-         case \"$input\" in *'\"name\":\"jira-new\"'*) ;; *) exit 3 ;; esac\n\
+         case \"$input\" in *'\"automation\":\"jira-new\"'*) ;; *) exit 3 ;; esac\n\
          printf '{\"state\": {\"cursor\": 5}}'\n",
         &[],
     );
@@ -394,7 +389,7 @@ async fn a_script_reading_its_input_saves_the_state_it_prints() {
         ObserverRunOutcome::Exited { exit_code: 0 }
     );
     assert_eq!(handled.accepted.unwrap().status, "succeeded");
-    let record = fx.service.observers().load(&id).unwrap();
+    let record = fx.record(&id);
     assert_eq!(record.script_state, Some(json!({"cursor": 5})));
     assert_eq!(fx.status_of(&handled.run_id), RunStatus::Succeeded);
     // The run directory is gone.
@@ -404,9 +399,10 @@ async fn a_script_reading_its_input_saves_the_state_it_prints() {
 }
 
 #[tokio::test]
-async fn an_entry_run_reads_its_gate_in_contract_version_two() {
-    // R11: the queue entry with its episode's start and the gate's choices
-    // and variables; exit 0 ends the run without an error (R14).
+async fn an_entry_run_reads_its_gate_in_contract_version_three() {
+    // R11: the check phase of the pair, the queue entry with its episode's
+    // start and the gate's choices and variables; exit 0 ends the run
+    // without an error (R14).
     let fx = Fixture::new();
     let (id, task) = fx.queue_observer("true\n");
     let runner = FakeRunner::exiting(0, "", "");
@@ -416,7 +412,11 @@ async fn an_entry_run_reads_its_gate_in_contract_version_two() {
 
     assert_eq!(fx.status_of(&handled.run_id), RunStatus::Succeeded);
     let input: serde_json::Value = serde_json::from_slice(&runner.specs()[0].stdin).unwrap();
-    assert_eq!(input["contract_version"], json!(2));
+    assert_eq!(input["contract_version"], json!(3));
+    assert_eq!(input["phase"], json!("check"));
+    assert_eq!(input["queue"], json!("mr-review"));
+    assert_eq!(input["automation"], json!("gitlab-mr-label"));
+    assert!(input.get("observer").is_none(), "{input}");
     let entry = &input["entry"];
     assert_eq!(entry["task_id"], json!(task.as_str()));
     assert_eq!(entry["episode"], json!("input-1"));
@@ -431,11 +431,8 @@ async fn an_entry_run_reads_its_gate_in_contract_version_two() {
         entry["variables"],
         json!([{"name": "note", "type": "text", "description": "What to change"}])
     );
-    let record = fx.service.observers().load(&id).unwrap();
-    assert_eq!(
-        record.state,
-        narsor_engine::observers::ObserverState::Active
-    );
+    let record = fx.record(&id);
+    assert_eq!(record.state, AutomationState::Active);
 }
 
 #[tokio::test]
@@ -449,13 +446,14 @@ async fn an_always_run_reads_no_entry() {
     worker.run_once().await.unwrap().expect("a run was due");
 
     let input: serde_json::Value = serde_json::from_slice(&runner.specs()[0].stdin).unwrap();
-    assert_eq!(input["contract_version"], json!(2));
+    assert_eq!(input["contract_version"], json!(3));
+    assert_eq!(input["queue"], json!("jira-intake"));
     assert!(input.get("entry").is_none(), "{input}");
 }
 
 #[tokio::test]
 async fn an_entry_run_exiting_two_is_an_error_of_its_entry_only() {
-    // R14: the error is recorded for the entry; the observer stays active
+    // R14: the error is recorded for the entry; the pair stays active
     // and counts no failure; the entry stays on its queue.
     let fx = Fixture::new();
     let (id, task) = fx.queue_observer("exit 2\n");
@@ -472,11 +470,8 @@ async fn an_entry_run_exiting_two_is_an_error_of_its_entry_only() {
     let entry_id = queue_entry_id(&task, "input-1");
     assert_eq!(failure.entry_id.as_deref(), Some(entry_id.as_str()));
     assert_eq!(failure.exit_code, Some(2));
-    let record = fx.service.observers().load(&id).unwrap();
-    assert_eq!(
-        record.state,
-        narsor_engine::observers::ObserverState::Active
-    );
+    let record = fx.record(&id);
+    assert_eq!(record.state, AutomationState::Active);
     assert_eq!(record.consecutive_failures, 0);
     assert!(fx
         .service
@@ -524,7 +519,7 @@ async fn the_script_gets_the_explicit_list_and_nothing_else() {
     assert_eq!(env_value(spec, "HOME"), spec.cwd.to_str());
     assert_eq!(spec.args, [SCRIPT_FILE]);
     let input: serde_json::Value = serde_json::from_slice(&spec.stdin).unwrap();
-    assert_eq!(input["observer"]["name"], "jira-new");
+    assert_eq!(input["automation"], "jira-new");
     assert_eq!(spec.timeout, StdDuration::from_secs(300));
 }
 
@@ -569,21 +564,30 @@ async fn the_worker_environment_does_not_reach_a_real_script() {
 }
 
 #[tokio::test]
-async fn gh_token_reaches_the_script_only_as_a_reference_of_the_observer() {
+async fn a_declared_secret_is_read_from_the_flat_directory_and_masked() {
+    // A4: one installation owner, so `{secrets dir}/{name}`. A file the
+    // automation does not declare stays in the directory.
     let fx = Fixture::new();
-    let secrets = fx.secrets_dir(&[("github", SENTINEL), ("other", "unused-value")]);
-    fx.observer("true\n", &[("github", "GH_TOKEN")]);
-    let runner = FakeRunner::exiting(0, r#"{"state": {}}"#, "");
+    let secrets = fx.secrets_dir(&[("gitlab-token", SENTINEL), ("other", "unused-value")]);
+    fx.observer(
+        "echo \"token $GITLAB_TOKEN\" >&2\nenv >&2\nprintf '{\"state\": {}}'\n",
+        &[("gitlab-token", "GITLAB_TOKEN")],
+    );
     let mut options = fx.options();
     options.secrets_dir = Some(secrets);
-    let worker = Worker::new(fx.api(), Arc::clone(&runner), options);
+    let worker = Worker::new(fx.api(), ProcessRunner, options);
 
-    worker.run_once().await.unwrap().unwrap();
+    let handled = worker.run_once().await.unwrap().unwrap();
 
-    let spec = &runner.specs()[0];
-    assert_eq!(env_value(spec, "GH_TOKEN"), Some(SENTINEL));
-    // A file of the secrets directory no reference names stays there.
-    assert!(spec.env.iter().all(|(_, value)| value != "unused-value"));
+    assert_eq!(fx.status_of(&handled.run_id), RunStatus::Succeeded);
+    let printed = &handled.report.stderr;
+    assert!(printed.contains(&format!("token {MASK}")), "{printed}");
+    assert!(
+        printed.contains(&format!("GITLAB_TOKEN={MASK}")),
+        "{printed}"
+    );
+    assert!(!printed.contains(SENTINEL), "{printed}");
+    assert!(!printed.contains("unused-value"), "{printed}");
 }
 
 #[tokio::test]
@@ -605,7 +609,7 @@ async fn a_missing_secret_file_fails_the_run_before_the_script_starts() {
     assert!(message.contains("'absent'"), "{message}");
     assert!(!message.contains(SENTINEL), "{message}");
     assert_eq!(fx.status_of(&handled.run_id), RunStatus::WorkerError);
-    let record = fx.service.observers().load(&id).unwrap();
+    let record = fx.record(&id);
     assert_eq!(record.script_state, None);
     assert_eq!(record.consecutive_failures, 1);
     assert_eq!(fs::read_dir(fx.root.join("work")).unwrap().count(), 0);
@@ -666,7 +670,7 @@ async fn secret_values_and_the_token_never_reach_the_server() {
     // No record keeps a run token; one in the text would be the token
     // leaking through the script's output.
     assert!(!stored.contains("nso."));
-    assert_eq!(fx.service.observers().load(&id).unwrap().script_state, None);
+    assert_eq!(fx.record(&id).script_state, None);
 }
 
 #[tokio::test]
@@ -774,7 +778,7 @@ async fn stdout_over_the_limit_is_a_format_error_and_keeps_the_state() {
     );
     assert!(handled.report.stdout.len() <= MAX_STDERR_BYTES);
     assert_eq!(fx.status_of(&handled.run_id), RunStatus::InvalidOutput);
-    let record = fx.service.observers().load(&id).unwrap();
+    let record = fx.record(&id);
     assert_eq!(record.script_state, None);
     assert_eq!(record.consecutive_failures, 1);
 }
@@ -849,7 +853,7 @@ async fn a_script_past_its_time_limit_is_killed_with_its_children() {
         .finish_observer_run(&RunId::parse(&run.run_id).unwrap(), report)
         .unwrap();
     assert_eq!(finished.status, RunStatus::TimedOut);
-    assert_eq!(fx.service.observers().load(&id).unwrap().script_state, None);
+    assert_eq!(fx.record(&id).script_state, None);
 }
 
 #[tokio::test]
@@ -899,6 +903,46 @@ async fn a_background_process_holding_stdout_past_the_limit_ends_with_it() {
         started.elapsed()
     );
     assert_eq!(report.outcome, ObserverRunOutcome::TimedOut);
+}
+
+// ---------------------------------------------------------------------------
+// The claim loop (U6)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn after_a_held_empty_claim_the_worker_claims_again_at_once() {
+    // A claim the server held longer than the pause is followed by the
+    // next at once (0, 400, 800 ms; with a pause after each: 0, 700 ms);
+    // one it answered at once (an older server, or one that stops) waits
+    // out the pause instead of looping (0, 300, 600, 900 ms).
+    let pause = StdDuration::from_millis(300);
+    let window = StdDuration::from_millis(1000);
+    for (hold, claims_in_window) in [
+        (StdDuration::from_millis(400), 3..=3),
+        (StdDuration::ZERO, 3..=5),
+    ] {
+        let fx = Fixture::new();
+        let api = Arc::new(NoRunApi {
+            hold,
+            claims: AtomicUsize::new(0),
+        });
+        let worker = Worker::new(
+            Arc::clone(&api),
+            FakeRunner::exiting(0, "", ""),
+            fx.options(),
+        );
+
+        worker
+            .serve(false, pause, tokio::time::sleep(window))
+            .await
+            .unwrap();
+
+        let claims = api.claims.load(Ordering::SeqCst);
+        assert!(
+            claims_in_window.contains(&claims),
+            "{claims} claims held {hold:?} each"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -960,91 +1004,6 @@ fn the_worker_refuses_a_secrets_directory_open_to_others() {
     assert!(check_secrets_dir(&secrets).is_ok());
 }
 
-// ---------------------------------------------------------------------------
-// Secrets of many owners
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn a_secret_is_read_from_the_subdirectory_of_the_observers_owner_only() {
-    let fx = Fixture::new();
-    // The same name at the top and under another owner: neither is used.
-    let secrets = fx.secrets_dir_of("someone-else", &[("jira-token", "not-yours")]);
-    fs::write(secrets.join("jira-token"), "shared\n").unwrap();
-    fx.observer("true\n", &[("jira-token", "JIRA_TOKEN")]);
-    let runner = FakeRunner::exiting(0, r#"{"state": {}}"#, "");
-    let mut options = fx.options();
-    options.secrets_dir = Some(secrets);
-    let worker = Worker::new(fx.api(), Arc::clone(&runner), options);
-
-    let missing = worker.run_once().await.unwrap().unwrap();
-
-    assert!(runner.specs().is_empty(), "the script must not start");
-    let ObserverRunOutcome::WorkerError { message } = &missing.report.outcome else {
-        panic!("{:?}", missing.report.outcome);
-    };
-    assert!(message.contains("'owner'"), "{message}");
-    assert!(!message.contains("not-yours") && !message.contains("shared"));
-    // The owner's own file is what the script gets: see
-    // `the_script_gets_the_explicit_list_and_nothing_else`.
-}
-
-/// A claim of a run of `owner` that needs one secret.
-fn run_of(owner: &str) -> ObserverWorkerRun {
-    ObserverWorkerRun {
-        run_id: "obs-1.1".into(),
-        owner: owner.into(),
-        token: "nso.obs-1.1.secret".into(),
-        script_version: 1,
-        script: "true\n".into(),
-        input: json!({}),
-        secrets: vec![ObserverSecretRef {
-            name: "jira-token".into(),
-            env: "JIRA_TOKEN".into(),
-        }],
-        timeout_secs: 60,
-        deadline: Utc::now() + chrono::Duration::seconds(120),
-    }
-}
-
-#[tokio::test]
-async fn an_owner_that_is_no_safe_directory_name_fails_the_run_before_the_script() {
-    let fx = Fixture::new();
-    // A file at the top, where `..` or an empty owner would lead.
-    let secrets = fx.secrets_dir(&[]);
-    fs::write(secrets.join("jira-token"), format!("{SENTINEL}\n")).unwrap();
-    let runner = FakeRunner::exiting(0, r#"{"state": {}}"#, "");
-    let mut options = fx.options();
-    options.secrets_dir = Some(secrets);
-    let worker = Worker::new(fx.api(), Arc::clone(&runner), options);
-
-    for owner in ["", ".", "..", "evil\u{1b}[2J", "nul\0byte"] {
-        let report = worker.execute(&run_of(owner)).await;
-
-        let ObserverRunOutcome::WorkerError { message } = &report.outcome else {
-            panic!("{owner:?}: {:?}", report.outcome);
-        };
-        assert!(message.contains("owner"), "{owner:?}: {message}");
-        assert!(!message.contains(SENTINEL));
-    }
-    assert!(runner.specs().is_empty(), "no script may start");
-}
-
-#[test]
-fn an_oidc_owner_is_one_directory_name() {
-    assert_eq!(owner_secrets_dir_name("local").unwrap(), "local");
-    assert_eq!(
-        owner_secrets_dir_name("oidc:https://login.example.com/realms/a#user-1").unwrap(),
-        "oidc:https:%2F%2Flogin.example.com%2Frealms%2Fa#user-1"
-    );
-    // `%` is spelled out too, so two owners never share a directory.
-    assert_ne!(
-        owner_secrets_dir_name("a%2Fb").unwrap(),
-        owner_secrets_dir_name("a/b").unwrap()
-    );
-    assert!(owner_secrets_dir_name("..").is_err());
-    assert!(owner_secrets_dir_name(&"x".repeat(256)).is_err());
-}
-
 #[test]
 fn root_is_never_the_script_user() {
     assert!(ScriptUser::lookup("root").is_err());
@@ -1069,7 +1028,7 @@ async fn a_script_user_cannot_read_the_worker_environment_or_secrets() {
         "id -u\n\
          cat /proc/{worker}/environ && echo READ-WORKER-ENV\n\
          ls {secrets} && echo LISTED-SECRETS\n\
-         cat {secrets}/owner/jira-token && echo READ-SECRET\n\
+         cat {secrets}/jira-token && echo READ-SECRET\n\
          touch \"$HOME/left-behind\"\n\
          printf '{{\"state\": {{}}}}' >&2\n",
         worker = std::process::id(),

@@ -1,7 +1,7 @@
 // Texts the views show that are not about one task's state: harness names,
 // usage limits, the harness of the header. Pure functions, tested in Node.
 
-import { percent, scaled, timeToReset, unapprovedVersion } from './model.js';
+import { percent, scaled, timeToReset } from './model.js';
 
 const HARNESS_SHORT = {
   'claude-code': 'claude',
@@ -240,7 +240,7 @@ export function clock(at) {
 }
 
 // ---------------------------------------------------------------------------
-// Observer queues (U11)
+// Automation queues (U11)
 
 /** A date and time in the browser's zone; `''` for none. */
 export function dateTime(at) {
@@ -256,10 +256,10 @@ export function intervalText(seconds) {
   return `co ${seconds}s`;
 }
 
-/** The schedule of an observer: `co 5m` or `cron 0 9 * * 1 (UTC)`. */
-export function scheduleText(observer) {
-  if (observer?.cron) return `cron ${observer.cron} (UTC)`;
-  if (typeof observer?.interval_secs === 'number') return intervalText(observer.interval_secs);
+/** The schedule of a queue: `co 5m` or `cron 0 9 * * 1 (UTC)`. */
+export function scheduleText(queue) {
+  if (queue?.cron) return `cron ${queue.cron} (UTC)`;
+  if (typeof queue?.interval_secs === 'number') return intervalText(queue.interval_secs);
   return '—';
 }
 
@@ -270,40 +270,23 @@ const MODE_TEXT = {
 
 /** The run mode with what it means; an unknown mode as it is. */
 export function modeText(mode) {
-  if (!mode) return 'brak obserwatorów';
+  if (!mode) return '—';
   return MODE_TEXT[mode] ?? mode;
 }
 
-const OBSERVER_STATE = {
-  draft: { text: 'szkic', role: 'done' },
-  active: { text: 'aktywny', role: 'live' },
-  paused: { text: 'wstrzymany', role: 'calm' },
-  needs_attention: { text: 'czeka na Ciebie', role: 'attention' },
-  error: { text: 'błąd', role: 'problem' },
+const AUTOMATION_STATE = {
+  active: { text: 'aktywna', role: 'live', stopped: false },
+  needs_attention: { text: 'czeka na Ciebie', role: 'attention', stopped: true },
+  error: { text: 'błąd', role: 'problem', stopped: true },
 };
 
-/** The state of an observer as `{text, role}`. */
-export function observerState(state) {
-  return OBSERVER_STATE[state] ?? { text: String(state ?? '?'), role: 'done' };
-}
-
 /**
- * The two labelled rows of the script versions (KTD-10, R32): the version
- * the schedule runs and the newest saved one.
+ * The state of an automation as `{text, role, stopped}`. A stopped one runs
+ * again when its queue file, `automation.yaml` or `check` script changes in
+ * the catalogue.
  */
-export function versionRows(observer) {
-  const approved = observer?.approved_version;
-  const latest = observer?.latest_version;
-  return [
-    ['wersja zatwierdzona', approved !== undefined && approved !== null ? `v${approved}` : 'brak'],
-    ['wersja najnowsza', latest !== undefined && latest !== null ? `v${latest}` : 'brak skryptu'],
-  ];
-}
-
-/** The mark of a newest version that is not approved (R32, AE10); `null` for none. */
-export function unapprovedText(observer) {
-  const version = unapprovedVersion(observer);
-  return version === null ? null : `wersja ${version} nie zatwierdzona`;
+export function automationState(state) {
+  return AUTOMATION_STATE[state] ?? { text: String(state ?? '?'), role: 'done', stopped: false };
 }
 
 /** The latest finished run: `#4 succeeded · 12.11.2026, 10:05:00`; `null` for none. */
@@ -313,10 +296,10 @@ export function lastRunText(run) {
 }
 
 /**
- * How one observer processed one queue entry (R23), as `{text, role}`
+ * How one automation processed one queue entry (R23), as `{text, role}`
  * parts: a run checks it now, the last run time, the newest error.
  */
-export function entryObserverParts(view) {
+export function entryAutomationParts(view) {
   const parts = [];
   if (view?.running) parts.push({ text: 'sprawdza teraz', role: 'live' });
   if (view?.last_run_at) parts.push({ text: `ostatni przebieg ${dateTime(view.last_run_at)}`, role: 'done' });
@@ -327,4 +310,83 @@ export function entryObserverParts(view) {
   }
   if (!parts.length) parts.push({ text: 'jeszcze nie sprawdzony', role: 'done' });
   return parts;
+}
+
+// ---------------------------------------------------------------------------
+// Entry and exit scripts of a watched gate (R20): a control-plane overlay on
+// the runner timeline. Without `task.gate_automation` (a server from before
+// it, a gate without scripts) the runner status shows unchanged.
+
+const GATE_PHASE = {
+  entering: { text: '⏳ czeka na skrypty wejścia', role: 'live' },
+  ready: { text: 'wejście gotowe', role: 'done' },
+  entry_failed: { text: '✗ skrypt wejścia nie powiódł się', role: 'problem' },
+  exiting: { text: '⏳ czeka na skrypty wyjścia', role: 'live' },
+  released: { text: 'skrypty wyjścia zakończone', role: 'done' },
+};
+
+const EXIT_AUTHOR = {
+  person: 'osoba', automation: 'automatyzacja', operator: 'operator', task_end: 'koniec zadania', runner: 'runner',
+};
+
+/** The label of the gate's position: the latest entry into its state; `null` for none. */
+export function gatePositionLabel(positions, gate) {
+  if (!gate?.step) return null;
+  const found = [...(positions ?? [])].reverse().find((p) => p.state_id === gate.step);
+  return found?.label ?? null;
+}
+
+/**
+ * `positions` with the gate's overlay: while an entry script failed its last
+ * attempt and the runner still has the gate in progress, the gate shows
+ * `failed`, with the failed script as its error.
+ */
+export function gateOverlay(positions, gate) {
+  const list = positions ?? [];
+  if (gate?.phase !== 'entry_failed') return list;
+  const label = gatePositionLabel(list, gate);
+  return list.map((p) => {
+    if (p.label !== label || !['in_progress', 'awaiting_decision'].includes(p.status)) return p;
+    const hook = (gate.hooks ?? []).find((h) => h.hook === 'in' && h.status === 'failed');
+    const error = hook
+      ? `skrypt wejścia ${hook.automation}: próba ${hook.attempts} z ${hook.max_attempts} nieudana${hook.last_error ? `: ${firstLine(hook.last_error, 120)}` : ''}`
+      : 'skrypt wejścia nie powiódł się';
+    return { ...p, status: 'failed', error };
+  });
+}
+
+/**
+ * The lines under the gate's step, as `{text, role}`: where its scripts
+ * stand, then every ended attempt (never a step of its own).
+ */
+export function gateLines(gate) {
+  if (!gate) return [];
+  const phase = GATE_PHASE[gate.phase] ?? { text: 'stan skryptów nieznany', role: 'done' };
+  let head = `kolejka ${gate.queue} · ${phase.text}`;
+  if (gate.exit) head += ` · wyjście ${gate.exit.choice ?? ''} (${EXIT_AUTHOR[gate.exit.author] ?? 'nieznany autor'})`;
+  const lines = [{ text: head, role: phase.role }];
+  for (const hook of gate.hooks ?? []) {
+    const word = hook.hook === 'out' ? 'wyjście' : 'wejście';
+    for (const entry of hook.log ?? []) {
+      let text = `${word} · ${hook.automation} · próba ${entry.attempt} z ${hook.max_attempts}`;
+      let role = 'done';
+      if (entry.error) {
+        text += ` · ✗ ${firstLine(entry.error, 120)}`;
+        role = 'problem';
+      } else if (entry.skipped) {
+        text += ` · pominięta: ${firstLine(entry.skipped, 120)}`;
+      } else {
+        text += ' · ✓ udana';
+      }
+      if (entry.retry_at) text += ` · następna próba ${clock(entry.retry_at)}`;
+      lines.push({ text, role });
+    }
+    if (hook.waiting_for) {
+      lines.push({
+        text: `${word} · ${hook.automation} · ⏳ czeka na plik katalogu ${hook.waiting_for}: popraw lub usuń plik albo uruchom krok ponownie`,
+        role: 'attention',
+      });
+    }
+  }
+  return lines;
 }

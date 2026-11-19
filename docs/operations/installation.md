@@ -239,13 +239,15 @@ workstation security boundary.
 
 ## Run the observer worker
 
-Observers poll external sources (Jira, GitHub, GitLab) with a shell script
-on a schedule. The control plane keeps the schedule; a worker process,
-`narsor-observer-worker`, claims the runs that are due, runs their
+Automations of the catalogue read external sources (Jira, GitHub, GitLab)
+with shell scripts, on the schedule of their queue or when a gate enters or
+leaves the queue. The control plane decides when a script runs; a worker
+process, `narsor-observer-worker`, claims the runs that are due, runs their
 scripts and reports the results. The server starts the worker and
-supervises it. How to write an observer and its script is in
-[Observers](../user/observers.md). Before an update from watch lists to
-observer queues, read [Updates](updates.md#update-to-observer-queues-d77).
+supervises it. How to write an automation and a queue is in
+[Automations and queues](../user/observers.md). Before an update from
+observers stored in the state to catalogue automations, read
+[Updates](updates.md#update-to-catalogue-automations-d78).
 
 **Enable the worker.** The worker is off by default. Set these settings in
 the server's configuration file (or as `NARSOR_<NAME>` environment
@@ -286,39 +288,29 @@ minute) and does not count as a failed run of the script.
 start of the worker, the server makes a new random key, keeps only its
 SHA-256 digest in memory, and gives the key to the worker in the
 `NARSOR_OBSERVER_WORKER_KEY` environment variable (not as an argument, so
-`ps` does not show it). The key can only claim due runs of all owners and
-report their results. No file holds the key. A restart of the worker or of
+`ps` does not show it). The key can only claim due runs and report their
+results. No file holds the key. A restart of the worker or of
 the server makes the old key invalid. There is no command to make or revoke
 a worker key.
 
-**Provide the secrets.** An observer names the secrets it needs (a name and
-an environment variable); their values never reach the control plane. One
-worker serves the observers of all owners, so the secrets directory has one
-subdirectory for each owner, and one file for each secret name in it. A
-script gets only the secrets of its observer's owner: an owner cannot use the
-secret of another owner by its name. The directory must be accessible to the
-server's user only (`0700`). In this example the server runs as the user
-`narsor`, and the owner is `local` (trusted mode):
+**Provide the secrets.** An automation names the secrets it needs in its
+`automation.yaml` (a name and an environment variable); their values never
+reach the control plane or the catalogue. The installation has one owner,
+so the secrets directory is flat: one file for each secret name. A script
+gets only the secrets its automation declares. The directory must be
+accessible to the server's user only (`0700`); the worker refuses to start
+otherwise. In this example the server runs as the user `narsor`:
 
 ```bash
 install -d -m 0700 -o narsor /etc/narsor/observer-secrets
-install -d -m 0700 -o narsor /etc/narsor/observer-secrets/local
 install -m 0600 -o narsor /dev/stdin \
-  /etc/narsor/observer-secrets/local/jira-token <<<"$JIRA_TOKEN"
+  /etc/narsor/observer-secrets/jira-token <<<"$JIRA_TOKEN"
 ```
 
-The name of the owner's subdirectory is the owner as the server records it,
-with `%` written as `%25` and `/` written as `%2F`:
-
-| mode | owner | subdirectory |
-| --- | --- | --- |
-| trusted | `local` | `local` |
-| network | `oidc:{issuer}#{subject}` | for example `oidc:https:%2F%2Flogin.example.com#1234` for the issuer `https://login.example.com` and the subject `1234` |
-
-When an owner name cannot be a directory name (it is empty, `.` or `..`,
-or it has a control character), the run fails before its script starts.
-When a secret file is missing, the run fails before its script starts, and
-its error names the owner's subdirectory.
+When a declared secret file is missing, the run fails before its script
+starts, and its error names the secret. Earlier versions had one
+subdirectory per owner (`{secrets dir}/{owner}/{name}`): move the files up
+into the directory itself.
 
 **Isolate the scripts.** Create a second system user for the scripts, which
 runs nothing else:
@@ -343,12 +335,14 @@ Limits of the server's service (`MemoryMax`, `TasksMax`) apply to the
 server, the worker and all scripts together.
 
 With `observer_insecure_same_user: true` scripts run as the server's own
-user. A script can then read the worker key, every owner's secrets and the
-server's state. The worker writes a warning at start. Do not use it in
+user. A script can then read the worker key, every secret and the server's
+state. The worker writes a warning at start. Do not use it in
 production.
 
-**What a script gets.** The worker asks for a due run every 10 seconds. For
-each run it makes a temporary directory (mode `0700`, owned by the script
+**What a script gets.** The worker asks for a due run; the server holds the
+request up to 25 seconds until a run is due, so a script starts soon after
+it is due. After an empty answer that came at once, the worker waits
+2 seconds before it asks again. For each run it makes a temporary directory (mode `0700`, owned by the script
 user, removed afterwards) and runs `sh` there with an empty environment plus
 exactly these variables:
 
@@ -359,19 +353,20 @@ exactly these variables:
 | `NARSOR_SERVER` | the control plane's URL |
 | `NARSOR_TOKEN` | the run's token: valid on this run's effect routes only, until its result or deadline |
 | `NARSOR_OBSERVER_RUN` | the run's id |
-| one per secret | the value of the observer's secret |
+| one per secret | the value of a secret that the automation declares |
 
 Nothing of the worker's own environment is passed on, the worker key
 included. The script reads the
 run's input as JSON on stdin and prints its result on stdout. It runs in a
-process group of its own: at its time limit (5 minutes) the group gets
+process group of its own: at its time limit (5 minutes for `check`,
+120 seconds for `in` and `out`) the group gets
 `SIGTERM`, then `SIGKILL` 5 seconds later; when the script exits, anything it
 left running is killed. A process can leave the group (`setsid`), so after
 each run the worker also kills every process of the script user, and it
 claims no run while a process of that user still runs. Thus a process left
 behind cannot read the secrets and the token of the next run. Use a
 dedicated script user that runs nothing else. stdout may hold at most 1 MiB (more is a format
-error that leaves the observer's state unchanged); the first 64 KiB of stderr
+error that leaves the state of the pair unchanged); the first 64 KiB of stderr
 are kept. Before the result leaves the worker, control characters are
 removed and every occurrence of a secret value or of the run's token is
 replaced by `[masked]`, error messages included. Masking is a second line of

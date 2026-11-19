@@ -12,7 +12,7 @@ install it.
 - [Running AI agents](user/agents.md) — `AgentAction`, sessions, permissions.
 - [The conductor](user/conductor.md) — the per-execution assistant.
 - [Remote tasks and backends](user/remote.md) — the control plane from the user's side.
-- [Observers](user/observers.md) — scripts that create tasks from Jira and answer decision gates from PR/MR reviews.
+- [Automations and queues](user/observers.md) — catalogue scripts that create tasks from Jira and serve decision gates of PR/MR reviews (entry, check and exit scripts).
 - [Configuration](user/configuration.md) — the config file and the on-disk layout.
 
 ## Operations (`docs/operations/`)

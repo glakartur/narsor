@@ -6,6 +6,7 @@
 
 pub use narsor_exec::api;
 pub mod auth;
+pub mod automations;
 pub use narsor_exec::conductor;
 pub mod config;
 pub use narsor_controller_client as controller_client;

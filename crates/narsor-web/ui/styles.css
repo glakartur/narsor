@@ -238,6 +238,7 @@ button.link { border: none; background: none; padding: 0 4px; color: var(--accen
 .step-detail { display: flex; flex-direction: column; min-height: 0; }
 .step-detail-head { padding: 8px 14px; border-bottom: 1px solid var(--border); display: flex; gap: 10px; align-items: baseline; }
 .step-detail .conversation { flex: 1; }
+.gate-scripts { list-style: none; margin: 0; padding: 6px 14px; border-bottom: 1px solid var(--border); }
 
 /* Events */
 .events { padding: 8px 14px; }
@@ -347,18 +348,13 @@ button.chip:hover { outline: 1px solid var(--accent); }
 .queues-body h3 { font-size: 13px; margin: 16px 0 6px; }
 .queue-table button.link { padding: 0; font-family: var(--mono); }
 button.small.active { background: var(--accent-soft); border-color: var(--accent); }
-.observer-card.unapproved { border-color: var(--attention); }
 .observer-head { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
 .observer-head button.link { padding: 0; }
 .facts.compact { padding: 0; gap: 2px 14px; font-size: 13px; }
 .cli-settings > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
 .cli-settings[open] { display: grid; gap: 6px; }
 .entry-observers { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; font-size: 12.5px; }
-.buttons.wrap { flex-wrap: wrap; }
-.schedule { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; display: grid; gap: 6px; margin: 0; }
-.schedule legend { font-size: 13px; font-weight: 600; padding: 0 4px; }
 .script-text { width: 100%; margin: 0; font-family: var(--mono); font-size: 12.5px; white-space: pre; overflow: auto; tab-size: 4; }
-textarea.script-text { resize: vertical; }
 pre.script-text { max-height: 50vh; background: var(--surface-2); padding: 8px 10px; border-radius: 8px; }
 .queue-mark { cursor: default; }
 button.queue-mark { cursor: pointer; text-decoration: none; padding: 0 2px; }

@@ -1,13 +1,15 @@
 //! Integration tests of the lifecycle of observer queue entries (U4): the
 //! runner's snapshot adds the entry of a watched gate's episode and removes
 //! it at every exit (R16), pause and restart change nothing (R17), a queue
-//! no active `on_episodes` observer serves gets one warning per episode
-//! (R9, R27), the schedule's guard drops an entry whose episode is gone
+//! the catalogue has no usable `on_episodes` queue for gets one warning per
+//! episode (R9, R27), the schedule's guard drops an entry whose episode is gone
 //! (R18, R19), and the task summary marks the episode on a queue (R21).
 //!
 //! A real `ProtocolService` over a temporary state root and a manual clock;
 //! the runner channel is reached through its seam (`gate_support`).
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -15,10 +17,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_engine::controller_protocol::{OwnerCommandRequest, ProtocolService};
 use narsor_engine::domain::TaskId;
-use narsor_engine::observers::{
-    queue_entry_id, ObserverConfig, ObserverEffect, ObserverId, ObserverMode, ObserverName,
-    QueueEntry,
-};
+use narsor_engine::observers::{queue_entry_id, AutomationKey, ObserverMode, QueueEntry};
 use narsor_engine::orchestration::{
     Clock, CommandRequest, ControlPlane, Observation, OwnerCommand, OwnerRef, RunnerState,
     TaskEventKind,
@@ -43,11 +42,14 @@ impl Clock for ManualClock {
     }
 }
 
-/// A state root, a clock, and a service over both.
+/// A root (catalogue and state), a clock, and a service over both.
 struct Fixture {
     root: PathBuf,
     clock: Arc<ManualClock>,
     service: ProtocolService,
+    /// The catalogue's queues as the fixture wrote them: mode and
+    /// automations.
+    queues: RefCell<BTreeMap<String, (ObserverMode, Vec<String>)>>,
 }
 
 impl Drop for Fixture {
@@ -76,6 +78,7 @@ impl Fixture {
             root,
             clock,
             service,
+            queues: RefCell::default(),
         }
     }
 
@@ -87,36 +90,38 @@ impl Fixture {
         *self.clock.0.lock().unwrap() += by;
     }
 
-    /// An observer of `owner`'s `queue` in `mode` with approved script
-    /// version 1. It creates no tasks.
-    fn active_of(
-        &self,
-        owner: OwnerRef,
-        name: &str,
-        queue: &str,
-        mode: ObserverMode,
-    ) -> ObserverId {
-        let mut config = ObserverConfig::new(
-            ObserverName::parse(name).unwrap(),
-            ObserverEffect::None,
-            mode,
+    /// The automation `name` (a `check` script that creates no tasks),
+    /// added to the catalogue's queue `queue` in `mode`.
+    fn active(&self, name: &str, queue: &str, mode: ObserverMode) -> AutomationKey {
+        crate::automation_support::automation(
+            &self.root,
+            name,
+            crate::automation_support::CHECK_SCRIPT,
+            &[],
         );
-        config.queue = queue.to_string();
-        let store = self.service.observers();
-        let id = store
-            .create(owner, config, None, self.now())
-            .unwrap()
-            .observer_id;
-        store
-            .add_script(&id, "echo '{\"state\": {}}'\n", self.now())
-            .unwrap();
-        self.service.approve_observer_version(&id, 1).unwrap();
-        id
+        let mut queues = self.queues.borrow_mut();
+        let (queue_mode, automations) = queues
+            .entry(queue.to_string())
+            .or_insert_with(|| (mode, Vec::new()));
+        *queue_mode = mode;
+        automations.push(name.to_string());
+        crate::automation_support::write(
+            &self.root,
+            &format!("queues/{queue}.yaml"),
+            &format!(
+                "automations: [{}]\nmode: {mode}\nschedule: {{interval_secs: 300}}\n",
+                automations.join(", ")
+            ),
+        );
+        AutomationKey::new(queue, name).unwrap()
     }
 
-    /// The same, of the default owner.
-    fn active(&self, name: &str, queue: &str, mode: ObserverMode) -> ObserverId {
-        self.active_of(owner(), name, queue, mode)
+    fn record(&self, key: &AutomationKey) -> narsor_engine::observers::AutomationRecord {
+        self.service
+            .observers()
+            .load(key)
+            .unwrap()
+            .expect("the pair has a record")
     }
 
     fn task(&self, id: &str) -> TaskId {
@@ -188,7 +193,7 @@ fn a_gate_with_a_watch_puts_its_episode_on_the_queue() {
     assert_eq!(entry.choices, gate.choices);
     assert_eq!(entry.variables, gate.variables);
     assert_eq!(entry.created_at, fx.now());
-    // An active `on_episodes` observer serves the queue: no warning.
+    // The catalogue has the `on_episodes` queue: no warning.
     assert!(fx.warnings(&task).is_empty());
 }
 
@@ -394,7 +399,7 @@ fn a_runner_problem_in_the_same_episode_keeps_the_entry_and_warns_once() {
         .record_runner_snapshot(&task, FIRST_RUNNER, 1, broken)
         .unwrap();
     fx.service
-        .follow_gate_episode(&outcome.task, &outcome.gate_change);
+        .follow_gate_episode(&outcome.task, &outcome.gate_change, None);
 
     assert!(outcome.gate_change.is_empty());
     assert_eq!(fx.entries(QUEUE), before);
@@ -409,20 +414,23 @@ fn a_runner_problem_in_the_same_episode_keeps_the_entry_and_warns_once() {
 
 #[test]
 fn an_entry_added_back_keeps_the_start_of_its_episode() {
-    // The queue's last observer goes, and its entries with it. A new
-    // observer of the queue adds the entry of the waiting task back; its
-    // start is the episode's, so a script still sees a review done since
-    // the gate began.
+    // The entry went with a crash between the task's record and the
+    // entry. The queue's next tick adds the entry of the waiting task back;
+    // its start is the episode's, so a script still sees a review done
+    // since the gate began.
     let fx = Fixture::new();
     fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
     let task = fx.task("task-1");
     wait_at(&fx.service, &task, "input-1", &review_gate(QUEUE));
     let began = fx.now();
-    fx.service.delete_observer(&owner(), "gitlab-mr").unwrap();
-    assert!(fx.entries(QUEUE).is_empty());
+    let store = fx.service.observers();
+    let lock = store.lock_queue_entries().unwrap();
+    assert!(store
+        .remove_queue_entry(&lock, &queue_entry_id(&task, "input-1"))
+        .unwrap());
+    drop(lock);
     fx.advance(Duration::hours(3));
 
-    fx.active("gitlab-mr-2", QUEUE, ObserverMode::OnEpisodes);
     let pass = fx.service.observer_pass();
 
     assert_eq!(pass.entries_restored, 1);
@@ -490,9 +498,9 @@ fn an_entry_of_a_round_that_cannot_be_read_is_skipped_not_fatal() {
     let next = fx.service.claim_observer_run();
 
     assert!(matches!(next, Ok(None)), "{next:?}");
-    // The round is over and saved: the observer waits for its next tick
+    // The round is over and saved: the pair waits for its next tick
     // instead of failing on the same entry at every claim.
-    let record = fx.service.observers().load(&observer).unwrap();
+    let record = fx.record(&observer);
     assert!(record.entry_round.is_empty(), "{:?}", record.entry_round);
     assert_eq!(record.run_due_since, None);
 }
@@ -500,7 +508,7 @@ fn an_entry_of_a_round_that_cannot_be_read_is_skipped_not_fatal() {
 #[test]
 fn a_corrupt_entry_of_a_waiting_task_is_rewritten_at_the_next_tick() {
     // A corrupt entry file of a waiting task kept its gate from every
-    // observer: the tick rewrites it from the task, with the episode's
+    // automation: the tick rewrites it from the task, with the episode's
     // start, and runs it. The next tick writes nothing.
     let fx = Fixture::new();
     fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
@@ -546,7 +554,7 @@ fn an_entry_of_a_newer_version_is_left_as_it_is() {
 #[test]
 fn an_unreadable_entry_of_an_episode_no_task_waits_in_is_removed() {
     // A bad entry file whose task left the gate: the next tick of an
-    // on_episodes observer removes it.
+    // pair of the on_episodes queue removes it.
     let fx = Fixture::new();
     fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
     let task = fx.task("task-1");
@@ -604,7 +612,7 @@ fn a_paused_task_keeps_its_entry() {
         .record_runner_snapshot(&task, FIRST_RUNNER, 1, at_safe_point)
         .unwrap();
     fx.service
-        .follow_gate_episode(&outcome.task, &outcome.gate_change);
+        .follow_gate_episode(&outcome.task, &outcome.gate_change, None);
     let paused = observe(&fx.service, &task, &lease, Observation::PausedAtSafePoint);
 
     assert_eq!(paused.runner_state, RunnerState::Stopped);
@@ -624,7 +632,7 @@ fn a_paused_task_keeps_its_entry() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_queue_of_always_observers_warns_and_the_gate_waits() {
+fn an_always_queue_warns_and_the_gate_waits() {
     // Covers AE11.
     let fx = Fixture::new();
     fx.active("jira-new", "jira-intake", ObserverMode::Always);
@@ -640,8 +648,8 @@ fn a_queue_of_always_observers_warns_and_the_gate_waits() {
         "{}",
         warnings[0].1
     );
-    // The entry is kept for an observer that may serve the queue later;
-    // the `always` observer's run never gets it (R25).
+    // The entry is kept for a queue file that may change later; the
+    // `always` run never gets it (R25).
     assert_eq!(fx.entries("jira-intake").len(), 1);
     fx.service.observer_pass();
     let claimed = fx.service.claim_observer_run().unwrap().expect("a run");
@@ -655,7 +663,7 @@ fn a_queue_of_always_observers_warns_and_the_gate_waits() {
 }
 
 #[test]
-fn a_queue_without_observers_warns_once_per_episode_not_per_snapshot() {
+fn a_queue_not_in_the_catalogue_warns_once_per_episode_not_per_snapshot() {
     let fx = Fixture::new();
     let task = fx.task("task-1");
     let gate = review_gate(QUEUE);
@@ -675,7 +683,7 @@ fn a_queue_without_observers_warns_once_per_episode_not_per_snapshot() {
     let warnings = fx.warnings(&task);
     assert_eq!(warnings.len(), 1);
     assert!(
-        warnings[0].1.contains("has no observer"),
+        warnings[0].1.contains("is not in the catalogue"),
         "{}",
         warnings[0].1
     );
@@ -693,28 +701,14 @@ fn a_queue_without_observers_warns_once_per_episode_not_per_snapshot() {
 }
 
 #[test]
-fn a_paused_observer_does_not_serve_its_queue() {
+fn a_queue_whose_file_cannot_be_used_warns_and_the_gate_waits() {
+    // AE8: a queue naming a missing automation is not active.
     let fx = Fixture::new();
-    let observer = fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
-    fx.service.pause_observer(&observer).unwrap();
-    let task = fx.task("task-1");
-
-    wait_at(&fx.service, &task, "input-1", &review_gate(QUEUE));
-
-    let warnings = fx.warnings(&task);
-    assert_eq!(warnings.len(), 1);
-    assert!(warnings[0].1.contains("is active"), "{}", warnings[0].1);
-}
-
-#[test]
-fn an_observer_of_another_owner_does_not_serve_the_queue() {
-    // R7: the queue is the task's owner's.
-    let fx = Fixture::new();
-    fx.active_of(
-        OwnerRef::new("someone-else"),
-        "foreign-mr",
+    crate::automation_support::on_episodes_queue(
+        &fx.root,
         QUEUE,
-        ObserverMode::OnEpisodes,
+        &["missing-automation"],
+        "{interval_secs: 300}",
     );
     let task = fx.task("task-1");
 
@@ -723,16 +717,11 @@ fn an_observer_of_another_owner_does_not_serve_the_queue() {
     let warnings = fx.warnings(&task);
     assert_eq!(warnings.len(), 1);
     assert!(
-        warnings[0].1.contains("has no observer"),
+        warnings[0].1.contains("cannot be used"),
         "{}",
         warnings[0].1
     );
-    assert!(fx
-        .service
-        .observers()
-        .queue_entries(&OwnerRef::new("someone-else"), QUEUE)
-        .unwrap()
-        .is_empty());
+    assert_eq!(fx.entries(QUEUE).len(), 1);
 }
 
 #[test]
@@ -803,7 +792,7 @@ fn the_guard_drops_an_entry_whose_gate_exited_and_runs_nothing() {
 
     assert!(fx.service.claim_observer_run().unwrap().is_none());
     assert!(fx.entries(QUEUE).is_empty());
-    let record = fx.service.observers().load(&observer).unwrap();
+    let record = fx.record(&observer);
     assert_eq!(record.last_run_sequence, 0, "no run was started");
     assert_eq!(record.run_due_since, None);
 }
@@ -867,7 +856,7 @@ fn the_pass_drops_an_entry_whose_episode_is_gone() {
 
 #[test]
 fn the_owners_archive_removes_the_entry_at_once() {
-    // R19, also for a queue no observer runs for.
+    // R19, also for a queue no automation runs for.
     let fx = Fixture::new();
     let task = fx.task("task-1");
     wait_at(&fx.service, &task, "input-1", &review_gate(QUEUE));

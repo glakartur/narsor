@@ -2,14 +2,17 @@
 //!
 //! `narsor-server` starts `narsor-observer-worker` and supervises it when its configuration enables
 //! the worker, and hands it a key it makes at every start of the worker in
-//! [`OBSERVER_WORKER_KEY_ENV`] (D5). The key claims runs of every owner's
-//! observers and reports their results, nothing else.
+//! [`OBSERVER_WORKER_KEY_ENV`] (D5). The key claims the runs of every
+//! (queue, automation) pair and reports their results, nothing else.
 //!
-//! The control plane decides when an observer runs; the worker only takes
-//! what is due and runs it:
+//! The control plane decides when an automation's script runs; the worker
+//! only takes what is due and runs it:
 //!
 //! ```text
-//! every 10 s   claim (worker key)                 → nothing due: wait
+//! claim (worker key), held by the server up to 25 s until a run is due
+//!                                                 → nothing due: claim again
+//!                                                   at once (at most one
+//!                                                   claim per CLAIM_PAUSE)
 //!              run dir (0700, removed afterwards)
 //!              sh script.sh, stdin = the input, env = the list below only
 //!              stdout/stderr read with limits, time limit, process group
@@ -21,17 +24,17 @@
 //! An empty environment plus exactly: `PATH`, `HOME` (the run directory),
 //! `NARSOR_SERVER`, `NARSOR_TOKEN` (the run's token, valid on the effect
 //! routes of this one run only), `NARSOR_OBSERVER_RUN` and one variable per
-//! secret reference of the observer. Nothing of the worker's own
-//! environment reaches it — neither the worker key nor a `GH_TOKEN` the
-//! worker was started with.
+//! secret the automation declares. Nothing of the worker's own environment
+//! reaches it — neither the worker key nor a `GH_TOKEN` the worker was
+//! started with.
 //!
-//! # Secrets of many owners
+//! # Secrets
 //!
-//! One worker serves every owner, so a secret is read from the observer
-//! owner's subdirectory only: `{secrets-dir}/{owner}/{name}`
-//! ([`owner_secrets_dir_name`]). An owner cannot name another owner's
-//! secret. An owner that is no safe directory name, or a secret the claim
-//! names but the directory lacks, fails the run before the script starts.
+//! The installation has one owner (A4), so the secrets directory is flat:
+//! `{secrets-dir}/{name}`, one file per secret name. A script gets the
+//! secrets its automation declares (`secrets: [{name, env}]`), and no
+//! other. A declared secret the directory lacks fails the run before the
+//! script starts.
 //!
 //! With `--script-user` the script runs as that system user, which must
 //! not be able to read the worker's secrets directory or its environment
@@ -91,8 +94,11 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 
 use narsor_api_client::api::{ApiClient, ClientError};
 
-/// How often the worker asks for a due run when none was due.
-pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// The shortest time between the starts of two claims that found no run,
+/// and the pause after a failed claim. A claim the server held (its
+/// long-poll) is followed by the next one at once; one answered at once
+/// (an older server, a server that stops) waits out the rest of it.
+pub const CLAIM_PAUSE: Duration = Duration::from_secs(2);
 
 /// Most bytes of stdout a script may print: the script contract's limit
 /// (`MAX_SCRIPT_OUTPUT_BYTES` of the control plane). More is a format
@@ -409,7 +415,7 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
         let Some(run) = self.api.claim().await? else {
             return Ok(None);
         };
-        tracing::info!(run = %run.run_id, version = run.script_version, "observer worker: claimed a run");
+        tracing::info!(run = %run.run_id, phase = %run.phase, script = %run.script_digest, "observer worker: claimed a run");
         let report = self.execute(&run).await;
         let accepted = self.send_report(&run.run_id, &report).await;
         Ok(Some(HandledRun {
@@ -420,16 +426,19 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
     }
 
     /// Claims and handles runs until `shutdown` resolves: a due run is
-    /// followed by the next claim at once, an empty claim by `poll`. With
-    /// `once`, stops after the first claim, due or not.
+    /// followed by the next claim at once, an empty claim by the next one
+    /// once `pause` passed since it started (at once after a claim the
+    /// server held that long), a failed claim by `pause`. With `once`,
+    /// stops after the first claim, due or not.
     pub async fn serve(
         &self,
         once: bool,
-        poll: Duration,
+        pause: Duration,
         shutdown: impl std::future::Future<Output = ()>,
     ) -> Result<(), WorkerStop> {
         tokio::pin!(shutdown);
         loop {
+            let started = tokio::time::Instant::now();
             let claimed = tokio::select! {
                 // Dropping a run in progress kills its process group.
                 () = &mut shutdown => return Ok(()),
@@ -439,14 +448,14 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
                 Ok(Some(_)) if once => return Ok(()),
                 Ok(Some(_)) => continue,
                 Ok(None) if once => return Ok(()),
-                Ok(None) => poll,
+                Ok(None) => pause.saturating_sub(started.elapsed()),
                 Err(error @ (ClientError::Unauthorized | ClientError::Forbidden)) => {
                     return Err(WorkerStop::CredentialRefused(error));
                 }
                 Err(error) if once => return Err(WorkerStop::Claim(error)),
                 Err(error) => {
                     tracing::warn!(%error, "observer worker: claim failed; trying again");
-                    poll
+                    pause
                 }
             };
             tokio::select! {
@@ -460,7 +469,7 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
     /// fails, a problem of the worker is a [`ObserverRunOutcome::WorkerError`].
     pub async fn execute(&self, run: &ObserverWorkerRun) -> ObserverRunReport {
         let mut masker = Masker::new([run.token.as_str()]);
-        let secrets = match self.read_secrets(&run.owner, &run.secrets) {
+        let secrets = match self.read_secrets(&run.secrets) {
             Ok(secrets) => secrets,
             Err(message) => return worker_error(&masker, &message),
         };
@@ -485,15 +494,13 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
         }
     }
 
-    /// The secret values of `references`, as `(variable, value)`, from
-    /// `owner`'s subdirectory of the secrets directory. Fails, naming the
-    /// reference only, when one cannot be read.
+    /// The secret values of `references`, as `(variable, value)`, from the
+    /// secrets directory. Fails, naming the reference only, when one cannot
+    /// be read.
     fn read_secrets(
         &self,
-        owner: &str,
         references: &[ObserverSecretRef],
     ) -> Result<Vec<(String, String)>, String> {
-        let owner_dir = owner_secrets_dir_name(owner)?;
         let mut secrets = Vec::new();
         for reference in references {
             let name = &reference.name;
@@ -512,17 +519,12 @@ impl<A: WorkerApi, R: ScriptRunner> Worker<A, R> {
             }
             let Some(dir) = &self.options.secrets_dir else {
                 return Err(format!(
-                    "the observer needs the secret '{name}', but the worker has no secrets \
+                    "the automation needs the secret '{name}', but the worker has no secrets \
                      directory (--secrets-dir)"
                 ));
             };
-            let value = read_secret(&dir.join(&owner_dir).join(name)).map_err(|problem| {
-                format!(
-                    "the secret '{name}' cannot be used: {problem} (the observer owner's \
-                     directory is '{}')",
-                    without_unsafe_chars_multiline(&owner_dir)
-                )
-            })?;
+            let value = read_secret(&dir.join(name))
+                .map_err(|problem| format!("the secret '{name}' cannot be used: {problem}"))?;
             secrets.push((reference.env.clone(), value));
         }
         Ok(secrets)
@@ -734,33 +736,6 @@ fn read_secret(path: &Path) -> Result<String, String> {
         return Err("it holds a NUL byte".to_string());
     }
     Ok(value.to_string())
-}
-
-/// The name of `owner`'s subdirectory of the secrets directory: the owner
-/// as written, with `%` and `/` spelled `%25` and `%2F`, so that an OIDC
-/// owner (`oidc:https://issuer#subject`) is one path component too. An
-/// empty owner, one with a control character, or one that would be `.` or
-/// `..` is refused: it could name no directory, or the wrong one.
-pub fn owner_secrets_dir_name(owner: &str) -> Result<String, String> {
-    if owner.is_empty() {
-        return Err(
-            "the run names no observer owner, so the worker cannot tell whose secrets to read"
-                .to_string(),
-        );
-    }
-    if owner.chars().any(char::is_control) {
-        return Err(format!(
-            "the observer owner '{}' holds a control character; it names no secrets directory",
-            without_unsafe_chars_multiline(owner)
-        ));
-    }
-    let name = owner.replace('%', "%25").replace('/', "%2F");
-    if name == "." || name == ".." || name.len() > 255 {
-        return Err(format!(
-            "the observer owner '{owner}' names no safe secrets directory"
-        ));
-    }
-    Ok(name)
 }
 
 /// One path component, not hidden, no separator.

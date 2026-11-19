@@ -10,7 +10,7 @@
 //! [`OBSERVER_WORKER_KEY_ENV`] — never as an argument, which `ps` shows. A
 //! new start, or a new daemon, makes every earlier key worthless. Nobody
 //! else makes or holds such a key, and it opens the worker routes only:
-//! claim a run of any owner's observer, report its result.
+//! claim a run of any (queue, automation) pair, report its result.
 //!
 //! # What the child gets
 //!
@@ -61,7 +61,8 @@ pub struct ObserverWorkerSettings {
     pub program: PathBuf,
     /// The API's URL for the worker and its scripts.
     pub server: String,
-    /// The secrets directory, one subdirectory per observer owner.
+    /// The secrets directory: one file per secret name, flat; a run gets
+    /// only the secrets its automation declares.
     pub secrets_dir: Option<PathBuf>,
     /// How scripts are isolated from the worker.
     pub isolation: ScriptIsolation,

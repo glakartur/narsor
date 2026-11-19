@@ -651,21 +651,25 @@ The engine strips control characters from `reason` and from the values and short
 
 ##### D. Watch block of a human decision (`watch`)
 
-A `decision` step with `by: human` (unified shape, §3.7.3) can put its wait on an observer queue.
-The observers of that queue run a script for the wait and can answer the gate as a person answers
-it. The person can still answer the gate at any time, with every choice.
+A `decision` step with `by: human` (unified shape, §3.7.3) can put its wait on a queue. A queue is
+a file of the catalogue (`{catalog}/queues/{name}.yaml`), not of the workflow: it names the
+automations that serve it (`{catalog}/automations/{name}/`), when they run and what they get (see
+[Automations and queues](../user/observers.md)). The automations of the queue run scripts for the
+wait: an entry script when the wait begins, a `check` script on the queue's schedule, which can
+answer the gate as a person answers it, and an exit script when the gate exits. The person can
+still answer the gate at any time, with every choice. The workflow does not know how the queue
+handles its source: it gives the queue only the params.
 
 ```yaml
 review_work:
   action:
     type: decision
     by: human
-    message: Review the merge request, then remove the label narsor-review.
+    message: Review the merge request, then remove its review label.
     watch:
       queue: mr-review                              # Queue name, no template
       params:                                       # Optional, rendered when the gate starts
         mr_url: "{{ context.workspace.code.pr_url }}"
-        label: narsor-review
         choice: check_feedback
   choices:
     check_feedback:
@@ -674,11 +678,13 @@ review_work:
       next: plan
 ```
 
-*   `queue` is required. It is a plain name of a queue of the task's owner. It cannot be a template.
+*   `queue` is required. It is the plain name of a queue file of the catalogue. It cannot be a
+    template. The workflow loads also when the catalogue has no such queue.
 *   `params` is optional. It is a flat map of names to text. The engine renders the template of each
     value when the gate starts. A number or a boolean is read as text. A list, a map or an empty
     value is a load error. Narsor does not interpret a value: not as a URL, a host or an object id.
-    The script checks its params.
+    The scripts check their params. An automation lists the params it reads (`params` of its
+    `automation.yaml`).
 *   The `choices` and `variables` of the gate do not change. `watch` adds no choice.
 
 **The wait episode.** Each time the gate starts to wait, the wait gets a new id, the *wait
@@ -690,42 +696,51 @@ snapshot. The control plane then adds one queue entry for the episode. The entry
 episode and its start time, the step, the rendered `params`, and the choices and variables of the
 gate. One episode has at most one entry.
 
-*   **Every exit from the gate removes the entry**: an answer of a script, an answer of the person,
-    or any other exit (for example, a manual transition). The control plane removes the entry while it
-    reads the snapshot that shows the exit. When the same snapshot shows a new watched gate, the
-    control plane removes the old entry first and then adds the new one.
+*   **Entry scripts.** When the episode begins, the control plane runs the `in` script of each
+    automation of the queue that has one. `check` runs for the entry only when every `in`
+    succeeded. When an `in` fails after its third attempt, the gate step has the status `failure`;
+    the person can still choose an exit or restart the step.
+*   **Every exit from the gate ends the entry**: an answer of a script, an answer of the person, an
+    operator's transition or chosen step, or a restart of the step. When the queue has `out`
+    scripts, the control plane holds the exit until they ended and then gives it to the runner;
+    the first exit of the episode wins. When the queue has none, the exit goes through at once.
+    The control plane removes the entry when the episode left the gate and its `out` scripts
+    ended. When the same snapshot shows a new watched gate, the `in` scripts of the new episode
+    wait for the `out` scripts of the old one.
 *   A pause, an `Interrupted` task, an automatic resume and a runner restart do not end the episode.
-    The entry stays.
+    The entry stays, and no `in` or `out` script runs again.
 *   Before a script runs for an entry, the control plane checks that the task still waits in that
     episode. When it does not, the control plane removes the entry and does not run the script.
-*   A task that is finished, archived or deleted loses its entry.
+*   A task that is finished, archived or deleted loses its entry. When it ended at the gate, the
+    `out` scripts run once in the background.
 
-**The first answer wins.** An observer script answers with `narsor-cli task decide TASK --episode
-EPISODE` (see [Observers](../user/observers.md)). The control plane checks the answer as it checks
+**The first answer wins.** A `check` script answers with `narsor-cli task decide TASK --episode
+EPISODE` (see [Automations and queues](../user/observers.md)). The control plane checks the answer as it checks
 the answer of a person: the episode is the current episode of the gate, the choice exists, the
 required variables have a value, and every variable is declared by the gate. The first answer of
 the episode exits the gate. A later answer for the same episode is refused. An answer for an
 earlier episode is refused, so an answer for a wait that the task left never ends a later wait. The
-task history records who answered: the person, or the observer and its run, with the reason that
-the script gave.
+task history records who answered: the person, or the automation and its run, with the reason
+that the script gave. Each attempt of an `in` or `out` script is an event of the gate step in the
+task history.
 
 **Warnings.** The control plane writes the warning `gate_queue_warning` (step, queue, episode,
 reason) to the task history once per episode when:
 
-*   the queue has no observer of the task's owner;
-*   all observers of the queue run in mode `always`. Only an `on_episodes` observer can answer a
-    gate;
-*   no `on_episodes` observer of the queue is active;
+*   the catalogue has no queue of that name;
+*   the queue file cannot be used (a catalogue problem);
+*   the queue has the mode `always`. Only an `on_episodes` queue can serve a gate;
 *   the entry could not be stored (for example, the params are over the limit).
 
-The gate then waits for the person. An `on_episodes` observer of the queue that is created or
-resumed later can still answer the gate while the task waits in the same episode: its schedule adds
-the entry back when it is missing.
+The gate then waits for the person. When the queue comes into the catalogue later (or its file is
+fixed), its automations can still answer the gate while the task waits in the same episode: the
+schedule adds the entry back when it is missing. The entry scripts do not run for such an episode;
+restart the gate step to get them.
 
 The validator refuses a `watch` on a decision with `by: conductor` (the conductor decides at once,
 so an entry could never matter), a `watch` without `queue`, a templated or invalid queue name, and
-a param name that is blank or has whitespace. It does not check that the queue has observers: the
-control plane checks this when the gate starts.
+a param name that is blank or has whitespace. It does not check that the catalogue has the queue:
+the control plane checks this when the gate starts.
 
 **The removed `wait` step.** The step type `wait`, its fields `event_type`, `filter`,
 `watch.observer`, `watch.object` and `watch.event_types`, and the context variable `event`
@@ -1048,9 +1063,9 @@ approval:
     has no value (a blank value is no value). The form also shows the values that the step keeps in
     its `scope: local` variables. `resume_comment_field` names a variable of `type: text` on the
     step. The comment is then required, and the target of that label must be an agent step.
-*   **`watch`** (`by: human` only). The gate puts each wait on an observer queue. An observer
-    script of that queue can answer the gate as the operator answers it. The first answer wins.
-    See §3.3.D.
+*   **`watch`** (`by: human` only). The gate puts each wait on a queue of the catalogue. The
+    queue's automations can prepare the source when the wait begins, answer the gate as the
+    operator answers it, and clean up before the gate exits. The first answer wins. See §3.3.D.
 *   **`by: conductor`.** The conductor decides, always. `autopilot` does not matter here. The engine
     gives the conductor the rendered message, the choices and what each choice requires. The conductor
     picks a label when it is sure and gives every value the label requires. The engine saves the

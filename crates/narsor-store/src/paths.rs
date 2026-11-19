@@ -13,6 +13,8 @@
 //! ```text
 //! {catalog}/repositories/{id}.yaml   -- CatalogPaths: declared, shareable,
 //! {catalog}/workflows/{name}.yaml                     mountable read-only
+//! {catalog}/automations/{name}/…     -- automation definition and scripts
+//! {catalog}/queues/{name}.yaml       -- queues served by automations
 //!
 //! {state}/executions/{id}/…          -- StatePaths: owned by one process
 //! {state}/narsor.log
@@ -22,10 +24,13 @@
 //! {state}/launch-specs/{task}.json    -- immutable launch input (task storage)
 //! {state}/materials/…                 -- bounded task materials (U9): manifests
 //!                                        and blobs, outside any workspace
-//! {state}/observers/{id}/…            -- observers of external sources: record,
-//!                                        script versions, run errors
-//! {state}/observer-queues/…           -- entries of observer queues (wait
+//! {state}/observers/…                 -- records of the removed stored observers:
+//!                                        never read, only reported at start
+//! {state}/observer-queues/entries/…   -- entries of observer queues (wait
 //!                                        episodes of decision gates)
+//! {state}/observer-queues/automations/{queue}/{automation}/…
+//!                                     -- runtime state of a catalogue (queue,
+//!                                        automation) pair: runs, run errors
 //!
 //! {work}/tasks/{id}/code/…           -- WorkPaths: local scratch, disposable
 //! ```
@@ -56,6 +61,13 @@ pub const BACKENDS_DIR: &str = "backends";
 
 /// Directory holding user profiles, under the catalogue root.
 pub const PROFILES_DIR: &str = "profiles";
+
+/// Directory holding automations (one subdirectory each: definition and
+/// scripts), under the catalogue root.
+pub const AUTOMATIONS_DIR: &str = "automations";
+
+/// Directory holding queue definitions, under the catalogue root.
+pub const QUEUES_DIR: &str = "queues";
 
 /// The runtime catalogue (runtime bundle and tool packages), under the
 /// catalogue root.
@@ -243,34 +255,35 @@ pub const MATERIAL_RECORD_FILE: &str = "material.json";
 /// Directory of one material's content-addressed blobs.
 pub const MATERIAL_BLOBS_DIR: &str = "blobs";
 
-/// Observers of external sources, directly under the state root: one
-/// sub-directory per observer (see `narsor_engine::observers::store`).
-///
-/// A sibling of [`ORCHESTRATION_DIR`], not inside it: nothing that walks task
-/// records should ever come across an observer's scripts or run errors.
+/// Where stored observers lived before automations moved to the catalogue,
+/// directly under the state root. Nothing reads it any more: the server
+/// only warns at start that records are left there (R22).
 pub const OBSERVERS_DIR: &str = "observers";
 
-/// Advisory lock serializing observer creation and deletion (unique names),
-/// inside [`OBSERVERS_DIR`]. Observer ids never contain `.`, so it can never
-/// collide with an observer directory.
-pub const OBSERVERS_CREATE_LOCK_FILE: &str = "create.lock";
-
-/// The record of one observer.
+/// The record file of a stored observer, as the startup warning looks for
+/// it.
 pub const OBSERVER_RECORD_FILE: &str = "observer.json";
 
-/// Advisory lock serializing every mutation of one observer.
-pub const OBSERVER_LOCK_FILE: &str = "observer.lock";
+/// The runtime state of catalogue automations, inside
+/// [`OBSERVER_QUEUES_DIR`]: one directory per queue, one per automation
+/// inside it (see `narsor_engine::observers::store`). Not directly under the
+/// state root: by default the catalogue shares that root, and its
+/// `automations/` directory holds the automation definitions.
+pub const AUTOMATION_STATES_DIR: &str = "automations";
 
-/// Directory of an observer's immutable script versions.
-pub const OBSERVER_SCRIPTS_DIR: &str = "scripts";
+/// The runtime record of one (queue, automation) pair.
+pub const AUTOMATION_STATE_FILE: &str = "state.json";
 
-/// Directory of the execution errors of an observer's runs (failed or lost
+/// Advisory lock serializing every mutation of one pair's record.
+pub const AUTOMATION_STATE_LOCK_FILE: &str = "state.lock";
+
+/// Directory of the execution errors of a pair's runs (failed or lost
 /// runs only).
-pub const OBSERVER_ERRORS_DIR: &str = "errors";
+pub const AUTOMATION_ERRORS_DIR: &str = "errors";
 
-/// The entries of observer queues, directly under the state root (see
-/// `narsor_engine::observers::store`). Not inside [`OBSERVERS_DIR`]: an entry
-/// belongs to a queue of an owner, which no single observer owns.
+/// The runtime state of observer queues, directly under the state root
+/// (see `narsor_engine::observers::store`): the queue entries, and the
+/// runtime records of the (queue, automation) pairs.
 pub const OBSERVER_QUEUES_DIR: &str = "observer-queues";
 
 /// Directory of the queue entries, one file per entry, inside
@@ -534,50 +547,48 @@ impl StatePaths {
             .join(sha256)
     }
 
-    /// `{root}/observers`
+    /// `{root}/observers`: only for the startup warning about stored
+    /// observers.
     pub fn observers_dir(&self) -> PathBuf {
         self.root.join(OBSERVERS_DIR)
     }
 
-    /// `{root}/observers/create.lock`
-    pub fn observers_create_lock_file(&self) -> PathBuf {
-        self.observers_dir().join(OBSERVERS_CREATE_LOCK_FILE)
+    /// `{root}/observer-queues/automations`
+    pub fn automation_states_dir(&self) -> PathBuf {
+        self.observer_queues_dir().join(AUTOMATION_STATES_DIR)
     }
 
-    /// `{root}/observers/{observer_id}`
-    pub fn observer_dir(&self, observer_id: &str) -> PathBuf {
-        self.observers_dir().join(observer_id)
+    /// `{root}/observer-queues/automations/{queue}`
+    pub fn automation_queue_dir(&self, queue: &str) -> PathBuf {
+        self.automation_states_dir().join(queue)
     }
 
-    /// `{root}/observers/{observer_id}/observer.json`
-    pub fn observer_record_file(&self, observer_id: &str) -> PathBuf {
-        self.observer_dir(observer_id).join(OBSERVER_RECORD_FILE)
+    /// `{root}/observer-queues/automations/{queue}/{automation}`
+    pub fn automation_state_dir(&self, queue: &str, automation: &str) -> PathBuf {
+        self.automation_queue_dir(queue).join(automation)
     }
 
-    /// `{root}/observers/{observer_id}/observer.lock`
-    pub fn observer_lock_file(&self, observer_id: &str) -> PathBuf {
-        self.observer_dir(observer_id).join(OBSERVER_LOCK_FILE)
+    /// `{root}/observer-queues/automations/{queue}/{automation}/state.json`
+    pub fn automation_state_file(&self, queue: &str, automation: &str) -> PathBuf {
+        self.automation_state_dir(queue, automation)
+            .join(AUTOMATION_STATE_FILE)
     }
 
-    /// `{root}/observers/{observer_id}/scripts`
-    pub fn observer_scripts_dir(&self, observer_id: &str) -> PathBuf {
-        self.observer_dir(observer_id).join(OBSERVER_SCRIPTS_DIR)
+    /// `{root}/observer-queues/automations/{queue}/{automation}/state.lock`
+    pub fn automation_state_lock_file(&self, queue: &str, automation: &str) -> PathBuf {
+        self.automation_state_dir(queue, automation)
+            .join(AUTOMATION_STATE_LOCK_FILE)
     }
 
-    /// `{root}/observers/{observer_id}/scripts/{version}.sh`
-    pub fn observer_script_file(&self, observer_id: &str, version: u32) -> PathBuf {
-        self.observer_scripts_dir(observer_id)
-            .join(format!("{version}.sh"))
+    /// `{root}/observer-queues/automations/{queue}/{automation}/errors`
+    pub fn automation_errors_dir(&self, queue: &str, automation: &str) -> PathBuf {
+        self.automation_state_dir(queue, automation)
+            .join(AUTOMATION_ERRORS_DIR)
     }
 
-    /// `{root}/observers/{observer_id}/errors`
-    pub fn observer_errors_dir(&self, observer_id: &str) -> PathBuf {
-        self.observer_dir(observer_id).join(OBSERVER_ERRORS_DIR)
-    }
-
-    /// `{root}/observers/{observer_id}/errors/{sequence:08}.json`
-    pub fn observer_error_file(&self, observer_id: &str, sequence: u64) -> PathBuf {
-        self.observer_errors_dir(observer_id)
+    /// `{root}/observer-queues/automations/{queue}/{automation}/errors/{sequence:08}.json`
+    pub fn automation_error_file(&self, queue: &str, automation: &str, sequence: u64) -> PathBuf {
+        self.automation_errors_dir(queue, automation)
             .join(event_file_name(sequence))
     }
 
@@ -774,6 +785,16 @@ impl CatalogPaths {
     /// `{root}/profiles`
     pub fn profiles_dir(&self) -> PathBuf {
         self.root.join(PROFILES_DIR)
+    }
+
+    /// `{root}/automations`
+    pub fn automations_dir(&self) -> PathBuf {
+        self.root.join(AUTOMATIONS_DIR)
+    }
+
+    /// `{root}/queues`
+    pub fn queues_dir(&self) -> PathBuf {
+        self.root.join(QUEUES_DIR)
     }
 
     /// `{root}/runtime.yaml`

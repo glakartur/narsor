@@ -31,6 +31,7 @@ use crate::domain::Event;
 use crate::task_usage_text::{step_cells, StepCells};
 use crate::tui::style::{Role, Styles};
 use narsor_protocol::api::{ConversationState, Position, PositionStatus};
+use narsor_protocol::controller::TaskGateAutomationView;
 
 use super::super::super::scroll::one_line;
 use super::super::super::selection::{render_bracketed_list_plain, PREFIX_WIDTH};
@@ -459,7 +460,7 @@ fn axis_cap(area_width: u16, today: u16) -> usize {
 }
 
 /// When a step started or ended, as the axis shows it.
-fn clock(time: Option<chrono::DateTime<chrono::Utc>>) -> String {
+pub(super) fn clock(time: Option<chrono::DateTime<chrono::Utc>>) -> String {
     time.map_or_else(String::new, |time| {
         time.with_timezone(&chrono::Local)
             .format("%m-%d %H:%M:%S")
@@ -743,12 +744,15 @@ fn step_lines(
 /// Draws the tab: the axis on the left, the selected step on the right.
 /// `keys` is the level the keys are on, `None` while they are outside the
 /// tab's content: the axis's bracket and the step conversation's bar are in
-/// the focus role only on that level (R12, R16).
+/// the focus role only on that level (R12, R16). `gate` is the task's gate
+/// automation overlay ([`super::gate`]), `None` from a server before it.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     styles: &Styles,
     progress: &mut Progress,
+    gate: Option<&TaskGateAutomationView>,
     stale: bool,
     keys: Option<StepFocus>,
     glyph: &str,
@@ -792,7 +796,8 @@ pub fn render(
         .timeline()
         .and_then(|response| response.observed_at)
         .unwrap_or_else(chrono::Utc::now);
-    let layout = AxisLayout::new(progress.positions(), area.width, now, styles, stale);
+    let positions = super::gate::overlay(progress.positions(), gate);
+    let layout = AxisLayout::new(&positions, area.width, now, styles, stale);
     let axis_width = layout.width.min(area.width);
     let axis = Rect::new(area.x, area.y, axis_width, area.height);
     let content = Rect::new(
@@ -821,31 +826,44 @@ pub fn render(
         content,
         styles,
         progress,
+        (&positions, gate),
         stale,
         conversation_focused,
         glyph,
     );
 }
 
-/// The right-hand side: the facts of the selected step, then its content.
+/// The right-hand side: the facts of the selected step, the gate's scripts
+/// when it is the gate's step, then its content. `overlaid` is the positions
+/// with the gate's overlay, and the overlay.
+#[allow(clippy::too_many_arguments)]
 fn render_step(
     frame: &mut Frame,
     area: Rect,
     styles: &Styles,
     progress: &mut Progress,
+    overlaid: (&[Position], Option<&TaskGateAutomationView>),
     stale: bool,
     focused: bool,
     glyph: &str,
 ) {
-    let Some(position) = progress.selected_position().cloned() else {
+    let (positions, gate) = overlaid;
+    let Some(label) = progress.selected_label() else {
         return;
     };
-    let position = &position;
+    let Some(position) = positions.iter().find(|position| position.label == label) else {
+        return;
+    };
     let now = progress
         .timeline()
         .and_then(|response| response.observed_at)
         .unwrap_or_else(chrono::Utc::now);
     let mut lines = step_lines(position, now, styles);
+    if let Some(gate) =
+        gate.filter(|_| super::gate::is_gate_position(positions, gate, &position.label))
+    {
+        lines.extend(super::gate::lines(gate, styles));
+    }
     lines.push(Line::raw(""));
     let facts = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)

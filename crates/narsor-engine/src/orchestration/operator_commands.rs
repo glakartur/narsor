@@ -24,10 +24,11 @@
 use super::control_plane::{ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    OperatorCommand, OperatorCommandOutcome, OperatorCommandRequest, OperatorCommandStatus,
-    QueuedOperatorCommand, RunnerState, TaskEventKind, TaskRecord,
+    GateExit, GateExitAuthor, HeldExitItem, OperatorCommand, OperatorCommandOutcome,
+    OperatorCommandRequest, OperatorCommandStatus, QueuedOperatorCommand, RunnerState,
+    TaskEventKind, TaskRecord,
 };
-use super::runner_state::fence_runner;
+use super::runner_state::{fence_runner, hold_gate_exit, reopen_unused_exit};
 use crate::domain::display::bounded_detail;
 use crate::domain::TaskId;
 
@@ -120,8 +121,31 @@ impl ControlPlane {
                         .map(|runner| runner.launch_generation)
                 })
                 .unwrap_or(record.generation);
+            let command_id = next_command_id(record);
+            // A transition, a step chosen or a restart at a watched gate
+            // leaves its episode: with exit scripts it waits for them like
+            // an answer (R10, R16).
+            if let Some(choice) = gate_exit_choice(&request.command) {
+                hold_gate_exit(
+                    record,
+                    None,
+                    GateExit {
+                        choice: choice.map(str::to_string),
+                        author: GateExitAuthor::Operator,
+                        run_id: None,
+                        held: Some(HeldExitItem::Command {
+                            command_id: command_id.clone(),
+                        }),
+                        at: now,
+                    },
+                )
+                .map_err(|reason| OrchestrationError::OperatorCommandRefused {
+                    task_id: record.task_id.clone(),
+                    reason,
+                })?;
+            }
             let queued = QueuedOperatorCommand {
-                command_id: next_command_id(record),
+                command_id,
                 idempotency_key: request.idempotency_key.clone(),
                 command: request.command.clone(),
                 requested_by: request.requested_by.clone(),
@@ -174,29 +198,33 @@ impl ControlPlane {
         }
         let mut changed = false;
         loop {
-            let (record, rejected) = self.mutate(task_id, |record, now| {
+            let (record, (rejected, reopened)) = self.mutate(task_id, |record, now| {
                 fence_runner(record, incarnation, launch_generation)?;
                 let runner_state = record.runner_state;
                 let Some(command) = record.operator_commands.iter_mut().find(|command| {
                     !command.status.is_settled()
                         && obsolete_reason(command, runner_state, launch_generation).is_some()
                 }) else {
-                    return Ok(Mutation::Unchanged(false));
+                    return Ok(Mutation::Unchanged((false, None)));
                 };
                 let detail = obsolete_reason(command, runner_state, launch_generation);
                 command.status = OperatorCommandStatus::Rejected;
                 command.updated_at = now;
                 command.detail = detail.clone();
                 command.forget_text();
+                let command_id = command.command_id.clone();
+                // A held exit that will never happen gives the gate back.
+                let reopened = reopen_unused_exit(record);
                 Ok(Mutation::Changed(
                     TaskEventKind::OperatorCommandResolved {
-                        command_id: command.command_id.clone(),
+                        command_id,
                         status: OperatorCommandStatus::Rejected,
                         detail,
                     },
-                    true,
+                    (true, reopened),
                 ))
             })?;
+            self.note_reopened_gate(task_id, reopened.as_ref());
             if !rejected {
                 return Ok((commands_for(&record, launch_generation), changed));
             }
@@ -217,7 +245,7 @@ impl ControlPlane {
         detail: Option<String>,
     ) -> Result<(QueuedOperatorCommand, bool)> {
         let detail = detail.map(|detail| bounded_detail(&detail));
-        let (_, settled) = self.mutate(task_id, |record, now| {
+        let (_, (settled, reopened)) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
             let target = if applied {
                 OperatorCommandStatus::Applied
@@ -234,7 +262,7 @@ impl ControlPlane {
                     command_id: command_id.to_string(),
                 })?;
             if command.status == target {
-                return Ok(Mutation::Unchanged((command.clone(), false)));
+                return Ok(Mutation::Unchanged(((command.clone(), false), None)));
             }
             if command.status.is_settled() {
                 return Err(OrchestrationError::OperatorCommandAlreadySettled {
@@ -249,6 +277,9 @@ impl ControlPlane {
             command.detail = detail.clone();
             command.forget_text();
             let settled = command.clone();
+            // A refused held exit gives the gate back; checked before old
+            // commands are forgotten, so the held one is still found.
+            let reopened = reopen_unused_exit(record);
             forget_old_commands(record);
             Ok(Mutation::Changed(
                 TaskEventKind::OperatorCommandResolved {
@@ -256,9 +287,10 @@ impl ControlPlane {
                     status: target,
                     detail,
                 },
-                (settled, true),
+                ((settled, true), reopened),
             ))
         })?;
+        self.note_reopened_gate(task_id, reopened.as_ref());
         Ok(settled)
     }
 }
@@ -336,12 +368,30 @@ fn open_commands(record: &TaskRecord) -> Vec<QueuedOperatorCommand> {
 }
 
 /// The open commands meant for the runner of `launch_generation`: one
-/// accepted for a later launch (a paused task's work) waits for it.
+/// accepted for a later launch (a paused task's work) waits for it, and one
+/// a watched gate holds waits for its exit scripts (R10).
 fn commands_for(record: &TaskRecord, launch_generation: u64) -> Vec<QueuedOperatorCommand> {
+    let held = record.held_command_id();
     open_commands(record)
         .into_iter()
-        .filter(|command| command.launch_generation == launch_generation)
+        .filter(|command| {
+            command.launch_generation == launch_generation
+                && held != Some(command.command_id.as_str())
+        })
         .collect()
+}
+
+/// How `command` leaves a gate episode, when it is a command that leaves
+/// one: a transition or a chosen step for its state or step, a restart of
+/// the gate step (a new episode of the same gate, R16) for none.
+fn gate_exit_choice(command: &OperatorCommand) -> Option<Option<&str>> {
+    match command {
+        OperatorCommand::Transition { target, .. } | OperatorCommand::SelectStep { target, .. } => {
+            Some(Some(target))
+        }
+        OperatorCommand::RestartStep { .. } => Some(None),
+        _ => None,
+    }
 }
 
 /// Why an unsettled command can no longer be carried out by the runner of

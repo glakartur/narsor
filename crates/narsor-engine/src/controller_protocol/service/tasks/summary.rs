@@ -3,7 +3,8 @@
 use chrono::{DateTime, Utc};
 
 use super::view::{
-    manual_transitions, task_attention, task_title, task_workspaces, workflow_steps,
+    gate_automation, manual_transitions, task_attention, task_title, task_workspaces,
+    workflow_steps,
 };
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::ProtocolService;
@@ -118,6 +119,7 @@ impl ProtocolService {
                     episode: entry.episode,
                     since: entry.created_at,
                 }),
+            gate_automation: gate_automation(record),
             as_of: now,
         };
         // Last: the offer reads the rest of the summary.
