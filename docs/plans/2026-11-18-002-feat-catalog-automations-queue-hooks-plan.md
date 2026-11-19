@@ -1,7 +1,7 @@
 ---
 title: "feat: Catalog automations and queue entry/exit scripts"
 type: feat
-status: active
+status: completed
 date: 2026-11-18
 origin: docs/brainstorms/2026-11-18-catalog-automations-and-queue-entry-exit-scripts-requirements.md
 ---
