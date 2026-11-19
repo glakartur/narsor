@@ -603,6 +603,11 @@ pub struct ActiveRun {
     /// entry per run, R30).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<RunEntry>,
+    /// For an `out` run, the exit generation of the gate at the claim
+    /// (`GateAutomation::exit_generation`): its end counts only for that
+    /// exit. `None` for other runs and in a record from before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_generation: Option<u64>,
 }
 
 /// The queue entry one run checks.

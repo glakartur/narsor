@@ -381,6 +381,12 @@ export function gateLines(gate) {
       if (entry.retry_at) text += ` · następna próba ${clock(entry.retry_at)}`;
       lines.push({ text, role });
     }
+    if (hook.waiting_for) {
+      lines.push({
+        text: `${word} · ${hook.automation} · ⏳ czeka na plik katalogu ${hook.waiting_for}: popraw lub usuń plik albo uruchom krok ponownie`,
+        role: 'attention',
+      });
+    }
   }
   return lines;
 }

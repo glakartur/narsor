@@ -249,9 +249,18 @@ the gate starts to wait ─▶ in (each automation that has one) ─▶ the step
   that in the task history.
 - **A file that cannot be used for a moment.** When the file of the queue
   or of the automation is a problem (section 2), for example because an
-  editor saved half of it, Narsor does not skip the script. The script
-  waits and runs when the file is correct again. Narsor skips it only when
-  the queue or the automation is really gone from the catalogue.
+  editor saved half of it, and Narsor cannot load the queue or the
+  automation without it, Narsor does not skip the script. The script
+  waits and runs when the file is correct again. Narsor records one
+  warning in the task history that names the file, and the task view
+  shows the file next to the script. The gate does not move until an
+  operator fixes or removes the file. A restart of the step does not help
+  in every case: a restart is an exit, so when the queue has `out` scripts
+  and its own file is the problem, the restart is held as well.
+  Narsor skips the script only when the queue or the automation is really
+  gone from the catalogue. A problem that does not stop the queue or the
+  automation (for example, a second file `queues/<name>.yml` next to a
+  valid `queues/<name>.yaml`) does not hold the script.
 - **An exit that does not happen.** When the runner refuses the held exit
   (for example, an operator's transition that is not allowed, or a restart
   that an older runner refuses), or the held answer becomes obsolete, the
@@ -259,7 +268,9 @@ the gate starts to wait ─▶ in (each automation that has one) ─▶ the step
   puts the gate back to `ready` (or to `failure` when an `in` failed):
   `check` runs again, and `in` does not run again. `out` already told the
   source that the gate was left, so the next exit is held again and runs
-  `out` again. This is one more reason why `out` must be idempotent.
+  `out` again. This is one more reason why `out` must be idempotent. An
+  `out` that still runs for the exit that did not happen does not count
+  for the next exit: `out` runs again with the new choice when it ends.
 
 The task view shows the `failure` status of a gate step whose `in` failed,
 and each attempt of `in` and `out` as an event in the step's history

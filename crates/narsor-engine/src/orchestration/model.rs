@@ -735,6 +735,25 @@ impl TaskRecord {
         }
     }
 
+    /// The id of the answer the watched gate's exit holds, while the gate
+    /// is `exiting` or `released`: once released it is still queued until
+    /// the runner's next poll, so it is not obsolete for a report or a
+    /// poll without a request meanwhile. A runner that left the gate
+    /// changed the watched gate first, so its answer is not kept.
+    pub fn exit_input_id(&self) -> Option<&str> {
+        let automation = self.watched_gate.as_ref()?.automation.as_ref()?;
+        if !matches!(
+            automation.phase,
+            GateAutomationPhase::Exiting | GateAutomationPhase::Released
+        ) {
+            return None;
+        }
+        match automation.exit.as_ref()?.held.as_ref()? {
+            HeldExitItem::Input { input_id } => Some(input_id),
+            HeldExitItem::Command { .. } => None,
+        }
+    }
+
     /// The id of the operator command the watched gate holds back from the
     /// runner, if it holds one ([`Self::held_exit_item`]).
     pub fn held_command_id(&self) -> Option<&str> {
@@ -1101,6 +1120,17 @@ pub struct GateAutomation {
     /// from the runner until every exit script ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<GateExit>,
+    /// Counts the exits of the episode that did not happen and gave way:
+    /// raised when a held exit is put back ([`Self::reopen_exit`]) or
+    /// replaced by a new one. An `out` run carries the value of its claim,
+    /// so the end of a run for an earlier exit does not count for the
+    /// current one. `0` in a record from before it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub exit_generation: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// The automations of a queue whose entry (`in`) and exit (`out`) scripts
@@ -1139,6 +1169,7 @@ impl GateAutomation {
             },
             hooks,
             exit: None,
+            exit_generation: 0,
         }
     }
 
@@ -1168,6 +1199,33 @@ impl GateAutomation {
             GateAutomationPhase::Released
         };
         self.exit = Some(exit);
+    }
+
+    /// Replaces the exit of an episode still left (`exiting` or
+    /// `released`) whose item gave way: `exit` is the new one, and a run
+    /// of the old exit no longer counts.
+    pub fn replace_exit(&mut self, exit: GateExit) {
+        self.exit = Some(exit);
+        self.exit_generation += 1;
+    }
+
+    /// Puts the episode back to where it stood before its exit, which did
+    /// not happen: `ready` (`entry_failed` when an entry script failed for
+    /// good), no exit, and every exit script pending again with no
+    /// attempts. A run of the old exit no longer counts.
+    pub fn reopen_exit(&mut self) {
+        self.exit = None;
+        self.exit_generation += 1;
+        for hook in self
+            .hooks
+            .iter_mut()
+            .filter(|hook| hook.hook == HookPhase::Out)
+        {
+            hook.status = GateHookStatus::Pending;
+            hook.log.clear();
+            hook.waiting_for = None;
+        }
+        self.phase = self.entry_outcome().unwrap_or(GateAutomationPhase::Ready);
     }
 
     /// Whether the episode is not left yet and an exit script of it has
@@ -1345,6 +1403,12 @@ pub struct GateHook {
     /// skip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub log: Vec<GateHookAttemptLog>,
+    /// The catalogue file (relative to the catalogue root) a pending
+    /// script waits for: it cannot be used now, so the script is neither
+    /// run nor skipped. Set once per file with a task warning; cleared when
+    /// an attempt of the script ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<String>,
 }
 
 /// One ended attempt of an entry or exit script, as the task view shows it.
@@ -1373,6 +1437,7 @@ impl GateHook {
             hook,
             status: GateHookStatus::Pending,
             log: Vec::new(),
+            waiting_for: None,
         }
     }
 

@@ -525,12 +525,15 @@ pub fn state_hint(task: &TaskSummary) -> Option<ToneLine> {
     Some(hint)
 }
 
-/// What an interrupted task waits for — the automatic resume or its owner —
-/// as the TUI tells it ([`loss_state`]).
 /// What the gate's entry or exit scripts mean for the owner, while they
-/// hold the gate: an entry script failed for good, or an exit is held.
+/// hold the gate of a task that still waits there (running, or waiting
+/// for an answer, not interrupted): an entry script failed for good, or an
+/// exit is held. A task that ended, paused or lost its workload gets the
+/// hint of its state.
 fn gate_hint(task: &TaskSummary) -> Option<ToneLine> {
-    if task.state == TaskState::Archived {
+    let waits = matches!(task.state, TaskState::Running | TaskState::HumanNeeded)
+        && task.runner_state != RunnerState::Interrupted;
+    if !waits {
         return None;
     }
     match task.gate_automation.as_ref()?.phase {
@@ -604,14 +607,22 @@ fn gate_hook_line(hook: &GateHookView, now: DateTime<Utc>) -> ToneLine {
         let seconds = (retry_at - now).num_seconds().max(0);
         text.push_str(&format!(" · next attempt in {}", short_age(seconds)));
     }
+    if let Some(file) = &hook.waiting_for {
+        text.push_str(&format!(
+            " · waits for the catalogue file {file}: an operator fixes or removes it, or restart \
+             the step"
+        ));
+    }
     let tone = match hook.status.as_str() {
         "failed" => Tone::Error,
-        "pending" if hook.last_error.is_some() => Tone::Warning,
+        "pending" if hook.last_error.is_some() || hook.waiting_for.is_some() => Tone::Warning,
         _ => Tone::Normal,
     };
     ToneLine::new(text, tone)
 }
 
+/// What an interrupted task waits for — the automatic resume or its owner —
+/// as the TUI tells it ([`loss_state`]).
 fn interrupted_hint(task: &TaskSummary) -> ToneLine {
     const OWNER_CHOICES: &str =
         "it still holds its backend slot — resume (u), start afresh (s) or archive (a)";

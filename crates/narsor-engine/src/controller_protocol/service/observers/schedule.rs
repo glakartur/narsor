@@ -1123,6 +1123,7 @@ impl ProtocolService {
             token_digest: token.digest(),
             tasks_created: 0,
             entry: run_entry,
+            exit_generation: None,
         };
         let claimed = ClaimedObserverRun {
             run_id,

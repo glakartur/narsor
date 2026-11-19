@@ -48,6 +48,10 @@ pub(super) fn gate_automation(record: &TaskRecord) -> Option<TaskGateAutomationV
                     retry_at: entry.retry_at,
                 })
                 .collect(),
+            waiting_for: hook
+                .waiting_for
+                .clone()
+                .filter(|_| hook.status == GateHookStatus::Pending),
         })
         .collect();
     Some(TaskGateAutomationView {

@@ -107,6 +107,14 @@ test('R20: a failed entry script shows the gate as failed with the attempt count
   assert.equal(attempts[2].text, 'wejście · label · próba 3 z 3 · ✗ api down');
 });
 
+test('a script waiting for a broken catalogue file says which file', () => {
+  const waiting = { automation: 'label', hook: 'in', status: 'pending', attempts: 0, max_attempts: 3, waiting_for: 'queues/mr.yaml' };
+  const lines = gateLines({ step: 'review', queue: 'mr', episode: 'ep', phase: 'entering', hooks: [waiting] });
+  assert.equal(lines.length, 2);
+  assert.match(lines[1].text, /^wejście · label · ⏳ czeka na plik katalogu queues\/mr\.yaml/);
+  assert.equal(lines[1].role, 'attention');
+});
+
 test('R20: without the overlay, or after a successful retry, the runner status stays', () => {
   assert.deepEqual(gateOverlay(gatePositions(), undefined), gatePositions());
   const ready = { step: 'review', queue: 'mr', episode: 'ep', phase: 'ready', hooks: [] };

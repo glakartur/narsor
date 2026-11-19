@@ -219,14 +219,31 @@ impl AutomationCatalogLoad {
         }
     }
 
-    /// Whether a file of queue `queue` or of automation `automation` cannot
-    /// be used now: the pair may be back once the file is fixed, so what
-    /// it has not run yet waits rather than counting as removed.
-    pub fn pair_has_problem(&self, queue: &str, automation: &str) -> bool {
-        self.problems.iter().any(|problem| {
-            problem_names_queue(&problem.file, queue)
-                || problem_names_automation(&problem.file, automation)
-        })
+    /// The problem that makes the pair (`queue`, `automation`) unusable
+    /// now, when one does: the queue (loaded or not) may still name the
+    /// automation, which is not loaded and a file of it has a problem; or
+    /// the queue is not loaded and a file of it has a problem. The pair may be
+    /// back once the file is fixed, so what it has not run yet waits rather
+    /// than counting as removed. A problem that leaves the pair usable (a
+    /// second file of a loaded queue) holds nothing back, and a loaded
+    /// queue that no longer names the automation removed it for good.
+    pub fn pair_problem(&self, queue: &str, automation: &str) -> Option<&CatalogProblem> {
+        let named =
+            |test: &dyn Fn(&Path) -> bool| self.problems.iter().find(|problem| test(&problem.file));
+        let loaded_queue = self.queues.get(queue);
+        let still_named = loaded_queue
+            .is_none_or(|loaded| loaded.automations.iter().any(|name| name == automation));
+        // The automation's own file first: a broken automation also makes
+        // every queue that names it unusable.
+        if still_named && !self.automations.contains_key(automation) {
+            if let Some(problem) = named(&|file| problem_names_automation(file, automation)) {
+                return Some(problem);
+            }
+        }
+        if loaded_queue.is_none() {
+            return named(&|file| problem_names_queue(file, queue));
+        }
+        None
     }
 
     /// The automations of `queue` that have a `hook` script, in the queue

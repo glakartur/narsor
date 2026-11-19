@@ -714,27 +714,34 @@ fn a_resume_that_waits_for_a_slot_says_so() {
 #[test]
 fn the_details_show_where_the_gate_scripts_stand_and_what_the_owner_can_do() {
     // The CLI shows what the TUI's gate overlay shows: the phase, each
-    // script with its attempts, error and next attempt, and the held exit.
+    // script with its attempts, error and next attempt, the catalogue file
+    // it waits for, and the held exit. The gate hint is for a task that
+    // still waits at the gate, not for one that ended there.
     let error = "the source API is down";
+    let entry_failed = json!([
+        {"automation": "gitlab-mr-label", "hook": "in", "status": "failed",
+         "attempts": 3, "max_attempts": 3, "last_error": error},
+        {"automation": "gitlab-mr-label", "hook": "out", "status": "pending",
+         "attempts": 0, "max_attempts": 3},
+    ]);
     let cases = [
         (
+            None,
             "entry_failed",
-            json!([
-                {"automation": "gitlab-mr-label", "hook": "in", "status": "failed",
-                 "attempts": 3, "max_attempts": 3, "last_error": error},
-                {"automation": "gitlab-mr-label", "hook": "out", "status": "pending",
-                 "attempts": 0, "max_attempts": 3},
-            ]),
+            entry_failed.clone(),
             None,
             vec![
                 "Gate       scripts of queue mr-review: entry failed",
                 "  in  gitlab-mr-label: failed, attempt 3 of 3 · the source API is down",
                 "  out gitlab-mr-label: pending, attempt 0 of 3",
             ],
-            "the entry script failed: answer the gate or restart the step (narsor-cli task restart-step)",
-            Tone::Error,
+            Some((
+                "the entry script failed: answer the gate or restart the step (narsor-cli task restart-step)",
+                Tone::Error,
+            )),
         ),
         (
+            None,
             "exiting",
             json!([
                 {"automation": "gitlab-mr-label", "hook": "out", "status": "pending",
@@ -748,12 +755,39 @@ fn the_details_show_where_the_gate_scripts_stand_and_what_the_owner_can_do() {
                 "  out gitlab-mr-label: pending, attempt 1 of 3 · the source API is down · next attempt in 10s",
                 "  exit held: check_feedback by person",
             ],
-            "the exit is held while the exit scripts run; it reaches the runner once they end",
-            Tone::Normal,
+            Some((
+                "the exit is held while the exit scripts run; it reaches the runner once they end",
+                Tone::Normal,
+            )),
+        ),
+        (
+            None,
+            "entering",
+            json!([
+                {"automation": "gitlab-mr-label", "hook": "in", "status": "pending",
+                 "attempts": 0, "max_attempts": 3, "waiting_for": "queues/mr-review.yaml"},
+            ]),
+            None,
+            vec![
+                "  in  gitlab-mr-label: pending, attempt 0 of 3 · waits for the catalogue file \
+                 queues/mr-review.yaml: an operator fixes or removes it, or restart the step",
+            ],
+            None,
+        ),
+        (
+            Some(ExecutionStatus::Failed),
+            "entry_failed",
+            entry_failed,
+            None,
+            vec!["Gate       scripts of queue mr-review: entry failed"],
+            None,
         ),
     ];
-    for (phase, hooks, exit, expected, hint, tone) in cases {
+    for (ended, phase, hooks, exit, expected, hint) in cases {
         let mut subject = task("t-1", "local", "running", 1);
+        if let Some(status) = ended {
+            subject = with_runner(subject, status, "review_work");
+        }
         subject.gate_automation = serde_json::from_value(json!({
             "step": "review_work", "queue": "mr-review", "episode": "input-1",
             "phase": phase, "hooks": hooks, "exit": exit,
@@ -767,10 +801,22 @@ fn the_details_show_where_the_gate_scripts_stand_and_what_the_owner_can_do() {
         for line in expected {
             assert!(
                 text.iter().any(|shown| shown == line),
-                "{phase}: {line}\n{text:#?}"
+                "{ended:?} {phase}: {line}\n{text:#?}"
             );
         }
-        let shown = state_hint(&subject).expect("a hint");
-        assert_eq!((shown.text.as_str(), shown.tone), (hint, tone), "{phase}");
+        let shown = state_hint(&subject);
+        match hint {
+            Some(hint) => {
+                let shown = shown.expect("a hint");
+                assert_eq!((shown.text.as_str(), shown.tone), hint, "{phase}");
+            }
+            None => assert!(
+                shown
+                    .as_ref()
+                    .is_none_or(|shown| !shown.text.contains("gate")
+                        && !shown.text.contains("exit scripts")),
+                "{ended:?} {phase}: {shown:?}"
+            ),
+        }
     }
 }

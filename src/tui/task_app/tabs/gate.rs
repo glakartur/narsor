@@ -117,32 +117,45 @@ fn hook_lines<'a>(
     } else {
         "wejście"
     };
-    hook.log.iter().map(move |entry| {
-        let mut text = format!(
-            "  {phase} · {} · próba {} z {}",
-            one_line(&hook.automation),
-            entry.attempt,
-            hook.max_attempts
-        );
-        let role = match (&entry.error, &entry.skipped) {
-            (Some(error), _) => {
-                text.push_str(&format!(" · ✗ {}", excerpt(error)));
-                Role::Problem
+    let waiting = hook.waiting_for.as_deref().map(|file| {
+        Line::styled(
+            format!(
+                "  {phase} · {} · ⏳ czeka na plik katalogu {}: popraw lub usuń plik albo uruchom krok ponownie",
+                one_line(&hook.automation),
+                one_line(file)
+            ),
+            styles.of(Role::Attention),
+        )
+    });
+    hook.log
+        .iter()
+        .map(move |entry| {
+            let mut text = format!(
+                "  {phase} · {} · próba {} z {}",
+                one_line(&hook.automation),
+                entry.attempt,
+                hook.max_attempts
+            );
+            let role = match (&entry.error, &entry.skipped) {
+                (Some(error), _) => {
+                    text.push_str(&format!(" · ✗ {}", excerpt(error)));
+                    Role::Problem
+                }
+                (None, Some(reason)) => {
+                    text.push_str(&format!(" · pominięta: {}", excerpt(reason)));
+                    Role::Done
+                }
+                (None, None) => {
+                    text.push_str(" · ✓ udana");
+                    Role::Done
+                }
+            };
+            if entry.retry_at.is_some() {
+                text.push_str(&format!(" · następna próba {}", clock(entry.retry_at)));
             }
-            (None, Some(reason)) => {
-                text.push_str(&format!(" · pominięta: {}", excerpt(reason)));
-                Role::Done
-            }
-            (None, None) => {
-                text.push_str(" · ✓ udana");
-                Role::Done
-            }
-        };
-        if entry.retry_at.is_some() {
-            text.push_str(&format!(" · następna próba {}", clock(entry.retry_at)));
-        }
-        Line::styled(text, styles.of(role))
-    })
+            Line::styled(text, styles.of(role))
+        })
+        .chain(waiting)
 }
 
 fn author_word(author: &str) -> &'static str {

@@ -178,6 +178,11 @@ pub struct GateHookView {
     /// Every ended attempt, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub log: Vec<GateHookAttemptView>,
+    /// The catalogue file a pending script waits for: it cannot be used
+    /// now, so the script neither runs nor is skipped until an operator
+    /// fixes or removes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<String>,
 }
 
 /// One ended attempt of an entry or exit script.

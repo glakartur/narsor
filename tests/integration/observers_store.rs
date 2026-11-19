@@ -72,6 +72,7 @@ fn active_run(sequence: u64) -> ActiveRun {
         token_digest: "sha256:abc".into(),
         tasks_created: 2,
         entry: None,
+        exit_generation: None,
     }
 }
 

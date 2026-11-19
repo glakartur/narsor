@@ -291,6 +291,25 @@ impl Fixture {
             .map(|automation| automation.phase)
     }
 
+    /// The reasons of the gate warnings in the task's history that say a
+    /// script waits for a catalogue file.
+    fn waiting_warnings(&self, task: &TaskId) -> Vec<String> {
+        self.service
+            .control_plane()
+            .events_since(task, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                TaskEventKind::GateQueueWarning { reason, .. }
+                    if reason.contains(" script of ") =>
+                {
+                    Some(reason)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The entry script attempts in the task's history: `(automation,
     /// failed, gate phase it moved to)`.
     fn attempts(&self, task: &TaskId) -> Vec<(String, bool, Option<GateAutomationPhase>)> {
@@ -925,15 +944,55 @@ fn a_held_exit_the_runner_refuses_returns_the_gate_to_ready() {
 }
 
 #[test]
+fn an_exit_script_run_of_an_exit_that_did_not_happen_does_not_count_for_the_next_exit() {
+    // The held transition is refused while its `out` still runs: the gate
+    // is back to ready and the person's answer is the new exit. The old run
+    // ran with the old choice, so its end does not release the new exit:
+    // `out` runs again with the person's choice first.
+    let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+    let task = ready_gate(&fx);
+    fx.operator_transition(&task, "check_work_feedback");
+    let old = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+    let control = fx.service.control_plane();
+    let command_id = control.task(&task).unwrap().operator_commands[0]
+        .command_id
+        .clone();
+    control
+        .settle_operator_command(&task, FIRST_RUNNER, 1, &command_id, false, None)
+        .unwrap();
+    assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Ready));
+    fx.person_answers(&task, "check_feedback", json!({}))
+        .unwrap();
+
+    fx.finish(&old, 0);
+
+    assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Exiting));
+    assert!(fx.runner_gets(&task).is_empty(), "delivered before out");
+    let new = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+    assert_eq!(
+        new.input.exit.as_ref().unwrap().choice.as_deref(),
+        Some("check_feedback")
+    );
+    fx.finish(&new, 0);
+    assert_eq!(fx.runner_gets(&task), vec!["check_feedback"]);
+}
+
+#[test]
 fn a_held_answer_survives_a_runner_report_without_a_request_while_out_runs() {
     // A runner sends no pending input while a pass is active or while it
-    // reports a problem; the held answer is not obsolete for that.
-    for problem in [false, true] {
+    // reports a problem; the held answer is not obsolete for that, while
+    // `out` runs nor once it ended and the answer waits for the next poll.
+    for (problem, after_out) in [(false, false), (true, false), (false, true), (true, true)] {
+        let case = format!("problem {problem}, after out {after_out}");
         let fx = Fixture::new(&[(LABEL, IN_OUT)]);
         let task = ready_gate(&fx);
         fx.person_answers(&task, "check_feedback", json!({}))
             .unwrap();
         let out = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+        if after_out {
+            fx.finish(&out, 0);
+            assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Released));
+        }
         if problem {
             runner_problem(&fx.service, &task);
         } else {
@@ -942,15 +1001,18 @@ fn a_held_answer_survives_a_runner_report_without_a_request_while_out_runs() {
                 .deliver_inputs(&task, FIRST_RUNNER, 1, None)
                 .unwrap();
         }
-        fx.finish(&out, 0);
+        if !after_out {
+            fx.finish(&out, 0);
+        }
         if problem {
             wait_at(&fx.service, &task, EPISODE, &review_gate(QUEUE));
         }
 
+        assert_eq!(fx.runner_gets(&task), vec!["check_feedback"], "{case}");
         assert_eq!(
-            fx.runner_gets(&task),
-            vec!["check_feedback"],
-            "problem snapshot: {problem}"
+            fx.hook_attempts(&task, "out").len(),
+            1,
+            "{case}: out ran once"
         );
     }
 }
@@ -1001,26 +1063,44 @@ fn a_missing_entry_of_an_episode_with_pending_out_is_added_back() {
 #[test]
 fn a_pending_entry_script_waits_while_a_catalogue_file_cannot_be_read() {
     // An editor may save a broken file for a moment: the script is neither
-    // skipped nor run until the file is fixed.
+    // skipped nor run until the file is fixed, and the history says once
+    // which file it waits for. A problem that leaves the pair usable (a
+    // second file of the same queue) holds nothing back.
+    let duplicate = format!("queues/{QUEUE}.yml");
     let cases = [
-        ("queue file", format!("queues/{QUEUE}.yaml")),
+        ("queue file", format!("queues/{QUEUE}.yaml"), true),
         (
             "automation file",
             format!("automations/{LABEL}/automation.yaml"),
+            true,
         ),
+        ("duplicate queue file", duplicate, false),
     ];
-    for (case, file) in cases {
+    for (case, file, waits) in cases {
         let fx = Fixture::new(&[(LABEL, IN_OUT)]);
-        let good = fs::read_to_string(fx.root.join(&file)).unwrap();
+        let good = fs::read_to_string(fx.root.join(format!("queues/{QUEUE}.yaml"))).unwrap();
         let task = fx.waiting_task();
+        if !waits {
+            write(&fx.root, &file, &good);
+            let run = fx.claim_entry_script(LABEL);
+            fx.finish(&run, 0);
+            assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Ready), "{case}");
+            assert!(fx.waiting_warnings(&task).is_empty(), "{case}");
+            continue;
+        }
+        let good = fs::read_to_string(fx.root.join(&file)).unwrap();
         write(&fx.root, &file, "automations: [unclosed\n");
 
+        assert!(fx.claim().is_none(), "{case}: claimed with a broken file");
         assert!(fx.claim().is_none(), "{case}: claimed with a broken file");
         assert!(
             fx.attempts(&task).is_empty(),
             "{case}: the script was skipped"
         );
         assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Entering));
+        let warnings = fx.waiting_warnings(&task);
+        assert_eq!(warnings.len(), 1, "{case}: {warnings:?}");
+        assert!(warnings[0].contains(&file), "{case}: {}", warnings[0]);
 
         write(&fx.root, &file, &good);
         let run = fx.claim_entry_script(LABEL);

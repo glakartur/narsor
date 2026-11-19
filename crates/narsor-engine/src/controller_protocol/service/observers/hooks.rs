@@ -15,9 +15,11 @@
 //!             phase `in`, the time limit GATE_HOOK_TIMEOUT_SECS
 //!           its automation left the queue, lost its `in` script, or the
 //!           queue left the catalogue → skipped (history), not run
-//!           a file of the queue or the automation cannot be used now
+//!           a file of the queue or the automation cannot be used now,
+//!           and the pair cannot run without it
 //!                                       → waits (not run, not skipped) until
-//!                                         the file is fixed or removed
+//!                                         the file is fixed or removed; one
+//!                                         gate warning per file
 //!           its `in` script cannot be read → a failed attempt
 //! result    exit 0                      → succeeded
 //!           anything else               → failed attempt: error file,
@@ -101,6 +103,9 @@ struct HookCandidate {
     hook: HookPhase,
     /// For `out`, how the gate was left.
     exit: Option<ScriptExit>,
+    /// For `out`, the gate's exit generation: the run counts for that exit
+    /// only.
+    exit_generation: Option<u64>,
 }
 
 impl ProtocolService {
@@ -190,6 +195,7 @@ impl ProtocolService {
             return None;
         }
         let exit = (hook == HookPhase::Out).then(|| script_exit(state.exit.as_ref()));
+        let exit_generation = (hook == HookPhase::Out).then_some(state.exit_generation);
         let since = state.exit.as_ref().map(|exit| exit.at).or(gate.began_at);
         for script in state
             .hooks
@@ -201,8 +207,12 @@ impl ProtocolService {
             };
             // A file of the pair cannot be used now (an editor may save it
             // half-written): the script waits for the file, neither run nor
-            // skipped.
-            if catalog.pair_has_problem(&key.queue, &key.automation) {
+            // skipped; the owner is told once per file.
+            if let Some(problem) = catalog.pair_problem(&key.queue, &key.automation) {
+                let file = problem.file.display().to_string();
+                if script.waiting_for.as_deref() != Some(file.as_str()) {
+                    self.note_hook_waiting(&entry, &key.automation, hook, &file, &problem.reason);
+                }
                 continue;
             }
             if let Some(reason) = no_hook_script(catalog, pairs, &key, hook) {
@@ -212,6 +222,7 @@ impl ProtocolService {
                     &key.automation,
                     hook,
                     &GateHookOutcome::Skipped(reason),
+                    None,
                 );
                 continue;
             }
@@ -225,6 +236,7 @@ impl ProtocolService {
                 entry,
                 hook,
                 exit,
+                exit_generation,
             });
         }
         None
@@ -250,6 +262,7 @@ impl ProtocolService {
             entry,
             hook,
             exit,
+            exit_generation,
             ..
         } = candidate;
         let lock = self.observers.lock(&key)?;
@@ -263,7 +276,8 @@ impl ProtocolService {
             exit,
         };
         match self.start_run(&mut record, queue, automation, plan, now) {
-            Ok((active, claimed)) => {
+            Ok((mut active, claimed)) => {
+                active.exit_generation = exit_generation;
                 record.active_hook = Some(active);
                 self.observers.save(&lock, &mut record, now)?;
                 tracing::info!(run = %claimed.run_id, task = %entry.task_id, episode = %entry.episode, %hook, "automations: an entry or exit script run starts");
@@ -278,6 +292,7 @@ impl ProtocolService {
                     &key.automation,
                     hook,
                     &GateHookOutcome::Failed(failure.error),
+                    exit_generation,
                 );
                 Ok(None)
             }
@@ -364,6 +379,7 @@ impl ProtocolService {
                 &record.key.automation,
                 active.phase,
                 &outcome,
+                active.exit_generation,
             );
         }
         Ok(())
@@ -389,6 +405,29 @@ impl ProtocolService {
         );
     }
 
+    /// Writes to the task that its pending `hook` script of `automation`
+    /// waits for the catalogue file `file`. A failure is logged: the next
+    /// pass tries again.
+    fn note_hook_waiting(
+        &self,
+        entry: &QueueEntry,
+        automation: &str,
+        hook: HookPhase,
+        file: &str,
+        reason: &str,
+    ) {
+        if let Err(error) = self.control.record_gate_hook_waiting(
+            &entry.task_id,
+            &entry.episode,
+            automation,
+            hook,
+            file,
+            reason,
+        ) {
+            tracing::warn!(task = %entry.task_id, episode = %entry.episode, %automation, %error, "automations: cannot record that an entry or exit script waits for a catalogue file");
+        }
+    }
+
     /// Writes the end of one attempt to the task (its history, the
     /// script's status, the gate's phase). A failure is logged: the attempt
     /// is lost, the script stays pending and runs again.
@@ -399,11 +438,16 @@ impl ProtocolService {
         automation: &str,
         hook: HookPhase,
         outcome: &GateHookOutcome,
+        exit_generation: Option<u64>,
     ) {
-        match self
-            .control
-            .record_gate_hook_attempt(task_id, episode, automation, hook, outcome)
-        {
+        match self.control.record_gate_hook_attempt(
+            task_id,
+            episode,
+            automation,
+            hook,
+            outcome,
+            exit_generation,
+        ) {
             Ok(phase) => {
                 if let Some(phase) = phase {
                     tracing::info!(task = %task_id, %episode, phase = phase.as_str(), "automations: the entry or exit scripts of a gate ended");
