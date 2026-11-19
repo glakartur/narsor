@@ -15,6 +15,9 @@
 //!             phase `in`, the time limit GATE_HOOK_TIMEOUT_SECS
 //!           its automation left the queue, lost its `in` script, or the
 //!           queue left the catalogue → skipped (history), not run
+//!           a file of the queue or the automation cannot be used now
+//!                                       → waits (not run, not skipped) until
+//!                                         the file is fixed or removed
 //!           its `in` script cannot be read → a failed attempt
 //! result    exit 0                      → succeeded
 //!           anything else               → failed attempt: error file,
@@ -43,7 +46,8 @@
 //!           of the task in progress; `in` of a task's new episode waits
 //!           while an episode it left still runs `out` (AE4)
 //!           its automation left the queue or lost its `out` script
-//!                                       → skipped (history)
+//!                                       → skipped (history); waits while a
+//!                                         file of the pair cannot be used
 //! result    as for `in`; after the last attempt the failure is in the
 //!           history and the exit goes on
 //! episode   no `out` pending any more   → `released`: the held exit is
@@ -195,6 +199,12 @@ impl ProtocolService {
             let Ok(key) = AutomationKey::new(entry.queue.clone(), script.automation.clone()) else {
                 continue;
             };
+            // A file of the pair cannot be used now (an editor may save it
+            // half-written): the script waits for the file, neither run nor
+            // skipped.
+            if catalog.pair_has_problem(&key.queue, &key.automation) {
+                continue;
+            }
             if let Some(reason) = no_hook_script(catalog, pairs, &key, hook) {
                 self.settle_hook(
                     &entry.task_id,
@@ -433,7 +443,9 @@ fn script_exit(exit: Option<&GateExit>) -> ScriptExit {
 
 /// Why the pair `key` runs no `hook` script for its queue now, `None` when
 /// it does: the queue (an `on_episodes` one) still names the automation and
-/// the automation still has the script.
+/// the automation still has the script. Asked only when no file of the
+/// pair has a problem: a pair absent from the catalogue is then removed for
+/// good.
 fn no_hook_script(
     catalog: &AutomationCatalogLoad,
     pairs: &BTreeMap<AutomationKey, &Queue>,

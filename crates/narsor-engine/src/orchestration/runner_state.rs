@@ -119,7 +119,7 @@ impl ControlPlane {
             .generated_title
             .as_deref()
             .and_then(|title| one_line_label(title, GENERATED_TITLE_MAX_CHARS));
-        let (task, (applied, gate_change)) = self.mutate(task_id, |record, now| {
+        let (task, (applied, gate_change, reopened)) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
             // A report without a title does not take back one already shown.
             if snapshot.generated_title.is_none() {
@@ -133,7 +133,7 @@ impl ControlPlane {
                     && previous.snapshot.snapshot_sequence == snapshot.snapshot_sequence
                 {
                     if previous.snapshot == snapshot {
-                        return Ok(Mutation::Unchanged((false, GateChange::default())));
+                        return Ok(Mutation::Unchanged((false, GateChange::default(), None)));
                     }
                     return Err(stale_snapshot(record, previous, &snapshot));
                 }
@@ -145,10 +145,6 @@ impl ControlPlane {
             }
 
             let pending = snapshot.pending_input.as_ref().map(|p| p.id.clone());
-            // Obsolete answers change in the same revision: the one event
-            // says what the runner reported, and the input statuses that
-            // follow from it are on the record that event points at.
-            obsolete_undelivered(record, pending.as_deref(), now);
             // A runner without an execution yet (it is still starting) says
             // nothing of a gate, and neither does one that reports a
             // problem: it sends its last execution id with no pending input,
@@ -161,6 +157,14 @@ impl ControlPlane {
                 } else {
                     GateChange::default()
                 };
+            // Obsolete answers change in the same revision: the one event
+            // says what the runner reported, and the input statuses that
+            // follow from it are on the record that event points at. After
+            // the gate is followed: an answer the gate still holds is not
+            // obsolete (its runner may send no pending input meanwhile),
+            // one of an episode the runner left is.
+            obsolete_undelivered(record, pending.as_deref(), now);
+            let reopened = reopen_unused_exit(record);
             let safe_point_generation = if snapshot.safe_point {
                 if record.runner_state == RunnerState::PauseRequested {
                     Some(record.generation)
@@ -189,8 +193,9 @@ impl ControlPlane {
                 safe_point_generation,
             });
             refresh_slot_release_due(record, now, grace);
-            Ok(Mutation::Changed(kind, (true, gate_change)))
+            Ok(Mutation::Changed(kind, (true, gate_change, reopened)))
         })?;
+        self.note_reopened_gate(task_id, reopened.as_ref());
         Ok(RunnerReportOutcome {
             task,
             applied,
@@ -423,12 +428,18 @@ impl ControlPlane {
         launch_generation: u64,
         pending_input_id: Option<&str>,
     ) -> Result<(Vec<QueuedInput>, bool)> {
-        let (_, delivered) = self.mutate(task_id, |record, now| {
+        let (_, (delivered, reopened)) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
-            let mut updates = obsolete_undelivered(record, pending_input_id, now);
             // The answer a gate holds waits until its exit scripts ended
-            // (R10).
+            // (R10); it is not obsolete meanwhile.
             let held = record.held_input_id().map(str::to_owned);
+            let mut updates = obsolete_undelivered(record, pending_input_id, now);
+            // Only an answer made obsolete now can give the gate back.
+            let reopened = if updates.is_empty() {
+                None
+            } else {
+                reopen_unused_exit(record)
+            };
             let mut deliverable = Vec::new();
             for input in record.inputs.iter_mut() {
                 if Some(input.pending_input_id.as_str()) != pending_input_id
@@ -451,14 +462,15 @@ impl ControlPlane {
                 }
             }
             if updates.is_empty() {
-                Ok(Mutation::Unchanged((deliverable, false)))
+                Ok(Mutation::Unchanged(((deliverable, false), None)))
             } else {
                 Ok(Mutation::Changed(
                     TaskEventKind::InputsUpdated { updates },
-                    (deliverable, true),
+                    ((deliverable, true), reopened),
                 ))
             }
         })?;
+        self.note_reopened_gate(task_id, reopened.as_ref());
         Ok(delivered)
     }
 
@@ -475,7 +487,7 @@ impl ControlPlane {
         detail: Option<String>,
     ) -> Result<(QueuedInput, bool)> {
         let detail = detail.map(|detail| bounded_detail(&detail));
-        let (_, settled) = self.mutate(task_id, |record, now| {
+        let (_, (settled, reopened)) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
             let target = if accepted {
                 InputStatus::Consumed
@@ -492,7 +504,7 @@ impl ControlPlane {
                     input_id: input_id.to_string(),
                 })?;
             if input.status == target {
-                return Ok(Mutation::Unchanged((input.clone(), false)));
+                return Ok(Mutation::Unchanged(((input.clone(), false), None)));
             }
             if input.status != InputStatus::Delivered {
                 return Err(OrchestrationError::InputAlreadySettled {
@@ -506,6 +518,7 @@ impl ControlPlane {
             input.detail = detail.clone();
             input.delivery = None;
             let settled = input.clone();
+            let reopened = reopen_unused_exit(record);
             Ok(Mutation::Changed(
                 TaskEventKind::InputsUpdated {
                     updates: vec![InputUpdate {
@@ -513,9 +526,10 @@ impl ControlPlane {
                         status: target,
                     }],
                 },
-                (settled, true),
+                ((settled, true), reopened),
             ))
         })?;
+        self.note_reopened_gate(task_id, reopened.as_ref());
         Ok(settled)
     }
 }
@@ -540,6 +554,28 @@ impl ControlPlane {
         };
         self.mutate(task_id, |_, _| Ok(Mutation::Changed(kind, ())))?;
         Ok(())
+    }
+
+    /// Writes to the task's history that the held exit of `gate` did not
+    /// happen ([`reopen_unused_exit`]), when it did not. The reset itself
+    /// was saved with the item's verdict; this event only explains it, so a
+    /// failure is logged.
+    pub(super) fn note_reopened_gate(&self, task_id: &TaskId, gate: Option<&WatchedGate>) {
+        let Some(gate) = gate else {
+            return;
+        };
+        let phase = gate
+            .automation
+            .as_ref()
+            .map_or(GateAutomationPhase::Ready, |state| state.phase);
+        let reason = format!(
+            "the held exit did not happen (the runner refused it, or it became obsolete); the \
+             gate is back to {} and its exit scripts run again at the next exit",
+            phase.as_str()
+        );
+        if let Err(error) = self.record_gate_queue_warning(task_id, gate, &reason) {
+            tracing::warn!(task = %task_id, episode = %gate.episode, %error, "automations: cannot record that a held exit did not happen");
+        }
     }
 
     /// Records the end of one attempt of the `hook` script of `automation`
@@ -749,6 +785,70 @@ fn exit_item_live(record: &TaskRecord, exit: &GateExit) -> bool {
     }
 }
 
+/// Puts the watched gate back to where it stood before its held exit,
+/// when the held item settled without leaving the gate: the runner refused
+/// it, or it became obsolete. The task still waits in the episode, so
+/// `check` runs again: the phase goes back to `ready` (`entry_failed` when
+/// an entry script failed for good; an entry script is not run again), the
+/// exit is cleared, and every exit script is pending again, so the next
+/// exit is held and runs them anew (R13: exit scripts are idempotent).
+///
+/// The exit scripts' attempt logs are cleared with them: each exit gets its
+/// own attempts, and the task's history keeps every attempt that ended
+/// ([`TaskEventKind::GateHookAttempt`]). An attempt still running ends
+/// with no effect, as its episode is no longer `exiting`.
+///
+/// Returns the gate when it was put back. Changes nothing for an exit that
+/// held no item (the task ended, the runner left), or whose item still
+/// leaves the gate ([`exit_item_unused`]).
+pub(super) fn reopen_unused_exit(record: &mut TaskRecord) -> Option<WatchedGate> {
+    let exit = record
+        .watched_gate
+        .as_ref()?
+        .automation
+        .as_ref()
+        .filter(|state| {
+            matches!(
+                state.phase,
+                GateAutomationPhase::Exiting | GateAutomationPhase::Released
+            )
+        })?
+        .exit
+        .clone()?;
+    if !exit_item_unused(record, &exit) {
+        return None;
+    }
+    let gate = record.watched_gate.as_mut()?;
+    let state = gate.automation.as_mut()?;
+    state.exit = None;
+    for hook in state
+        .hooks
+        .iter_mut()
+        .filter(|hook| hook.hook == HookPhase::Out)
+    {
+        hook.status = GateHookStatus::Pending;
+        hook.log.clear();
+    }
+    state.phase = state.entry_outcome().unwrap_or(GateAutomationPhase::Ready);
+    Some(gate.clone())
+}
+
+/// Whether the item `exit` held settled without leaving the gate: an
+/// answer refused or made obsolete, a command refused. An exit that held
+/// nothing, or an item no longer on the record (a forgotten command), is
+/// not known to be unused.
+fn exit_item_unused(record: &TaskRecord, exit: &GateExit) -> bool {
+    match &exit.held {
+        None => false,
+        Some(HeldExitItem::Input { input_id }) => record.input(input_id).is_some_and(|input| {
+            matches!(input.status, InputStatus::Rejected | InputStatus::Obsolete)
+        }),
+        Some(HeldExitItem::Command { command_id }) => record
+            .operator_command(command_id)
+            .is_some_and(|command| command.status == OperatorCommandStatus::Rejected),
+    }
+}
+
 /// The wait before the attempt after `attempts` failed ones, `None` when
 /// none follows (after `max_attempts`).
 fn retry_delay(attempts: u32, max_attempts: u32) -> Option<Duration> {
@@ -847,15 +947,24 @@ pub(super) fn fence_runner(
 
 /// Marks every still-queued answer to a request other than `pending` as
 /// obsolete and drops its payload. Delivered answers are left to the
-/// runner's acknowledgement.
+/// runner's acknowledgement, and so is the answer the watched gate holds
+/// while its exit scripts run ([`TaskRecord::held_input_id`]): it waits on
+/// purpose, and a runner sends no pending input while a pass is active or
+/// before it has an execution. Once the runner left the gate, the gate is
+/// no longer the watched one and its held answer is obsolete like any
+/// other.
 fn obsolete_undelivered(
     record: &mut TaskRecord,
     pending: Option<&str>,
     now: DateTime<Utc>,
 ) -> Vec<InputUpdate> {
+    let held = record.held_input_id().map(str::to_owned);
     let mut updates = Vec::new();
     for input in record.inputs.iter_mut() {
-        if input.status == InputStatus::Queued && Some(input.pending_input_id.as_str()) != pending {
+        if input.status == InputStatus::Queued
+            && Some(input.pending_input_id.as_str()) != pending
+            && held.as_deref() != Some(input.input_id.as_str())
+        {
             input.status = InputStatus::Obsolete;
             input.updated_at = now;
             input.delivery = None;

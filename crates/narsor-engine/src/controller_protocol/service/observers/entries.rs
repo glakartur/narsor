@@ -23,8 +23,9 @@
 //!                  or is starting (no pending input), or whose entry scripts
 //!                  have not all succeeded (R9)
 //!                                               → kept, not run (R17)
-//!                  a task of the queue that waits in its watched episode with
-//!                  no entry, or with an entry file that cannot be parsed
+//!                  a task of the queue that waits in its watched episode, or
+//!                  whose exit scripts of an episode still run, with no entry,
+//!                  or with an entry file that cannot be parsed
 //!                                               → entry added back (or rewritten), no
 //!                                                 warning
 //!                  an unreadable entry file of an episode no task waits in
@@ -218,41 +219,41 @@ impl ProtocolService {
     /// ended meanwhile. No warning: the snapshot that began the episode
     /// wrote the one there is. Failures are logged; the next tick tries
     /// again.
+    ///
+    /// An episode whose exit scripts still run ([`TaskRecord::exiting_gate`]:
+    /// one the task left, or the gate of a task that ended there) needs its
+    /// entry too: the hook claim finds `out` only through it, and `in` of the
+    /// task's next episode waits until `out` ended.
     pub(super) fn restore_queue_entries(
         &self,
         tasks: &[TaskRecord],
         queues: &BTreeSet<String>,
     ) -> usize {
-        let missing: Vec<&TaskRecord> = tasks
+        let missing: Vec<(&TaskRecord, &WatchedGate)> = tasks
             .iter()
-            .filter(|task| {
-                task.watched_gate.as_ref().is_some_and(|gate| {
-                    queues.contains(&gate.watch.queue) && waits_in(task, &task.owner, &gate.episode)
-                })
+            .flat_map(|task| entry_gates(task).map(move |gate| (task, gate)))
+            .filter(|(task, gate)| {
+                queues.contains(&gate.watch.queue) && self.entry_needs_write(task, gate)
             })
-            .filter(|task| self.entry_needs_write(task))
             .collect();
         let mut restored = 0;
-        for task in missing {
-            match self.restore_queue_entry(&task.task_id) {
+        for (task, gate) in missing {
+            match self.restore_queue_entry(&task.task_id, &gate.episode) {
                 Ok(true) => restored += 1,
                 Ok(false) => {}
                 Err(error) => {
-                    tracing::warn!(task = %task.task_id, %error, "observers: cannot add back a queue entry");
+                    tracing::warn!(task = %task.task_id, episode = %gate.episode, %error, "observers: cannot add back a queue entry");
                 }
             }
         }
         restored
     }
 
-    /// Whether the entry of the episode `task` waits in must be written: it
-    /// is missing, or its file cannot be parsed. A file of a newer version,
-    /// or one the filesystem cannot read, is left alone: a write at every
-    /// tick would fail the same way.
-    fn entry_needs_write(&self, task: &TaskRecord) -> bool {
-        let Some(gate) = &task.watched_gate else {
-            return false;
-        };
+    /// Whether the entry of `task`'s episode `gate` must be written: it is
+    /// missing, or its file cannot be parsed. A file of a newer version, or
+    /// one the filesystem cannot read, is left alone: a write at every tick
+    /// would fail the same way.
+    fn entry_needs_write(&self, task: &TaskRecord, gate: &WatchedGate) -> bool {
         match self
             .observers
             .queue_entry(&queue_entry_id(&task.task_id, &gate.episode))
@@ -313,10 +314,11 @@ impl ProtocolService {
         removed
     }
 
-    /// Adds the entry of the episode `task_id` waits in now, if it has
-    /// none, or rewrites it if its file cannot be parsed; `true` when it
-    /// was written.
-    fn restore_queue_entry(&self, task_id: &TaskId) -> Result<bool, ObserverError> {
+    /// Adds the entry of the episode `episode` of `task_id`, if it has none,
+    /// or rewrites it if its file cannot be parsed, while the task (read
+    /// again under the lock) still waits in it or still runs its exit
+    /// scripts; `true` when it was written.
+    fn restore_queue_entry(&self, task_id: &TaskId, episode: &str) -> Result<bool, ObserverError> {
         let lock = self.observers.lock_queue_entries()?;
         let task = match self.control.task(task_id) {
             Ok(task) => task,
@@ -326,11 +328,7 @@ impl ProtocolService {
                 return Ok(false);
             }
         };
-        let Some(gate) = task
-            .watched_gate
-            .as_ref()
-            .filter(|gate| waits_in(&task, &task.owner, &gate.episode))
-        else {
+        let Some(gate) = entry_gates(&task).find(|gate| gate.episode == episode) else {
             return Ok(false);
         };
         let entry = QueueEntry::from_gate(
@@ -432,6 +430,18 @@ pub(crate) fn gate_scripts(catalog: &AutomationCatalogLoad, queue: &str) -> Gate
         entry: catalog.automations_with(found, HookPhase::In),
         exit: catalog.automations_with(found, HookPhase::Out),
     }
+}
+
+/// The episodes of `task` that need a queue entry: the one it waits in,
+/// and every one whose exit scripts still run (one it left, or the gate of
+/// a task that ended there, R18).
+fn entry_gates(task: &TaskRecord) -> impl Iterator<Item = &WatchedGate> {
+    task.exiting_gates
+        .iter()
+        .chain(task.watched_gate.as_ref())
+        .filter(|gate| {
+            waits_in(task, &task.owner, &gate.episode) || task.exiting_gate(&gate.episode).is_some()
+        })
 }
 
 /// Whether `entry`'s task `task` still waits in the entry's episode (R18).

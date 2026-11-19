@@ -247,11 +247,27 @@ the gate starts to wait ─▶ in (each automation that has one) ─▶ the step
 - **A changed catalogue.** When the automation left the queue, or lost its
   `in` or `out` script, before the script ran, Narsor skips it and records
   that in the task history.
+- **A file that cannot be used for a moment.** When the file of the queue
+  or of the automation is a problem (section 2), for example because an
+  editor saved half of it, Narsor does not skip the script. The script
+  waits and runs when the file is correct again. Narsor skips it only when
+  the queue or the automation is really gone from the catalogue.
+- **An exit that does not happen.** When the runner refuses the held exit
+  (for example, an operator's transition that is not allowed, or a restart
+  that an older runner refuses), or the held answer becomes obsolete, the
+  task still waits at the gate. Narsor records that in the task history and
+  puts the gate back to `ready` (or to `failure` when an `in` failed):
+  `check` runs again, and `in` does not run again. `out` already told the
+  source that the gate was left, so the next exit is held again and runs
+  `out` again. This is one more reason why `out` must be idempotent.
 
 The task view shows the `failure` status of a gate step whose `in` failed,
 and each attempt of `in` and `out` as an event in the step's history
 (*Przebieg*). An attempt is never a new step. `check` runs report nothing
-to the task.
+to the task. `narsor-cli task show` prints the same status in a `Gate`
+block: the phase, one line for each script (its status, attempts, last
+error and next attempt) and the held exit; `--json` has it in
+`gate_automation`.
 
 ## 5. The script contract
 

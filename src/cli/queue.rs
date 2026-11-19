@@ -2,8 +2,8 @@
 //!
 //! | command | what |
 //! | --- | --- |
-//! | `queue list` | the catalogue's queues with mode, schedule, automations and entry counts, and the catalogue files that cannot be used |
-//! | `queue show NAME` | one queue: its automations (scripts, state, runs, errors) and its entries |
+//! | `queue list [--json]` | the catalogue's queues with mode, schedule, automations and entry counts, and the catalogue files that cannot be used |
+//! | `queue show NAME [--json]` | one queue: its automations (scripts, state, runs, errors) and its entries |
 //!
 //! Queues and automations are catalogue files: no command creates, changes
 //! or deletes them (R21, R22). The commands go through [`QueueApi`],
@@ -19,6 +19,7 @@ use futures::future::BoxFuture;
 use super::commands::{CliError, Result};
 use super::queue_text::{queue_list_output, queue_show_output};
 use super::remote::failure;
+use super::task_text::safe_json;
 use crate::api::{ApiClient, ClientError, ServerTarget};
 use crate::config::Flags;
 use crate::controller_protocol::{ObserverQueueListResponse, ObserverQueueView};
@@ -30,7 +31,11 @@ pub enum QueueCommand {
     /// Lists the catalogue's queues with their mode, schedule, automations
     /// and how many gate episodes wait on them, and the catalogue files
     /// that cannot be used.
-    List,
+    List {
+        /// Print the server's answer as JSON (the queues and the problems).
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Shows one queue: its automations with their scripts, state, runs
     /// and errors, and the gate episodes that wait on it.
@@ -38,6 +43,9 @@ pub enum QueueCommand {
         /// The queue's name.
         #[arg(value_name = "QUEUE")]
         queue: String,
+        /// Print the queue view as JSON instead.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -94,21 +102,35 @@ where
     N: Fn() -> DateTime<Utc>,
 {
     match command {
-        QueueCommand::List => {
+        QueueCommand::List { json } => {
             let listing = api
                 .observer_queues()
                 .await
                 .map_err(|error| failure("Could not list the queues", error))?;
+            if json {
+                return json_output(&listing);
+            }
             Ok(queue_list_output(&listing))
         }
-        QueueCommand::Show { queue } => {
+        QueueCommand::Show { queue, json } => {
             let view = api.observer_queue(&queue).await.map_err(|error| {
                 failure(
                     &format!("Could not read queue '{}'", without_unsafe_chars(&queue)),
                     error,
                 )
             })?;
+            if json {
+                return json_output(&view);
+            }
             Ok(queue_show_output(&view, now()))
         }
     }
+}
+
+/// `value` as pretty JSON, cleaned like `task show --json`, with a final
+/// newline.
+fn json_output<T: serde::Serialize>(value: &T) -> Result<String> {
+    safe_json(value)
+        .map(|json| format!("{json}\n"))
+        .map_err(|error| CliError::failure(format!("Could not write JSON: {error}")))
 }

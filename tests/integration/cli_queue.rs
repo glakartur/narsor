@@ -474,6 +474,14 @@ async fn queue_list_shows_each_queue_with_its_automations_and_a_bad_file_with_it
     assert!(shown.contains("  task-1 "), "{shown}");
     assert!(shown.contains(" 4m\n"), "the entry waits 4m: {shown}");
     assert!(shown.contains("    gitlab-mr-label: no run yet"), "{shown}");
+    // `--json` prints the server's whole answer, for a script or an agent.
+    let listed: ObserverQueueListResponse =
+        serde_json::from_str(&fx.cli(&["list", "--json"]).await.unwrap()).unwrap();
+    assert!(listed.queues.iter().any(|queue| queue.queue == "mr-review"));
+    assert_eq!(listed.problems[0].file, "queues/broken.yaml");
+    let shown: ObserverQueueView =
+        serde_json::from_str(&fx.cli(&["show", "mr-review", "--json"]).await.unwrap()).unwrap();
+    assert_eq!(shown.entries.len(), 1);
     let error = fx.cli(&["show", "nothing"]).await.unwrap_err();
     assert_eq!(
         error,

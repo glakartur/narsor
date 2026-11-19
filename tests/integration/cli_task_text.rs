@@ -5,6 +5,7 @@
 //! their only reader now.
 
 use chrono::{Duration, TimeZone, Utc};
+use serde_json::json;
 
 use narsor::api::{ClientError, HarnessSelectionSnapshot};
 use narsor::cli::task_text::{
@@ -708,4 +709,68 @@ fn a_resume_that_waits_for_a_slot_says_so() {
     );
     let starts = command_outcome(OwnerCommand::Resume, &Ok(response(false)));
     assert!(!starts.text.contains("waits"), "{starts:?}");
+}
+
+#[test]
+fn the_details_show_where_the_gate_scripts_stand_and_what_the_owner_can_do() {
+    // The CLI shows what the TUI's gate overlay shows: the phase, each
+    // script with its attempts, error and next attempt, and the held exit.
+    let error = "the source API is down";
+    let cases = [
+        (
+            "entry_failed",
+            json!([
+                {"automation": "gitlab-mr-label", "hook": "in", "status": "failed",
+                 "attempts": 3, "max_attempts": 3, "last_error": error},
+                {"automation": "gitlab-mr-label", "hook": "out", "status": "pending",
+                 "attempts": 0, "max_attempts": 3},
+            ]),
+            None,
+            vec![
+                "Gate       scripts of queue mr-review: entry failed",
+                "  in  gitlab-mr-label: failed, attempt 3 of 3 · the source API is down",
+                "  out gitlab-mr-label: pending, attempt 0 of 3",
+            ],
+            "the entry script failed: answer the gate or restart the step (narsor-cli task restart-step)",
+            Tone::Error,
+        ),
+        (
+            "exiting",
+            json!([
+                {"automation": "gitlab-mr-label", "hook": "out", "status": "pending",
+                 "attempts": 1, "max_attempts": 3, "last_error": error,
+                 "log": [{"attempt": 1, "at": at(), "error": error,
+                          "retry_at": at() + Duration::seconds(10)}]},
+            ]),
+            Some(json!({"choice": "check_feedback", "author": "person"})),
+            vec![
+                "Gate       scripts of queue mr-review: exiting",
+                "  out gitlab-mr-label: pending, attempt 1 of 3 · the source API is down · next attempt in 10s",
+                "  exit held: check_feedback by person",
+            ],
+            "the exit is held while the exit scripts run; it reaches the runner once they end",
+            Tone::Normal,
+        ),
+    ];
+    for (phase, hooks, exit, expected, hint, tone) in cases {
+        let mut subject = task("t-1", "local", "running", 1);
+        subject.gate_automation = serde_json::from_value(json!({
+            "step": "review_work", "queue": "mr-review", "episode": "input-1",
+            "phase": phase, "hooks": hooks, "exit": exit,
+        }))
+        .unwrap();
+
+        let text: Vec<String> = detail_lines(&subject, None, None)
+            .into_iter()
+            .map(|line| line.text)
+            .collect();
+        for line in expected {
+            assert!(
+                text.iter().any(|shown| shown == line),
+                "{phase}: {line}\n{text:#?}"
+            );
+        }
+        let shown = state_hint(&subject).expect("a hint");
+        assert_eq!((shown.text.as_str(), shown.tone), (hint, tone), "{phase}");
+    }
 }

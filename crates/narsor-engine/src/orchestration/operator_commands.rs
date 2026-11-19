@@ -28,7 +28,7 @@ use super::model::{
     OperatorCommandRequest, OperatorCommandStatus, QueuedOperatorCommand, RunnerState,
     TaskEventKind, TaskRecord,
 };
-use super::runner_state::{fence_runner, hold_gate_exit};
+use super::runner_state::{fence_runner, hold_gate_exit, reopen_unused_exit};
 use crate::domain::display::bounded_detail;
 use crate::domain::TaskId;
 
@@ -198,29 +198,33 @@ impl ControlPlane {
         }
         let mut changed = false;
         loop {
-            let (record, rejected) = self.mutate(task_id, |record, now| {
+            let (record, (rejected, reopened)) = self.mutate(task_id, |record, now| {
                 fence_runner(record, incarnation, launch_generation)?;
                 let runner_state = record.runner_state;
                 let Some(command) = record.operator_commands.iter_mut().find(|command| {
                     !command.status.is_settled()
                         && obsolete_reason(command, runner_state, launch_generation).is_some()
                 }) else {
-                    return Ok(Mutation::Unchanged(false));
+                    return Ok(Mutation::Unchanged((false, None)));
                 };
                 let detail = obsolete_reason(command, runner_state, launch_generation);
                 command.status = OperatorCommandStatus::Rejected;
                 command.updated_at = now;
                 command.detail = detail.clone();
                 command.forget_text();
+                let command_id = command.command_id.clone();
+                // A held exit that will never happen gives the gate back.
+                let reopened = reopen_unused_exit(record);
                 Ok(Mutation::Changed(
                     TaskEventKind::OperatorCommandResolved {
-                        command_id: command.command_id.clone(),
+                        command_id,
                         status: OperatorCommandStatus::Rejected,
                         detail,
                     },
-                    true,
+                    (true, reopened),
                 ))
             })?;
+            self.note_reopened_gate(task_id, reopened.as_ref());
             if !rejected {
                 return Ok((commands_for(&record, launch_generation), changed));
             }
@@ -241,7 +245,7 @@ impl ControlPlane {
         detail: Option<String>,
     ) -> Result<(QueuedOperatorCommand, bool)> {
         let detail = detail.map(|detail| bounded_detail(&detail));
-        let (_, settled) = self.mutate(task_id, |record, now| {
+        let (_, (settled, reopened)) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
             let target = if applied {
                 OperatorCommandStatus::Applied
@@ -258,7 +262,7 @@ impl ControlPlane {
                     command_id: command_id.to_string(),
                 })?;
             if command.status == target {
-                return Ok(Mutation::Unchanged((command.clone(), false)));
+                return Ok(Mutation::Unchanged(((command.clone(), false), None)));
             }
             if command.status.is_settled() {
                 return Err(OrchestrationError::OperatorCommandAlreadySettled {
@@ -273,6 +277,9 @@ impl ControlPlane {
             command.detail = detail.clone();
             command.forget_text();
             let settled = command.clone();
+            // A refused held exit gives the gate back; checked before old
+            // commands are forgotten, so the held one is still found.
+            let reopened = reopen_unused_exit(record);
             forget_old_commands(record);
             Ok(Mutation::Changed(
                 TaskEventKind::OperatorCommandResolved {
@@ -280,9 +287,10 @@ impl ControlPlane {
                     status: target,
                     detail,
                 },
-                (settled, true),
+                ((settled, true), reopened),
             ))
         })?;
+        self.note_reopened_gate(task_id, reopened.as_ref());
         Ok(settled)
     }
 }

@@ -219,6 +219,16 @@ impl AutomationCatalogLoad {
         }
     }
 
+    /// Whether a file of queue `queue` or of automation `automation` cannot
+    /// be used now: the pair may be back once the file is fixed, so what
+    /// it has not run yet waits rather than counting as removed.
+    pub fn pair_has_problem(&self, queue: &str, automation: &str) -> bool {
+        self.problems.iter().any(|problem| {
+            problem_names_queue(&problem.file, queue)
+                || problem_names_automation(&problem.file, automation)
+        })
+    }
+
     /// The automations of `queue` that have a `hook` script, in the queue
     /// file's order.
     pub fn automations_with(&self, queue: &Queue, hook: HookPhase) -> Vec<String> {
@@ -240,6 +250,12 @@ impl AutomationCatalogLoad {
 pub(crate) fn problem_names_queue(file: &Path, queue: &str) -> bool {
     file.parent() == Some(Path::new("queues"))
         && file.file_stem().and_then(|stem| stem.to_str()) == Some(queue)
+}
+
+/// Whether the catalogue file or directory `file` (relative to the
+/// catalogue root) belongs to automation `automation`.
+fn problem_names_automation(file: &Path, automation: &str) -> bool {
+    file.starts_with(Path::new("automations").join(automation))
 }
 
 /// Why a script could not be read.

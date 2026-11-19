@@ -363,13 +363,19 @@ owner gets `403`.
 
 | Command | What it does |
 |---|---|
-| `queue list` | One line per queue of the catalogue: its mode, its schedule, its automations and the number of its entries; a queue that does not run says why. Then the catalogue files that cannot be used, each with the reason. |
-| `queue show QUEUE` | One queue: its mode and schedule, the workflow of the tasks it creates, the problem of its file, its automations (description, scripts, state, the run in progress, the next run, a `no worker` warning, and the newest errors with the exit code, the entry and the reason) and its entries, oldest first (task, step, episode, waiting time, params, and for each automation how it handled the entry). |
+| `queue list [--json]` | One line per queue of the catalogue: its mode, its schedule, its automations and the number of its entries; a queue that does not run says why. Then the catalogue files that cannot be used, each with the reason. |
+| `queue show QUEUE [--json]` | One queue: its mode and schedule, the workflow of the tasks it creates, the problem of its file, its automations (description, scripts, state, the run in progress, the next run, a `no worker` warning, and the newest errors with the exit code, the entry and the reason) and its entries, oldest first (task, step, episode, waiting time, params, and for each automation how it handled the entry). |
 
 ```console
 $ narsor-cli queue list
 $ narsor-cli queue show mr-review
+$ narsor-cli queue show mr-review --json | jq '.entries | length'
 ```
+
+With `--json`, the commands print the server's whole answer as JSON, as
+`task show --json` does: `queue list` prints the queues and the catalogue
+problems, `queue show` prints the queue view. Use it in scripts and for
+agents.
 
 The commands `observer create`, `update`, `list`, `show`, `queue list`,
 `queue show`, `script set`, `script show`, `approve`, `pause`, `resume` and

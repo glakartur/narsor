@@ -22,7 +22,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_engine::automations::HookPhase;
 use narsor_engine::controller_protocol::{
     ClaimedObserverRun, OwnerCommandRequest, ProtocolError, ProtocolService, RunOutcome, RunReport,
-    SubmitInputRequest,
+    SubmitInputRequest, SubmitOperatorCommandRequest,
 };
 use narsor_engine::domain::TaskId;
 use narsor_engine::observers::{queue_entry_id, ScriptExit};
@@ -873,4 +873,313 @@ fn a_restart_while_an_exit_is_held_is_refused() {
     let out = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
     fx.finish(&out, 0);
     assert_eq!(fx.runner_gets(&task), vec!["check_feedback"]);
+}
+
+// ---------------------------------------------------------------------------
+// Held exits that do not happen, and recovery of exit scripts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_held_exit_the_runner_refuses_returns_the_gate_to_ready() {
+    // The runner refuses the held operator transition after `out` ran: the
+    // task still waits in the episode, so `check` runs again, and the next
+    // exit is held and runs `out` again (R13: `out` is idempotent).
+    let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+    let task = ready_gate(&fx);
+    fx.operator_transition(&task, "check_work_feedback");
+    let out = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+    fx.finish(&out, 0);
+    let control = fx.service.control_plane();
+    let (commands, _) = control
+        .deliver_operator_commands(&task, FIRST_RUNNER, 1)
+        .unwrap();
+    control
+        .settle_operator_command(
+            &task,
+            FIRST_RUNNER,
+            1,
+            &commands[0].command_id,
+            false,
+            Some("no such transition".into()),
+        )
+        .unwrap();
+
+    assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Ready));
+    let warned = control
+        .events_since(&task, 0)
+        .unwrap()
+        .into_iter()
+        .any(|event| matches!(event.kind, TaskEventKind::GateQueueWarning { .. }));
+    assert!(warned, "the history says the exit did not happen");
+    let check = fx.next_tick_run().expect("check runs again");
+    assert_eq!(check.phase, HookPhase::Check);
+    fx.finish(&check, 0);
+    fx.person_answers(&task, "check_feedback", json!({}))
+        .unwrap();
+    assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Exiting));
+    assert!(fx.runner_gets(&task).is_empty(), "delivered before out");
+    let again = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+    assert_eq!(again.input.exit.as_ref().unwrap().author, "person");
+    fx.finish(&again, 0);
+    assert_eq!(fx.runner_gets(&task), vec!["check_feedback"]);
+}
+
+#[test]
+fn a_held_answer_survives_a_runner_report_without_a_request_while_out_runs() {
+    // A runner sends no pending input while a pass is active or while it
+    // reports a problem; the held answer is not obsolete for that.
+    for problem in [false, true] {
+        let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+        let task = ready_gate(&fx);
+        fx.person_answers(&task, "check_feedback", json!({}))
+            .unwrap();
+        let out = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+        if problem {
+            runner_problem(&fx.service, &task);
+        } else {
+            fx.service
+                .control_plane()
+                .deliver_inputs(&task, FIRST_RUNNER, 1, None)
+                .unwrap();
+        }
+        fx.finish(&out, 0);
+        if problem {
+            wait_at(&fx.service, &task, EPISODE, &review_gate(QUEUE));
+        }
+
+        assert_eq!(
+            fx.runner_gets(&task),
+            vec!["check_feedback"],
+            "problem snapshot: {problem}"
+        );
+    }
+}
+
+#[test]
+fn a_missing_entry_of_an_episode_with_pending_out_is_added_back() {
+    // The entry is the index the hook claim walks: without it `out` never
+    // runs, and `in` of the task's next episode waits for ever.
+    for archived in [false, true] {
+        let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+        let task = ready_gate(&fx);
+        if archived {
+            fx.service
+                .command(
+                    &owner(),
+                    task.as_str(),
+                    OwnerCommandRequest {
+                        command: OwnerCommand::Archive,
+                        idempotency_key: "archive-1".into(),
+                        expected_generation: None,
+                    },
+                )
+                .unwrap();
+        } else {
+            past_gates(&fx.service, &task);
+            wait_at(&fx.service, &task, "input-2", &review_gate(QUEUE));
+        }
+        let store = fx.service.observers();
+        let lock = store.lock_queue_entries().unwrap();
+        assert!(store
+            .remove_queue_entry(&lock, &queue_entry_id(&task, EPISODE))
+            .unwrap());
+        drop(lock);
+        assert!(fx.claim().is_none(), "archived {archived}: nothing to run");
+
+        fx.advance(Duration::seconds(300));
+        fx.service.observer_pass();
+        let out = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
+        fx.finish(&out, 0);
+
+        if !archived {
+            fx.claim_hook(HookPhase::In, LABEL, "input-2");
+        }
+        assert!(!fx.has_entry(&task, EPISODE), "archived {archived}");
+    }
+}
+
+#[test]
+fn a_pending_entry_script_waits_while_a_catalogue_file_cannot_be_read() {
+    // An editor may save a broken file for a moment: the script is neither
+    // skipped nor run until the file is fixed.
+    let cases = [
+        ("queue file", format!("queues/{QUEUE}.yaml")),
+        (
+            "automation file",
+            format!("automations/{LABEL}/automation.yaml"),
+        ),
+    ];
+    for (case, file) in cases {
+        let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+        let good = fs::read_to_string(fx.root.join(&file)).unwrap();
+        let task = fx.waiting_task();
+        write(&fx.root, &file, "automations: [unclosed\n");
+
+        assert!(fx.claim().is_none(), "{case}: claimed with a broken file");
+        assert!(
+            fx.attempts(&task).is_empty(),
+            "{case}: the script was skipped"
+        );
+        assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Entering));
+
+        write(&fx.root, &file, &good);
+        let run = fx.claim_entry_script(LABEL);
+        fx.finish(&run, 0);
+        assert_eq!(fx.phase(&task), Some(GateAutomationPhase::Ready), "{case}");
+    }
+}
+
+/// What makes a run claimable in [`a_waiting_claim_returns_a_run_as_soon_as_it_becomes_due`].
+#[derive(Debug, Clone, Copy)]
+enum Trigger {
+    /// The `check` run of one entry ends: the pair is free for the next.
+    CheckRunEnds,
+    /// The `in` of one automation ends: the next automation's `in` is due.
+    EntryScriptEnds,
+    /// The person answers the gate: the exit is held, `out` is due.
+    PersonAnswers,
+    /// A `check` run answers the gate (`task decide`).
+    CheckDecides,
+    /// The owner restarts the gate step through the operator route.
+    OperatorRestarts,
+    /// The owner archives the task at the gate.
+    Archive,
+}
+
+#[tokio::test]
+async fn a_waiting_claim_returns_a_run_as_soon_as_it_becomes_due() {
+    // U6: every change that makes a run claimable wakes a waiting claim.
+    // The `in` row also covers the wake of the attempt's end (settle_hook):
+    // it is on the same call as the wake of the run's result.
+    use Trigger::*;
+    let cases = [
+        (CheckRunEnds, HookPhase::Check),
+        (EntryScriptEnds, HookPhase::In),
+        (PersonAnswers, HookPhase::Out),
+        (CheckDecides, HookPhase::Out),
+        (OperatorRestarts, HookPhase::Out),
+        (Archive, HookPhase::Out),
+    ];
+    for (trigger, expected) in cases {
+        let (fx, fire) = trigger_setup(trigger);
+        let mut claim = tokio::spawn(Arc::clone(&fx.service).claim_observer_run_waiting());
+        let waits = tokio::time::timeout(StdDuration::from_millis(200), &mut claim).await;
+        assert!(
+            waits.is_err(),
+            "{trigger:?}: a run was due before the trigger"
+        );
+
+        fire(&fx);
+
+        let run = tokio::time::timeout(StdDuration::from_secs(5), claim)
+            .await
+            .unwrap_or_else(|_| panic!("{trigger:?}: the claim was not woken"))
+            .unwrap()
+            .unwrap()
+            .unwrap_or_else(|| panic!("{trigger:?}: no run"));
+        assert_eq!(run.phase, expected, "{trigger:?}");
+    }
+}
+
+/// The action that fires a [`Trigger`] on its fixture.
+type Fire = Box<dyn Fn(&Fixture)>;
+
+/// A fixture where nothing is claimable until `trigger` fires, and the
+/// action that fires it.
+fn trigger_setup(trigger: Trigger) -> (Fixture, Fire) {
+    match trigger {
+        Trigger::CheckRunEnds => {
+            let fx = Fixture::new(&[("jira-review", &[])]);
+            fx.waiting_task();
+            let other = queued_task(&fx.service, "task-2", &owner());
+            running(&fx.service, &other);
+            wait_at(&fx.service, &other, EPISODE, &review_gate(QUEUE));
+            fx.service.observer_pass();
+            let first = fx.claim().expect("the first check run");
+            (fx, Box::new(move |fx| fx.finish(&first, 0)))
+        }
+        Trigger::EntryScriptEnds => {
+            let fx = Fixture::new(&[(LABEL, &[HookPhase::In]), ("sonar-gate", &[HookPhase::In])]);
+            fx.waiting_task();
+            let first = fx.claim_entry_script(LABEL);
+            (fx, Box::new(move |fx| fx.finish(&first, 0)))
+        }
+        Trigger::PersonAnswers => {
+            let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+            let task = ready_gate(&fx);
+            (
+                fx,
+                Box::new(move |fx| {
+                    fx.person_answers(&task, "check_feedback", json!({}))
+                        .unwrap()
+                }),
+            )
+        }
+        Trigger::CheckDecides => {
+            let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+            ready_gate(&fx);
+            let check = fx.next_tick_run().expect("a check run");
+            (
+                fx,
+                Box::new(move |fx| {
+                    let entry = check.input.entry.as_ref().unwrap();
+                    fx.service
+                        .observer_decide(
+                            &check.run_id,
+                            ObserverDecideRequest {
+                                task_id: entry.task_id.to_string(),
+                                episode: entry.episode.clone(),
+                                choice: "check_feedback".into(),
+                                reason: None,
+                                variables: Default::default(),
+                            },
+                        )
+                        .unwrap();
+                }),
+            )
+        }
+        Trigger::OperatorRestarts => {
+            let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+            let task = ready_gate(&fx);
+            (
+                fx,
+                Box::new(move |fx| {
+                    fx.service
+                        .submit_operator_command(
+                            &owner(),
+                            task.as_str(),
+                            SubmitOperatorCommandRequest {
+                                command: OperatorCommand::RestartStep {
+                                    note: None,
+                                    failure_key: None,
+                                },
+                                idempotency_key: "restart-1".into(),
+                                expected_generation: None,
+                            },
+                        )
+                        .unwrap();
+                }),
+            )
+        }
+        Trigger::Archive => {
+            let fx = Fixture::new(&[(LABEL, IN_OUT)]);
+            let task = ready_gate(&fx);
+            (
+                fx,
+                Box::new(move |fx| {
+                    fx.service
+                        .command(
+                            &owner(),
+                            task.as_str(),
+                            OwnerCommandRequest {
+                                command: OwnerCommand::Archive,
+                                idempotency_key: "archive-1".into(),
+                                expected_generation: None,
+                            },
+                        )
+                        .unwrap();
+                }),
+            )
+        }
+    }
 }

@@ -76,6 +76,27 @@ cutover: Narsor does not migrate the observers stored in
    `{state}/observers/`. Narsor does not read them any more, and the start
    warning goes away.
 
+### Rollback
+
+A rollback to the previous server loses the state of the entry and exit
+scripts. The previous server does not know the fields
+`WatchedGate.automation` and `TaskRecord.exiting_gates`, and it drops them
+when it writes the task again. Then:
+
+- an exit that waits for `out` (an answer or an operator command) is no
+  longer held: it goes to the runner at the next poll, and `out` does not
+  run for it;
+- `in` and `out` that did not run yet never run, and the task view no
+  longer shows the attempts of the scripts.
+
+Before a rollback, let the tasks leave the gates whose scripts run:
+
+1. Stop new exits: do not answer gates and do not send operator commands.
+2. Wait until no task is in the phase `entering` or `exiting`.
+   `narsor-cli task show TASK` shows the phase in its `Gate` block, and
+   `narsor-cli task show TASK --json` in `gate_automation.phase`.
+3. Then stop the server and install the previous binaries.
+
 The two sections below are for updates to earlier versions. The observer
 commands that they name are removed by the update above.
 
