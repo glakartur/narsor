@@ -128,10 +128,14 @@ request() {
 answer=$(request GET "repos/$owner/$repo/pulls/$number") || exit "$ERROR"
 printf '%s' "$answer" | jq -e 'type == "object" and (.labels | type) == "array"' >/dev/null ||
     fail "the answer for $mr_url is not a pull request"
-if printf '%s' "$answer" | jq -e --arg label "$label" 'any(.labels[]; (.name | ascii_downcase) == ($label | ascii_downcase))' >/dev/null; then
+# `$wanted`, not `$label`: jq 1.6 reserves `label` as a keyword. A jq error
+# fails the run instead of reading as "no label".
+has_label=$(printf '%s' "$answer" | jq -r --arg wanted "$label" 'any(.labels[]; (.name | ascii_downcase) == ($wanted | ascii_downcase))') ||
+    fail "cannot read the labels of $mr_url"
+if [ "$has_label" = true ]; then
     done_with "$mr_url already has the label $label"
 fi
 
 request POST "repos/$owner/$repo/issues/$number/labels" \
-    "$(jq -n -c --arg label "$label" '{labels: [$label]}')" >/dev/null || exit "$ERROR"
+    "$(jq -n -c --arg wanted "$label" '{labels: [$wanted]}')" >/dev/null || exit "$ERROR"
 done_with "the label $label is on $mr_url"

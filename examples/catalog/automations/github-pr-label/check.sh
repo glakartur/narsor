@@ -135,7 +135,11 @@ printf '%s' "$answer" | jq -e 'type == "object" and (.labels | type) == "array"'
 
 state=$(printf '%s' "$answer" | jq -r 'if .merged == true or .merged_at != null then "merged" else .state end')
 [ "$state" = open ] || done_with "$mr_url is $state; nothing to answer"
-if printf '%s' "$answer" | jq -e --arg label "$label" 'any(.labels[]; (.name | ascii_downcase) == ($label | ascii_downcase))' >/dev/null; then
+# `$wanted`, not `$label`: jq 1.6 reserves `label` as a keyword. A jq error
+# fails the run instead of reading as "no label".
+has_label=$(printf '%s' "$answer" | jq -r --arg wanted "$label" 'any(.labels[]; (.name | ascii_downcase) == ($wanted | ascii_downcase))') ||
+    fail "cannot read the labels of $mr_url"
+if [ "$has_label" = true ]; then
     done_with "$mr_url still has the label $label"
 fi
 
