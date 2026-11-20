@@ -11,6 +11,7 @@ const KEYS = [
   ['n', 'nowe zadanie'],
   ['.', 'akcje zadania'],
   ['[ / ]', 'poprzednia / następna zakładka'],
+  ['Home / End', 'początek / koniec rozmowy (Rozmowa, Przebieg)'],
   ['K / J', 'wyżej / niżej w kolejce'],
   ['H', 'historia'],
   ['R', 'repozytoria'],

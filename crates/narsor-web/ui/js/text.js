@@ -421,3 +421,13 @@ export function gateLines(gate) {
   }
   return lines;
 }
+
+/**
+ * The `scrollTop` that keeps the bottom visible line of a scroll container
+ * in place when its visible height changes from `oldHeight` to `newHeight`
+ * (the answer panel below it grew or shrank). Clamped to the content.
+ */
+export function bottomAnchoredScrollTop({ scrollTop, scrollHeight, oldHeight, newHeight }) {
+  const top = scrollTop + oldHeight - newHeight;
+  return Math.min(Math.max(0, top), Math.max(0, scrollHeight - newHeight));
+}

@@ -514,7 +514,7 @@ impl Conversation {
             selected: None,
             follow: true,
             readers: BTreeMap::new(),
-            empty: TranscriptState::new(TranscriptId::from(task_id)),
+            empty: TranscriptState::new(TranscriptId::from(task_id)).with_auto_expand_latest(),
             built: false,
             loading: false,
             failure: None,
@@ -679,7 +679,7 @@ impl Conversation {
             let id = TranscriptId::from(format!("{}/{}", self.task_id, position.label));
             self.readers
                 .entry(position.label.clone())
-                .or_insert_with(|| TranscriptState::new(id))
+                .or_insert_with(|| TranscriptState::new(id).with_auto_expand_latest())
                 .replace_entries(built.entries);
         }
         if self.follow && !self.transcript().is_following_end() {

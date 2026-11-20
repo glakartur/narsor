@@ -33,6 +33,13 @@ pub struct TranscriptState {
     pub(super) revealed_members: HashMap<ExpansionIdentity, HashSet<TranscriptEntryId>>,
     selected: Option<TranscriptEntryId>,
     selected_source: Option<TranscriptEntryId>,
+    /// Opt-in policy: while following, show the newest utterance's speech in
+    /// full.
+    auto_expand_latest: bool,
+    /// The one entry expanded by that policy, kept apart from the
+    /// operator's own [`Self::expanded`] so only it collapses when a newer
+    /// entry arrives.
+    auto_expanded: Option<ExpansionIdentity>,
 }
 
 impl TranscriptState {
@@ -50,7 +57,17 @@ impl TranscriptState {
             revealed_members: HashMap::new(),
             selected: None,
             selected_source: None,
+            auto_expand_latest: false,
+            auto_expanded: None,
         }
+    }
+
+    /// Turns on the follow-mode policy that shows the newest utterance's
+    /// speech in full and collapses the previous one when a newer entry
+    /// arrives.
+    pub fn with_auto_expand_latest(mut self) -> Self {
+        self.auto_expand_latest = true;
+        self
     }
 
     pub fn conversation(&self) -> &TranscriptId {
@@ -94,6 +111,7 @@ impl TranscriptState {
         self.selected_source = self.entries.last().map(|entry| entry.id.clone());
         self.loaded = true;
         self.following_end = true;
+        self.mark_latest_utterance();
         self.scroll.to_bottom(self.total_lines());
     }
 
@@ -111,7 +129,11 @@ impl TranscriptState {
             .or_else(|| self.selected.clone());
         let following = self.following_end;
         self.entries = entries;
-        self.restore_selection(selected);
+        if following {
+            self.select_latest();
+        } else {
+            self.restore_selection(selected);
+        }
         self.restore_after_change(anchor, following);
     }
 
@@ -125,26 +147,28 @@ impl TranscriptState {
         let following = self.following_end;
         self.entries.extend(entries);
         if following {
-            self.selected = self
-                .projected_entries()
-                .last()
-                .map(|entry| entry.id.clone());
-            self.selected_source = self
-                .projected_entries()
-                .last()
-                .and_then(|entry| entry.source_ids.last().cloned());
+            self.select_latest();
         }
         self.restore_after_change(anchor, following);
     }
 
+    /// A height change keeps the last visible line in place: the reply input
+    /// growing under the transcript must not hide the line being read. The
+    /// selection does not move, even when it leaves the view.
     pub fn set_viewport(&mut self, height: usize) {
+        let height = height.max(1);
         if self.scroll.viewport() == height {
             return;
         }
-        let anchor = self.anchor();
-        let following = self.following_end;
+        let total = self.total_lines();
+        if self.following_end {
+            self.scroll.set_viewport(height);
+            self.scroll.to_bottom(total);
+            return;
+        }
+        let bottom = (self.scroll.offset() + self.scroll.viewport()).min(total);
         self.scroll.set_viewport(height);
-        self.restore_after_change(anchor, following);
+        self.scroll.set_offset(bottom.saturating_sub(height), total);
     }
 
     pub fn set_width(&mut self, width: usize) {
@@ -259,7 +283,11 @@ impl TranscriptState {
         let anchor = self.anchor();
         let following = false;
         let identity = self.expansion_identity(entry);
-        if !self.expanded.insert(identity.clone()) {
+        if self.is_auto_expanded(entry) && !self.expanded.contains(&identity) {
+            // The operator sees it expanded, so the toggle collapses it and
+            // the entry is theirs to expand again.
+            self.auto_expanded = None;
+        } else if !self.expanded.insert(identity.clone()) {
             self.expanded.remove(&identity);
             self.forget_revealed_members_if_hidden(&identity);
         } else {
@@ -270,6 +298,34 @@ impl TranscriptState {
 
     pub fn is_expanded(&self, entry: &TranscriptEntryId) -> bool {
         self.expanded.contains(&self.expansion_identity(entry))
+    }
+
+    /// Whether the follow-mode policy shows this entry's speech in full.
+    /// The global raw view ignores it.
+    fn is_auto_expanded(&self, entry: &TranscriptEntryId) -> bool {
+        self.mode != DisplayMode::Raw
+            && self.auto_expanded.as_ref() == Some(&self.expansion_identity(entry))
+    }
+
+    /// Moves the auto-expansion to the newest projected entry when it is
+    /// speech with more lines than its preview, and clears it otherwise.
+    fn mark_latest_utterance(&mut self) {
+        if !self.auto_expand_latest {
+            return;
+        }
+        self.auto_expanded = self
+            .projected_entries()
+            .last()
+            .filter(|entry| !entry.group_header && entry.speech_continuation > 0)
+            .map(|entry| self.expansion_identity(&entry.id));
+    }
+
+    /// Puts the cursor on the newest entry, as following does.
+    fn select_latest(&mut self) {
+        let latest = self.projected_entries().last().cloned();
+        self.selected = latest.as_ref().map(|entry| entry.id.clone());
+        self.selected_source = latest.and_then(|entry| entry.source_ids.last().cloned());
+        self.mark_latest_utterance();
     }
 
     pub fn line_down(&mut self) {
@@ -312,11 +368,8 @@ impl TranscriptState {
         if self.following_end {
             self.following_end = false;
         } else {
+            self.select_latest();
             self.scroll.to_bottom(self.total_lines());
-            if let Some(entry) = self.projected_entries().last() {
-                self.selected = Some(entry.id.clone());
-                self.selected_source = entry.source_ids.last().cloned();
-            }
             self.following_end = true;
         }
     }
@@ -539,81 +592,89 @@ impl TranscriptState {
         let card = self.mode != DisplayMode::Raw && !self.is_raw(&entry.id);
         let nested =
             self.mode == DisplayMode::Rendered && entry.subagent.is_some() && !entry.group_header;
-        let lines =
-            match self.mode {
-                DisplayMode::Raw => {
+        let lines = match self.mode {
+            DisplayMode::Raw => {
+                vec![(
+                    raw_display(&entry.raw),
+                    TranscriptPresentation::Neutral,
+                    false,
+                    false,
+                )]
+            }
+            DisplayMode::Rendered | DisplayMode::Chronology => {
+                if self.is_raw(&entry.id) {
                     vec![(
                         raw_display(&entry.raw),
                         TranscriptPresentation::Neutral,
                         false,
                         false,
                     )]
-                }
-                DisplayMode::Rendered | DisplayMode::Chronology => {
-                    if self.is_raw(&entry.id) {
-                        vec![(
-                            raw_display(&entry.raw),
-                            TranscriptPresentation::Neutral,
-                            false,
-                            false,
-                        )]
-                    } else if entry.group_header {
-                        let marker = if self.is_expanded(&entry.id) {
-                            "▾"
+                } else if entry.group_header {
+                    let marker = if self.is_expanded(&entry.id) {
+                        "▾"
+                    } else {
+                        "▸"
+                    };
+                    vec![(
+                        format!("{marker} {}", entry.header),
+                        entry.presentation,
+                        true,
+                        false,
+                    )]
+                } else {
+                    let mut lines = entry
+                        .rendered_lines
+                        .iter()
+                        .cloned()
+                        .map(|text| (text, entry.presentation, false, true))
+                        .collect::<Vec<_>>();
+                    let has_details = !entry.detail_lines.is_empty()
+                        && !entry
+                            .detail_lines
+                            .iter()
+                            .map(|detail| detail.text.as_str())
+                            .eq(entry.rendered_lines.iter().map(String::as_str));
+                    let revealed = if !has_details {
+                        0
+                    } else if self.is_expanded(&entry.id) {
+                        entry.detail_lines.len()
+                    } else if self.is_auto_expanded(&entry.id) {
+                        entry.speech_continuation.min(entry.detail_lines.len())
+                    } else {
+                        0
+                    };
+                    let expanded = revealed > 0;
+                    lines.extend(
+                        entry.detail_lines[..revealed]
+                            .iter()
+                            .map(|detail| (detail.text.clone(), detail.presentation, false, true)),
+                    );
+                    // Conversation and Chronology intentionally share the
+                    // same card header. The source timestamp is already
+                    // shown as date, hour, minute and second; switching a
+                    // projection must not turn into a formatting change.
+                    let marker = if has_details {
+                        if expanded {
+                            "⌄"
                         } else {
-                            "▸"
-                        };
-                        vec![(
+                            "›"
+                        }
+                    } else {
+                        "·"
+                    };
+                    lines.insert(
+                        0,
+                        (
                             format!("{marker} {}", entry.header),
                             entry.presentation,
                             true,
                             false,
-                        )]
-                    } else {
-                        let mut lines = entry
-                            .rendered_lines
-                            .iter()
-                            .cloned()
-                            .map(|text| (text, entry.presentation, false, true))
-                            .collect::<Vec<_>>();
-                        let expanded = self.is_expanded(&entry.id);
-                        let has_details = !entry.detail_lines.is_empty()
-                            && !entry
-                                .detail_lines
-                                .iter()
-                                .map(|detail| detail.text.as_str())
-                                .eq(entry.rendered_lines.iter().map(String::as_str));
-                        if expanded && has_details {
-                            lines.extend(entry.detail_lines.iter().map(|detail| {
-                                (detail.text.clone(), detail.presentation, false, true)
-                            }));
-                        }
-                        // Conversation and Chronology intentionally share the
-                        // same card header. The source timestamp is already
-                        // shown as date, hour, minute and second; switching a
-                        // projection must not turn into a formatting change.
-                        let marker = if has_details {
-                            if expanded {
-                                "⌄"
-                            } else {
-                                "›"
-                            }
-                        } else {
-                            "·"
-                        };
-                        lines.insert(
-                            0,
-                            (
-                                format!("{marker} {}", entry.header),
-                                entry.presentation,
-                                true,
-                                false,
-                            ),
-                        );
-                        lines
-                    }
+                        ),
+                    );
+                    lines
                 }
-            };
+            }
+        };
         lines
             .into_iter()
             .enumerate()
