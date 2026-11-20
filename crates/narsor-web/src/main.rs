@@ -14,7 +14,7 @@ use std::sync::Arc;
 use clap::Parser;
 use narsor_api_client::api::token::TokenSource;
 use narsor_api_client::api::{ensure_daemon_running, ApiClient, DiscoveryError};
-use narsor_shared::config::{self, Flags};
+use narsor_shared::config::{self, CheckReport, Flags};
 use narsor_web::gateway::{Gateway, Reconnect, Upstream};
 use narsor_web::launch;
 use narsor_web::settings::{configure, TokenMode, Upstream as UpstreamSetting, WebSettings};
@@ -42,6 +42,10 @@ struct Cli {
     /// A command that prints the server's token (for a URL upstream).
     #[arg(long, env = "NARSOR_TOKEN_COMMAND", value_name = "COMMAND")]
     token_command: Option<String>,
+    /// Checks the configuration, prints the report as JSON and exits 0 (no
+    /// problem) or 1, without starting anything (`narsor-cli config show`).
+    #[arg(long, hide = true)]
+    check_config: bool,
 }
 
 #[tokio::main]
@@ -67,11 +71,16 @@ async fn run(cli: Cli) -> Result<(), String> {
     };
     let environment = config::resolve::environment_from_process();
     let resolved = config::resolve(&flags, &environment, config::Scope::WEB);
+    if cli.check_config {
+        let problems = configure(&resolved).err().unwrap_or_default();
+        CheckReport::build("narsor-web", &resolved, &problems).print_and_exit();
+    }
     // R26: an un-migrated configuration runs on built-in values; say so.
     if let Some(warning) = config::legacy::warning(&resolved, &environment) {
         tracing::warn!("{warning}");
     }
     let settings = configure(&resolved).map_err(|problems| {
+        let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
         format!(
             "the configuration does not hold up:\n  {}",
             problems.join("\n  ")

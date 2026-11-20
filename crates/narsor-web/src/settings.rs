@@ -22,7 +22,7 @@ use std::net::{SocketAddr, ToSocketAddrs as _};
 use narsor_shared::config::settings::{
     SettingKey, WEB_TOKEN_PASSTHROUGH, WEB_TOKEN_SERVER, WEB_UPSTREAM_LOCAL,
 };
-use narsor_shared::config::Resolved;
+use narsor_shared::config::{Problem, Resolved};
 
 /// Where the API is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,8 +64,8 @@ pub struct WebSettings {
 /// `narsor-web`'s configuration step: its settings from `config`, or every
 /// problem at once — the resolution errors and the rules between the
 /// settings — before anything starts (R7, R8).
-pub fn configure(config: &Resolved) -> Result<WebSettings, Vec<String>> {
-    let mut problems: Vec<String> = config.errors().iter().map(ToString::to_string).collect();
+pub fn configure(config: &Resolved) -> Result<WebSettings, Vec<Problem>> {
+    let mut problems = Problem::of_resolution(config);
     match WebSettings::from_config(config) {
         Ok(settings) if problems.is_empty() => Ok(settings),
         Ok(_) => Err(problems),
@@ -78,7 +78,7 @@ pub fn configure(config: &Resolved) -> Result<WebSettings, Vec<String>> {
 
 impl WebSettings {
     /// The settings from the resolved configuration, or every problem at once.
-    pub fn from_config(config: &Resolved) -> Result<Self, Vec<String>> {
+    pub fn from_config(config: &Resolved) -> Result<Self, Vec<Problem>> {
         Self::parse(
             config.text(SettingKey::WebBind).unwrap_or_default(),
             config.text(SettingKey::WebUpstream).unwrap_or_default(),
@@ -87,12 +87,15 @@ impl WebSettings {
     }
 
     /// The settings from the three texts.
-    pub fn parse(bind: &str, upstream: &str, token: &str) -> Result<Self, Vec<String>> {
+    pub fn parse(bind: &str, upstream: &str, token: &str) -> Result<Self, Vec<Problem>> {
         let mut problems = Vec::new();
         let bind = match resolve_loopback(bind) {
             Ok(address) => Some(address),
             Err(problem) => {
-                problems.push(format!("{}: {problem}", SettingKey::WebBind));
+                problems.push(Problem::at(
+                    SettingKey::WebBind,
+                    format!("{}: {problem}", SettingKey::WebBind),
+                ));
                 None
             }
         };
@@ -104,20 +107,26 @@ impl WebSettings {
             WEB_TOKEN_PASSTHROUGH => TokenMode::Passthrough,
             WEB_TOKEN_SERVER | "" => TokenMode::Server,
             other => {
-                problems.push(format!(
-                    "{}: '{WEB_TOKEN_SERVER}' or '{WEB_TOKEN_PASSTHROUGH}' was expected, but \
-                     '{other}' was found",
-                    SettingKey::WebToken
+                problems.push(Problem::at(
+                    SettingKey::WebToken,
+                    format!(
+                        "{}: '{WEB_TOKEN_SERVER}' or '{WEB_TOKEN_PASSTHROUGH}' was expected, \
+                         but '{other}' was found",
+                        SettingKey::WebToken
+                    ),
                 ));
                 TokenMode::Server
             }
         };
         if token == TokenMode::Passthrough && upstream == Upstream::Local {
             let token = SettingKey::WebToken;
-            problems.push(format!(
-                "{token}: 'passthrough' with {}: 'local' would hand the local daemon's token to \
-                 the browser; use {token}: 'server'",
-                SettingKey::WebUpstream
+            problems.push(Problem::at(
+                token,
+                format!(
+                    "{token}: 'passthrough' with {}: 'local' would hand the local daemon's token \
+                     to the browser; use {token}: 'server'",
+                    SettingKey::WebUpstream
+                ),
             ));
         }
         match bind {
@@ -181,7 +190,7 @@ mod tests {
         for bind in ["0.0.0.0:8484", "[::]:8484", "192.168.1.10:8484"] {
             let problems = WebSettings::parse(bind, "local", "server").unwrap_err();
             assert!(
-                problems[0].contains("not a loopback address"),
+                problems[0].message().contains("not a loopback address"),
                 "{bind}: {problems:?}"
             );
         }
@@ -190,8 +199,11 @@ mod tests {
     #[test]
     fn passthrough_to_the_local_daemon_is_refused() {
         let problems = WebSettings::parse("127.0.0.1:1", "local", "passthrough").unwrap_err();
-        assert!(problems[0].contains("web.token"), "{problems:?}");
-        assert!(problems[0].contains("web.upstream"), "{problems:?}");
+        assert_eq!(problems[0].path(), Some("web.token"), "{problems:?}");
+        assert!(
+            problems[0].message().contains("web.upstream"),
+            "{problems:?}"
+        );
     }
 
     #[test]

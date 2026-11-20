@@ -88,33 +88,43 @@ pub struct RunnerArgs {
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
 
+    /// Checks the configuration, prints the report as JSON and exits 0 (no
+    /// problem) or 1, without starting anything (`narsor-cli config show`).
+    /// The task arguments are not needed then.
+    #[arg(long, hide = true)]
+    pub check_config: bool,
+
     /// The task this runner works for.
-    #[arg(long, value_name = "TASK_ID")]
-    pub task_id: String,
+    #[arg(long, value_name = "TASK_ID", required_unless_present = "check_config")]
+    pub task_id: Option<String>,
 
     /// Where the task storage is mounted.
-    #[arg(long, value_name = "DIRECTORY")]
-    pub task_storage: PathBuf,
+    #[arg(
+        long,
+        value_name = "DIRECTORY",
+        required_unless_present = "check_config"
+    )]
+    pub task_storage: Option<PathBuf>,
 
     /// The launch spec file (JSON); required on the first start.
     #[arg(long, value_name = "FILE")]
     pub launch_spec: Option<PathBuf>,
 
     /// The control plane's base URL, e.g. `https://narsor.example`.
-    #[arg(long, value_name = "URL")]
-    pub control_plane: String,
+    #[arg(long, value_name = "URL", required_unless_present = "check_config")]
+    pub control_plane: Option<String>,
 
     /// The read-only file holding this incarnation's runner credential.
-    #[arg(long, value_name = "FILE")]
-    pub credential_file: PathBuf,
+    #[arg(long, value_name = "FILE", required_unless_present = "check_config")]
+    pub credential_file: Option<PathBuf>,
 
     /// The read-only directory of mounted secrets.
     #[arg(long, value_name = "DIRECTORY")]
     pub secrets_dir: Option<PathBuf>,
 
     /// The incarnation the credential was issued for.
-    #[arg(long, value_name = "ID")]
-    pub incarnation: String,
+    #[arg(long, value_name = "ID", required_unless_present = "check_config")]
+    pub incarnation: Option<String>,
 
     /// Where HOME points for every action: the task storage, or the host's.
     #[arg(long, value_enum, value_name = "MODE", default_value_t = HomeMode::Private)]
@@ -179,6 +189,12 @@ pub struct RunnerArgs {
 
 /// Runs the runner and maps its end onto the exit-code contract.
 pub async fn run_command(args: RunnerArgs) -> i32 {
+    if args.check_config {
+        let resolved = resolve_configuration(args.config);
+        let problems = narsor_exec::config::Problem::of_resolution(&resolved);
+        narsor_exec::config::CheckReport::build("narsor-runner", &resolved, &problems)
+            .print_and_exit();
+    }
     let config = match runner_config(args) {
         Ok(config) => config,
         Err(error) => {
@@ -214,15 +230,9 @@ fn exit_code(ended: Result<RunnerExit, RunnerError>) -> i32 {
 /// The runner's configuration from its arguments; an error names an
 /// argument that is not valid.
 pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
-    let task_id = TaskId::parse(&args.task_id).map_err(|error| error.to_string())?;
-    let resolved = narsor_exec::config::resolve::resolve(
-        &narsor_exec::config::Flags {
-            config: args.config,
-            ..Default::default()
-        },
-        &narsor_exec::config::resolve::environment_from_process(),
-        narsor_exec::config::Scope::RUNNER,
-    );
+    let task_id =
+        TaskId::parse(&required(args.task_id, "--task-id")?).map_err(|error| error.to_string())?;
+    let resolved = resolve_configuration(args.config);
     if !resolved.is_ok() {
         return Err(resolved
             .errors()
@@ -234,10 +244,10 @@ pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
     let defaults = RunnerTiming::default();
     Ok(RunnerConfig {
         task_id,
-        storage: args.task_storage,
+        storage: required(args.task_storage, "--task-storage")?,
         launch_spec: args.launch_spec,
-        control_plane: args.control_plane,
-        credential_file: args.credential_file,
+        control_plane: required(args.control_plane, "--control-plane")?,
+        credential_file: required(args.credential_file, "--credential-file")?,
         secrets_dir: args.secrets_dir,
         harness_home: HarnessHome {
             mode: args.home,
@@ -250,7 +260,7 @@ pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
             model: resolved.conductor_model(),
             effort: resolved.conductor_effort(),
         },
-        incarnation: args.incarnation,
+        incarnation: required(args.incarnation, "--incarnation")?,
         timing: RunnerTiming {
             poll_wait: std::time::Duration::from_secs(args.poll_wait_secs),
             retry_min: std::time::Duration::from_millis(args.retry_min_ms),
@@ -263,6 +273,24 @@ pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
         read_only: args.read_only,
         pinned_git_credential_only: args.pinned_git_credential_only,
     })
+}
+
+/// The runner's scope of the application configuration, from `file` (none:
+/// the cascade) and the process environment.
+fn resolve_configuration(file: Option<PathBuf>) -> narsor_exec::config::Resolved {
+    narsor_exec::config::resolve::resolve(
+        &narsor_exec::config::Flags {
+            config: file,
+            ..Default::default()
+        },
+        &narsor_exec::config::resolve::environment_from_process(),
+        narsor_exec::config::Scope::RUNNER,
+    )
+}
+
+/// An argument clap requires unless `--check-config` is given.
+fn required<T>(value: Option<T>, flag: &str) -> Result<T, String> {
+    value.ok_or_else(|| format!("{flag} is required"))
 }
 
 /// Sets the variables every action's child process inherits.

@@ -43,6 +43,7 @@ mod conductor_title;
 mod config_cascade;
 mod config_file;
 mod config_resolve;
+mod config_show;
 mod controller_supervision;
 mod conversation_store;
 mod deploy_manifests;

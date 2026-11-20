@@ -233,17 +233,34 @@ fn harness_directory_flag(args: &LocalArgs) -> Option<&'static str> {
 /// from no file at all with `--no-config`, else from the usual search; the
 /// `NARSOR_GLOBAL__*` and `NARSOR_CONTROLLER__*` variables win over the file.
 fn read_config(args: &LocalArgs) -> Result<Resolved, ControllerError> {
-    let environment = narsor_engine::config::resolve::environment_from_process();
-    let resolved = if args.no_config || args.config.is_some() {
-        local_controller::resolve(args.config.as_deref(), &environment)
-    } else {
-        narsor_engine::config::resolve(&Flags::default(), &environment, local_controller::SCOPE)
-    };
+    let resolved = resolve_config(args.config.as_deref(), args.no_config);
     if !resolved.is_ok() {
         let errors: Vec<String> = resolved.errors().iter().map(ToString::to_string).collect();
         return Err(ControllerError::usage(errors.join("\n")));
     }
     Ok(resolved)
+}
+
+/// The `local` scope of the configuration: from `file`, from no file at
+/// all with `no_config`, else from the cascade; and the process
+/// environment.
+fn resolve_config(file: Option<&Path>, no_config: bool) -> Resolved {
+    let environment = narsor_engine::config::resolve::environment_from_process();
+    if no_config || file.is_some() {
+        local_controller::resolve(file, &environment)
+    } else {
+        narsor_engine::config::resolve(&Flags::default(), &environment, local_controller::SCOPE)
+    }
+}
+
+/// `narsor-controller --check-config [--config <file>]`: checks the `local`
+/// scope of the configuration, prints the report as JSON and exits 0 (no
+/// problem) or 1, without starting anything (`narsor-cli config show`).
+pub fn check_command(file: Option<&Path>) -> ! {
+    let resolved = resolve_config(file, false);
+    let problems = narsor_engine::config::Problem::of_resolution(&resolved);
+    narsor_engine::config::CheckReport::build("narsor-controller", &resolved, &problems)
+        .print_and_exit()
 }
 
 /// Tells the user, before anything else happens, what serving a control

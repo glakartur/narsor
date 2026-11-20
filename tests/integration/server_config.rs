@@ -43,7 +43,7 @@ impl ConfigFile {
         let env = environment(env);
         match configure(&self.resolve(Scope::SERVER, &env), &env) {
             Ok(_) => Vec::new(),
-            Err(problems) => problems,
+            Err(problems) => problems.iter().map(ToString::to_string).collect(),
         }
     }
 }

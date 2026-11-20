@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use narsor_engine::config::{self, Flags};
+use narsor_engine::config::{self, CheckReport, Flags};
 use narsor_engine::persistence::DaemonInfo;
 use narsor_server::runtime::run_daemon;
 use narsor_server::settings::configure;
@@ -21,6 +21,13 @@ struct Args {
     /// Configuration file to read instead of searching for one.
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
+
+    /// Checks the configuration, prints the report as JSON and exits 0 (no
+    /// problem) or 1, without starting anything (`narsor-cli config show`).
+    /// The report includes the local controller's configuration a trusted
+    /// server would refuse to start on.
+    #[arg(long, hide = true)]
+    check_config: bool,
 
     /// Optional server lifecycle operation; no operation starts the server.
     #[command(subcommand)]
@@ -58,6 +65,10 @@ async fn run() {
     };
     let environment = config::resolve::environment_from_process();
     let resolved = config::resolve(&flags, &environment, config::Scope::SERVER);
+    if args.check_config {
+        let problems = configure(&resolved, &environment).err().unwrap_or_default();
+        CheckReport::build("narsor-server", &resolved, &problems).print_and_exit();
+    }
     if resolved.has_usage_error() {
         refuse(resolved.errors().iter().map(ToString::to_string), 2);
     }
@@ -100,7 +111,7 @@ async fn run() {
     // Every rule between the settings, before anything starts (R7, R8).
     let settings = match configure(&resolved, &environment) {
         Ok(settings) => settings,
-        Err(problems) => refuse(problems.into_iter(), 1),
+        Err(problems) => refuse(problems.iter().map(ToString::to_string), 1),
     };
 
     if let Err(error) = run_daemon(&resolved, settings).await {

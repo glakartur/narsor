@@ -14,7 +14,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use ipnet::IpNet;
 use reqwest::Url;
 
-use crate::config::{settings, Resolved, SettingKey};
+use crate::config::{settings, Problem, Resolved, SettingKey};
 
 use super::oidc::OidcSettings;
 
@@ -117,14 +117,20 @@ impl SecuritySettings {
                 allowed_origins: origins,
             },
             Err(message) => {
-                problems.push(format!("{}: {message}", SettingKey::CorsAllowedOrigins));
+                problems.push(Problem::at(
+                    SettingKey::CorsAllowedOrigins,
+                    format!("{}: {message}", SettingKey::CorsAllowedOrigins),
+                ));
                 CorsPolicy::deny()
             }
         };
         let bind = match resolve_bind(&self.bind) {
             Ok(addresses) => Some(addresses),
             Err(message) => {
-                problems.push(format!("{}: {message}", SettingKey::ServerBind));
+                problems.push(Problem::at(
+                    SettingKey::ServerBind,
+                    format!("{}: {message}", SettingKey::ServerBind),
+                ));
                 None
             }
         };
@@ -143,7 +149,7 @@ impl SecuritySettings {
         &self,
         bind: Option<Vec<SocketAddr>>,
         cors: CorsPolicy,
-        problems: &mut Vec<String>,
+        problems: &mut Vec<Problem>,
     ) -> Option<SecurityPlan> {
         // Settings that only mean something in network mode are refused
         // rather than ignored: an operator who set an issuer believes users
@@ -161,22 +167,28 @@ impl SecuritySettings {
         let mode = SettingKey::ServerMode;
         for (key, set) in network_only {
             if set {
-                problems.push(format!(
-                    "{key} is set, but {mode} is 'trusted', which ignores it; set \
-                     {mode}: network to authenticate users, or remove {key}"
+                problems.push(Problem::at(
+                    key,
+                    format!(
+                        "{key} is set, but {mode} is 'trusted', which ignores it; set \
+                         {mode}: network to authenticate users, or remove {key}"
+                    ),
                 ));
             }
         }
         let addresses = bind?;
         for address in &addresses {
             if let Err(reason) = loopback_only(address) {
-                problems.push(format!(
-                    "{} '{}' resolves to {address}, {reason}; trusted mode has no user \
-                     authentication beyond a local token and must listen on loopback \
-                     (127.0.0.1 or [::1]) only — use {}: network to serve other hosts",
+                problems.push(Problem::at(
                     SettingKey::ServerBind,
-                    self.bind,
-                    SettingKey::ServerMode
+                    format!(
+                        "{} '{}' resolves to {address}, {reason}; trusted mode has no user \
+                         authentication beyond a local token and must listen on loopback \
+                         (127.0.0.1 or [::1]) only — use {}: network to serve other hosts",
+                        SettingKey::ServerBind,
+                        self.bind,
+                        SettingKey::ServerMode
+                    ),
                 ));
             }
         }
@@ -190,22 +202,28 @@ impl SecuritySettings {
         &self,
         bind: Option<Vec<SocketAddr>>,
         cors: CorsPolicy,
-        problems: &mut Vec<String>,
+        problems: &mut Vec<Problem>,
     ) -> Option<SecurityPlan> {
         let mode = SettingKey::ServerMode;
         let issuer = match &self.oidc_issuer {
             Some(issuer) => match parse_issuer(issuer) {
                 Ok(_) => Some(issuer.trim().to_string()),
                 Err(message) => {
-                    problems.push(format!("{}: {message}", SettingKey::OidcIssuer));
+                    problems.push(Problem::at(
+                        SettingKey::OidcIssuer,
+                        format!("{}: {message}", SettingKey::OidcIssuer),
+                    ));
                     None
                 }
             },
             None => {
-                problems.push(format!(
-                    "{mode} is 'network' but {} is not set; network mode authenticates every \
-                     user with the configured OIDC issuer",
-                    SettingKey::OidcIssuer
+                problems.push(Problem::at(
+                    SettingKey::OidcIssuer,
+                    format!(
+                        "{mode} is 'network' but {} is not set; network mode authenticates \
+                         every user with the configured OIDC issuer",
+                        SettingKey::OidcIssuer
+                    ),
                 ));
                 None
             }
@@ -213,20 +231,27 @@ impl SecuritySettings {
         let audience = match &self.oidc_audience {
             Some(audience) => Some(audience.trim().to_string()),
             None => {
-                problems.push(format!(
-                    "{mode} is 'network' but {} is not set; without it a token issued for any \
-                     other application of the issuer would be accepted",
-                    SettingKey::OidcAudience
+                problems.push(Problem::at(
+                    SettingKey::OidcAudience,
+                    format!(
+                        "{mode} is 'network' but {} is not set; without it a token issued for \
+                         any other application of the issuer would be accepted",
+                        SettingKey::OidcAudience
+                    ),
                 ));
                 None
             }
         };
         if self.tls_termination != TlsTermination::Proxy {
-            problems.push(format!(
-                "{mode} is 'network' but no TLS policy is configured; set {}: proxy and list \
-                 the TLS-terminating proxies in {} (the server does not serve TLS itself)",
+            problems.push(Problem::at(
                 SettingKey::TlsTermination,
-                SettingKey::TrustedProxies
+                format!(
+                    "{mode} is 'network' but no TLS policy is configured; set {}: proxy and \
+                     list the TLS-terminating proxies in {} (the server does not serve TLS \
+                     itself)",
+                    SettingKey::TlsTermination,
+                    SettingKey::TrustedProxies
+                ),
             ));
         }
         let proxies = self
@@ -236,16 +261,22 @@ impl SecuritySettings {
             .collect::<Result<Vec<_>, _>>();
         let proxy = match proxies {
             Ok(proxies) if proxies.is_empty() => {
-                problems.push(format!(
-                    "{mode} is 'network' but {} is empty; list the addresses of the proxies \
-                     that terminate TLS in front of the server",
-                    SettingKey::TrustedProxies
+                problems.push(Problem::at(
+                    SettingKey::TrustedProxies,
+                    format!(
+                        "{mode} is 'network' but {} is empty; list the addresses of the \
+                         proxies that terminate TLS in front of the server",
+                        SettingKey::TrustedProxies
+                    ),
                 ));
                 None
             }
             Ok(trusted) => Some(ProxyPolicy { trusted }),
             Err(message) => {
-                problems.push(format!("{}: {message}", SettingKey::TrustedProxies));
+                problems.push(Problem::at(
+                    SettingKey::TrustedProxies,
+                    format!("{}: {message}", SettingKey::TrustedProxies),
+                ));
                 None
             }
         };
@@ -267,11 +298,11 @@ impl SecuritySettings {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
     "the server's security configuration is not usable: {}",
-    problems.join("; ")
+    problems.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
 )]
 pub struct SecurityConfigError {
     /// Every problem found.
-    pub problems: Vec<String>,
+    pub problems: Vec<Problem>,
 }
 
 /// What the server will do, after validation.

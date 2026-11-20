@@ -10,7 +10,7 @@
 //! section would otherwise surface only once the API is up.
 
 use narsor_engine::auth::{SecurityPlan, SecuritySettings, ServerMode};
-use narsor_engine::config::{local_controller, Environment, Resolved};
+use narsor_engine::config::{local_controller, Environment, Problem, Resolved};
 use narsor_engine::launch::OwnerDefaults;
 
 use crate::observer_worker::{observer_plan, ObserverPlan};
@@ -41,8 +41,8 @@ impl ServerSettings {
 pub fn configure(
     config: &Resolved,
     environment: &Environment,
-) -> Result<ServerSettings, Vec<String>> {
-    let mut problems: Vec<String> = config.errors().iter().map(ToString::to_string).collect();
+) -> Result<ServerSettings, Vec<Problem>> {
+    let mut problems = Problem::of_resolution(config);
 
     let security_settings = SecuritySettings::from_config(config);
     let network = security_settings.mode == ServerMode::Network;
@@ -56,11 +56,11 @@ pub fn configure(
     if !network {
         let controller = local_controller::resolve(config.file().path(), environment);
         for error in controller.errors() {
-            let message = error.to_string();
+            let problem = Problem::from(error);
             // A file that does not parse is the server's problem as well,
             // and already listed.
-            if !problems.contains(&message) {
-                problems.push(format!("local controller: {message}"));
+            if !problems.contains(&problem) {
+                problems.push(problem.prefixed("local controller: "));
             }
         }
     }

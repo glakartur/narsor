@@ -43,6 +43,11 @@ struct Args {
     /// Kept for compatibility; the interface always uses the configured backend.
     #[arg(long)]
     remote: bool,
+
+    /// Checks the configuration, prints the report as JSON and exits 0 (no
+    /// problem) or 1, without starting anything (`narsor-cli config show`).
+    #[arg(long, hide = true)]
+    check_config: bool,
 }
 
 #[tokio::main]
@@ -57,6 +62,10 @@ async fn main() {
     };
     let environment = config::resolve::environment_from_process();
     let resolved = config::resolve(&flags, &environment, config::Scope::TUI);
+    if args.check_config {
+        let problems = config::Problem::of_resolution(&resolved);
+        config::CheckReport::build("narsor", &resolved, &problems).print_and_exit();
+    }
 
     if !resolved.is_ok() {
         for error in resolved.errors() {

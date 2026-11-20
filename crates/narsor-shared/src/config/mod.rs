@@ -24,6 +24,7 @@
 //! caller decides whether to refuse to start or to print what it has.
 
 pub mod cascade;
+pub mod check;
 pub mod client_paths;
 pub mod duration;
 pub mod file;
@@ -36,6 +37,7 @@ pub(crate) mod security_validation;
 pub mod settings;
 
 pub use cascade::{CascadeError, ConfigCascade, Resolution};
+pub use check::{CheckReport, Problem, CHECK_CONFIG_FLAG};
 pub use client_paths::ClientPaths;
 pub use file::{FileError, FileValues, ParsedFile};
 pub use harness_home::{

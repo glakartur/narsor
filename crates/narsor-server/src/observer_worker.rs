@@ -40,7 +40,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use narsor_controller_runtime::Supervision;
-use narsor_engine::config::{Resolved, SettingKey};
+use narsor_engine::config::{Problem, Resolved, SettingKey};
 use narsor_engine::controller_protocol::credentials::BearerToken;
 use narsor_engine::controller_protocol::wire::OBSERVER_WORKER_KEY_ENV;
 #[cfg(doc)]
@@ -103,7 +103,7 @@ pub struct ObserverPlan {
 pub fn observer_plan(
     config: &Resolved,
     network: bool,
-) -> Result<Option<ObserverPlan>, Vec<String>> {
+) -> Result<Option<ObserverPlan>, Vec<Problem>> {
     let Some(worker) = config.observer_worker() else {
         return Ok(None);
     };
@@ -116,23 +116,32 @@ pub fn observer_plan(
         (Some(user), false) => Some(ScriptIsolation::User(user)),
         (None, true) => Some(ScriptIsolation::SameUser),
         (None, false) => {
-            problems.push(format!(
-                "{enabled}: true needs {script_user}, the system user scripts run as (or \
-                 {same_user}: true, for a trial only)"
+            problems.push(Problem::at(
+                SettingKey::ObserverScriptUser,
+                format!(
+                    "{enabled}: true needs {script_user}, the system user scripts run as (or \
+                     {same_user}: true, for a trial only)"
+                ),
             ));
             None
         }
         (Some(_), true) => {
-            problems.push(format!(
-                "{script_user} and {same_user}: true contradict each other; set one of them"
+            problems.push(Problem::at(
+                SettingKey::ObserverInsecureSameUser,
+                format!(
+                    "{script_user} and {same_user}: true contradict each other; set one of them"
+                ),
             ));
             None
         }
     };
     if network && worker.server.is_none() {
-        problems.push(format!(
-            "{enabled}: true in network mode needs {server_url}: the URL clients reach the \
-             API at, through the TLS proxy"
+        problems.push(Problem::at(
+            SettingKey::ObserverServerUrl,
+            format!(
+                "{enabled}: true in network mode needs {server_url}: the URL clients reach the \
+                 API at, through the TLS proxy"
+            ),
         ));
     }
     match isolation {

@@ -585,7 +585,9 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Workflow { command } => remote::workflow(command, &target, &state, &flags).await,
         Command::Repo { command } => remote::repo_admin(command, &target, &state, &flags).await,
         Command::Config { command } => match command {
-            ConfigCommand::Show { format } => commands::config_show(&config, format),
+            ConfigCommand::Show { format } => {
+                commands::config_show(&config, flags.root.as_deref(), format)
+            }
         },
         Command::ConnectionProfile { command } => match command {
             ConnectionProfileCommand::Export { output } => {
