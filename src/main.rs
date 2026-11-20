@@ -52,6 +52,10 @@ async fn main() -> anyhow::Result<()> {
     // environment itself, which is what keeps it testable without set_var.
     let environment = config::resolve::environment_from_process();
     let resolved = config::resolve(&flags, &environment, config::Scope::CLI);
+    // R26: an un-migrated configuration runs on built-in values; say so.
+    if let Some(warning) = config::legacy::warning(&resolved, &environment) {
+        eprintln!("narsor-cli: warning: {warning}");
+    }
 
     if let Some(code) = refuse_broken_configuration(&cli, &resolved) {
         std::process::exit(code);

@@ -54,14 +54,6 @@ impl Problem {
         }
     }
 
-    /// A problem of no one setting (a file that does not parse).
-    pub fn general(message: impl Into<String>) -> Self {
-        Self {
-            path: None,
-            message: message.into(),
-        }
-    }
-
     /// The same problem with `prefix` in front of its message.
     pub fn prefixed(self, prefix: &str) -> Self {
         Self {

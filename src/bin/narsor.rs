@@ -66,6 +66,10 @@ async fn main() {
         let problems = config::Problem::of_resolution(&resolved);
         config::CheckReport::build("narsor", &resolved, &problems).print_and_exit();
     }
+    // R26: an un-migrated configuration runs on built-in values; say so.
+    if let Some(warning) = config::legacy::warning(&resolved, &environment) {
+        eprintln!("narsor: warning: {warning}");
+    }
 
     if !resolved.is_ok() {
         for error in resolved.errors() {

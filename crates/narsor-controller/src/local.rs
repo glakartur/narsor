@@ -307,6 +307,11 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
         PLAIN_HTTP_BEYOND_LOOPBACK,
     )?;
     let config = read_config(&args)?;
+    // R26: an un-migrated configuration runs on built-in values; say so.
+    let environment = narsor_engine::config::resolve::environment_from_process();
+    if let Some(warning) = narsor_engine::config::legacy::warning(&config, &environment) {
+        eprintln!("narsor-controller: warning: {warning}");
+    }
     let home = resolve_home(&args, place, &config)?;
     if place == ControlPlanePlace::Remote {
         warn_untrusted(&connection.control_plane, &home);
