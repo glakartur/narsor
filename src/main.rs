@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
     // Read once, here, and handed in: resolution never reaches for the process
     // environment itself, which is what keeps it testable without set_var.
     let environment = config::resolve::environment_from_process();
-    let resolved = config::resolve(&flags, &environment);
+    let resolved = config::resolve(&flags, &environment, config::Scope::CLI);
 
     if let Some(code) = refuse_broken_configuration(&cli, &resolved) {
         std::process::exit(code);

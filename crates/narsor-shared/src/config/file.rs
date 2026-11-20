@@ -36,9 +36,9 @@ use narsor_protocol::controller::MAX_CONCURRENT_TASKS_LIMIT;
 use narsor_protocol::harness::HARNESSES;
 use narsor_protocol::identifier::BackendId;
 
+use super::scope::Scope;
 use super::settings::{
-    self, SettingKey, SettingValue, EFFORT_SCALE, LOG_LEVELS, MAX_ESCALATION_THRESHOLD,
-    MODEL_TIERS, NO_LIMIT,
+    self, Section, SettingKey, SettingValue, EFFORT_SCALE, LOG_LEVELS, MODEL_TIERS, NO_LIMIT,
 };
 
 /// The largest configuration file that will be parsed.
@@ -133,41 +133,26 @@ pub enum FileError {
         found: String,
     },
 
-    /// A key no setting answers to.
+    /// A key inside a read section that no setting answers to.
     ///
-    /// The list of keys that *would* have been accepted is derived from the
+    /// The list of paths that *would* have been accepted is derived from the
     /// registry when the message is rendered, rather than carried: it is the
     /// same list every time, and carrying it would allocate it once per
     /// offending key.
     #[error(
-        "Configuration file '{path}' sets unknown key '{key}'; known keys are: {}.",
-        known_keys()
+        "Configuration file '{path}' sets unknown key '{key}'; known keys of this section \
+         are: {}.",
+        known_keys(key)
     )]
     UnknownKey {
         /// The file.
         path: PathBuf,
-        /// The key as written.
+        /// The full dotted path as written.
         key: String,
     },
 
-    /// A key that was a setting in an earlier version and is not one now.
-    ///
-    /// Separate from [`FileError::UnknownKey`] because the two call for
-    /// different sentences: an unknown key is answered with the list of keys
-    /// that would have worked, while a retired one is answered by naming what
-    /// replaced it. Falling through to the generic message would print the
-    /// successors without ever saying they *are* the successors.
-    #[error("Configuration file '{path}': {message}")]
-    RetiredKey {
-        /// The file.
-        path: PathBuf,
-        /// The key as written.
-        key: String,
-        /// What happened to it, and what to set instead.
-        message: String,
-    },
-
-    /// A known key whose value does not fit.
+    /// A known key whose value does not fit, or a group of settings written
+    /// as something other than a mapping.
     #[error("Configuration file '{path}', key '{key}': {message}")]
     BadValue {
         /// The file.
@@ -189,20 +174,18 @@ impl FileError {
             | FileError::Syntax { path, .. }
             | FileError::NotAMapping { path, .. }
             | FileError::UnknownKey { path, .. }
-            | FileError::RetiredKey { path, .. }
             | FileError::BadValue { path, .. } => path,
         }
     }
 
-    /// The key the message is about, for the errors that have one.
+    /// The full dotted path the message is about, for the errors that have
+    /// one.
     ///
     /// This is what lets `config show` mark the offending row rather than
     /// printing the complaint beside the table.
     pub fn key(&self) -> Option<&str> {
         match self {
-            FileError::UnknownKey { key, .. }
-            | FileError::RetiredKey { key, .. }
-            | FileError::BadValue { key, .. } => Some(key),
+            FileError::UnknownKey { key, .. } | FileError::BadValue { key, .. } => Some(key),
             _ => None,
         }
     }
@@ -245,8 +228,8 @@ impl ParsedFile {
     }
 }
 
-/// Reads and parses one configuration file.
-pub fn load(path: &Path) -> ParsedFile {
+/// Reads and parses one configuration file, visiting only what `scope` reads.
+pub fn load(path: &Path, scope: &Scope) -> ParsedFile {
     // Opened once and then asked its own size: the check has to come before
     // the read — using the length of what was read would mean holding an
     // oversized file in memory to discover it was oversized — but the size of
@@ -295,14 +278,19 @@ pub fn load(path: &Path) -> ParsedFile {
         }
     };
 
-    parse(path, &contents)
+    parse(path, &contents, scope)
 }
 
 /// Parses the text of a configuration file.
 ///
 /// Separate from [`load`] so that the two phases can be exercised without a
 /// filesystem; `path` is carried only to name the file in the messages.
-pub fn parse(path: &Path, contents: &str) -> ParsedFile {
+///
+/// Only the sections of `scope` are walked, plus its extra settings, each
+/// read as a single leaf. Unknown roots and roots outside the scope are
+/// skipped without a word (R5, R12): they belong to another binary, to a
+/// later version, or to nobody.
+pub fn parse(path: &Path, contents: &str, scope: &Scope) -> ParsedFile {
     let contents = contents.strip_prefix(BOM).unwrap_or(contents);
 
     // Phase one: no types, no rejections — just the document.
@@ -331,51 +319,38 @@ pub fn parse(path: &Path, contents: &str) -> ParsedFile {
         }
     };
 
-    // Phase two: every key against the registry, every value on its own, and
-    // every complaint collected rather than the first one raised.
-    let mut values = BTreeMap::new();
-    let mut errors = Vec::new();
+    // Phase two: every scoped key against the registry, every value on its
+    // own, and every complaint collected rather than the first one raised.
+    let mut walk = Walk {
+        path,
+        values: BTreeMap::new(),
+        errors: Vec::new(),
+    };
 
-    for (raw_key, raw_value) in mapping {
-        let Some(key) = raw_key.as_str().map(ToString::to_string) else {
-            errors.push(FileError::UnknownKey {
-                path: path.to_path_buf(),
-                key: describe(&raw_key),
-            });
+    for (raw_key, raw_value) in &mapping {
+        let Some(section) = raw_key.as_str().and_then(Section::from_name) else {
             continue;
         };
-
-        let Some(setting) = SettingKey::from_key(&key) else {
-            // Checked before the generic complaint, so a key that used to work
-            // is told what replaced it rather than being read as a typo.
-            if let Some(withdrawn) = settings::retired(&key) {
-                errors.push(FileError::RetiredKey {
-                    path: path.to_path_buf(),
-                    key,
-                    message: withdrawn.message(),
-                });
-            } else {
-                errors.push(FileError::UnknownKey {
-                    path: path.to_path_buf(),
-                    key,
-                });
-            }
+        if scope.includes_section(section) {
+            walk.node(section.name().to_string(), raw_value);
             continue;
-        };
-
-        match value_of(setting, &raw_value) {
-            Ok(value) => {
-                values.insert(setting, value);
+        }
+        for extra in scope
+            .extra()
+            .iter()
+            .filter(|extra| extra.section() == section)
+        {
+            if let Some(raw) = leaf(raw_value, extra) {
+                walk.leaf(*extra, raw);
             }
-            Err(message) => errors.push(FileError::BadValue {
-                path: path.to_path_buf(),
-                key,
-                message,
-            }),
         }
     }
 
-    // Sorted by key so that the same file always produces the same report,
+    let Walk {
+        values, mut errors, ..
+    } = walk;
+
+    // Sorted by path so that the same file always produces the same report,
     // whatever order the document happened to use.
     errors.sort_by(|left, right| {
         left.key()
@@ -389,13 +364,95 @@ pub fn parse(path: &Path, contents: &str) -> ParsedFile {
     }
 }
 
-/// Every key the file may set, in registry order, ready to print.
-fn known_keys() -> String {
-    SettingKey::ALL
+/// The values and complaints collected while walking the tree.
+struct Walk<'a> {
+    path: &'a Path,
+    values: BTreeMap<SettingKey, SettingValue>,
+    errors: Vec<FileError>,
+}
+
+impl Walk<'_> {
+    /// One node of a read section: a setting, a group of settings, or a key
+    /// nobody answers to.
+    ///
+    /// The walk stops at the first path that names a setting and hands the
+    /// raw value over whole, so a setting that takes a mapping
+    /// (`runner.agent_args`) is not mistaken for a group.
+    fn node(&mut self, key: String, raw: &serde_yaml::Value) {
+        if let Some(setting) = SettingKey::from_key(&key) {
+            self.leaf(setting, raw);
+            return;
+        }
+        match raw {
+            // `server:` with nothing below it sets nothing.
+            serde_yaml::Value::Null => {}
+            serde_yaml::Value::Mapping(children) => {
+                for (raw_child, raw_value) in children {
+                    let child = match raw_child.as_str() {
+                        Some(name) => format!("{key}.{name}"),
+                        None => format!("{key}.{}", describe(raw_child)),
+                    };
+                    if SettingKey::from_key(&child).is_some() || SettingKey::is_group(&child) {
+                        self.node(child, raw_value);
+                    } else {
+                        self.errors.push(FileError::UnknownKey {
+                            path: self.path.to_path_buf(),
+                            key: child,
+                        });
+                    }
+                }
+            }
+            other => self.errors.push(FileError::BadValue {
+                path: self.path.to_path_buf(),
+                key,
+                message: format!(
+                    "a mapping of settings was expected, but {} was found",
+                    describe(other)
+                ),
+            }),
+        }
+    }
+
+    /// One setting's raw value, validated.
+    fn leaf(&mut self, setting: SettingKey, raw: &serde_yaml::Value) {
+        match value_of(setting, raw) {
+            Ok(value) => {
+                self.values.insert(setting, value);
+            }
+            Err(message) => self.errors.push(FileError::BadValue {
+                path: self.path.to_path_buf(),
+                key: setting.key().to_string(),
+                message,
+            }),
+        }
+    }
+}
+
+/// The raw value of one setting inside its section, if the file writes it.
+///
+/// Used for the extra settings of a scope, whose section is not walked: a
+/// group on the way that is not a mapping simply holds no such setting; the
+/// binary that owns the section reports it.
+fn leaf<'a>(section: &'a serde_yaml::Value, setting: &SettingKey) -> Option<&'a serde_yaml::Value> {
+    setting
+        .segments()
+        .skip(1)
+        .try_fold(section, |node, segment| node.as_mapping()?.get(segment))
+}
+
+/// Every path of the section `key` belongs to, in registry order, ready to
+/// print.
+fn known_keys(key: &str) -> String {
+    let section = key.split('.').next().unwrap_or_default();
+    let known: Vec<&str> = SettingKey::ALL
         .iter()
-        .map(|key| key.key())
-        .collect::<Vec<_>>()
-        .join(", ")
+        .filter(|setting| setting.section().name() == section)
+        .map(|setting| setting.key())
+        .collect();
+    if known.is_empty() {
+        return "(none)".to_string();
+    }
+    known.join(", ")
 }
 
 /// Validates one value against the setting it was written under.
@@ -428,16 +485,13 @@ fn value_of(setting: SettingKey, raw: &serde_yaml::Value) -> Result<SettingValue
         return agent_args_value(raw);
     }
 
-    if setting == SettingKey::ObserverInsecureSameUser {
+    if setting.is_bool() {
         if let Some(flag) = raw.as_bool() {
             return value_from_text(setting, &flag.to_string());
         }
     }
 
-    if matches!(
-        setting,
-        SettingKey::MaxConcurrentTasks | SettingKey::EscalationThreshold
-    ) {
+    if setting == SettingKey::MaxConcurrentTasks {
         if let Some(number) = raw.as_u64() {
             return value_from_text(setting, &number.to_string());
         }
@@ -516,7 +570,10 @@ pub fn split_list(text: &str) -> Vec<String> {
 /// interchangeable if they are validated alike.
 pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, String> {
     match setting {
-        SettingKey::CatalogDir | SettingKey::StateDir | SettingKey::WorkDir => {
+        SettingKey::GlobalRoot
+        | SettingKey::CatalogDir
+        | SettingKey::StateDir
+        | SettingKey::WorkDir => {
             if text.trim().is_empty() {
                 return Err("a directory path was expected, but the value is empty".to_string());
             }
@@ -535,7 +592,7 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             }
         }
 
-        SettingKey::AgentTimeout | SettingKey::TuiRefreshInterval => {
+        SettingKey::TuiRefreshInterval => {
             // The spelled-out word means "no limit" (for the refresh: no
             // periodic read at all), so a value inherited from /etc/narsor/
             // can be revoked and not only replaced.
@@ -662,19 +719,6 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             }
         }
 
-        SettingKey::EscalationThreshold => {
-            let written = text.trim();
-            match written.parse::<u32>() {
-                Ok(threshold) if threshold <= MAX_ESCALATION_THRESHOLD => {
-                    Ok(SettingValue::Text(threshold.to_string()))
-                }
-                _ => Err(format!(
-                    "a number of attempts between 0 and {MAX_ESCALATION_THRESHOLD} was expected \
-                     (0 turns escalation off), but '{written}' was found"
-                )),
-            }
-        }
-
         SettingKey::TrustedProxies => {
             let items = split_list(text);
             for item in &items {
@@ -708,15 +752,11 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
 
         SettingKey::LocalHome => one_of(text, "local HOME mode", &settings::LOCAL_HOME_MODES),
 
-        SettingKey::ObserverWorker => one_of(
-            text,
-            "observer worker mode",
-            &[settings::OBSERVER_WORKER_OFF, settings::OBSERVER_WORKER_ON],
-        ),
+        SettingKey::ObserverEnabled | SettingKey::ObserverInsecureSameUser => {
+            one_of(text, "boolean", &["false", "true"])
+        }
 
-        SettingKey::ObserverInsecureSameUser => one_of(text, "boolean", &["false", "true"]),
-
-        SettingKey::ObserverWorkerServer => {
+        SettingKey::ObserverServerUrl => {
             let written = text.trim();
             if written.is_empty()
                 || written.starts_with("http://")
@@ -947,29 +987,5 @@ mod tests {
             );
         }
         assert!(value_from_text(SettingKey::ConductorEffort, "ultra").is_err());
-    }
-
-    #[test]
-    fn the_escalation_threshold_takes_zero_to_the_largest_number_of_attempts() {
-        for text in ["0", "3", "100", " 7 "] {
-            assert!(
-                value_from_text(SettingKey::EscalationThreshold, text).is_ok(),
-                "'{text}' was refused"
-            );
-        }
-        for text in ["101", "-1", "abc", "", "1.5"] {
-            assert!(
-                value_from_text(SettingKey::EscalationThreshold, text).is_err(),
-                "'{text}' was accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn the_escalation_threshold_may_be_a_yaml_integer() {
-        let raw: serde_yaml::Value = serde_yaml::from_str("5").unwrap();
-        assert!(value_of(SettingKey::EscalationThreshold, &raw).is_ok());
-        let too_big: serde_yaml::Value = serde_yaml::from_str("101").unwrap();
-        assert!(value_of(SettingKey::EscalationThreshold, &too_big).is_err());
     }
 }

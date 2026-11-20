@@ -56,7 +56,7 @@ async fn main() {
         config: args.config,
     };
     let environment = config::resolve::environment_from_process();
-    let resolved = config::resolve(&flags, &environment);
+    let resolved = config::resolve(&flags, &environment, config::Scope::TUI);
 
     if !resolved.is_ok() {
         for error in resolved.errors() {

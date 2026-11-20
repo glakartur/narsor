@@ -1,11 +1,14 @@
 //! Giving every setting a value and a reason.
 //!
-//! For each setting in the registry, in this order: the command-line flag, the
+//! For each setting the binary's [`Scope`] reads, in this order: the command-line flag, the
 //! environment variable, the file that won the cascade, and finally the value
 //! compiled into the binary. The first hit wins — **per setting**, not per
 //! file (R2). A file that sets one key therefore does not displace a flag that
 //! sets another, and each row of `config show` can name the one thing that
 //! decided it (R8).
+//!
+//! The three server directories are then joined to `global.root` when they
+//! are relative (R10); their source stays the source of their own key.
 //!
 //! # Why this returns values and errors together
 //!
@@ -24,16 +27,14 @@
 //! provides.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::{AgentArgs, HarnessHome, HomeMode};
 
 use super::cascade::{CascadeError, ConfigCascade, Resolution};
 use super::file::{self, FileError, FileValues};
-use super::settings::{
-    self, SettingKey, SettingValue, Source, DEFAULT_ESCALATION_THRESHOLD, ENV_PREFIX, LOG_OFF,
-    RUST_LOG,
-};
+use super::scope::Scope;
+use super::settings::{SettingKey, SettingValue, Source, ENV_PREFIX, LOG_OFF, RUST_LOG};
 
 /// The environment, as a map read once rather than consulted repeatedly.
 pub type Environment = BTreeMap<String, String>;
@@ -71,49 +72,14 @@ impl Flags {
     /// fact, and stating them in two places would need a runtime check that
     /// they agree.
     fn value(&self, setting: SettingKey) -> Option<(SettingValue, &'static str)> {
+        // `--root` sets `global.root` only; the server directories follow it
+        // because they are relative to it (R9, R10).
         match setting {
-            // One flag, three settings. `--root` stays the single knob for
-            // local work and for tests, and it stays a *flag* rather than a
-            // fourth setting the three derive from: a derived value would need
-            // a source variant of its own ("derived from data_dir") and break
-            // the one-setting-one-key-one-source model the whole preview
-            // stands on (D-B).
-            SettingKey::CatalogDir | SettingKey::StateDir | SettingKey::WorkDir => self
+            SettingKey::GlobalRoot => self
                 .root
                 .clone()
                 .map(|root| (SettingValue::Path(root), "--root")),
-            SettingKey::AgentHarness
-            | SettingKey::AgentTimeout
-            | SettingKey::AgentArgs
-            | SettingKey::MaxConcurrentTasks
-            | SettingKey::EscalationThreshold
-            | SettingKey::ConductorModel
-            | SettingKey::ConductorEffort
-            | SettingKey::LogLevel
-            | SettingKey::TuiRefreshInterval
-            | SettingKey::DefaultBackend
-            | SettingKey::DefaultProfile
-            | SettingKey::ServerMode
-            | SettingKey::ServerBind
-            | SettingKey::OidcIssuer
-            | SettingKey::OidcAudience
-            | SettingKey::OwnerSubject
-            | SettingKey::TlsTermination
-            | SettingKey::TrustedProxies
-            | SettingKey::CorsAllowedOrigins
-            | SettingKey::LocalWorkspaceRoots
-            | SettingKey::LocalHome
-            | SettingKey::LocalCodexHome
-            | SettingKey::LocalClaudeConfigDir
-            | SettingKey::LocalClaudeProfileSource
-            | SettingKey::ObserverWorker
-            | SettingKey::ObserverWorkerServer
-            | SettingKey::ObserverSecretsDir
-            | SettingKey::ObserverScriptUser
-            | SettingKey::ObserverInsecureSameUser
-            | SettingKey::WebBind
-            | SettingKey::WebUpstream
-            | SettingKey::WebToken => None,
+            _ => None,
         }
     }
 }
@@ -128,21 +94,6 @@ pub enum ConfigError {
     /// Reading or validating the file failed.
     #[error(transparent)]
     File(#[from] FileError),
-
-    /// A variable that carried a setting in an earlier version.
-    ///
-    /// Its own variant because it cannot be reported by the loop that asks for
-    /// one variable per known setting: that loop never looks the name up, so
-    /// the variable would be ignored in silence — the one outcome R6 forbids.
-    #[error("{message}")]
-    RetiredEnv {
-        /// The key it used to set, so the row can be marked.
-        key: &'static str,
-        /// The variable.
-        variable: String,
-        /// What happened to it, and what to set instead.
-        message: String,
-    },
 
     /// A setting given in the environment does not hold up.
     #[error("Environment variable {variable}: {message}")]
@@ -162,7 +113,7 @@ impl ConfigError {
     pub fn key(&self) -> Option<&str> {
         match self {
             ConfigError::File(error) => error.key(),
-            ConfigError::Env { key, .. } | ConfigError::RetiredEnv { key, .. } => Some(key),
+            ConfigError::Env { key, .. } => Some(key),
             ConfigError::Cascade(_) => None,
         }
     }
@@ -176,41 +127,49 @@ impl ConfigError {
             // Not a usage error: it stops every subcommand, but `config show`
             // has to survive it and print the table, because that is the one
             // tool for diagnosing a configuration (D-D, D-J).
-            ConfigError::File(_) | ConfigError::Env { .. } | ConfigError::RetiredEnv { .. } => {
-                false
-            }
+            ConfigError::File(_) | ConfigError::Env { .. } => false,
         }
     }
 }
 
-/// Every setting, with its value and where that value came from.
+/// Every setting of one scope, with its value and where that value came from.
 #[derive(Debug)]
 pub struct Resolved {
     values: BTreeMap<SettingKey, (SettingValue, Source)>,
+    scope: Scope,
     file: Resolution,
     errors: Vec<ConfigError>,
 }
 
 impl Resolved {
-    /// The effective value of one setting.
+    /// The effective value of one setting of the scope.
     ///
     /// Total by construction: every setting has a value compiled into the
-    /// binary, so there is no "unset" to handle (R1).
+    /// binary, so there is no "unset" to handle (R1). Asking for a setting
+    /// outside the scope is a programming error, not a runtime fallback.
     pub fn value(&self, setting: SettingKey) -> &SettingValue {
-        &self
-            .values
-            .get(&setting)
-            .expect("every setting is resolved")
-            .0
+        &self.entry(setting).0
     }
 
     /// Where that value came from.
     pub fn source(&self, setting: SettingKey) -> &Source {
-        &self
-            .values
-            .get(&setting)
-            .expect("every setting is resolved")
-            .1
+        &self.entry(setting).1
+    }
+
+    fn entry(&self, setting: SettingKey) -> &(SettingValue, Source) {
+        self.values.get(&setting).unwrap_or_else(|| {
+            panic!("setting '{setting}' is outside the scope this binary resolved")
+        })
+    }
+
+    /// The scope that was resolved.
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    /// The base directory of the installation (`global.root`).
+    pub fn root(&self) -> &Path {
+        self.root_of(SettingKey::GlobalRoot)
     }
 
     /// What the cascade found, for a listing that names the shadowed files.
@@ -233,7 +192,8 @@ impl Resolved {
         self.errors.iter().any(ConfigError::is_usage)
     }
 
-    /// Where workflow definitions and the repository registry are read from.
+    /// Where workflow definitions and the repository registry are read from,
+    /// already joined to the root when it was written relative.
     pub fn catalog_dir(&self) -> &Path {
         self.root_of(SettingKey::CatalogDir)
     }
@@ -253,9 +213,11 @@ impl Resolved {
         crate::config::client_paths::ClientPaths::new(self.state_dir())
     }
 
-    /// One of the three roots, which are all paths.
+    /// One of the directory settings, which are all paths.
     fn root_of(&self, setting: SettingKey) -> &Path {
-        self.value(setting).as_path().expect("a root is a path")
+        self.value(setting)
+            .as_path()
+            .expect("a directory is a path")
     }
 
     /// The agent harness an action that names none falls back to.
@@ -263,15 +225,6 @@ impl Resolved {
         self.value(SettingKey::AgentHarness)
             .as_text()
             .expect("the harness is text")
-    }
-
-    /// The time limit an agent action that declares none falls back to.
-    ///
-    /// `None` is "no limit", which is what such an action gets today.
-    pub fn agent_timeout(&self) -> Option<u64> {
-        self.value(SettingKey::AgentTimeout)
-            .as_duration()
-            .expect("the timeout is a duration")
     }
 
     /// How often the terminal interface re-reads the daemon on its own
@@ -296,7 +249,8 @@ impl Resolved {
             .expect("the default profile is text")
     }
 
-    /// Which HOME and harness configuration a local task's runner gets.
+    /// Which HOME and harness configuration a local task's runner gets
+    /// (`controller.local.*`).
     pub fn local_harness_home(&self) -> HarnessHome {
         let mode = match self.text(SettingKey::LocalHome) {
             Some("private") => HomeMode::Private,
@@ -314,15 +268,14 @@ impl Resolved {
         }
     }
 
-    /// The observer worker the server starts, `None` when it starts none.
+    /// The observer worker the server starts (`server.observer.*`), `None`
+    /// when it starts none.
     pub fn observer_worker(&self) -> Option<ObserverWorkerConfig> {
-        if self.text(SettingKey::ObserverWorker) != Some(settings::OBSERVER_WORKER_ON) {
+        if self.text(SettingKey::ObserverEnabled) != Some("true") {
             return None;
         }
         Some(ObserverWorkerConfig {
-            server: self
-                .text(SettingKey::ObserverWorkerServer)
-                .map(str::to_string),
+            server: self.text(SettingKey::ObserverServerUrl).map(str::to_string),
             secrets_dir: self.text(SettingKey::ObserverSecretsDir).map(PathBuf::from),
             script_user: self
                 .text(SettingKey::ObserverScriptUser)
@@ -345,7 +298,7 @@ impl Resolved {
             .unwrap_or_default()
     }
 
-    /// The `agent_args` setting: extra arguments by harness.
+    /// The `runner.agent_args` setting: extra arguments by harness.
     pub fn agent_args(&self) -> AgentArgs {
         self.text(SettingKey::AgentArgs)
             .and_then(|text| serde_yaml::from_str(text).ok())
@@ -366,29 +319,10 @@ impl Resolved {
             .map(str::to_string)
     }
 
-    /// What the engine needs from the configuration for an `agent` action.
-    pub fn agent_defaults(&self) -> AgentDefaults {
-        AgentDefaults {
-            harness: self.agent_harness().to_string(),
-            timeout_secs: self.agent_timeout(),
-            args: self.agent_args(),
-            escalation_threshold: self.escalation_threshold(),
-            conductor_model: self.conductor_model(),
-            conductor_effort: self.conductor_effort(),
-        }
-    }
-
     /// The limit of tasks processed at once across all backends, if any.
     pub fn max_concurrent_tasks(&self) -> Option<u32> {
         self.text(SettingKey::MaxConcurrentTasks)
             .and_then(|text| text.parse().ok())
-    }
-
-    /// Failed attempts after which a step is raised; `0` means never.
-    pub fn escalation_threshold(&self) -> u32 {
-        self.text(SettingKey::EscalationThreshold)
-            .and_then(|text| text.parse().ok())
-            .unwrap_or(DEFAULT_ESCALATION_THRESHOLD)
     }
 
     /// The `tracing` filter to install, or `None` for "install nothing".
@@ -408,7 +342,7 @@ impl Resolved {
     }
 }
 
-/// What the server starts its observer worker with (`observer_*`).
+/// What the server starts its observer worker with (`server.observer.*`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObserverWorkerConfig {
     /// The API's URL for the worker and its scripts; `None`: the server's
@@ -422,41 +356,28 @@ pub struct ObserverWorkerConfig {
     pub insecure_same_user: bool,
 }
 
-/// The configuration values an engine needs for an agent action.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentDefaults {
-    /// The fallback harness name.
-    pub harness: String,
-    /// The fallback timeout, or no limit.
-    pub timeout_secs: Option<u64>,
-    /// Extra arguments of the harness runs, by harness; those of the harness
-    /// that runs win over Narsor's own.
-    pub args: AgentArgs,
-    /// Consecutive failed attempts of a step after which its model or effort
-    /// is raised within its ceiling; `0` turns escalation off.
-    pub escalation_threshold: u32,
-    /// The model tier the conductor runs on; `None` is the harness's default.
-    pub conductor_model: Option<String>,
-    /// The effort the conductor runs with; `None` is the harness's default.
-    pub conductor_effort: Option<String>,
-}
-
-/// Works out every setting, reading the environment that was handed in.
-pub fn resolve(flags: &Flags, environment: &Environment) -> Resolved {
+/// Works out every setting of `scope`, reading the environment that was
+/// handed in.
+pub fn resolve(flags: &Flags, environment: &Environment, scope: Scope) -> Resolved {
     let cascade = ConfigCascade::new(flags.config.clone());
-    resolve_with(flags, environment, &cascade)
+    resolve_with(flags, environment, &cascade, scope)
 }
 
 /// The same, against a cascade named explicitly.
 ///
 /// The seam a test uses so that it reaches neither `~/.config` nor `/etc`.
-pub fn resolve_with(flags: &Flags, environment: &Environment, cascade: &ConfigCascade) -> Resolved {
+pub fn resolve_with(
+    flags: &Flags,
+    environment: &Environment,
+    cascade: &ConfigCascade,
+    scope: Scope,
+) -> Resolved {
     let mut errors = Vec::new();
 
     let (file_resolution, file_values) = match cascade.resolve() {
         Ok(resolution) => match resolution.path() {
             Some(path) => {
-                let parsed = file::load(path);
+                let parsed = file::load(path, &scope);
                 // The keys that held up stay in force even when others did
                 // not: `config show` prints the good rows beside the bad ones,
                 // and dropping them would make the table lie (D-D).
@@ -474,22 +395,8 @@ pub fn resolve_with(flags: &Flags, environment: &Environment, cascade: &ConfigCa
 
     let file_path = file_resolution.path().map(Path::to_path_buf);
 
-    // Swept separately, and before the settings: the loop below asks for one
-    // variable per *known* setting, so a retired one is never looked up there
-    // and would pass unnoticed (D-I).
-    for withdrawn in settings::RETIRED_KEYS {
-        let variable = withdrawn.env_var();
-        if environment.contains_key(&variable) {
-            errors.push(ConfigError::RetiredEnv {
-                key: withdrawn.key,
-                variable,
-                message: withdrawn.env_message(),
-            });
-        }
-    }
-
     let mut values = BTreeMap::new();
-    for setting in SettingKey::ALL {
+    for setting in scope.settings() {
         let (value, source) = resolve_one(
             setting,
             flags,
@@ -501,10 +408,45 @@ pub fn resolve_with(flags: &Flags, environment: &Environment, cascade: &ConfigCa
         values.insert(setting, (value, source));
     }
 
+    join_directories_to_root(&mut values);
+
     Resolved {
         values,
+        scope,
         file: file_resolution,
         errors,
+    }
+}
+
+/// Joins every relative server directory of the scope to `global.root`.
+///
+/// An absolute directory is used as it is. `.` components of the relative
+/// value are dropped, so the built-in `.` is the root itself (`./.narsor`,
+/// not `./.narsor/.`).
+fn join_directories_to_root(values: &mut BTreeMap<SettingKey, (SettingValue, Source)>) {
+    let Some(root) = values
+        .get(&SettingKey::GlobalRoot)
+        .and_then(|(value, _)| value.as_path())
+        .map(Path::to_path_buf)
+    else {
+        return;
+    };
+    for directory in SettingKey::ROOTS {
+        let Some((SettingValue::Path(path), _)) = values.get_mut(&directory) else {
+            continue;
+        };
+        if path.is_absolute() {
+            continue;
+        }
+        let relative: PathBuf = path
+            .components()
+            .filter(|component| !matches!(component, Component::CurDir))
+            .collect();
+        *path = if relative.as_os_str().is_empty() {
+            root.clone()
+        } else {
+            root.join(relative)
+        };
     }
 }
 

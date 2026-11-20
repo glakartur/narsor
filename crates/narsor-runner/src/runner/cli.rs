@@ -221,6 +221,7 @@ pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
             ..Default::default()
         },
         &narsor_exec::config::resolve::environment_from_process(),
+        narsor_exec::config::Scope::RUNNER,
     );
     if !resolved.is_ok() {
         return Err(resolved

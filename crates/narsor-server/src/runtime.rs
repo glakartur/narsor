@@ -34,7 +34,8 @@ use crate::observer_worker::{
 use narsor_engine::auth::{
     OidcVerifier, OwnerStore, SecurityPlan, SecuritySettings, StartupOwnership,
 };
-use narsor_engine::config::Resolved;
+use narsor_engine::config::resolve::environment_from_process;
+use narsor_engine::config::{resolve, Flags, HarnessHome, Resolved, Scope};
 use narsor_engine::controller_protocol::{AutoResumePass, ProtocolService};
 use narsor_engine::engine::HarnessRegistry;
 use narsor_engine::environment::{BackendKind, BackendRecord, EnvironmentCatalog};
@@ -109,7 +110,6 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     } else {
         refuse_declared_local_backend(config.catalog_dir())?;
     }
-    let defaults = config.agent_defaults();
     // A harness without a model for a tier is a configuration error found
     // here, not a step that fails hours into a task.
     HarnessRegistry::defaults()
@@ -121,7 +121,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         .map(str::to_owned)
         .collect();
     let selector = Arc::new(
-        DefaultHarnessSelector::load(paths.clone(), supported, defaults.harness.clone())
+        DefaultHarnessSelector::load(paths.clone(), supported, config.agent_harness().to_string())
             .await
             .map_err(|error| {
                 CliError::failure(format!("could not load default harness selection: {error}"))
@@ -338,9 +338,33 @@ fn local_controller_settings(
         storage: config.work_dir().join("local-controller"),
         // Every runner the controller starts reads it anew: a launch
         // setting of the backend, not part of the task.
-        harness_args: config.local_harness_home().runner_args(),
+        harness_args: controller_harness_home(config)?.runner_args(),
         log_directive: config.log_directive(),
     })
+}
+
+/// The local HOME settings (`controller.local.*`) the local controller's
+/// runners get.
+///
+/// Temporary: they belong to the controller's section, which the server's
+/// own scope does not read, so the controller scope is resolved here against
+/// the same winning file. The server -> controller handoff replaces this
+/// with the controller reading its own section.
+fn controller_harness_home(config: &Resolved) -> Result<HarnessHome> {
+    let flags = Flags {
+        root: None,
+        config: config.file().path().map(Path::to_path_buf),
+    };
+    let controller = resolve(&flags, &environment_from_process(), Scope::CONTROLLER);
+    if !controller.is_ok() {
+        let errors: Vec<String> = controller
+            .errors()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        return Err(CliError::failure(errors.join("\n")));
+    }
+    Ok(controller.local_harness_home())
 }
 
 /// What the daemon starts its observer worker with, `None` when the

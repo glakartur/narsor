@@ -66,7 +66,7 @@ fn print_config_table(config: &Resolved) {
         "SETTING", "VALUE"
     );
 
-    for setting in SettingKey::ALL {
+    for setting in config.scope().settings() {
         match masking_error(config, setting) {
             Some(message) => {
                 println!(
@@ -133,7 +133,7 @@ fn print_config_table(config: &Resolved) {
 /// that nothing downstream has to parse a sentence.
 fn print_config_json(config: &Resolved) {
     let mut settings = serde_json::Map::new();
-    for setting in SettingKey::ALL {
+    for setting in config.scope().settings() {
         let mut entry = serde_json::Map::new();
         match masking_error(config, setting) {
             Some(message) => {

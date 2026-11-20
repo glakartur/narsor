@@ -144,7 +144,7 @@ pub struct LocalArgs {
 }
 
 /// The HOME settings runners are started with (R17, R18; KTD15): each from
-/// its flag, else from `config` — its `NARSOR_LOCAL_*` variable, else the
+/// its flag, else from `config` — its `NARSOR_CONTROLLER__LOCAL__*` variable, else the
 /// configuration file. With a control plane beyond this machine the mode is
 /// `private` unless something set it, and `host` needs `--accept-host-home`;
 /// so do the harness directories — the user's own logins — which the
@@ -155,7 +155,7 @@ fn resolve_home(
     config: Option<&Resolved>,
 ) -> Result<HarnessHome, ControllerError> {
     let configured = config.map(Resolved::local_harness_home).unwrap_or_default();
-    // `local_home` has a built-in value (`host`); only one somebody set
+    // `controller.local.home` has a built-in value (`host`); only one somebody set
     // counts for a server that is not trusted.
     let mode_set = config
         .is_some_and(|config| !matches!(config.source(SettingKey::LocalHome), Source::BuiltIn));
@@ -228,6 +228,7 @@ fn read_config(args: &LocalArgs) -> Result<Resolved, ControllerError> {
     let resolved = narsor_engine::config::resolve(
         &flags,
         &narsor_engine::config::resolve::environment_from_process(),
+        narsor_engine::config::Scope::CONTROLLER,
     );
     if !resolved.is_ok() {
         let errors: Vec<String> = resolved.errors().iter().map(ToString::to_string).collect();

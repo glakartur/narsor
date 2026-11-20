@@ -65,7 +65,11 @@ async fn run(cli: Cli) -> Result<(), String> {
         root: cli.root.clone(),
         config: cli.config.clone(),
     };
-    let resolved = config::resolve(&flags, &config::resolve::environment_from_process());
+    let resolved = config::resolve(
+        &flags,
+        &config::resolve::environment_from_process(),
+        config::Scope::WEB,
+    );
     if !resolved.is_ok() {
         let faults: Vec<String> = resolved.errors().iter().map(ToString::to_string).collect();
         return Err(format!(

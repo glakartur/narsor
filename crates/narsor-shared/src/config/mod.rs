@@ -29,6 +29,7 @@ pub mod duration;
 pub mod file;
 pub mod harness_home;
 pub mod resolve;
+pub mod scope;
 pub(crate) mod security_validation;
 pub mod settings;
 
@@ -38,11 +39,11 @@ pub use file::{FileError, FileValues, ParsedFile};
 pub use harness_home::{
     HarnessHome, HomeMode, API_KEY_ENVS, CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV,
 };
-pub use resolve::AgentDefaults;
 pub use resolve::{resolve, ConfigError, Environment, Flags, ObserverWorkerConfig, Resolved};
+pub use scope::Scope;
 pub use security_validation::is_loopback_host;
 pub use settings::{
-    agent_args_for, agent_args_key, render_value, AgentArgs, SettingKey, SettingValue, Source,
-    AGENT_ARGS_ENV, DEFAULT_BACKEND, DEFAULT_ESCALATION_THRESHOLD, DEFAULT_TUI_REFRESH_SECS,
-    EFFORT_SCALE, ENV_PREFIX, MASK, MODEL_TIERS, NO_LIMIT,
+    agent_args_for, agent_args_key, render_value, AgentArgs, Section, SettingKey, SettingValue,
+    Source, AGENT_ARGS_ENV, DEFAULT_BACKEND, DEFAULT_TUI_REFRESH_SECS, EFFORT_SCALE, ENV_PREFIX,
+    MASK, MODEL_TIERS, NO_LIMIT,
 };

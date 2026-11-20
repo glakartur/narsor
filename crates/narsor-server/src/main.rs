@@ -56,7 +56,7 @@ async fn run() {
         config: args.config,
     };
     let environment = config::resolve::environment_from_process();
-    let resolved = config::resolve(&flags, &environment);
+    let resolved = config::resolve(&flags, &environment, config::Scope::SERVER);
     if !resolved.is_ok() {
         for error in resolved.errors() {
             eprintln!("{error}");

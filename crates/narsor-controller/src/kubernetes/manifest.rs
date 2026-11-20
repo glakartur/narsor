@@ -56,7 +56,7 @@ use super::names;
 use narsor_controller_runtime::backend::{
     BackendError, BackendResult, TaskResources, WorkloadLaunch,
 };
-use narsor_engine::config::HarnessHome;
+use narsor_engine::config::{HarnessHome, AGENT_ARGS_ENV};
 use narsor_engine::domain::{ImageReference, ResolvedImage, SecretReference, TaskLaunchSpec};
 
 /// Component label of a read-only runner's Pod.
@@ -88,9 +88,10 @@ pub const BUNDLE_PAYLOAD: &str = "/narsor";
 pub const INSTALL_COMMAND: [&str; 4] = ["cp", "-a", "/narsor/.", "/opt/narsor/"];
 /// Name of the main container.
 pub const RUNNER_CONTAINER: &str = "runner";
-/// Controller ConfigMap key containing the runner's `NARSOR_AGENT_ARGS`.
+/// Controller ConfigMap holding the runner's [`AGENT_ARGS_ENV`] under the
+/// key of the same name.
 const RUNNER_ARGS_CONFIG_MAP: &str = "narsor-controller-config";
-const RUNNER_ARGS_CONFIG_KEY: &str = "NARSOR_AGENT_ARGS";
+const RUNNER_ARGS_CONFIG_KEY: &str = AGENT_ARGS_ENV;
 /// Key of the runner credential in the launch Secret.
 pub const CREDENTIAL_KEY: &str = "credential";
 /// Key of the launch spec in the launch Secret.
@@ -787,7 +788,7 @@ pub fn pod(
                 "env": [
                     { "name": "PATH", "value": runner_path(plan) },
                     {
-                        "name": "NARSOR_AGENT_ARGS",
+                        "name": AGENT_ARGS_ENV,
                         "valueFrom": { "configMapKeyRef": {
                             "name": RUNNER_ARGS_CONFIG_MAP,
                             "key": RUNNER_ARGS_CONFIG_KEY,
@@ -1099,7 +1100,7 @@ pub fn check_pod_shape(pod: &Value, policy: &ShapePolicy) -> Result<(), Vec<Stri
                 });
         if env_from_other_objects {
             problems.push(format!(
-                "container '{cname}' may only read NARSOR_AGENT_ARGS from the controller ConfigMap"
+                "container '{cname}' may only read {AGENT_ARGS_ENV} from the controller ConfigMap"
             ));
         }
     }
