@@ -2,9 +2,9 @@
 // is a dialog over the shell, as in the TUI (`H`, `R`, `h`, `L`).
 
 import { html, useEffect, useRef, useState } from '../lib.js';
-import { shortIdentifier, stateIcon, statusWord, titleOf } from '../model.js';
+import { shortIdentifier, stateIcon, titleOf } from '../model.js';
 import { archivedRun } from '../text.js';
-import { Workspaces } from './details.js';
+import { StatusRow, Workspaces } from './details.js';
 import { Field } from './fields.js';
 import { useRead } from './read.js';
 import { Info } from './tabs/info.js';
@@ -187,14 +187,10 @@ export function Limit({ store, onClose }) {
 export function ArchivedTask({ store, task, onClose }) {
   const read = useRead((signal) => store.api.timeline(task.task_id, signal), task.task_id);
   const run = archivedRun(read);
-  const icon = stateIcon(task);
   return html`<${Dialog} title=${titleOf(task)} onClose=${onClose} wide>
     <div class="details-meta">
       <${Workspaces} task=${task} />
-      <div class="status-row">
-        <span class=${`role-${icon.role}`}><span aria-hidden="true">${icon.glyph}</span> ${statusWord(task)}</span>
-        <span class="muted"> · </span><span class="role-done">${task.workflow_id} v${task.workflow_version}</span>
-      </div>
+      <${StatusRow} task=${task} parts=${[{ text: `${task.workflow_id} v${task.workflow_version}`, role: 'done' }]} />
       ${run.usage && html`<div class="usage-row muted mono">${run.usage}</div>`}
     </div>
     <h3>Przebieg</h3>

@@ -12,7 +12,7 @@ pub use crate::domain::runner_snapshot::{
 use crate::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec, WorkspaceHeader};
 use chrono::{DateTime, Utc};
 use narsor_protocol::api::{ConversationState, Timeline};
-use narsor_protocol::controller::MoveTaskTarget;
+use narsor_protocol::controller::{MoveTaskTarget, STORAGE_DELETED_AT_ARCHIVE};
 use serde::{Deserialize, Serialize};
 
 pub use narsor_protocol::controller::{
@@ -972,9 +972,6 @@ impl ArchivedRun {
     }
 }
 
-/// Why an archived step has no conversation to read.
-pub const ARCHIVED_CONVERSATION_REASON: &str = "storage usunięty przy archiwizacji";
-
 /// `timeline` reduced to what outlives the task storage: one header row per
 /// step with its labels, status, times, error, harness, model, effort,
 /// usage, cost and decision fields as reported. The attempt ids, session
@@ -991,7 +988,7 @@ pub fn archived_timeline(timeline: &Timeline) -> Timeline {
         position.resumed_harness_session = None;
         position.harness_session_id = None;
         position.conversation = ConversationState::NotCreated {
-            reason: ARCHIVED_CONVERSATION_REASON.to_string(),
+            reason: STORAGE_DELETED_AT_ARCHIVE.to_string(),
         };
     }
     trimmed

@@ -132,13 +132,10 @@ pub(super) fn current_position(timeline: &Timeline) -> Option<String> {
         .map(|position| position.label.clone())
 }
 
-/// The transitions an owner can ask for out of the state the runner last
-/// reported: read from the sealed workflow snapshot, only while the task is
-/// running (nothing else can carry one out).
-pub(super) fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
-    if record.runner_state != RunnerState::Running {
-        return None;
-    }
+/// The sealed workflow of the task and the state of it the runner last
+/// reported; `None` while there is no such report or the workflow cannot be
+/// read.
+fn reported_state(record: &TaskRecord) -> Option<(WorkflowDefinition, &str)> {
     let current = record
         .runner
         .as_ref()?
@@ -147,6 +144,17 @@ pub(super) fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer>
         .current_state
         .as_deref()?;
     let definition = record.launch_spec.definition().ok()?;
+    Some((definition, current))
+}
+
+/// The transitions an owner can ask for out of the state the runner last
+/// reported: read from the sealed workflow snapshot, only while the task is
+/// running (nothing else can carry one out).
+pub(super) fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
+    if record.runner_state != RunnerState::Running {
+        return None;
+    }
+    let (definition, current) = reported_state(record)?;
     transition_offer(&definition, current)
 }
 
@@ -156,22 +164,17 @@ pub(super) fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer>
 /// alone is not enough: a failed step ends the execution as failed while its
 /// state is not a terminal one.
 pub(crate) fn at_workflow_terminal_state(record: &TaskRecord) -> bool {
-    let Some(runner) = record.runner.as_ref() else {
-        return false;
-    };
-    let snapshot = &runner.snapshot;
-    if !snapshot.execution_status.is_terminal() {
-        return false;
-    }
-    let Some(current) = snapshot.execution_cursor.current_state.as_deref() else {
-        return false;
-    };
-    record
-        .launch_spec
-        .definition()
-        .ok()
-        .and_then(|definition| definition.states.get(current).map(|state| state.terminal))
-        .unwrap_or(false)
+    let terminal_status = record
+        .runner
+        .as_ref()
+        .is_some_and(|runner| runner.snapshot.execution_status.is_terminal());
+    terminal_status
+        && reported_state(record).is_some_and(|(definition, current)| {
+            definition
+                .states
+                .get(current)
+                .is_some_and(|state| state.terminal)
+        })
 }
 
 /// Every step of the workflow, for the stop in which the owner may choose

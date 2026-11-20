@@ -639,8 +639,12 @@ fn provisioning_failed(task: &TaskSummary) -> bool {
 /// execution that sits in a terminal state of its workflow is archived. A
 /// stuck task gets there by a manual transition first. Read from the record,
 /// since the summary does not carry the `terminal` flag of the state.
+///
+/// An archiving or archived task is not this function's case: its callers
+/// settle it first ([`unavailable_reason`] refuses it, and a repeated
+/// archive converges in the control plane).
 pub(super) fn archive_reason(record: &TaskRecord) -> Option<String> {
-    if record.runner_state.is_archival() || at_workflow_terminal_state(record) {
+    if at_workflow_terminal_state(record) {
         return None;
     }
     Some(
@@ -648,6 +652,21 @@ pub(super) fn archive_reason(record: &TaskRecord) -> Option<String> {
          przebieg; zadanie, które utknęło, najpierw przejdź ręcznie do stanu końcowego"
             .to_string(),
     )
+}
+
+/// Why Archive is refused at the send: the summary's offer is the one
+/// source, since it already weighs the record (D80). The words are the
+/// reason the offer left it out for.
+fn archive_refusal(summary: &TaskSummary, record: &TaskRecord) -> Option<String> {
+    let offered = summary
+        .actions
+        .iter()
+        .flatten()
+        .any(|offer| offer.id == TaskActionId::Archive);
+    if offered {
+        return None;
+    }
+    unavailable_reason(summary, TaskActionId::Archive).or_else(|| archive_reason(record))
 }
 
 /// Why a task is not one whose step can be acted on — `None` when its
@@ -742,10 +761,10 @@ impl ProtocolService {
             return Ok(());
         }
         let summary = self.summarize(record)?;
-        let reason = unavailable_reason(&summary, id).or_else(|| match id {
-            TaskActionId::Archive => archive_reason(record),
-            _ => None,
-        });
+        let reason = match id {
+            TaskActionId::Archive => archive_refusal(&summary, record),
+            _ => unavailable_reason(&summary, id),
+        };
         match reason {
             Some(reason) => Err(ProtocolError::conflict("action_unavailable", reason)),
             None => Ok(()),
@@ -761,17 +780,17 @@ impl ProtocolService {
         command: OwnerCommand,
         expected_generation: Option<u64>,
     ) -> ProtocolResult<()> {
-        // An archive of an archiving or archived task converges in the
-        // control plane, so it is not refused here.
-        if command == OwnerCommand::Archive && record.runner_state.is_archival() {
-            return Ok(());
-        }
-        if command != OwnerCommand::Archive
-            && !matches!(
+        let checked = match command {
+            // An archive of an archiving or archived task converges in the
+            // control plane, so it is not refused here.
+            OwnerCommand::Archive => !record.runner_state.is_archival(),
+            // A command the lifecycle refuses is left to it.
+            _ => matches!(
                 lifecycle::command_effect(record.runner_state, command),
                 lifecycle::CommandEffect::Transition(_)
-            )
-        {
+            ),
+        };
+        if !checked {
             return Ok(());
         }
         self.require_available(record, owner_action(command, record), expected_generation)

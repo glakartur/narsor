@@ -40,7 +40,7 @@ use super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
 use super::background::{DetailJob, JobKey, OpeningKind, Outcome};
 use super::detail::{
-    edge_layout, fit_cells, render_view, title_is_cut, KeysAt, StepLevel, TaskDetail, ViewOptions,
+    edge_layout, fit_cells, render_view, title_is_cut, KeysAt, TaskDetail, ViewOptions,
 };
 use super::list::{history_row_text, title_of, RowText, StateIcon};
 use super::notify::Severity;
@@ -79,9 +79,6 @@ pub struct History {
     entries: Vec<TaskSummary>,
     selected: usize,
     tab: DetailTab,
-    /// The level of the focus on *Przebieg* of the details, as in the task
-    /// details but without following: the run is over.
-    step_focus: StepLevel,
     details: BTreeMap<String, TaskDetail>,
     /// The first row of the list in view, kept between frames so that a new
     /// read does not scroll the list.
@@ -95,7 +92,6 @@ impl History {
             entries: Vec::new(),
             selected: 0,
             tab: DetailTab::Progress,
-            step_focus: StepLevel::default(),
             details: BTreeMap::new(),
             top: 0,
         };
@@ -118,10 +114,6 @@ impl History {
             .retain(|key, _| self.entries.iter().any(|task| key_of(task) == *key));
         for detail in self.details.values_mut() {
             detail.invalidate();
-        }
-        // Another selected entry starts its details on the timeline.
-        if self.selected_entry().map(key_of) != kept {
-            self.back_to_axis();
         }
     }
 
@@ -150,11 +142,6 @@ impl History {
         self.tab
     }
 
-    /// The level of the focus on *Przebieg* of the details.
-    pub fn step_focus(&self) -> StepFocus {
-        self.step_focus.get()
-    }
-
     /// What the details of the selected entry remember, once shown or read.
     pub fn selected_detail(&self) -> Option<&TaskDetail> {
         let key = key_of(self.selected_entry()?);
@@ -181,9 +168,9 @@ impl History {
     }
 
     fn on_detail_action(&mut self, action: Action) {
-        let (tab, step) = (self.tab, self.step_focus());
+        let tab = self.tab;
         if let Some(detail) = self.selected_detail_mut() {
-            detail.on_action(tab, step, action);
+            detail.on_action(tab, StepFocus::Axis, action);
         }
     }
 
@@ -198,15 +185,9 @@ impl History {
         )
     }
 
-    /// Back on the timeline, every entry's timeline letting its step go.
-    fn back_to_axis(&mut self) {
-        self.step_focus.back_to_axis(&mut self.details);
-    }
-
-    /// `[` / `]`: the tab `by` places along, on its timeline.
+    /// `[` / `]`: the tab `by` places along.
     fn shift_tab(&mut self, by: isize) {
         self.tab = self.tab.shifted(by);
-        self.back_to_axis();
     }
 }
 
@@ -259,7 +240,7 @@ impl TaskApp {
             View::History(history) => Some(detail_keys(
                 Context::HistoryDetails,
                 history.tab,
-                history.step_focus(),
+                StepFocus::Axis,
             )),
             _ => None,
         }
@@ -278,7 +259,7 @@ impl TaskApp {
             Action::Help => self.help_open = true,
             Action::Quit => self.on_quit(),
             Action::Back if context == Context::History => self.close_view(),
-            Action::Back => self.focus_history(Focus::List),
+            Action::Back => self.focus = Focus::List,
             Action::SwitchFocus => {
                 self.focus = if self.focus == Focus::List {
                     Focus::Details
@@ -286,8 +267,7 @@ impl TaskApp {
                     Focus::List
                 };
             }
-            Action::Open => self.focus_history(Focus::Details),
-            Action::LeaveStep => self.with_history(History::back_to_axis),
+            Action::Open => self.focus = Focus::Details,
             Action::ChooseHarness => return Request::OpenHarness,
             Action::PrevTab => self.with_history(|history| history.shift_tab(-1)),
             Action::NextTab => self.with_history(|history| history.shift_tab(1)),
@@ -372,13 +352,6 @@ impl TaskApp {
         if let View::History(history) = &mut self.view {
             change(history);
         }
-    }
-
-    /// Puts the keys on the history's list or on its details, which start on
-    /// the timeline.
-    fn focus_history(&mut self, focus: Focus) {
-        self.focus = focus;
-        self.with_history(History::back_to_axis);
     }
 
     /// `Esc` from a view that has its own screen: back to the list of tasks.
@@ -474,7 +447,7 @@ pub fn render_details(
     } = look;
     let tab = history.tab;
     let keys = if focused {
-        KeysAt::Content(history.step_focus())
+        KeysAt::Content(StepFocus::Axis)
     } else {
         KeysAt::Elsewhere
     };

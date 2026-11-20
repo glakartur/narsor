@@ -78,8 +78,8 @@ pub enum Context {
     /// A layer over [`Context::HistoryDetails`]: the timeline of a closed
     /// run, which has nothing to follow and no step to open.
     HistoryAxis,
-    /// A layer over either details: the conversation of the step picked on
-    /// the timeline.
+    /// A layer over [`Context::Details`]: the conversation of the step
+    /// picked on the timeline.
     StepConversation,
     /// A layer over either details: reading any tab but *Przebieg*.
     Reading,
@@ -172,12 +172,11 @@ pub struct Stack {
 
 impl Stack {
     /// The stacks with a layer, each layer over the bases it goes with.
-    pub const LAYERED: [Stack; 8] = [
+    pub const LAYERED: [Stack; 7] = [
         Stack::layered(Context::Axis, Context::Details),
         Stack::layered(Context::StepConversation, Context::Details),
         Stack::layered(Context::Reading, Context::Details),
         Stack::layered(Context::HistoryAxis, Context::HistoryDetails),
-        Stack::layered(Context::StepConversation, Context::HistoryDetails),
         Stack::layered(Context::Reading, Context::HistoryDetails),
         Stack::layered(Context::AgentConversation, Context::Details),
         Stack::layered(Context::AgentConversation, Context::HistoryDetails),

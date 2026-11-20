@@ -1,7 +1,7 @@
 ---
 title: "feat: Archive a finished task with its header and run snapshot"
 type: feat
-status: active
+status: completed
 date: 2026-11-20
 origin: docs/brainstorms/2026-11-20-archive-task-with-run-snapshot-requirements.md
 ---

@@ -828,7 +828,6 @@ mod foundations {
         fn the_history_has_the_same_layers_without_the_tasks_actions_or_following() {
             for layer in [
                 Context::HistoryAxis,
-                Context::StepConversation,
                 Context::Reading,
                 Context::AgentConversation,
             ] {
@@ -11363,7 +11362,6 @@ mod task_app_create {
                 press(&mut app, code);
             }
             let history = app.history().unwrap();
-            assert_eq!(history.step_focus(), narsor::tui::task_app::StepFocus::Axis);
             let progress = history.selected_detail().unwrap().progress();
             assert_eq!(progress.selected_label(), None, "no step is picked");
             assert!(progress.step_view().is_none());

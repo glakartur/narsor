@@ -69,7 +69,9 @@ use crate::controller_protocol::{
 };
 use crate::task_usage_text::{self, TaskUsage};
 use narsor_protocol::api::{ConversationState, Position};
-use narsor_protocol::controller::{ExecutionCursor, QueueReason, TaskState};
+use narsor_protocol::controller::{
+    ExecutionCursor, QueueReason, TaskState, STORAGE_DELETED_AT_ARCHIVE,
+};
 
 use super::super::keymap::Action;
 use super::super::scroll::one_line;
@@ -437,16 +439,13 @@ pub fn readiness(task: &TaskSummary) -> Readiness {
     }
 }
 
-/// The words of a tab whose data went away with the archiving.
-const STORAGE_DELETED: &str = "storage usunięty przy archiwizacji";
-
 /// What *Przebieg*, *Rozmowa*, *Zdarzenia* and *Dyrygent* say when there is
 /// nothing to show, or `None` when there is. *Przebieg* of a history entry
 /// asks [`closed_run_message`] instead: the archive kept its run.
 pub fn unstarted_message(task: &TaskSummary, queue_place: Option<usize>) -> Option<String> {
     match readiness(task) {
         Readiness::Started => None,
-        Readiness::Archived => Some(STORAGE_DELETED.to_string()),
+        Readiness::Archived => Some(STORAGE_DELETED_AT_ARCHIVE.to_string()),
         Readiness::NotStarted => {
             let place = match queue_place {
                 Some(place) => format!("#{place} w kolejce"),
@@ -464,7 +463,7 @@ pub fn closed_run_message(progress: &Progress) -> Option<String> {
     progress
         .timeline()
         .is_some_and(|response| response.timeline.is_none())
-        .then(|| STORAGE_DELETED.to_string())
+        .then(|| STORAGE_DELETED_AT_ARCHIVE.to_string())
 }
 
 /// Whether the terminal named by the environment draws OSC 8 hyperlinks.
