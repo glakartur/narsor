@@ -843,10 +843,10 @@ mod foundations {
             }
             let axis = Stack::layered(Context::HistoryAxis, Context::HistoryDetails);
             assert!(!stack_keys(axis).iter().any(|key| key == "f"));
-            assert_eq!(
-                lookup(axis, &press(KeyCode::Enter)),
-                Some(Action::EnterStep)
-            );
+            // The steps of an archived run are header rows only: none opens.
+            for code in [KeyCode::Enter, KeyCode::Right, KeyCode::Char('j')] {
+                assert_eq!(lookup(axis, &press(code)), None, "{code:?}");
+            }
         }
 
         #[test]
@@ -2878,14 +2878,15 @@ mod task_app_detail {
     use narsor::api::{ApiClient, ClientError};
     use narsor::tui::style::Styles;
     use narsor::tui::task_app::detail::{
-        self, hyperlinks_supported, queue_text, readiness, short_age, unstarted_message,
-        DetailRead, Readiness,
+        self, closed_run_message, hyperlinks_supported, queue_text, readiness, short_age,
+        unstarted_message, DetailRead, Readiness,
     };
     use narsor::tui::task_app::tabs::conversation::{
         AttemptRead, Attempts, Conversation, ReadFailure,
     };
     use narsor::tui::task_app::tabs::events::Availability;
     use narsor::tui::task_app::tabs::info;
+    use narsor::tui::task_app::tabs::progress::Progress;
     use narsor::tui::task_app::{DetailTab, Focus, TaskApp};
     use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
     use narsor_engine::controller_protocol::{
@@ -3682,6 +3683,22 @@ mod task_app_detail {
                 unstarted_message(&archived, None).as_deref(),
                 Some("storage usunięty przy archiwizacji")
             );
+            // *Przebieg* of a history entry says so only when no run was kept:
+            // not while it reads, not when the read failed.
+            let mut progress = Progress::default();
+            assert_eq!(closed_run_message(&progress), None);
+            progress.apply(1, Err("serwer zajęty".to_string()));
+            assert_eq!(closed_run_message(&progress), None);
+            let mut nothing_kept = timeline("a", Vec::new(), None);
+            nothing_kept.timeline = None;
+            progress.apply(2, Ok(nothing_kept));
+            assert_eq!(
+                closed_run_message(&progress).as_deref(),
+                Some("storage usunięty przy archiwizacji")
+            );
+            let kept = timeline("a", vec![position("plan", PositionStatus::Succeeded)], None);
+            progress.apply(3, Ok(kept));
+            assert_eq!(closed_run_message(&progress), None);
             let provisioning = task("b", "local", "provisioning", 2);
             assert_eq!(
                 unstarted_message(&provisioning, None).as_deref(),
@@ -9036,8 +9053,8 @@ mod task_app_conductor {
     use narsor_protocol::controller::ConductorView;
 
     use super::task_app_support::{
-        chat_entry, conductor_view, event, listing, task, titled, waiting_on, with_conductor,
-        with_controller, with_runner, without_conductor,
+        archived, archived_step, archived_timeline, chat_entry, conductor_view, event, listing,
+        task, titled, waiting_on, with_conductor, with_controller, with_runner, without_conductor,
     };
 
     fn app() -> TaskApp {
@@ -9893,12 +9910,20 @@ mod task_app_conductor {
         #[test]
         fn an_archived_task_says_its_storage_went_with_the_archiving() {
             let mut app = app();
-            app.load(listing(
-                vec![titled(task("a", "local", "archived", 1), "NAR-12")],
-                "c",
-            ));
-            press(&mut app, KeyCode::Enter);
-            app.detail_mut().set_tab(DetailTab::Conductor);
+            app.load(listing(vec![], "c"));
+            press(&mut app, KeyCode::Char('H'));
+            app.open_history(listing(vec![archived("a", "NAR-12", 1)], "c"));
+            // The run the archive kept does not bring the conductor back.
+            app.on_history_timeline(
+                "a",
+                Ok(archived_timeline(
+                    "a",
+                    vec![archived_step("plan", "claude", "opus", 0.4)],
+                )),
+            );
+            while app.history().unwrap().tab() != DetailTab::Conductor {
+                press(&mut app, KeyCode::Char(']'));
+            }
             let text = screen(&mut app, 120, 30);
             assert!(
                 text.contains("storage usunięty przy archiwizacji"),
@@ -10120,8 +10145,8 @@ mod task_app_create {
     use narsor_engine::domain::ParamType;
 
     use super::task_app_support::{
-        archived, capabilities, catalogue, catalogue_workflow, listing, queued, registry,
-        repository, titled, with_workspaces, workflow_input, workspace,
+        archived, archived_step, archived_timeline, capabilities, catalogue, catalogue_workflow,
+        listing, queued, registry, repository, titled, with_workspaces, workflow_input, workspace,
     };
     use narsor_protocol::controller::WorkspaceRequest;
 
@@ -11289,18 +11314,24 @@ mod task_app_create {
         }
 
         #[test]
-        fn an_archived_task_has_the_tabs_read_only_and_says_its_storage_is_gone() {
+        fn an_archived_task_shows_its_kept_run_and_says_the_rest_of_its_storage_is_gone() {
             let mut app = opened();
+            app.on_history_timeline(
+                "old",
+                Ok(archived_timeline(
+                    "old",
+                    vec![archived_step("plan", "claude", "opus", 0.4)],
+                )),
+            );
             press(&mut app, KeyCode::Enter);
             assert_eq!(app.key_context().base, Context::HistoryDetails);
             for (tab, expected) in [
-                (DetailTab::Progress, "storage usunięty przy archiwizacji"),
+                (DetailTab::Progress, "plan #1"),
                 (
                     DetailTab::Conversation,
                     "storage usunięty przy archiwizacji",
                 ),
                 (DetailTab::Events, "storage usunięty przy archiwizacji"),
-                (DetailTab::Conductor, "storage usunięty przy archiwizacji"),
             ] {
                 while app.history().unwrap().tab() != tab {
                     press(&mut app, KeyCode::Char(']'));
@@ -11312,6 +11343,60 @@ mod task_app_create {
             let screen = screen(&mut app, 130, 30);
             assert!(screen.contains("NAR-9"), "{screen}");
             assert!(screen.contains("Historia"), "{screen}");
+        }
+
+        #[test]
+        fn enter_on_a_step_of_an_archived_run_opens_nothing() {
+            let mut app = opened();
+            app.on_history_timeline(
+                "old",
+                Ok(archived_timeline(
+                    "old",
+                    vec![
+                        archived_step("plan", "claude", "opus", 0.4),
+                        archived_step("review", "claude", "sonnet", 0.2),
+                    ],
+                )),
+            );
+            press(&mut app, KeyCode::Enter);
+            for code in [KeyCode::Enter, KeyCode::Right, KeyCode::Char('j')] {
+                press(&mut app, code);
+            }
+            let history = app.history().unwrap();
+            assert_eq!(history.step_focus(), narsor::tui::task_app::StepFocus::Axis);
+            let progress = history.selected_detail().unwrap().progress();
+            assert_eq!(progress.selected_label(), None, "no step is picked");
+            assert!(progress.step_view().is_none());
+        }
+
+        #[tokio::test]
+        async fn a_failed_read_of_an_archived_run_is_read_again_when_the_entry_is_selected_anew() {
+            let mut app = opened();
+            app.sync_detail().await;
+            let failed = |app: &TaskApp| {
+                app.history()
+                    .unwrap()
+                    .selected_detail()
+                    .and_then(|detail| detail.progress().failure().map(str::to_string))
+            };
+            assert_eq!(
+                failed(&app).as_deref(),
+                Some("brak połączenia z serwerem"),
+                "the server is out of reach"
+            );
+            let revision = app.history().unwrap().selected_entry().unwrap().revision;
+            let due = |app: &TaskApp| {
+                app.history()
+                    .unwrap()
+                    .selected_detail()
+                    .unwrap()
+                    .progress()
+                    .needs_read(revision)
+            };
+            assert!(!due(&app), "a failure is not read again on its own");
+            ch(&mut app, 'j');
+            ch(&mut app, 'k');
+            assert!(due(&app), "selecting the entry anew reads it again");
         }
 
         #[test]

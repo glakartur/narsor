@@ -325,6 +325,14 @@ impl Progress {
         }
     }
 
+    /// A closed run, as the history shows it: no step is picked, so the axis
+    /// has no cursor and no step's content shows, and nothing is followed.
+    pub fn drop_selection(&mut self) {
+        self.selected = None;
+        self.follow = false;
+        self.paused = false;
+    }
+
     /// `f`: follow the running step, or stay where the cursor is. Following
     /// again jumps to the running step at once.
     pub fn toggle_follow(&mut self) {

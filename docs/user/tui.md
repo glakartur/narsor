@@ -138,8 +138,16 @@ even when following the current step; going back catches up. *Przebieg* and
 the whole one narrowed to that entry into the step, so the workflow choices
 (`WYBÓR WORKFLOW`) made in the step show in both, and the one-line parts (the
 headers and the choices) are clipped with `…` in a narrow window while the text
-wraps. The history's
-details work the same way, without following.
+wraps.
+
+**The history's details** (`H`) show what the archive kept. The header is the
+one of an active task, with the total cost. *Przebieg* shows one row per step
+(harness, model, effort, tokens, subagents, cost and conductor cost); the steps
+cannot be picked or opened, and nothing is followed. The step conversations,
+the events and the conductor went away with the storage, so *Rozmowa*,
+*Zdarzenia* and *Dyrygent* say `storage usunięty przy archiwizacji`. *Przebieg*
+says it only when the task has no kept run at all. When the read of the run
+fails, *Przebieg* shows why; select the entry again to read it again.
 
 In the conversation, the entries of one subagent form **one collapsed group**,
 placed at the subagent's first entry even when main-agent entries come between
@@ -327,6 +335,7 @@ the current step or a draft.
 | List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `Ctrl+.` (or `.`) action panel, `n` `z` `H` `R`, `Ctrl+↑` `Ctrl+↓` `m`, `o` `c` `r`, `h` default harness, `L` task limit |
 | Details | `[` / `]` tabs, `Tab` content ↔ panel, `Ctrl+.` (or `.`) action panel, `h` default harness, `L` task limit (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step |
+| — *Przebieg* in the history | `Esc` list (the steps of an archived run cannot be picked or opened) |
 | — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry (a subagent's group `▸` / `▾` too), `v` raw entry, `Ctrl+V` raw all |
 | — the other tabs | `Esc` list, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` to the end and follow |
 | Panel | `Tab` actions ↔ fields, `Enter` send, `Ctrl+J` new line (also `Shift+Enter` / `Alt+Enter` where the terminal reports modifiers), `Esc` fold (with the server's forms: next form), `1`–`9` choose, `[` / `]` previous / next waiting (not with the server's forms) |

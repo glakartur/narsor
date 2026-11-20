@@ -76,7 +76,7 @@ pub enum Context {
     /// A layer over [`Context::Details`]: the step timeline of *Przebieg*.
     Axis,
     /// A layer over [`Context::HistoryDetails`]: the timeline of a closed
-    /// run, which has nothing to follow.
+    /// run, which has nothing to follow and no step to open.
     HistoryAxis,
     /// A layer over either details: the conversation of the step picked on
     /// the timeline.
@@ -1331,69 +1331,15 @@ pub static BINDINGS: &[Binding] = &[
         "podążaj",
         "włącz albo wyłącz podążanie za bieżącym krokiem",
     ),
-    // The timeline of *Przebieg* in the history: a closed run, nothing to follow.
+    // The timeline of *Przebieg* in the history: a closed run, nothing to
+    // follow, and its steps are header rows only, so there is no step to pick
+    // or open.
     bind(
         Context::HistoryAxis,
         Key::code(KeyCode::Esc),
         Action::Back,
         "lista",
         "wróć na listę historii",
-    ),
-    bind(
-        Context::HistoryAxis,
-        Key::char('j'),
-        Action::Down,
-        "kroki",
-        "następny krok",
-    ),
-    bind(
-        Context::HistoryAxis,
-        Key::code(KeyCode::Down),
-        Action::Down,
-        "",
-        "następny krok",
-    ),
-    bind(
-        Context::HistoryAxis,
-        Key::char('k'),
-        Action::Up,
-        "",
-        "poprzedni krok",
-    ),
-    bind(
-        Context::HistoryAxis,
-        Key::code(KeyCode::Up),
-        Action::Up,
-        "",
-        "poprzedni krok",
-    ),
-    bind(
-        Context::HistoryAxis,
-        Key::char('g'),
-        Action::Top,
-        "",
-        "pierwszy krok",
-    ),
-    bind(
-        Context::HistoryAxis,
-        Key::char('G'),
-        Action::Bottom,
-        "",
-        "ostatni krok",
-    ),
-    bind(
-        Context::HistoryAxis,
-        Key::code(KeyCode::Enter),
-        Action::EnterStep,
-        "rozmowa kroku",
-        "wejdź do rozmowy wybranego kroku",
-    ),
-    bind(
-        Context::HistoryAxis,
-        Key::code(KeyCode::Right),
-        Action::EnterStep,
-        "",
-        "wejdź do rozmowy wybranego kroku",
     ),
     // The conversation of the step picked on the timeline.
     bind(
