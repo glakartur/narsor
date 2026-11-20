@@ -300,3 +300,84 @@ fn a_task_that_is_not_stopped_lists_no_steps() {
 fn a_stopped_task_without_a_workflow_snapshot_lists_no_steps() {
     assert!(workflow_steps(&record_of(None, RunnerState::Stopped)).is_none());
 }
+
+/// A timeline whose one step `state` points into task storage.
+fn timeline_of(state: &str) -> crate::engine::Timeline {
+    serde_json::from_value(serde_json::json!({
+        "positions": [{
+            "label": format!("{state} #1"),
+            "state_id": state,
+            "visit": 1,
+            "action_execution_id": "act-2",
+            "action_type": "agent",
+            "status": "succeeded",
+            "started_at": null,
+            "ended_at": null,
+            "error": null,
+            "resumed_harness_session": null,
+            "harness_session_interrupted": false,
+            "retry_pending": false,
+            "conversation": { "state": "recorded" },
+            "attempts": ["act-1", "act-2"],
+            "usage": { "cost_usd": 0.5 }
+        }],
+        "links": { "3": { "link": "position", "value": format!("{state} #1") } },
+        "default_position": null
+    }))
+    .unwrap()
+}
+
+/// An archived task whose runner last reported `reported`, with `frozen`
+/// as the run kept at archive.
+fn archived_with(
+    reported: Option<crate::engine::Timeline>,
+    frozen: Option<crate::orchestration::ArchivedRun>,
+) -> TaskRecord {
+    let mut record = record_of(None, RunnerState::Archived);
+    record.runner = Some(crate::orchestration::RunnerObservation {
+        incarnation: "pod-1".to_string(),
+        launch_generation: 1,
+        snapshot: serde_json::from_value(serde_json::json!({
+            "snapshot_sequence": 1,
+            "execution_status": "completed",
+            "event_cursor": 0,
+            "timeline": reported,
+            "observed_at": "2026-11-20T10:00:00Z"
+        }))
+        .unwrap(),
+        received_at: chrono::Utc::now(),
+        safe_point_generation: None,
+    });
+    record.archived_run = frozen;
+    record
+}
+
+#[test]
+fn an_archived_task_serves_its_frozen_run_else_its_last_report_trimmed() {
+    use super::tasks::served_timeline;
+    let frozen = crate::orchestration::ArchivedRun {
+        timeline: Some(crate::orchestration::archived_timeline(&timeline_of(
+            "plan",
+        ))),
+        workspaces: Vec::new(),
+    };
+
+    let served = served_timeline(&archived_with(
+        Some(timeline_of("later")),
+        Some(frozen.clone()),
+    ));
+    assert_eq!(
+        served, frozen.timeline,
+        "the frozen copy, not a newer report"
+    );
+
+    let served = served_timeline(&archived_with(Some(timeline_of("plan")), None))
+        .expect("the last reported timeline");
+    let step = &served.positions[0];
+    assert_eq!(step.label, "plan #1");
+    assert_eq!(step.usage.and_then(|usage| usage.cost_usd), Some(0.5));
+    assert!(step.attempt_ids().is_empty(), "{step:?}");
+    assert!(served.links.is_empty());
+
+    assert_eq!(served_timeline(&archived_with(None, None)), None);
+}

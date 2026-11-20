@@ -666,6 +666,64 @@ mod tests {
     }
 
     #[test]
+    fn an_archived_record_from_before_the_frozen_run_was_kept_still_loads() {
+        use crate::domain::{
+            GitIdentity, ResolvedEnvironment, ResourceProfile, TaskLaunchSpec, TaskRepository,
+            TaskRepositorySource, TaskWorkspace,
+        };
+        use crate::orchestration::{CommandRequest, ControlPlane, NewTask, OwnerCommand, OwnerRef};
+        let root = std::env::temp_dir().join(format!("narsor-store-{}", uuid::Uuid::new_v4()));
+        let paths = StatePaths::new(&root);
+        let control = ControlPlane::new(paths.clone());
+        let task_id = TaskId::parse("task-1").unwrap();
+        let workspace = TaskWorkspace::single(TaskRepository::new(
+            "narsor",
+            TaskRepositorySource::Git(Box::new(GitIdentity {
+                repository: None,
+                remote_url: "https://example.com/narsor.git".to_string(),
+                commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                git_ref: None,
+                ref_origin: None,
+                credential: None,
+            })),
+        ));
+        let spec = TaskLaunchSpec::new(
+            "wf",
+            1,
+            serde_json::json!({}),
+            workspace,
+            ResolvedEnvironment::harness_only("claude-code"),
+            ResourceProfile::new(1000, 2048),
+        );
+        control
+            .create_task(NewTask::new(
+                task_id.clone(),
+                OwnerRef::new("owner"),
+                BackendId::parse("k8s").unwrap(),
+                spec,
+            ))
+            .unwrap();
+        control
+            .command(
+                &task_id,
+                CommandRequest::new(OwnerCommand::Archive, "archive-1"),
+            )
+            .unwrap();
+        let file = paths.orchestration_task_file(task_id.as_str());
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        stored.as_object_mut().unwrap().remove("archived_run");
+        fs::write(&file, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+        let loaded = OrchestrationStore::new(paths).load_task(&task_id);
+        let _ = fs::remove_dir_all(&root);
+
+        let record = loaded.expect("an old-shape archived record loads");
+        assert!(record.runner_state.is_archival());
+        assert_eq!(record.archived_run, None);
+    }
+
+    #[test]
     fn a_record_in_another_state_or_no_json_is_not_archived() {
         assert!(!is_archived_record(br#"{"runner_state":"archiving"}"#));
         assert!(!is_archived_record(b"{\"half\":"));

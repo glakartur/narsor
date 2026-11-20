@@ -9,8 +9,9 @@ use crate::domain::human_input::HumanInputDelivery;
 pub use crate::domain::runner_snapshot::{
     PendingInputRef, RunnerSnapshot, RETIRED_CONDUCTOR_HARNESS,
 };
-use crate::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
+use crate::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec, WorkspaceHeader};
 use chrono::{DateTime, Utc};
+use narsor_protocol::api::{ConversationState, Timeline};
 use narsor_protocol::controller::MoveTaskTarget;
 use serde::{Deserialize, Serialize};
 
@@ -389,6 +390,14 @@ pub struct TaskRecord {
     /// `None` for a task its owner created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<TaskProvenance>,
+    /// The run as the runner last reported it when the owner archived the
+    /// task, trimmed to its step headers ([`archived_timeline`]). Set once,
+    /// in the mutation that sets [`Self::archive`], so a runner report
+    /// accepted while the task is `Archiving` cannot change it; `None` for
+    /// a task archived without a runner snapshot and for records archived
+    /// before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_run: Option<ArchivedRun>,
     /// The event of revision [`Self::revision`]: an outbox of one, so a crash
     /// between writing the record and appending the event is repaired from
     /// the record itself (see `OrchestrationStore::publish_last_event`).
@@ -939,6 +948,53 @@ pub struct RunnerObservation {
     /// safe point — the precondition for removing its compute (KTD2).
     #[serde(default)]
     pub safe_point_generation: Option<u64>,
+}
+
+/// What an archived task keeps of its run: the step headers of the last
+/// reported timeline and the workspace headers, frozen at archive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchivedRun {
+    /// The last reported timeline, trimmed ([`archived_timeline`]).
+    #[serde(default)]
+    pub timeline: Option<Timeline>,
+    /// The last reported workspace headers, as reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<WorkspaceHeader>,
+}
+
+impl ArchivedRun {
+    /// The frozen copy of what `snapshot` reported.
+    pub fn of(snapshot: &RunnerSnapshot) -> Self {
+        Self {
+            timeline: snapshot.timeline.as_ref().map(archived_timeline),
+            workspaces: snapshot.workspaces.clone(),
+        }
+    }
+}
+
+/// Why an archived step has no conversation to read.
+pub const ARCHIVED_CONVERSATION_REASON: &str = "storage usunięty przy archiwizacji";
+
+/// `timeline` reduced to what outlives the task storage: one header row per
+/// step with its labels, status, times, error, harness, model, effort,
+/// usage, cost and decision fields as reported. The attempt ids, session
+/// ids and event links point into the storage that archive deletes, so
+/// they are dropped, and every step reads as having no conversation — a
+/// client starts no read of it.
+pub fn archived_timeline(timeline: &Timeline) -> Timeline {
+    let mut trimmed = timeline.clone();
+    trimmed.links.clear();
+    for position in &mut trimmed.positions {
+        position.attempts.clear();
+        // `Position::attempt_ids` falls back to it.
+        position.action_execution_id = None;
+        position.resumed_harness_session = None;
+        position.harness_session_id = None;
+        position.conversation = ConversationState::NotCreated {
+            reason: ARCHIVED_CONVERSATION_REASON.to_string(),
+        };
+    }
+    trimmed
 }
 
 /// One owner answer queued for the runner.

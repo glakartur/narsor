@@ -13,6 +13,8 @@ mod view;
 
 pub(crate) use commands::refuse_reserved_key;
 pub(crate) use create::launch_refusal;
+#[cfg(test)]
+pub(crate) use history::served_timeline;
 pub use view::task_workspaces;
 #[cfg(test)]
 pub(crate) use view::{transition_offer, workflow_steps};

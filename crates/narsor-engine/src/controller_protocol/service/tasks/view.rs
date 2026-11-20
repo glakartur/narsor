@@ -242,15 +242,23 @@ pub(super) fn task_title(record: &TaskRecord) -> Option<String> {
     effective_title(record.launch_spec.title.as_deref(), generated.as_deref())
 }
 
-/// The workspace rows a task shows: what its runner reported, else what the
-/// launch spec knows, which is all there is while the task waits in the
-/// queue. The workspaces keep the launch spec's order.
+/// The workspace rows a task shows: what was frozen when it was archived,
+/// else what its runner reported, else what the launch spec knows, which is
+/// all there is while the task waits in the queue. The workspaces keep the
+/// launch spec's order.
 pub fn task_workspaces(record: &TaskRecord) -> Vec<WorkspaceHeader> {
-    let reported = record
+    let frozen = record
+        .archived_run
+        .as_ref()
+        .map(|run| run.workspaces.as_slice());
+    let last_reported = record
         .runner
         .as_ref()
-        .map(|runner| runner.snapshot.workspaces.as_slice())
-        .filter(|workspaces| !workspaces.is_empty());
+        .map(|runner| runner.snapshot.workspaces.as_slice());
+    let reported = [frozen, last_reported]
+        .into_iter()
+        .flatten()
+        .find(|workspaces| !workspaces.is_empty());
     match reported {
         // A remote runner's word is not trusted with a terminal.
         Some(workspaces) => workspaces
