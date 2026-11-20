@@ -4,10 +4,13 @@
 // is drawn as text nodes, never as HTML.
 
 import { html, useEffect, useRef, useState } from '../../lib.js';
-import { attemptsOf, clock, groupEntries, pagingDone } from '../../text.js';
+import { attemptsOf, bottomAnchoredScrollTop, clock, groupEntries, pagingDone } from '../../text.js';
 import { useRead } from '../read.js';
 
 const BYTE_BUDGET = 65_536;
+
+/** Asks the open conversation to jump to its `start` or `end` (Home/End). */
+export const JUMP_EVENT = 'narsor:conversation-jump';
 const MAX_PAGES = 40;
 
 /** Conversations already read, by `task/attempt`: `{entries, next, closed}`. */
@@ -158,6 +161,35 @@ export function Conversation({ api, task, positions, emptyText = 'brak zapisanej
   useEffect(() => {
     if (follow) bottom.current?.scrollIntoView({ block: 'end' });
   }, [count, follow]);
+  // The answer panel below grows and shrinks while the operator types: keep
+  // the bottom visible line in place, and the end in view while following.
+  const followRef = useRef(follow);
+  followRef.current = follow;
+  useEffect(() => {
+    const el = box.current;
+    if (!el || typeof ResizeObserver === 'undefined') return undefined;
+    let height = el.clientHeight;
+    const observer = new ResizeObserver(() => {
+      const newHeight = el.clientHeight;
+      if (newHeight === height) return;
+      el.scrollTop = followRef.current
+        ? el.scrollHeight
+        : bottomAnchoredScrollTop({ scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, oldHeight: height, newHeight });
+      height = newHeight;
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [recorded.length > 0]);
+  // Home/End only jump; following still follows the scroll position.
+  useEffect(() => {
+    const onJump = (event) => {
+      const el = box.current;
+      if (!el) return;
+      el.scrollTop = event.detail === 'start' ? 0 : el.scrollHeight;
+    };
+    window.addEventListener(JUMP_EVENT, onJump);
+    return () => window.removeEventListener(JUMP_EVENT, onJump);
+  }, []);
   const onScroll = (event) => {
     const el = event.currentTarget;
     setFollow(el.scrollHeight - el.scrollTop - el.clientHeight < 40);

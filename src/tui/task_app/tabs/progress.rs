@@ -70,7 +70,8 @@ impl StepView {
         Self {
             transcript: TranscriptState::new(TranscriptId::from(format!(
                 "step/{state_id}/{visit}"
-            ))),
+            )))
+            .with_auto_expand_latest(),
             loading: false,
             failure: None,
             record: None,
@@ -1034,6 +1035,30 @@ mod tests {
             ),
             step("lint", used((2_100, 400), None, 0.03)),
         ]
+    }
+
+    #[test]
+    fn a_followed_step_shows_its_newest_utterance_in_full() {
+        use crate::tui::transcript::{
+            TranscriptDetailLine, TranscriptEntry, TranscriptEntryId, TranscriptPresentation,
+        };
+        let utterance = TranscriptEntry::new(
+            TranscriptEntryId::from("1"),
+            vec!["head".into()],
+            Vec::new(),
+        )
+        .with_details(vec![TranscriptDetailLine::new(
+            "tail",
+            TranscriptPresentation::Agent,
+        )])
+        .with_speech_continuation(1);
+        let mut view = StepView::new("review", 1);
+        view.transcript_mut().load(vec![utterance]);
+        assert!(view
+            .transcript()
+            .logical_lines()
+            .iter()
+            .any(|line| line.text == "tail"));
     }
 
     #[test]

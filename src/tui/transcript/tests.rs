@@ -572,3 +572,207 @@ fn the_workflow_choice_flag_does_not_change_the_line_count() {
         transcript.visual_line_count_for(&marked)
     );
 }
+
+/// An agent utterance whose body shows `preview` lines and whose speech
+/// continues for `continuation` more, followed by `technical` detail lines.
+fn utterance(id: &str, preview: usize, continuation: usize, technical: usize) -> TranscriptEntry {
+    let speech = (0..continuation).map(|n| {
+        TranscriptDetailLine::new(format!("{id} more {n}"), TranscriptPresentation::Agent)
+    });
+    let technical = (0..technical).map(|n| {
+        TranscriptDetailLine::new(format!("{id} usage {n}"), TranscriptPresentation::Technical)
+    });
+    TranscriptEntry::new(
+        TranscriptEntryId::from(id),
+        (0..preview).map(|n| format!("{id} line {n}")).collect(),
+        Vec::new(),
+    )
+    .with_header(format!("AGENT · {id}"))
+    .with_presentation(TranscriptPresentation::Agent)
+    .with_details(speech.chain(technical).collect())
+    .with_speech_continuation(continuation)
+}
+
+fn shown(transcript: &TranscriptState, text: &str) -> bool {
+    transcript
+        .logical_lines()
+        .iter()
+        .any(|line| line.text == text)
+}
+
+fn following_reader() -> TranscriptState {
+    TranscriptState::new(TranscriptId::from("attempt")).with_auto_expand_latest()
+}
+
+#[test]
+fn following_shows_the_newest_utterance_in_full_and_collapses_the_previous_one() {
+    // Covers AE1, AE2.
+    let mut transcript = following_reader();
+    transcript.load(vec![utterance("old", 5, 2, 0), utterance("first", 5, 7, 0)]);
+    assert!(shown(&transcript, "first more 6"));
+
+    transcript.to_top();
+    let old = TranscriptEntryId::from("old");
+    transcript.toggle_expanded(&old);
+    transcript.toggle_follow();
+    transcript.append(vec![utterance("second", 5, 7, 0)]);
+
+    assert!(!shown(&transcript, "first more 0"), "first collapsed");
+    assert!(
+        shown(&transcript, "first line 4"),
+        "first keeps its preview"
+    );
+    assert!(shown(&transcript, "second more 6"));
+    assert!(shown(&transcript, "old more 1"), "a manual expansion stays");
+}
+
+#[test]
+fn a_non_speech_newest_entry_is_not_expanded_and_ends_the_previous_auto_expansion() {
+    // Covers AE3.
+    let mut transcript = following_reader();
+    transcript.load(vec![utterance("speech", 5, 7, 0)]);
+    let mut tool = tool("t", "Bash", "completed");
+    tool.detail_lines = vec![TranscriptDetailLine::new(
+        "long output",
+        TranscriptPresentation::Technical,
+    )];
+    transcript.append(vec![tool]);
+
+    assert!(!shown(&transcript, "speech more 0"));
+    assert!(!shown(&transcript, "long output"));
+}
+
+#[test]
+fn following_a_tall_utterance_shows_its_end_with_the_cursor_on_it() {
+    // Covers AE4.
+    let mut transcript = following_reader();
+    transcript.set_viewport(20);
+    transcript.load(vec![utterance("earlier", 1, 0, 0)]);
+    transcript.append(vec![utterance("tall", 5, 34, 0)]);
+
+    let lines = transcript.logical_lines();
+    let visible = wrap_visible_lines(&lines, 80, transcript.scroll_offset(), 20);
+    assert_eq!(visible.len(), 20);
+    assert_eq!(visible.last().unwrap().text, "tall more 33");
+    assert_eq!(
+        transcript.selected_entry(),
+        Some(&TranscriptEntryId::from("tall"))
+    );
+}
+
+#[test]
+fn leaving_follow_keeps_the_auto_expanded_utterance_open() {
+    // Covers AE5.
+    let mut transcript = following_reader();
+    transcript.load(vec![utterance("a", 5, 0, 0), utterance("b", 5, 7, 0)]);
+    transcript.line_up();
+    assert!(!transcript.is_following_end());
+    assert!(shown(&transcript, "b more 6"));
+
+    // The operator sees it expanded, so a toggle collapses it.
+    transcript.toggle_expanded(&TranscriptEntryId::from("b"));
+    assert!(!shown(&transcript, "b more 0"));
+}
+
+#[test]
+fn auto_expansion_reveals_speech_but_not_technical_details() {
+    let mut transcript = following_reader();
+    transcript.load(vec![utterance("result", 5, 3, 2)]);
+    assert!(shown(&transcript, "result more 2"));
+    assert!(!shown(&transcript, "result usage 0"));
+}
+
+#[test]
+fn a_reader_without_the_policy_keeps_the_preview_of_the_newest_utterance() {
+    let mut transcript = TranscriptState::new(TranscriptId::from("chat"));
+    transcript.load(vec![utterance("u", 5, 7, 0)]);
+    assert!(!shown(&transcript, "u more 0"));
+}
+
+#[test]
+fn a_refresh_while_following_moves_the_cursor_to_the_newest_entry() {
+    let mut transcript = following_reader();
+    transcript.load(vec![utterance("a", 1, 0, 0)]);
+    transcript.replace_entries(vec![utterance("a", 1, 0, 0), utterance("b", 5, 7, 0)]);
+    assert_eq!(
+        transcript.selected_entry(),
+        Some(&TranscriptEntryId::from("b"))
+    );
+    assert!(shown(&transcript, "b more 6"));
+}
+
+/// The last content row visible in a viewport of `height` rows.
+fn last_visible_row(transcript: &TranscriptState, height: usize) -> String {
+    let lines = transcript.logical_lines();
+    wrap_visible_lines(&lines, 80, transcript.scroll_offset(), height)
+        .last()
+        .unwrap()
+        .text
+        .clone()
+}
+
+#[test]
+fn a_viewport_height_change_keeps_the_last_visible_line_and_the_cursor() {
+    // Covers AE6.
+    let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+    transcript.set_viewport(20);
+    transcript.load(vec![utterance("a", 5, 0, 0), utterance("b", 60, 0, 0)]);
+    transcript.to_top();
+    transcript.line_down();
+    transcript.page_down();
+    let selected = transcript.selected_entry().cloned();
+    let before = last_visible_row(&transcript, 20);
+
+    transcript.set_viewport(17);
+    assert_eq!(last_visible_row(&transcript, 17), before);
+    assert_eq!(transcript.selected_entry().cloned(), selected);
+
+    transcript.set_viewport(20);
+    assert_eq!(last_visible_row(&transcript, 20), before);
+}
+
+#[test]
+fn a_viewport_change_near_the_top_or_while_following_stays_in_bounds() {
+    let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+    transcript.set_viewport(20);
+    transcript.load(vec![utterance("a", 5, 0, 0), utterance("b", 30, 0, 0)]);
+    assert_eq!(last_visible_row(&transcript, 20), "b line 29");
+    transcript.set_viewport(14);
+    assert_eq!(last_visible_row(&transcript, 14), "b line 29", "following");
+
+    transcript.to_top();
+    transcript.set_viewport(30);
+    assert_eq!(transcript.scroll_offset(), 0);
+    transcript.set_viewport(10);
+    assert!(transcript.scroll_offset() <= 20);
+}
+
+#[test]
+fn collapsing_a_manually_and_auto_expanded_utterance_hides_its_speech() {
+    let mut transcript = following_reader();
+    transcript.load(vec![utterance("a", 5, 0, 0), utterance("b", 5, 7, 0)]);
+    let b = TranscriptEntryId::from("b");
+    transcript.toggle_expanded(&b);
+    transcript.toggle_expanded(&b);
+    assert!(shown(&transcript, "b more 6"), "expanded by hand");
+    transcript.toggle_follow();
+
+    transcript.toggle_expanded(&b);
+
+    assert!(!shown(&transcript, "b more 0"));
+}
+
+#[test]
+fn following_in_raw_view_does_not_move_the_auto_expansion() {
+    let mut transcript = following_reader();
+    transcript.load(vec![utterance("a", 5, 7, 0)]);
+    transcript.toggle_mode();
+    transcript.toggle_follow();
+    transcript.append(vec![
+        utterance("b", 1, 0, 0),
+        utterance("b.2", 5, 7, 0).sharing_previous_raw(),
+    ]);
+    transcript.toggle_mode();
+
+    assert!(shown(&transcript, "a more 6"));
+}

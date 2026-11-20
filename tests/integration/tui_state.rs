@@ -450,10 +450,12 @@ fn transcript_reanchors_across_detail_mode_resize_and_missing_entry() {
         transcript.selected_entry(),
         Some(&TranscriptEntryId::from("two"))
     );
+    // A height change keeps the bottom line: the view ended on `two`, so
+    // the one-line view shows `two`. The cursor does not move.
     transcript.set_viewport(1);
     assert_eq!(
         transcript.anchor().unwrap().entry_id,
-        TranscriptEntryId::from("one")
+        TranscriptEntryId::from("two")
     );
     assert_eq!(
         transcript.selected_entry(),
@@ -695,6 +697,21 @@ mod foundations {
 
         fn step_conversation() -> Stack {
             Stack::layered(Context::StepConversation, Context::Details)
+        }
+
+        #[test]
+        fn home_and_end_jump_in_a_conversation_but_stay_text_in_a_field() {
+            for stack in [
+                step_conversation(),
+                Stack::layered(Context::Reading, Context::Details),
+            ] {
+                assert_eq!(lookup(stack, &press(KeyCode::Home)), Some(Action::Top));
+                assert_eq!(lookup(stack, &press(KeyCode::End)), Some(Action::Bottom));
+                assert!(stack_keys(stack).contains(&"End".to_string()), "{stack:?}");
+            }
+            for key in [KeyCode::Home, KeyCode::End] {
+                assert_eq!(lookup(Context::Form, &press(key)), None);
+            }
         }
 
         fn stack_keys(stack: Stack) -> Vec<String> {

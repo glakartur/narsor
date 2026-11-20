@@ -192,6 +192,7 @@ pub(crate) fn agent_transcript_entry(event: &TranscriptEvent) -> TranscriptEntry
     } else {
         Vec::new()
     };
+    let speech_continuation = extra_body.len();
     let details = extra_body
         .into_iter()
         .map(|text| TranscriptDetailLine::new(text, presentation))
@@ -216,6 +217,7 @@ pub(crate) fn agent_transcript_entry(event: &TranscriptEvent) -> TranscriptEntry
         TranscriptEntry::new(TranscriptEntryId::from(id), body, Arc::clone(&event.raw))
             .with_header(header)
             .with_details(details)
+            .with_speech_continuation(speech_continuation)
             .with_presentation(presentation)
             .with_subagent(event.subagent.clone());
     if event.element_index > 0 {
@@ -660,6 +662,55 @@ mod tests {
             expanded[0].contains("USER · Narsor · sent · "),
             "{expanded:?}"
         );
+    }
+
+    #[test]
+    fn only_the_cut_speech_is_marked_as_its_continuation() {
+        let numbered = |count: usize| {
+            (1..=count)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let cases = [
+            (ChatElement::AgentText { text: numbered(12) }, 7),
+            (
+                ChatElement::RunResult {
+                    text: Some(numbered(8)),
+                    structured_output: None,
+                    stop_reason: None,
+                    is_error: false,
+                    cost_usd: None,
+                    usage: Some(json!({"input_tokens": 1})),
+                    subagent_stats: None,
+                    turns: None,
+                    duration_ms: None,
+                },
+                3,
+            ),
+            (
+                ChatElement::ToolResult {
+                    call_id: Some("c1".into()),
+                    tool: Some("Bash".into()),
+                    call_summary: None,
+                    status: ToolResultStatus::Ok,
+                    content: numbered(30),
+                    truncated: false,
+                },
+                0,
+            ),
+        ];
+        for (element, continuation) in cases {
+            let card = &transcript_entries(&entry(1, "x", vec![element.clone()]))[0];
+            assert_eq!(card.speech_continuation, continuation, "{element:?}");
+            let speech = &card.detail_lines[..continuation];
+            assert!(
+                speech
+                    .iter()
+                    .all(|line| line.presentation != TranscriptPresentation::Technical),
+                "{element:?}"
+            );
+        }
     }
 
     #[test]

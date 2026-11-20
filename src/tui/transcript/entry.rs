@@ -121,6 +121,11 @@ pub struct TranscriptEntry {
     pub presentation: TranscriptPresentation,
     /// Additional lines included only when expanded in rendered mode.
     pub detail_lines: Vec<TranscriptDetailLine>,
+    /// How many leading [`Self::detail_lines`] continue the speech of the
+    /// body (zero for non-speech entries). A reader that auto-expands the
+    /// latest utterance reveals only these; technical details stay behind a
+    /// manual expansion.
+    pub speech_continuation: usize,
     /// Whether the adapter marked this entry as a workflow choice. Renderers
     /// highlight its card; the flag never derives from the entry's text.
     pub workflow_choice: bool,
@@ -177,6 +182,7 @@ impl TranscriptEntry {
             rendered_lines,
             presentation: TranscriptPresentation::Neutral,
             detail_lines: Vec::new(),
+            speech_continuation: 0,
             workflow_choice: false,
             clip_head: false,
             details: None,
@@ -218,6 +224,13 @@ impl TranscriptEntry {
 
     pub fn with_details(mut self, detail_lines: Vec<TranscriptDetailLine>) -> Self {
         self.detail_lines = detail_lines;
+        self
+    }
+
+    /// Marks the first `lines` detail lines as the continuation of the
+    /// speech shown in the body.
+    pub fn with_speech_continuation(mut self, lines: usize) -> Self {
+        self.speech_continuation = lines;
         self
     }
 

@@ -1413,6 +1413,20 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::StepConversation,
+        Key::code(KeyCode::Home),
+        Action::Top,
+        "",
+        "na początek",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::code(KeyCode::End),
+        Action::Bottom,
+        "",
+        "na koniec",
+    ),
+    bind(
+        Context::StepConversation,
         Key::code(KeyCode::Enter),
         Action::Expand,
         "rozwiń",
@@ -1536,6 +1550,20 @@ pub static BINDINGS: &[Binding] = &[
     bind(
         Context::Reading,
         Key::char('G'),
+        Action::Bottom,
+        "",
+        "na koniec",
+    ),
+    bind(
+        Context::Reading,
+        Key::code(KeyCode::Home),
+        Action::Top,
+        "",
+        "na początek",
+    ),
+    bind(
+        Context::Reading,
+        Key::code(KeyCode::End),
         Action::Bottom,
         "",
         "na koniec",

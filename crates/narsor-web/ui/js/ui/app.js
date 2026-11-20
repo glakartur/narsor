@@ -15,6 +15,7 @@ import { useNow, useStore } from './hooks.js';
 import { Queues } from './queues.js';
 import { hashOf, routeOf } from '../store.js';
 import { TaskList } from './tasklist.js';
+import { JUMP_EVENT } from './tabs/conversation.js';
 import { Toast } from './toast.js';
 
 function typing(target) {
@@ -126,6 +127,11 @@ export function App({ store, onSignOut }) {
         J: () => { const task = rows.find((row) => row.task_id === store.state.selectedTaskId); if (task?.runner_state === 'queued') move(task, 1); },
         K: () => { const task = rows.find((row) => row.task_id === store.state.selectedTaskId); if (task?.runner_state === 'queued') move(task, -1); },
       };
+      if (selected && (store.state.tab === 'conversation' || store.state.tab === 'progress')) {
+        const jump = (to) => () => window.dispatchEvent(new CustomEvent(JUMP_EVENT, { detail: to }));
+        keys.Home = jump('start');
+        keys.End = jump('end');
+      }
       const action = keys[event.key];
       if (action) {
         event.preventDefault();

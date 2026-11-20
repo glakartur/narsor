@@ -120,3 +120,14 @@ test('R20: without the overlay, or after a successful retry, the runner status s
   const ready = { step: 'review', queue: 'mr', episode: 'ep', phase: 'ready', hooks: [] };
   assert.equal(gateOverlay(gatePositions(), ready)[2].status, 'awaiting_decision');
 });
+
+import { bottomAnchoredScrollTop } from '../ui/js/text.js';
+
+test('a conversation keeps its bottom line when its height changes', () => {
+  const shrunk = bottomAnchoredScrollTop({ scrollTop: 1000, scrollHeight: 3000, oldHeight: 600, newHeight: 540 });
+  assert.equal(shrunk, 1060);
+  assert.equal(bottomAnchoredScrollTop({ scrollTop: shrunk, scrollHeight: 3000, oldHeight: 540, newHeight: 600 }), 1000);
+  assert.equal(bottomAnchoredScrollTop({ scrollTop: 10, scrollHeight: 3000, oldHeight: 500, newHeight: 600 }), 0);
+  assert.equal(bottomAnchoredScrollTop({ scrollTop: 2400, scrollHeight: 3000, oldHeight: 600, newHeight: 300 }), 2700);
+  assert.equal(bottomAnchoredScrollTop({ scrollTop: 0, scrollHeight: 200, oldHeight: 600, newHeight: 300 }), 0);
+});
