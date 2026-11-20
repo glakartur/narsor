@@ -897,6 +897,8 @@ fn report_finished_run(
             .map_or(1, |runner| runner.snapshot.snapshot_sequence + 1),
     );
     snapshot.execution_status = ExecutionStatus::Completed;
+    snapshot.execution_cursor.execution_id = Some("exec-1".into());
+    snapshot.execution_cursor.current_state = Some("completed".into());
     snapshot.timeline = Some(timeline);
     snapshot.workspaces = vec![workspace_header(branch)];
     fx.control
@@ -909,15 +911,78 @@ fn report_finished_run(
         .expect("runner snapshot");
 }
 
+/// The workflow of [`archive_freezes_the_step_headers_and_no_later_report_changes_them`]:
+/// three agent steps that end in the terminal state `completed`.
+const THREE_STEPS: &str = r#"
+schema: v2
+name: three-steps
+version: 1
+states:
+  plan:
+    action: { type: script, command: "true" }
+    exit: { next: implement }
+  implement:
+    action: { type: script, command: "true" }
+    exit: { next: review }
+  review:
+    action: { type: script, command: "true" }
+    exit: { next: completed }
+  completed: {}
+terminal_states: { completed: completed }
+"#;
+
 #[test]
 fn archive_freezes_the_step_headers_and_no_later_report_changes_them() {
+    // The whole flow (D80): the run completes in a terminal state, the owner
+    // archives it through the offer, a later runner report arrives, and the
+    // timeline read still returns the frozen step rows with their cost.
     let fx = Fixture::new();
+    let definition = narsor_engine::workflow::load_from_str(THREE_STEPS).unwrap();
+    let spec = TaskLaunchSpec::new(
+        definition.id.clone(),
+        definition.version,
+        serde_json::json!({}),
+        git_workspace(),
+        narsor_engine::domain::ResolvedEnvironment::harness_only("claude-code"),
+        narsor_engine::domain::ResourceProfile::new(1000, 2048),
+    )
+    .with_definition(&definition)
+    .unwrap();
+    let owner = OwnerRef::new("oidc:https://issuer|artur");
+    fx.control
+        .create_task(NewTask::new(
+            task("task-1"),
+            owner.clone(),
+            backend_id("k8s"),
+            spec,
+        ))
+        .unwrap();
     let lease = fx.lease("k8s", "controller-a");
-    fx.running("task-1", &lease);
+    fx.observe("task-1", &lease, Observation::StartAccepted)
+        .unwrap();
+    fx.observe("task-1", &lease, Observation::RunnerReady)
+        .unwrap();
+    let service = narsor_engine::controller_protocol::ProtocolService::new(
+        fx.reopen(),
+        crate::environment_support::seeded_resolver(fx.root.path()),
+    );
+    let archive = |key: &str| {
+        service
+            .command(
+                &owner,
+                "task-1",
+                narsor_engine::controller_protocol::OwnerCommandRequest {
+                    command: OwnerCommand::Archive,
+                    idempotency_key: key.into(),
+                    expected_generation: None,
+                },
+            )
+            .expect("the owner's archive")
+    };
     let steps = [("plan", 0.25), ("implement", 1.5), ("review", 0.75)];
     report_finished_run(&fx, "task-1", reported_timeline(&steps), "feat/x");
 
-    fx.command("task-1", OwnerCommand::Archive, "archive-1");
+    archive("archive-1");
     // A report still accepted while the task is archiving, and a repeated
     // archive, leave the frozen copy as it was.
     report_finished_run(
@@ -926,9 +991,10 @@ fn archive_freezes_the_step_headers_and_no_later_report_changes_them() {
         reported_timeline(&[("other", 9.0)]),
         "feat/y",
     );
-    let record = fx.command("task-1", OwnerCommand::Archive, "archive-2");
+    archive("archive-2");
 
-    assert_eq!(record.runner_state, RunnerState::Archiving);
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert!(record.runner_state.is_archival());
     let last_reported = &record.runner.as_ref().unwrap().snapshot;
     assert_eq!(last_reported.workspaces, vec![workspace_header("feat/y")]);
     let frozen = record.archived_run.as_ref().expect("a frozen run");
@@ -939,7 +1005,11 @@ fn archive_freezes_the_step_headers_and_no_later_report_changes_them() {
             .as_deref(),
         Some("feat/x")
     );
-    let timeline = frozen.timeline.as_ref().expect("a frozen timeline");
+    let served = service
+        .timeline(&owner, "task-1")
+        .expect("the timeline read");
+    let timeline = served.timeline.as_ref().expect("the frozen timeline");
+    assert_eq!(Some(timeline), frozen.timeline.as_ref());
     let reported = reported_timeline(&steps);
     assert_eq!(timeline.positions.len(), 3);
     assert!(timeline.links.is_empty());

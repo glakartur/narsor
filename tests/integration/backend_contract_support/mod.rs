@@ -62,8 +62,8 @@ use narsor_engine::controller_protocol::{
 };
 use narsor_engine::domain::{BackendId, TaskId, TaskLaunchSpec};
 use narsor_engine::orchestration::{
-    CommandActor, NewTask, Observation, OperatorCommand, OperatorCommandStatus, OwnerCommand,
-    OwnerRef, ResumePolicy, RunnerState, TaskEventKind, TaskRecord,
+    CommandActor, CommandRequest, NewTask, Observation, OperatorCommand, OperatorCommandStatus,
+    OwnerCommand, OwnerRef, ResumePolicy, RunnerState, TaskEventKind, TaskRecord,
 };
 use narsor_engine::persistence::paths::StatePaths;
 use narsor_server::controller_protocol::http::{controller_routes, runner_routes};
@@ -415,6 +415,19 @@ impl<T: ContractTarget> Harness<T> {
         if let Err(error) = self.command(task, command, key) {
             panic!("{command:?} of {task}: {error}");
         }
+    }
+
+    /// An archive from inside the control plane, which takes it in any
+    /// state ("archive wins"). The owner's offer takes one only at a
+    /// terminal state of the workflow (D80); this is how a contract test
+    /// archives a task that is queued, provisioning, stopped or lost.
+    pub fn archive_in_control_plane(&self, task: &str, key: &str) {
+        self.service
+            .apply_command(
+                &TaskId::parse(task).unwrap(),
+                CommandRequest::new(OwnerCommand::Archive, key),
+            )
+            .unwrap_or_else(|error| panic!("archive of {task}: {error}"));
     }
 
     /// The owner moves the task's work to the terminal state of
@@ -816,6 +829,7 @@ pub async fn lifecycle_round_trip<T: ContractTarget>() {
         "the resumed runner continues the same storage's work"
     );
 
+    h.finish("task-1").await;
     h.must("task-1", OwnerCommand::Archive, "archive-1");
     h.wait_runner_state("task-1", RunnerState::Archived).await;
     let observed = h.observe("task-1").await;
@@ -1097,7 +1111,7 @@ pub async fn an_unknown_task_without_storage_stays_unknown<T: ContractTarget>() 
     assert_eq!(counters.workloads_created, 1, "{counters:?}");
     assert_eq!(counters.storages_created, 1, "{counters:?}");
 
-    h.must("task-1", OwnerCommand::Archive, "archive-1");
+    h.archive_in_control_plane("task-1", "archive-1");
     h.wait_runner_state("task-1", RunnerState::Archived).await;
 }
 
@@ -1139,6 +1153,7 @@ pub async fn archive_deletes_exactly_once<T: ContractTarget>() {
     };
     let first = h.start_controller();
     h.running("task-1").await;
+    h.finish("task-1").await;
 
     h.must("task-1", OwnerCommand::Archive, "archive-1");
     h.must("task-1", OwnerCommand::Archive, "archive-1");
@@ -1288,7 +1303,7 @@ pub async fn archive_racing_start_creates_nothing<T: ContractTarget>() {
         return;
     };
     h.create("early");
-    h.must("early", OwnerCommand::Archive, "archive-early");
+    h.archive_in_control_plane("early", "archive-early");
     assert_eq!(h.runner_state("early"), RunnerState::Archived);
 
     h.probe
@@ -1297,7 +1312,7 @@ pub async fn archive_racing_start_creates_nothing<T: ContractTarget>() {
     h.create("racing");
     h.wait_runner_state("racing", RunnerState::Provisioning)
         .await;
-    h.must("racing", OwnerCommand::Archive, "archive-racing");
+    h.archive_in_control_plane("racing", "archive-racing");
     h.wait_runner_state("racing", RunnerState::Archived).await;
     h.probe.clear_faults();
     h.settle().await;
@@ -1395,6 +1410,7 @@ pub async fn the_controller_never_starts_more_than_the_limit<T: ContractTarget>(
 
     // The slot task-2 frees goes to the waiting resume, which continues on
     // its own storage (`backend.resume`), not to a fresh provision.
+    h.finish("task-2").await;
     h.must("task-2", OwnerCommand::Archive, "archive-2");
     h.wait_runner_state("task-2", RunnerState::Archived).await;
     h.wait_runner_state("task-1", RunnerState::Running).await;
@@ -1697,7 +1713,7 @@ pub async fn an_archive_removes_the_reader_before_the_storage<T: ContractTarget>
     h.running_reader("task-1").await;
 
     h.probe.delay_deletions(4);
-    h.must("task-1", OwnerCommand::Archive, "archive-1");
+    h.archive_in_control_plane("task-1", "archive-1");
     h.wait_runner_state("task-1", RunnerState::Archived).await;
 
     assert!(h.reader("task-1").await.is_none());

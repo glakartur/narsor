@@ -7492,17 +7492,17 @@ mod task_app_actions {
         }
 
         #[test]
-        fn archive_is_offered_wherever_the_control_plane_takes_it() {
+        fn archive_is_offered_only_at_a_terminal_state_of_the_workflow() {
             let failed = waiting_on(
                 runner_state("provisioning"),
                 AttentionKind::ProvisioningFailed,
                 "p-1",
                 None,
             );
-            // The control plane archives a running, queued or paused task too
-            // (it frees the slot), so the server offers it and the panel shows it.
+            // D80: the server offers archive only once the run reached a
+            // terminal state; the panel shows what it is given.
+            assert!(offers(finished("a", 1), "Archiwizuj"));
             for task in [
-                finished("a", 1),
                 runner_state("interrupted"),
                 failed,
                 running("a", 1),
@@ -7510,7 +7510,7 @@ mod task_app_actions {
                 runner_state("paused"),
             ] {
                 let state = task.runner_state;
-                assert!(offers(task, "Archiwizuj"), "{state:?}");
+                assert!(!offers(task, "Archiwizuj"), "{state:?}");
             }
         }
 
@@ -7606,7 +7606,7 @@ mod task_app_actions {
         fn the_link_is_the_last_entry_of_the_panel() {
             assert_eq!(
                 panel_of(with_pull_request(running("a", 1))),
-                ["Pauza", "Stop", "Archiwizuj", "Otwórz link"]
+                ["Pauza", "Stop", "Otwórz link"]
             );
         }
     }
@@ -7622,7 +7622,7 @@ mod task_app_actions {
             // Covers AE1.
             let mut app = loaded(running("a", 1));
             ch(&mut app, '.');
-            assert_eq!(panel_labels(&app), ["Pauza", "Stop", "Archiwizuj"]);
+            assert_eq!(panel_labels(&app), ["Pauza", "Stop"]);
             let chooser = app.overlay().unwrap().chooser().unwrap();
             assert!(
                 chooser
@@ -7657,8 +7657,8 @@ mod task_app_actions {
             assert_eq!(app.overlay().unwrap().chooser().unwrap().selected(), 2);
             ch(&mut app, 'k');
             assert_eq!(app.overlay().unwrap().chooser().unwrap().selected(), 1);
-            ch(&mut app, '4');
-            assert_eq!(app.overlay().unwrap().chooser().unwrap().selected(), 3);
+            ch(&mut app, '3');
+            assert_eq!(app.overlay().unwrap().chooser().unwrap().selected(), 2);
             press(&mut app, KeyCode::Esc);
             assert!(app.overlay().is_none());
             assert_eq!(app.key_context().base, Context::List);
@@ -7701,7 +7701,7 @@ mod task_app_actions {
             ch(&mut app, '.');
             assert_eq!(
                 panel_labels(&app),
-                ["Pauza", "Przerwij krok", "Stop", "Archiwizuj"],
+                ["Pauza", "Przerwij krok", "Stop"],
                 "in the server's order"
             );
             let request = act(choose(&mut app, "Przerwij krok"));

@@ -96,7 +96,8 @@ The sign-in form says which token it needs (*Skąd wziąć token?*).
   with text that was not sent.
 - **Akcje:** what you can do with the task now, as the server offers it
   (pause, resume, select a step, archive …). Irreversible actions say so and
-  ask for confirmation.
+  ask for confirmation. Archive is offered only when the run reached a
+  terminal state of its workflow; move a stuck task there first.
 
 - **Kolejki automatyzacji** (the queues page, read-only): the queues of the
   catalogue with their entries and the catalogue files that cannot be used,

@@ -24,6 +24,7 @@ use narsor_protocol::controller::{
 };
 use narsor_protocol::display::{loss_state, LossState};
 
+use super::view::at_workflow_terminal_state;
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::ProtocolService;
 use crate::orchestration::{lifecycle, OwnerCommand, TaskRecord};
@@ -372,9 +373,9 @@ pub(super) fn unavailable_reason(task: &TaskSummary, id: TaskActionId) -> Option
             )),
             _ => Some(state_phrase(task).to_string()),
         },
-        // The control plane takes an archive in any state ("archive wins":
-        // it frees the slot of a running, queued or paused task), so the
-        // offer follows it. Only a task already archiving or archived has nothing to do.
+        // Whether the execution reached a terminal state of its workflow is
+        // read from the record ([`archive_reason`], D80); the summary alone
+        // only says the task is already archiving or archived.
         TaskActionId::Archive if task.runner_state.is_archival() => {
             Some("zadanie jest archiwizowane".to_string())
         }
@@ -634,6 +635,21 @@ fn provisioning_failed(task: &TaskSummary) -> bool {
         .any(|item| item.kind == AttentionKind::ProvisioningFailed)
 }
 
+/// Why the task cannot be archived for what its record says (D80): only an
+/// execution that sits in a terminal state of its workflow is archived. A
+/// stuck task gets there by a manual transition first. Read from the record,
+/// since the summary does not carry the `terminal` flag of the state.
+pub(super) fn archive_reason(record: &TaskRecord) -> Option<String> {
+    if record.runner_state.is_archival() || at_workflow_terminal_state(record) {
+        return None;
+    }
+    Some(
+        "zadanie nie jest w stanie końcowym workflow — archiwizować można tylko zakończony \
+         przebieg; zadanie, które utknęło, najpierw przejdź ręcznie do stanu końcowego"
+            .to_string(),
+    )
+}
+
 /// Why a task is not one whose step can be acted on — `None` when its
 /// runner is alive and in a step.
 fn not_running(task: &TaskSummary) -> Option<String> {
@@ -726,7 +742,11 @@ impl ProtocolService {
             return Ok(());
         }
         let summary = self.summarize(record)?;
-        match unavailable_reason(&summary, id) {
+        let reason = unavailable_reason(&summary, id).or_else(|| match id {
+            TaskActionId::Archive => archive_reason(record),
+            _ => None,
+        });
+        match reason {
             Some(reason) => Err(ProtocolError::conflict("action_unavailable", reason)),
             None => Ok(()),
         }
@@ -734,17 +754,20 @@ impl ProtocolService {
 
     /// An owner command of the offer, checked before the control plane sees
     /// it. A command the lifecycle itself refuses (`illegal_command`) or an
-    /// archive of an archived task (which converges) is left to it.
+    /// archive of an archival task (which converges) is left to it.
     pub(super) fn require_owner_command_available(
         &self,
         record: &TaskRecord,
         command: OwnerCommand,
         expected_generation: Option<u64>,
     ) -> ProtocolResult<()> {
-        // An archive of an archived task converges in the control plane, so
-        // it is not refused here.
-        if command == OwnerCommand::Archive
-            || !matches!(
+        // An archive of an archiving or archived task converges in the
+        // control plane, so it is not refused here.
+        if command == OwnerCommand::Archive && record.runner_state.is_archival() {
+            return Ok(());
+        }
+        if command != OwnerCommand::Archive
+            && !matches!(
                 lifecycle::command_effect(record.runner_state, command),
                 lifecycle::CommandEffect::Transition(_)
             )
@@ -1091,8 +1114,9 @@ mod tests {
     }
 
     #[test]
-    fn a_running_task_offers_exactly_pause_stop_and_archive_in_the_panel() {
-        // Covers AE1.
+    fn the_summary_of_a_running_task_offers_pause_stop_and_archive_in_the_panel() {
+        // Covers AE1. Archive then passes the record's check of a terminal
+        // state (`archive_reason`, D80), which a running task fails.
         let mut task = summary("running", "running", true);
         task.runner = Some(runner("review", "agent"));
         assert_eq!(
@@ -1357,7 +1381,6 @@ mod tests {
         ] {
             assert!(offered(&task, id).is_none(), "{id:?}");
         }
-        assert!(offered(&task, TaskActionId::Archive).is_some());
     }
 
     #[test]
@@ -1519,6 +1542,9 @@ mod tests {
             ResolvedEnvironment::harness_only("claude-code"),
             ResourceProfile::new(1000, 2048),
         );
+        let spec = spec
+            .with_definition(&crate::workflow::load_from_str(STEPS).unwrap())
+            .unwrap();
         let control = ControlPlane::new(crate::persistence::StatePaths::new(root));
         let mut record = control
             .create_task(NewTask::new(
@@ -1531,6 +1557,60 @@ mod tests {
         record.runner_state = runner_state;
         let service = ProtocolService::new(control, std::sync::Arc::new(NoLaunches));
         (service, record)
+    }
+
+    /// The sealed workflow of [`service_and_record`]: two steps and two
+    /// terminal states, one of them the end of a cancelled run.
+    const STEPS: &str = r#"
+schema: v2
+name: steps
+version: 1
+states:
+  work:
+    action:
+      type: script
+      command: "true"
+    exit: { next: check }
+  check:
+    action:
+      type: script
+      command: "true"
+    choices:
+      passed: { next: completed }
+      dropped: { next: cancelled }
+  completed: {}
+  cancelled: {}
+terminal_states: { completed: completed, cancelled: cancelled }
+"#;
+
+    /// `record` as its runner last reported it: `status` in `state`.
+    fn reported(mut record: TaskRecord, status: &str, state: &str) -> TaskRecord {
+        record.runner = Some(crate::orchestration::RunnerObservation {
+            incarnation: "pod-1".to_string(),
+            launch_generation: record.generation,
+            snapshot: serde_json::from_value(json!({
+                "snapshot_sequence": 1,
+                "execution_status": status,
+                "execution_cursor": {
+                    "execution_id": "e",
+                    "current_state": state,
+                    "action_execution_id": null
+                },
+                "event_cursor": 0,
+                "observed_at": "2026-11-20T10:00:00Z"
+            }))
+            .expect("a snapshot"),
+            received_at: chrono::Utc::now(),
+            safe_point_generation: None,
+        });
+        record
+    }
+
+    /// A fresh state root for one test.
+    fn temp_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("narsor-actions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
     }
 
     /// The code and the message of a conflict; panics on anything else.
@@ -1564,10 +1644,6 @@ mod tests {
         assert!(service
             .require_available(&record, TaskActionId::Pause, Some(record.generation + 1))
             .is_ok());
-        // What can be done passes.
-        assert!(service
-            .require_available(&record, TaskActionId::Archive, None)
-            .is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1595,6 +1671,130 @@ mod tests {
         assert!(service
             .require_owner_command_available(&queued, OwnerCommand::Pause, None)
             .is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn archive_is_offered_and_taken_only_at_a_terminal_state_of_the_workflow() {
+        // Covers AE1: the offer and the dispatch agree in every case.
+        let cases: [(&str, RunnerState, Option<(&str, &str)>, bool); 6] = [
+            (
+                "completed in a terminal state",
+                RunnerState::Stopped,
+                Some(("completed", "completed")),
+                true,
+            ),
+            (
+                "waiting for input",
+                RunnerState::Running,
+                Some(("input_needed", "work")),
+                false,
+            ),
+            (
+                "running",
+                RunnerState::Running,
+                Some(("running", "work")),
+                false,
+            ),
+            ("queued", RunnerState::Queued, None, false),
+            (
+                "stopped mid-workflow",
+                RunnerState::Stopped,
+                Some(("paused", "check")),
+                false,
+            ),
+            (
+                "failed step in a non-terminal state",
+                RunnerState::Stopped,
+                Some(("failed", "work")),
+                false,
+            ),
+        ];
+        for (name, runner_state, report, archivable) in cases {
+            let root = temp_root();
+            let (service, record) = service_and_record(&root, runner_state);
+            let record = match report {
+                Some((status, state)) => reported(record, status, state),
+                None => record,
+            };
+
+            let served = service.summarize(&record).unwrap();
+            let dispatch =
+                service.require_owner_command_available(&record, OwnerCommand::Archive, None);
+
+            let offered = served
+                .actions
+                .iter()
+                .flatten()
+                .any(|offer| offer.id == TaskActionId::Archive);
+            assert_eq!(offered, archivable, "{name}");
+            if archivable {
+                assert!(dispatch.is_ok(), "{name}: {dispatch:?}");
+            } else {
+                let (code, message) = conflict(dispatch);
+                assert_eq!(code, "action_unavailable", "{name}");
+                assert_eq!(Some(message), archive_reason(&record), "{name}");
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn a_run_moved_by_hand_to_a_terminal_cancelled_state_can_be_archived() {
+        // Covers AE2: a stuck task reaches a terminal state by a manual
+        // transition; the runner then reports the run cancelled there.
+        let root = temp_root();
+        let (service, record) = service_and_record(&root, RunnerState::Stopped);
+        let record = reported(record, "cancelled", "cancelled");
+
+        let served = service.summarize(&record).unwrap();
+
+        assert!(served
+            .actions
+            .iter()
+            .flatten()
+            .any(|offer| offer.id == TaskActionId::Archive));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_repeated_archive_of_an_archiving_task_is_answered_not_refused() {
+        // The control plane took an archive of a queued task (its own path,
+        // without the offer); the owner's retry of that key gets its
+        // receipt, and a new key converges on the archival task.
+        let root = temp_root();
+        let (service, record) = service_and_record(&root, RunnerState::Queued);
+        let accepted = service
+            .control
+            .command(
+                &record.task_id,
+                crate::orchestration::CommandRequest {
+                    command: OwnerCommand::Archive,
+                    idempotency_key: "archive-1".to_string(),
+                    expected_generation: None,
+                    actor: crate::orchestration::CommandActor::Owner,
+                },
+            )
+            .unwrap();
+        let owner = record.owner.clone();
+        let send = |key: &str| {
+            service.command(
+                &owner,
+                record.task_id.as_str(),
+                narsor_protocol::controller::OwnerCommandRequest {
+                    command: OwnerCommand::Archive,
+                    idempotency_key: key.to_string(),
+                    expected_generation: None,
+                },
+            )
+        };
+
+        let retry = send("archive-1").expect("the stored receipt");
+        let again = send("archive-2").expect("a converging archive");
+
+        assert!(retry.replayed);
+        assert_eq!(retry.receipt, accepted.receipt);
+        assert!(again.task.runner_state.is_archival());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -57,8 +57,21 @@ pub fn task(id: &str, backend: &str, runner_state: &str, rank: u32) -> TaskSumma
 /// `task` with the actions the server would offer for what it shows now:
 /// the client reads them, it does not work them out. Built again by every
 /// builder below that changes what the offer depends on.
+///
+/// The server offers archive only at a terminal state of the workflow (D80),
+/// which it reads from the record. A summary built by hand has no workflow,
+/// so a terminal execution status stands for that state here.
 pub fn offered(mut task: TaskSummary) -> TaskSummary {
-    task.actions = Some(narsor_engine::controller_protocol::task_actions(&task));
+    let mut actions = narsor_engine::controller_protocol::task_actions(&task);
+    let at_terminal_state = task
+        .runner
+        .as_ref()
+        .is_some_and(|runner| runner.execution_status.is_terminal());
+    if !at_terminal_state {
+        actions
+            .retain(|offer| offer.id != narsor_engine::controller_protocol::TaskActionId::Archive);
+    }
+    task.actions = Some(actions);
     task
 }
 

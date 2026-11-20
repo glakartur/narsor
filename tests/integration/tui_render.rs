@@ -5798,8 +5798,8 @@ mod task_app_actions_render {
     use narsor_engine::domain::ExecutionStatus;
 
     use crate::task_app_support::{
-        header_workspace, listing, queued, task, titled, with_controller, with_header_workspaces,
-        with_pr, with_runner, with_transitions,
+        header_workspace, listing, task, titled, with_controller, with_header_workspaces, with_pr,
+        with_runner, with_transitions,
     };
 
     fn press(app: &mut TaskApp, code: KeyCode) {
@@ -5842,7 +5842,6 @@ mod task_app_actions_render {
             "krok 1 z 2",
             "Pauza",
             "Stop",
-            "Archiwizuj",
             "Opis",
             "skończy krok",
         ] {
@@ -5852,8 +5851,10 @@ mod task_app_actions_render {
             );
         }
         // Only what can be done now: nothing greyed out with a reason. A
-        // comment and a move are not entries of the panel.
+        // comment and a move are not entries of the panel; a run that has
+        // not reached a terminal state is not archived (D80).
         for missing in [
+            "Archiwizuj",
             "Zwolnij slot",
             "niedostępne",
             "Napisz do agenta",
@@ -5870,7 +5871,7 @@ mod task_app_actions_render {
         let rows: Vec<&str> = screen.lines().collect();
         let list = rows
             .iter()
-            .position(|row| row.contains("Archiwizuj"))
+            .position(|row| row.contains("Stop"))
             .expect("the list");
         let description = rows
             .iter()
@@ -5896,11 +5897,10 @@ mod task_app_actions_render {
         );
 
         press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('j'));
         let buffer = draw(120, 40, |frame| {
             layout::render(frame, &mut app, &Styles::new(false), Instant::now())
         });
-        assert_action_number(&buffer, "Archiwizuj", 3);
+        assert_action_number(&buffer, "Stop", 2);
         assert!(!rows(&buffer)[row_of(&buffer, "Pauza")].contains("| 1 |"));
     }
 
@@ -5999,20 +5999,6 @@ mod task_app_actions_render {
             confirm.contains("! nieodwracalne") && confirm.contains("Enter wyślij"),
             "{confirm}"
         );
-    }
-
-    #[test]
-    fn a_queued_task_offers_only_the_archive() {
-        let mut app = TaskApp::new(
-            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
-            "local",
-            None,
-        );
-        app.load(listing(vec![queued("a", 1)], "c"));
-        press(&mut app, KeyCode::Char('.'));
-        let screen = draw_app(&mut app, 120, 40, false);
-        assert!(screen.contains("Archiwizuj"), "{screen}");
-        assert!(!screen.contains("Pauza"), "{screen}");
     }
 
     #[test]

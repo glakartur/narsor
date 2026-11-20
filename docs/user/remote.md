@@ -20,7 +20,7 @@ narsor-cli task create --file ./my-workflow.yaml --input name=value   # a workfl
 narsor-cli task list [--archived] [--json]        # queue position (#n), `?`/`!` attention mark, backend, lifecycle, title; --archived: the history
 narsor-cli task move <task> --before|--after <other> | --top | --bottom   # reorder a queued task
 narsor-cli task show <task> [--json]              # title and links, what it waits on, observations with their age, timeline, conversation
-narsor-cli task pause|resume|start|archive <task> # archive deletes the workload and its storage
+narsor-cli task pause|resume|start|archive <task> # archive (only at a terminal state of the workflow) deletes the workload and its storage
 narsor-cli task input <task> --field reason=ok [--artifact name=path] [--variable k=v] [--label L] [--waiting-id ID]   # answer the input the runner waits for
 narsor-cli task interrupt <task>                      # cut short the step the runner works on
 narsor-cli task transition <task> <state> [--override --reason <why>]   # manual transition; an override is audited

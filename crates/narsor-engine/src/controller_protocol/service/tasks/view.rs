@@ -150,6 +150,30 @@ pub(super) fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer>
     transition_offer(&definition, current)
 }
 
+/// Whether the execution of the task sits in a terminal state of its sealed
+/// workflow (D80): the runner reported a terminal execution status, and the
+/// state it reported is marked `terminal` in the workflow. A terminal status
+/// alone is not enough: a failed step ends the execution as failed while its
+/// state is not a terminal one.
+pub(crate) fn at_workflow_terminal_state(record: &TaskRecord) -> bool {
+    let Some(runner) = record.runner.as_ref() else {
+        return false;
+    };
+    let snapshot = &runner.snapshot;
+    if !snapshot.execution_status.is_terminal() {
+        return false;
+    }
+    let Some(current) = snapshot.execution_cursor.current_state.as_deref() else {
+        return false;
+    };
+    record
+        .launch_spec
+        .definition()
+        .ok()
+        .and_then(|definition| definition.states.get(current).map(|state| state.terminal))
+        .unwrap_or(false)
+}
+
 /// Every step of the workflow, for the stop in which the owner may choose
 /// one: the task is stopped (a finished workflow is stopped too). The first is the
 /// initial step, the rest follow by name. `None` elsewhere, so a list of
