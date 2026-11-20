@@ -229,6 +229,7 @@ button.link { border: none; background: none; padding: 0 4px; color: var(--accen
 /* Progress */
 .progress { display: grid; grid-template-columns: minmax(240px, 340px) 1fr; height: 100%; min-height: 0; }
 .axis { list-style: none; margin: 0; padding: 8px; overflow-y: auto; border-right: 1px solid var(--border); }
+.axis.read-only { border-right: none; border-bottom: none; padding: 0; max-height: none; overflow: visible; }
 .step-button { display: flex; gap: 10px; width: 100%; text-align: left; border: 1px solid transparent; background: transparent; padding: 6px 8px; }
 .step.selected .step-button { background: var(--accent-soft); border-color: var(--accent); }
 .step-glyph { font-family: var(--mono); width: 14px; flex: none; }

@@ -15,18 +15,20 @@ use narsor::cli::task_text::{
 };
 use narsor_engine::controller_protocol::{
     ConversationResponse, ConversationUnavailableReason, ExecutionEventsSource, QueueView,
-    CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
+    TimelineResponse, CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
 };
 use narsor_engine::domain::{ExecutionStatus, TaskId};
+use narsor_engine::engine::{Position, PositionStatus};
 use narsor_engine::orchestration::{
     AttentionKind, ConversationAttemptSummary, HarnessUnavailable, OwnerCommand, QueueReason,
     RunnerState, TaskEvent, TaskEventKind, EXHAUSTION_REASON_PREFIX, UNSPECIFIED_LOSS,
 };
+use narsor_protocol::api::{PositionUsage, TokenCounts};
 
 use crate::task_app_support;
 use task_app_support::{
-    at, exhausted, header_workspace, interrupted, queued, task, titled, waiting_on,
-    with_header_workspaces, with_pr, with_runner,
+    archived, at, exhausted, header_workspace, interrupted, position, queued, task, timeline,
+    titled, waiting_on, with_header_workspaces, with_pr, with_runner,
 };
 
 fn queue(reason: QueueReason) -> QueueView {
@@ -819,4 +821,90 @@ fn the_details_show_where_the_gate_scripts_stand_and_what_the_owner_can_do() {
             ),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// An archived task's run (`task show`)
+// ---------------------------------------------------------------------------
+
+fn reported_step(state: &str, model: &str, cost_usd: Option<f64>) -> Position {
+    let mut step = position(state, PositionStatus::Succeeded);
+    step.ended_at = Some(at() + Duration::minutes(4));
+    step.harness = Some("claude-code".into());
+    step.model = Some(model.into());
+    step.usage = Some(PositionUsage {
+        total: Some(TokenCounts {
+            input: 1_500,
+            output: 72_000,
+            ..TokenCounts::default()
+        }),
+        cost_usd,
+        ..PositionUsage::default()
+    });
+    step
+}
+
+fn archived_show(timeline: Option<TimelineResponse>) -> Vec<String> {
+    detail_lines(&archived("t-9", "NAR-9 done", 1), timeline.as_ref(), None)
+        .into_iter()
+        .map(|line| line.text)
+        .collect()
+}
+
+#[test]
+fn show_of_an_archived_task_lists_each_step_with_its_model_and_cost() {
+    let steps = vec![
+        reported_step("plan", "opus", Some(0.5)),
+        reported_step("build", "sonnet", Some(1.25)),
+    ];
+
+    let text = archived_show(Some(timeline("t-9", steps, None)));
+
+    let has = |needle: &str| text.iter().any(|line| line.contains(needle));
+    assert!(has("Timeline   2 step(s), kept at archive"), "{text:#?}");
+    assert!(has("Usage      razem $1.75"), "{text:#?}");
+    assert!(
+        has("  plan #1  succeeded  agent  2026-10-09 12:00:00 → 12:04:00"),
+        "{text:#?}"
+    );
+    assert!(
+        has("      claude-code · opus · ↑1.5k ↓72k · $0.50"),
+        "{text:#?}"
+    );
+    assert!(
+        has("      claude-code · sonnet · ↑1.5k ↓72k · $1.25"),
+        "{text:#?}"
+    );
+}
+
+#[test]
+fn a_step_without_a_reported_cost_shows_no_cost() {
+    let text = archived_show(Some(timeline(
+        "t-9",
+        vec![reported_step("plan", "opus", None)],
+        None,
+    )));
+
+    let step = text
+        .iter()
+        .find(|line| line.contains("claude-code · opus"))
+        .expect("the step's usage line");
+    assert!(!step.contains('$'), "{text:#?}");
+}
+
+#[test]
+fn an_archived_task_without_a_timeline_says_its_storage_was_deleted() {
+    let mut nothing = timeline("t-9", Vec::new(), None);
+    nothing.timeline = None;
+
+    let text = archived_show(Some(nothing));
+
+    assert!(
+        text.iter()
+            .any(|line| line == "Timeline   storage deleted at archive, no steps were kept"),
+        "{text:#?}"
+    );
+    assert!(!text
+        .iter()
+        .any(|line| line.contains("not reported yet") && line.starts_with("Timeline")));
 }

@@ -7,7 +7,7 @@ import {
   branchText, notice, pullRequest, queueEntryMark, queuePositions, queueText, readiness, secondsBetween, shortAge,
   shortIdentifier, stateIcon, statusWord, stepIcon, titleOf,
 } from '../model.js';
-import { sumUsage, usageLine } from '../text.js';
+import { STORAGE_DELETED, sumUsage, usageLine } from '../text.js';
 import { AnswerPanel } from './answer.js';
 import { useRead } from './read.js';
 import { Conductor } from './tabs/conductor.js';
@@ -51,7 +51,7 @@ function statusParts(task, places, timeline) {
   return parts.sort((a, b) => order[a.role] - order[b.role]);
 }
 
-function Workspaces({ task }) {
+export function Workspaces({ task }) {
   return (task.workspaces ?? []).map((workspace) => {
     const pr = pullRequest(workspace);
     const branches = branchText(workspace);
@@ -68,7 +68,7 @@ function Workspaces({ task }) {
 }
 
 function Unstarted({ task, places }) {
-  if (readiness(task) === 'archived') return html`<p class="empty">storage usunięty przy archiwizacji</p>`;
+  if (readiness(task) === 'archived') return html`<p class="empty">${STORAGE_DELETED}</p>`;
   const place = places.get(task.task_id);
   return html`<p class="empty">jeszcze nie wystartowało, ${place ? `#${place} ` : ''}w kolejce</p>`;
 }

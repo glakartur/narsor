@@ -98,6 +98,13 @@ The sign-in form says which token it needs (*Skąd wziąć token?*).
   (pause, resume, select a step, archive …). Irreversible actions say so and
   ask for confirmation. Archive is offered only when the run reached a
   terminal state of its workflow; move a stuck task there first.
+- **Historia** (`H`): the archived tasks. An archived task opens with its
+  header (workspaces, final status, workflow, the usage row with the total
+  cost) and *Przebieg*: one row per step with harness, model, effort, cost,
+  tokens and subagents, as the run reported them at archive. The steps do not
+  open: the conversation, the events and the conductor were deleted with the
+  storage. A task without a reported timeline says *storage usunięty przy
+  archiwizacji*; a failed read shows its error.
 
 - **Kolejki automatyzacji** (the queues page, read-only): the queues of the
   catalogue with their entries and the catalogue files that cannot be used,
@@ -150,6 +157,6 @@ Shortcuts do nothing while the focus is in a text field. `?` shows them.
 - `u` refreshes the list (`R` opens the repositories, as in the TUI).
 - A new task that is being sent is shown in the new-task dialog
   (*wysyłanie…*, *nie wysłano* with *Ponów*), not as a row of the list.
-- History lists archived tasks.
+- History shows an archived task in one dialog (header, step rows, *Info*), not in the details pane with tabs.
 - No drag and drop in the queue; use ▲ ▼ or `K` / `J`.
 - No OIDC sign-in in the browser (paste a token).

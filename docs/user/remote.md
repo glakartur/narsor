@@ -32,6 +32,14 @@ narsor-cli task workflows | validate <path> | capabilities   # the catalogue, a 
 narsor [--server URL]                         # the TUI over the same control plane
 ```
 
+For an archived task, `task show` prints the run kept at archive: the total
+usage (`Usage      razem $…`) and one line per step (label, status, action
+type, start → end), with an indented line for the harness, model, effort,
+tokens, subagents, cost and conductor cost the harness reported. A figure the
+harness did not report is left out, never shown as `$0`. A task archived
+without any reported timeline prints `Timeline   storage deleted at archive,
+no steps were kept`. `task steps` is unchanged.
+
 Without `--server` these use the local daemon (trusted mode). For a network
 deployment pass `--server https://…` (or `NARSOR_SERVER`) and an OIDC access
 token via `NARSOR_TOKEN_FILE`, `NARSOR_TOKEN_COMMAND` or `NARSOR_TOKEN`; a

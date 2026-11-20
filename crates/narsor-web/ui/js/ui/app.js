@@ -153,7 +153,7 @@ export function App({ store, onSignOut }) {
       ${newOpen && html`<${NewTask} store=${store} onClose=${() => setNewOpen(false)}
         onCreated=${(id) => { setNewOpen(false); store.select(id); }} />`}
       ${dialog?.kind === 'history' && html`<${History} store=${store} onClose=${() => setDialog(null)} onOpen=${(task) => setDialog({ kind: 'archived', task })} />`}
-      ${dialog?.kind === 'archived' && html`<${ArchivedTask} task=${dialog.task} onClose=${() => setDialog({ kind: 'history' })} />`}
+      ${dialog?.kind === 'archived' && html`<${ArchivedTask} store=${store} task=${dialog.task} onClose=${() => setDialog({ kind: 'history' })} />`}
       ${dialog?.kind === 'repositories' && html`<${Repositories} store=${store} onClose=${() => setDialog(null)} />`}
       ${dialog?.kind === 'harness' && html`<${Harness} store=${store} onClose=${() => setDialog(null)} />`}
       ${dialog?.kind === 'limit' && html`<${Limit} store=${store} onClose=${() => setDialog(null)} />`}

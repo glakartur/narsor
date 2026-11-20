@@ -2,9 +2,13 @@
 // is a dialog over the shell, as in the TUI (`H`, `R`, `h`, `L`).
 
 import { html, useEffect, useRef, useState } from '../lib.js';
-import { shortIdentifier, stateIcon, titleOf } from '../model.js';
+import { shortIdentifier, stateIcon, statusWord, titleOf } from '../model.js';
+import { archivedRun } from '../text.js';
+import { Workspaces } from './details.js';
 import { Field } from './fields.js';
+import { useRead } from './read.js';
 import { Info } from './tabs/info.js';
+import { Progress } from './tabs/progress.js';
 
 export function Dialog({ title, onClose, children, wide = false }) {
   const ref = useRef(null);
@@ -175,10 +179,29 @@ export function Limit({ store, onClose }) {
   </${Dialog}>`;
 }
 
-/** An archived task: only its record is left (storage removed). */
-export function ArchivedTask({ task, onClose }) {
+/**
+ * An archived task: its header and the step rows of its run, frozen at
+ * archive. The conversation, the events and the conductor went with the
+ * storage, so the steps do not open.
+ */
+export function ArchivedTask({ store, task, onClose }) {
+  const read = useRead((signal) => store.api.timeline(task.task_id, signal), task.task_id);
+  const run = archivedRun(read);
+  const icon = stateIcon(task);
   return html`<${Dialog} title=${titleOf(task)} onClose=${onClose} wide>
-    <p class="muted">Zadanie zarchiwizowane — storage usunięty przy archiwizacji.</p>
+    <div class="details-meta">
+      <${Workspaces} task=${task} />
+      <div class="status-row">
+        <span class=${`role-${icon.role}`}><span aria-hidden="true">${icon.glyph}</span> ${statusWord(task)}</span>
+        <span class="muted"> · </span><span class="role-done">${task.workflow_id} v${task.workflow_version}</span>
+      </div>
+      ${run.usage && html`<div class="usage-row muted mono">${run.usage}</div>`}
+    </div>
+    <h3>Przebieg</h3>
+    ${run.kind === 'steps'
+      ? html`<${Progress} task=${task} timeline=${run.timeline} now=${new Date(task.as_of ?? Date.now())} readOnly />`
+      : html`<p class=${run.kind === 'error' ? 'role-problem' : 'muted'}>${run.text}</p>`}
+    <p class="muted small-text">Rozmowa, zdarzenia i dyrygent zostały usunięte razem ze storage przy archiwizacji.</p>
     <${Info} task=${task} />
   </${Dialog}>`;
 }
