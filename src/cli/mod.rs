@@ -359,7 +359,7 @@ pub enum DaemonCommand {
 
 /// The workflow half of the command line.
 ///
-/// Every one of these honours `catalog_dir`, because `{catalog}/workflows`
+/// Every one of these honours `server.catalog`, because `{catalog}/workflows`
 /// is one of the directories the resolver searches.
 #[derive(Debug, Subcommand)]
 pub enum WorkflowCommand {
@@ -392,7 +392,7 @@ pub enum WorkflowCommand {
 /// The registry half of the command line.
 ///
 /// The registry lives in `{catalog}/repositories/`, so every one of these
-/// honours `catalog_dir` — and the global `--root`, which sets it.
+/// honours `server.catalog` — and the global `--root`, which sets it.
 #[derive(Debug, Subcommand)]
 pub enum RepoCommand {
     /// Registers a repository under an id workflows can name.

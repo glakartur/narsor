@@ -3,7 +3,7 @@
 //! ([`crate::observer_worker`]).
 //!
 //! * [`prepare`] gives a child a clean start: none of the daemon's
-//!   `NARSOR_*` variables, `RUST_LOG` after the daemon's level, a process
+//!   `NARSOR_*` variables but the ones the child is named to get, `RUST_LOG` after the daemon's level, a process
 //!   group of its own, and an end with the daemon — `PR_SET_PDEATHSIG`,
 //!   checked against the daemon's pid in case the daemon died first, and
 //!   no capability: the daemon's ambient set is cleared
@@ -19,6 +19,7 @@
 //! started by a thread that lives as long as its supervision: a pool thread
 //! ending after idling would kill a healthy child.
 
+use std::ffi::OsString;
 use std::io::{self, BufRead as _, Write as _};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -39,17 +40,20 @@ pub const RESTART_RESET_AFTER: Duration = Duration::from_secs(60);
 pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Gives `command` a clean start as a child of this daemon: no `NARSOR_*`
-/// variable of the daemon, `RUST_LOG` set to `log_directive` (or removed),
+/// variable of the daemon but those starting with one of `keep`, `RUST_LOG` set to `log_directive` (or removed),
 /// stdin and stdout closed, stderr piped, a process group of its own, and
 /// `SIGTERM` when the starting thread ends, and an empty ambient
 /// capability set, so that the child gets no capability from the daemon.
 /// Add the child's own variables after this call.
-pub fn prepare(command: &mut Command, log_directive: Option<&str>) {
+///
+/// `keep` lists the prefixes of the `NARSOR_*` variables this child does
+/// get from the daemon: the local controller's sections for the controller
+/// (R21), none for the observer worker.
+pub fn prepare(command: &mut Command, log_directive: Option<&str>, keep: &[String]) {
     let parent = std::process::id();
-    for (name, _) in std::env::vars_os() {
-        if name.as_encoded_bytes().starts_with(ENV_PREFIX.as_bytes()) {
-            command.env_remove(name);
-        }
+    let names = std::env::vars_os().map(|(name, _)| name);
+    for name in variables_to_remove(names, keep) {
+        command.env_remove(name);
     }
     match log_directive {
         Some(directive) => command.env("RUST_LOG", directive),
@@ -77,6 +81,24 @@ pub fn prepare(command: &mut Command, log_directive: Option<&str>) {
             capabilities::clear_ambient()
         });
     }
+}
+
+/// The daemon's variables among `names` a child must not inherit: every
+/// `NARSOR_*` variable, except those starting with one of `keep`.
+pub fn variables_to_remove(
+    names: impl IntoIterator<Item = OsString>,
+    keep: &[String],
+) -> Vec<OsString> {
+    names
+        .into_iter()
+        .filter(|name| {
+            let bytes = name.as_encoded_bytes();
+            bytes.starts_with(ENV_PREFIX.as_bytes())
+                && !keep
+                    .iter()
+                    .any(|prefix| bytes.starts_with(prefix.as_bytes()))
+        })
+        .collect()
 }
 
 /// Starts a thread named `thread` that copies `child`'s stderr to the

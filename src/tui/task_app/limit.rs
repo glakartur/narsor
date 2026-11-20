@@ -4,7 +4,7 @@
 //! more or one less. The daemon holds the number and computes every figure
 //! the list shows; the interface adds and subtracts nothing but the step of
 //! one it offers. The change lasts until the daemon restarts, when the
-//! `max_concurrent_tasks` setting applies again.
+//! `server.max_concurrent_tasks` setting applies again.
 //!
 //! A lower limit does not stop work at once. The daemon asks running tasks
 //! to stop at a safe point, and only as many stop as the limit is exceeded

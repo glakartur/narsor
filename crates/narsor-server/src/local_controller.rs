@@ -19,13 +19,20 @@
 //!
 //! # What the child gets
 //!
-//! Every setting as a flag, already resolved, and `--no-config`: the child
-//! reads no configuration file and none of the daemon's `NARSOR_*`
-//! variables, which are all removed from its environment (R6). The
-//! enrollment code is the one `NARSOR_*` variable it gets, and only when
-//! there is one — never as an argument (R12). `RUST_LOG` follows the
-//! daemon's log level; the child's stderr is copied, line by line and
-//! prefixed, to the daemon's own stderr, which is the daemon's log (R4).
+//! Its connection and storage as flags, and its configuration the way the
+//! daemon got it (R21): `--config <file>` naming the file that won the
+//! daemon's cascade, or `--no-config` when none won, so the child cannot
+//! find a file that appeared later. The child reads its own `controller`
+//! section from it, on every start: a supervised restart reads the file
+//! again. Of the daemon's `NARSOR_*` variables only those of the
+//! controller's sections (`NARSOR_GLOBAL__*`, `NARSOR_CONTROLLER__*`) reach
+//! it; the others are removed from its environment (R6). The enrollment
+//! code is the one other `NARSOR_*` variable it gets, and only when there
+//! is one — never as an argument (R12). The daemon checks the controller's
+//! configuration before it binds its API
+//! ([`crate::settings::configure`]). `RUST_LOG` follows the daemon's log
+//! level; the child's stderr is copied, line by line and prefixed, to the
+//! daemon's own stderr, which is the daemon's log (R4).
 //!
 //! # Supervision
 //!
@@ -91,8 +98,11 @@ pub struct LocalControllerSettings {
     pub credential_file: PathBuf,
     /// The backend's storage: task storages and runner records.
     pub storage: PathBuf,
-    /// The HOME and harness arguments runners are started with.
-    pub harness_args: Vec<OsString>,
+    /// The arguments naming the child's configuration file:
+    /// `--config <file>` or `--no-config`.
+    pub config_args: Vec<OsString>,
+    /// The prefixes of the daemon's `NARSOR_*` variables the child gets.
+    pub forwarded_env_prefixes: Vec<String>,
     /// The `tracing` filter of the daemon, handed on as `RUST_LOG`.
     pub log_directive: Option<String>,
 }
@@ -318,7 +328,6 @@ fn spawn(
         .arg(&settings.credential_file)
         .arg("--storage")
         .arg(&settings.storage)
-        .args(&settings.harness_args)
         .arg("--lease-ttl-secs")
         .arg(
             ControllerConfig::new(String::new())
@@ -330,8 +339,12 @@ fn spawn(
         .arg(LOCK_TIMEOUT.as_secs().to_string())
         .arg("--parent-pid")
         .arg(std::process::id().to_string())
-        .arg("--no-config");
-    child_process::prepare(&mut command, settings.log_directive.as_deref());
+        .args(&settings.config_args);
+    child_process::prepare(
+        &mut command,
+        settings.log_directive.as_deref(),
+        &settings.forwarded_env_prefixes,
+    );
     if let Some(code) = code {
         command.env(ENROLLMENT_CODE_ENV, code);
     }

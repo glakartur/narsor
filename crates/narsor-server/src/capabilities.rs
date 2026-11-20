@@ -204,7 +204,7 @@ mod tests {
     fn local_controller_child() -> Command {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "cat /proc/self/status"]);
-        child_process::prepare(&mut command, None);
+        child_process::prepare(&mut command, None, &[]);
         command.stdout(std::process::Stdio::piped());
         command
     }

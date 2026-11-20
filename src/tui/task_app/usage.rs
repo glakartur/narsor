@@ -3,7 +3,7 @@
 //! The interface reads `GET /control/v1/usage` when it starts and then every
 //! [`USAGE_PERIOD`], on a clock of its own: not the schedule of the task list
 //! ([`super::super::refresh::RefreshSchedule`] has a backoff and can be
-//! switched off), so `NARSOR_TUI_REFRESH_INTERVAL=none` does not stop it. The
+//! switched off), so `NARSOR_TUI__REFRESH_INTERVAL=none` does not stop it. The
 //! next read is due a period after the previous one finished, whatever it
 //! brought.
 //!

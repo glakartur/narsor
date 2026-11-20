@@ -51,7 +51,7 @@ data:
     #   - auth=.credentials.json
   # Optional. The controller forwards only this key to runner Pods; it does
   # not parse or rewrite the value. Each list item is one argv token.
-  # NARSOR_AGENT_ARGS: |
+  # NARSOR_RUNNER__AGENT_ARGS: |
   #   claude:
   #     - --dangerously-skip-permissions
   #     - "--append-system-prompt=value with spaces"

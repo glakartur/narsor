@@ -698,7 +698,9 @@ fn configure_server(
         .as_ref()
         .and_then(SettingValue::as_path)
         .map(Path::to_path_buf)
-        .ok_or_else(|| CliError::failure("server.catalog is missing after installer configuration"))?;
+        .ok_or_else(|| {
+            CliError::failure("server.catalog is missing after installer configuration")
+        })?;
     let backend_path = catalog_dir
         .join("backends")
         .join(format!("{backend_id}.yaml"));

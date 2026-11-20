@@ -5,7 +5,7 @@
 //! start. A queued task is offered `Start` only once it holds a
 //! [`CapacityReservation`], and a controller's `StartAccepted` for a task
 //! without one is refused, so no controller can exceed the shared
-//! `max_concurrent_tasks` budget however stale or eager it is.
+//! `server.max_concurrent_tasks` budget however stale or eager it is.
 //!
 //! # One global scheduling decision at a time
 //!

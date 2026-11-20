@@ -28,6 +28,8 @@ pub mod client_paths;
 pub mod duration;
 pub mod file;
 pub mod harness_home;
+pub mod legacy;
+pub mod local_controller;
 pub mod resolve;
 pub mod scope;
 pub(crate) mod security_validation;
@@ -45,5 +47,5 @@ pub use security_validation::is_loopback_host;
 pub use settings::{
     agent_args_for, agent_args_key, render_value, AgentArgs, Section, SettingKey, SettingValue,
     Source, AGENT_ARGS_ENV, DEFAULT_BACKEND, DEFAULT_TUI_REFRESH_SECS, EFFORT_SCALE, ENV_PREFIX,
-    MASK, MODEL_TIERS, NO_LIMIT,
+    MASK, MODEL_TIERS, NO_LIMIT, REMOVED_FLAT_KEYS,
 };

@@ -201,6 +201,12 @@ impl Section {
         }
     }
 
+    /// The prefix of the environment variables of this section's settings
+    /// (`NARSOR_SERVER__`).
+    pub fn env_prefix(self) -> String {
+        format!("{ENV_PREFIX}{}__", self.name().to_uppercase())
+    }
+
     /// The section written under this root key, if there is one.
     pub fn from_name(name: &str) -> Option<Section> {
         Section::ALL
@@ -218,6 +224,10 @@ impl fmt::Display for Section {
 // ---------------------------------------------------------------------------
 // The registry
 // ---------------------------------------------------------------------------
+
+/// Keys of the flat layout that were removed rather than moved (R22): no
+/// setting replaces them.
+pub const REMOVED_FLAT_KEYS: [&str; 2] = ["agent_timeout", "escalation_threshold"];
 
 /// Every setting this version has.
 ///
@@ -416,6 +426,51 @@ impl SettingKey {
             SettingKey::WebUpstream => "web.upstream",
             SettingKey::WebToken => "web.token",
         }
+    }
+
+    /// The key of the flat layout this setting replaces, `None` for a setting
+    /// that had none (`global.root` was only the `--root` flag).
+    ///
+    /// The one list of the old names: the startup warning about an
+    /// un-migrated configuration (R26) and the comments `init` writes (R19)
+    /// both read it, so they cannot disagree.
+    pub fn former_key(self) -> Option<&'static str> {
+        Some(match self {
+            SettingKey::GlobalRoot => return None,
+            SettingKey::LogLevel => "log_level",
+            SettingKey::CatalogDir => "catalog_dir",
+            SettingKey::StateDir => "state_dir",
+            SettingKey::WorkDir => "work_dir",
+            SettingKey::AgentHarness => "agent_harness",
+            SettingKey::MaxConcurrentTasks => "max_concurrent_tasks",
+            SettingKey::DefaultBackend => "default_backend",
+            SettingKey::DefaultProfile => "default_profile",
+            SettingKey::LocalWorkspaceRoots => "local_workspace_roots",
+            SettingKey::ServerMode => "server_mode",
+            SettingKey::ServerBind => "server_bind",
+            SettingKey::OidcIssuer => "oidc_issuer",
+            SettingKey::OidcAudience => "oidc_audience",
+            SettingKey::OwnerSubject => "owner_subject",
+            SettingKey::TlsTermination => "tls_termination",
+            SettingKey::TrustedProxies => "trusted_proxies",
+            SettingKey::CorsAllowedOrigins => "cors_allowed_origins",
+            SettingKey::ObserverEnabled => "observer_worker",
+            SettingKey::ObserverServerUrl => "observer_worker_server",
+            SettingKey::ObserverSecretsDir => "observer_secrets_dir",
+            SettingKey::ObserverScriptUser => "observer_script_user",
+            SettingKey::ObserverInsecureSameUser => "observer_insecure_same_user",
+            SettingKey::LocalHome => "local_home",
+            SettingKey::LocalCodexHome => "local_codex_home",
+            SettingKey::LocalClaudeConfigDir => "local_claude_config_dir",
+            SettingKey::LocalClaudeProfileSource => "local_claude_profile_source",
+            SettingKey::AgentArgs => "agent_args",
+            SettingKey::ConductorModel => "conductor_model",
+            SettingKey::ConductorEffort => "conductor_effort",
+            SettingKey::TuiRefreshInterval => "tui_refresh_interval",
+            SettingKey::WebBind => "web_bind",
+            SettingKey::WebUpstream => "web_upstream",
+            SettingKey::WebToken => "web_token",
+        })
     }
 
     /// The segments of the path, from the section down to the leaf.

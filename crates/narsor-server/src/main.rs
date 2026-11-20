@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use narsor_engine::config::{self, Flags};
 use narsor_engine::persistence::DaemonInfo;
 use narsor_server::runtime::run_daemon;
+use narsor_server::settings::configure;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[derive(Debug, Parser)]
@@ -57,14 +58,14 @@ async fn run() {
     };
     let environment = config::resolve::environment_from_process();
     let resolved = config::resolve(&flags, &environment, config::Scope::SERVER);
-    if !resolved.is_ok() {
-        for error in resolved.errors() {
-            eprintln!("{error}");
-        }
-        std::process::exit(if resolved.has_usage_error() { 2 } else { 1 });
+    if resolved.has_usage_error() {
+        refuse(resolved.errors().iter().map(ToString::to_string), 2);
     }
 
     if matches!(args.command, Some(ServerCommand::Stop)) {
+        if !resolved.is_ok() {
+            refuse(resolved.errors().iter().map(ToString::to_string), 1);
+        }
         if let Err(message) = stop_daemon(&resolved) {
             eprintln!("{message}");
             std::process::exit(1);
@@ -72,7 +73,8 @@ async fn run() {
         return;
     }
 
-    if let Some(directive) = resolved.log_directive() {
+    let logging = resolved.log_directive();
+    if let Some(directive) = &logging {
         let subscriber = FmtSubscriber::builder()
             .with_env_filter(EnvFilter::builder().parse_lossy(directive))
             .with_writer(std::io::stderr)
@@ -84,10 +86,36 @@ async fn run() {
         }
     }
 
-    if let Err(error) = run_daemon(&resolved).await {
+    // R26: an un-migrated configuration runs on built-in values; say so.
+    if let Some(warning) = config::legacy::warning(&resolved, &environment) {
+        if logging.is_some() {
+            tracing::warn!("{warning}");
+        } else {
+            // With logging off nothing would carry a tracing event, and an
+            // old configuration that set a level is itself ignored.
+            eprintln!("narsor-server: warning: {warning}");
+        }
+    }
+
+    // Every rule between the settings, before anything starts (R7, R8).
+    let settings = match configure(&resolved, &environment) {
+        Ok(settings) => settings,
+        Err(problems) => refuse(problems.into_iter(), 1),
+    };
+
+    if let Err(error) = run_daemon(&resolved, settings).await {
         eprintln!("{}", error.message);
         std::process::exit(error.exit_code);
     }
+}
+
+/// Prints every problem of the configuration and exits with `code`.
+fn refuse(problems: impl Iterator<Item = String>, code: i32) -> ! {
+    eprintln!("narsor-server: the configuration does not hold up:");
+    for problem in problems {
+        eprintln!("  {problem}");
+    }
+    std::process::exit(code);
 }
 
 /// Stop the daemon named by this installation's discovery record.

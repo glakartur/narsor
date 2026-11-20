@@ -888,7 +888,7 @@ pub struct QueueStatus {
 /// Scheduler inputs, read fresh for each admission decision.
 ///
 /// Backend availability determines whether a task can start on that backend;
-/// `max_concurrent_tasks` is one shared budget across all backends.
+/// `server.max_concurrent_tasks` is one shared budget across all backends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulingPolicy {
     /// Whether this task's backend can currently accept work.
@@ -908,7 +908,7 @@ pub enum BackendAvailability {
 
 /// The durable owner choice of the default backend (R10).
 ///
-/// Only an *override* of the configured `default_backend`; absent or
+/// Only an *override* of the configured `server.defaults.backend`; absent or
 /// `backend: None` means the configured value applies. It is read when a
 /// task is created and never again for that task, so changing it moves
 /// nothing that already exists.

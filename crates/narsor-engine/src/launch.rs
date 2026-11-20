@@ -11,7 +11,7 @@
 //! * **Backend** — the request's explicit `backend`, else the owner default
 //!   (R10): the override the owner chose through the control plane, which
 //!   fills in `backend` before resolution, else the configured
-//!   `default_backend`. An existing task never re-resolves, so changing the
+//!   `server.defaults.backend`. An existing task never re-resolves, so changing the
 //!   default moves no task.
 //! * **Base image** — a step's `image` wins over the workflow's
 //!   `globals.image`, which wins over the repository's `base_image` (R15).
@@ -23,7 +23,7 @@
 //!   which the control plane hands its runner with every answer
 //!   ([`LaunchResolver::default_harness`]) as long as the task's backend
 //!   runs it. Only a workflow's own `harness:` pins an action.
-//! * **Profile** — the request, else `default_profile`.
+//! * **Profile** — the request, else `server.defaults.profile`.
 //! * **Resources** — the request, else the backend's default, never above
 //!   the backend's maximum.
 //!
@@ -265,7 +265,7 @@ impl CatalogLaunchResolver {
     /// by a workflow definition (or built from its inputs) must not be able
     /// to name any directory of the host: it has to be absolute and, once
     /// symlinks and `..` are resolved, lie inside one of the owner's
-    /// `local_workspace_roots`. The sealed spec keeps the canonical path, so
+    /// `server.local_workspace_roots`. The sealed spec keeps the canonical path, so
     /// nothing is re-resolved later.
     fn allowed_local_directory(&self, path: &str) -> Result<String, LaunchError> {
         let refuse = |reason: String| LaunchError::UnsupportedWorkspace(reason);

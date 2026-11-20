@@ -117,13 +117,13 @@ spec:
     - expression: >-
         variables.containers.all(c, !has(c.envFrom) &&
         (!has(c.env) || c.env.all(e, !has(e.valueFrom) ||
-        (e.name == 'NARSOR_AGENT_ARGS' &&
+        (e.name == 'NARSOR_RUNNER__AGENT_ARGS' &&
         has(e.valueFrom.configMapKeyRef) &&
         e.valueFrom.configMapKeyRef.name == 'narsor-controller-config' &&
-        e.valueFrom.configMapKeyRef.key == 'NARSOR_AGENT_ARGS' &&
+        e.valueFrom.configMapKeyRef.key == 'NARSOR_RUNNER__AGENT_ARGS' &&
         has(e.valueFrom.configMapKeyRef.optional) &&
         e.valueFrom.configMapKeyRef.optional))))
-      message: "only NARSOR_AGENT_ARGS from the controller ConfigMap may reach a task via env"
+      message: "only NARSOR_RUNNER__AGENT_ARGS from the controller ConfigMap may reach a task via env"
     - expression: >-
         variables.volumes.all(v, !has(v.hostPath) &&
         (has(v.emptyDir) || has(v.persistentVolumeClaim) || has(v.secret) || has(v.projected)))

@@ -10,7 +10,7 @@
 //! | users prove | a random per-process token from the `0600` discovery file | an OIDC access token of the configured issuer and audience |
 //! | owner | the local token holder | one OIDC identity, bound by config or a one-time claim (R38) |
 //!
-//! The mode is a setting (`server_mode`), never inferred: a misconfiguration
+//! The mode is a setting (`server.mode`), never inferred: a misconfiguration
 //! stops the daemon with a message naming every problem
 //! ([`SecuritySettings::validate`]).
 //!

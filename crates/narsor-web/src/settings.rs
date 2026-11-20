@@ -2,9 +2,9 @@
 //!
 //! Three keys of the shared configuration (`config show` lists them):
 //!
-//! - `web_bind` — where the browser interface listens;
-//! - `web_upstream` — `local` (the local daemon) or the server's URL;
-//! - `web_token` — `server`: `narsor-web` holds the server's token and gives
+//! - `web.bind` — where the browser interface listens;
+//! - `web.upstream` — `local` (the local daemon) or the server's URL;
+//! - `web.token` — `server`: `narsor-web` holds the server's token and gives
 //!   the browser a session token of its own; `passthrough`: the browser's
 //!   own token goes to the server unchanged.
 //!
@@ -61,6 +61,21 @@ pub struct WebSettings {
     pub token: TokenMode,
 }
 
+/// `narsor-web`'s configuration step: its settings from `config`, or every
+/// problem at once — the resolution errors and the rules between the
+/// settings — before anything starts (R7, R8).
+pub fn configure(config: &Resolved) -> Result<WebSettings, Vec<String>> {
+    let mut problems: Vec<String> = config.errors().iter().map(ToString::to_string).collect();
+    match WebSettings::from_config(config) {
+        Ok(settings) if problems.is_empty() => Ok(settings),
+        Ok(_) => Err(problems),
+        Err(rules) => {
+            problems.extend(rules);
+            Err(problems)
+        }
+    }
+}
+
 impl WebSettings {
     /// The settings from the resolved configuration, or every problem at once.
     pub fn from_config(config: &Resolved) -> Result<Self, Vec<String>> {
@@ -77,7 +92,7 @@ impl WebSettings {
         let bind = match resolve_loopback(bind) {
             Ok(address) => Some(address),
             Err(problem) => {
-                problems.push(format!("web_bind: {problem}"));
+                problems.push(format!("{}: {problem}", SettingKey::WebBind));
                 None
             }
         };
@@ -90,18 +105,20 @@ impl WebSettings {
             WEB_TOKEN_SERVER | "" => TokenMode::Server,
             other => {
                 problems.push(format!(
-                    "web_token: '{WEB_TOKEN_SERVER}' or '{WEB_TOKEN_PASSTHROUGH}' was expected, \
-                     but '{other}' was found"
+                    "{}: '{WEB_TOKEN_SERVER}' or '{WEB_TOKEN_PASSTHROUGH}' was expected, but \
+                     '{other}' was found",
+                    SettingKey::WebToken
                 ));
                 TokenMode::Server
             }
         };
         if token == TokenMode::Passthrough && upstream == Upstream::Local {
-            problems.push(
-                "web_token: 'passthrough' with web_upstream: 'local' would hand the local \
-                 daemon's token to the browser; use web_token: 'server'"
-                    .to_string(),
-            );
+            let token = SettingKey::WebToken;
+            problems.push(format!(
+                "{token}: 'passthrough' with {}: 'local' would hand the local daemon's token to \
+                 the browser; use {token}: 'server'",
+                SettingKey::WebUpstream
+            ));
         }
         match bind {
             Some(bind) if problems.is_empty() => Ok(Self {
@@ -173,7 +190,8 @@ mod tests {
     #[test]
     fn passthrough_to_the_local_daemon_is_refused() {
         let problems = WebSettings::parse("127.0.0.1:1", "local", "passthrough").unwrap_err();
-        assert!(problems[0].contains("web_token"), "{problems:?}");
+        assert!(problems[0].contains("web.token"), "{problems:?}");
+        assert!(problems[0].contains("web.upstream"), "{problems:?}");
     }
 
     #[test]
