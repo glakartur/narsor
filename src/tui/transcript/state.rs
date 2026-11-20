@@ -283,11 +283,16 @@ impl TranscriptState {
         let anchor = self.anchor();
         let following = false;
         let identity = self.expansion_identity(entry);
-        if self.is_auto_expanded(entry) && !self.expanded.contains(&identity) {
+        let auto = self.is_auto_expanded(entry);
+        if auto && !self.expanded.contains(&identity) {
             // The operator sees it expanded, so the toggle collapses it and
             // the entry is theirs to expand again.
             self.auto_expanded = None;
         } else if !self.expanded.insert(identity.clone()) {
+            // Collapsing must hide every line, the auto-expanded speech too.
+            if auto {
+                self.auto_expanded = None;
+            }
             self.expanded.remove(&identity);
             self.forget_revealed_members_if_hidden(&identity);
         } else {
@@ -310,7 +315,9 @@ impl TranscriptState {
     /// Moves the auto-expansion to the newest projected entry when it is
     /// speech with more lines than its preview, and clears it otherwise.
     fn mark_latest_utterance(&mut self) {
-        if !self.auto_expand_latest {
+        // The raw projection folds a source line into its first element, so
+        // its newest entry is not the newest utterance; keep the mark.
+        if !self.auto_expand_latest || self.mode == DisplayMode::Raw {
             return;
         }
         self.auto_expanded = self

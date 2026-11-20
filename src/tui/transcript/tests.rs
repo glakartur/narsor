@@ -746,3 +746,33 @@ fn a_viewport_change_near_the_top_or_while_following_stays_in_bounds() {
     transcript.set_viewport(10);
     assert!(transcript.scroll_offset() <= 20);
 }
+
+#[test]
+fn collapsing_a_manually_and_auto_expanded_utterance_hides_its_speech() {
+    let mut transcript = following_reader();
+    transcript.load(vec![utterance("a", 5, 0, 0), utterance("b", 5, 7, 0)]);
+    let b = TranscriptEntryId::from("b");
+    transcript.toggle_expanded(&b);
+    transcript.toggle_expanded(&b);
+    assert!(shown(&transcript, "b more 6"), "expanded by hand");
+    transcript.toggle_follow();
+
+    transcript.toggle_expanded(&b);
+
+    assert!(!shown(&transcript, "b more 0"));
+}
+
+#[test]
+fn following_in_raw_view_does_not_move_the_auto_expansion() {
+    let mut transcript = following_reader();
+    transcript.load(vec![utterance("a", 5, 7, 0)]);
+    transcript.toggle_mode();
+    transcript.toggle_follow();
+    transcript.append(vec![
+        utterance("b", 1, 0, 0),
+        utterance("b.2", 5, 7, 0).sharing_previous_raw(),
+    ]);
+    transcript.toggle_mode();
+
+    assert!(shown(&transcript, "a more 6"));
+}
