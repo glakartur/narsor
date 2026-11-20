@@ -186,7 +186,7 @@ pub fn worker_key(value: Option<String>) -> Result<String, StartError> {
         _ => Err(StartError::Usage(format!(
             "narsor-observer-worker needs the key narsor-server gives it in \
              {OBSERVER_WORKER_KEY_ENV}; enable the worker in the server's configuration \
-             (observer_worker: on) instead of starting it by hand"
+             (server.observer.enabled: true) instead of starting it by hand"
         ))),
     }
 }

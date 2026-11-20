@@ -130,8 +130,9 @@ graph TD
 | `narsor`, `narsor-cli`, `narsor-web` | `narsor-server` | Discover the daemon; launch it when it is not running | process (`api-client/src/api/launch.rs`) |
 | `narsor`, `narsor-cli`, `narsor-web` | `narsor-server` | Owner operations and the event stream | REST + SSE, `/control/v1` |
 | Browser | `narsor-web` | Application files and the API proxy | HTTP, loopback only |
-| `narsor-server` | `narsor-controller local` | Start as a child, enroll, supervise | process (`server/src/local_controller.rs`) |
-| `narsor-server` | `narsor-observer-worker` | Start and supervise when the configuration enables it | process (`server/src/observer_worker.rs`) |
+| `narsor-server` | `narsor-controller local` | Start as a child with the server's configuration file (or `--no-config`) and only its `NARSOR_GLOBAL__*` / `NARSOR_CONTROLLER__*` variables; enroll, supervise | process (`server/src/local_controller.rs`, `shared/src/config/local_controller.rs`) |
+| `narsor-cli` | `narsor-server`, `narsor-web`, `narsor`, `narsor-runner`, `narsor-controller` | `config show`: run each sibling binary with `--check-config` and merge the JSON reports | process (`src/cli/commands/config.rs`) |
+| `narsor-server` | `narsor-observer-worker` | Start and supervise when `server.observer.enabled` is `true` | process (`server/src/observer_worker.rs`) |
 | `narsor-controller` (local, kubernetes) | `narsor-server` | Enroll, lease, heartbeat, commands, acks, reports | HTTP, `/controller/v1` |
 | `narsor-controller local` | `narsor-runner` | One runner process per task | process (`narsor-controller/src/local/backend.rs`) |
 | `narsor-controller kubernetes` | Kubernetes | One Pod (command `narsor-runner`) and one PVC per task | Kubernetes API (`controller/src/kubernetes/manifest.rs`) |
@@ -148,6 +149,13 @@ Properties of the runtime:
 - The `local` backend works like the `kubernetes` backend: its controller is
   a separate process that enrolls through the same `/controller/v1`
   protocol.
+- Each binary reads only `global` and its own sections of the configuration
+  file (`narsor-shared`, `config/scope.rs`): `narsor-server` the `server`
+  section, `narsor-controller local` the `controller` section,
+  `narsor-runner` the `runner` section, `narsor` the `tui` section,
+  `narsor-web` the `web` section, and the clients also `server.state` for
+  daemon discovery. An error in one section stops only the programs that
+  read it. See `docs/user/configuration.md`.
 - Automations and queues are catalogue files (`{catalog}/automations/`,
   `{catalog}/queues/`), read by `narsor-engine` (`automations/`) at every
   load, with no cache. Their scheduling lives in the control plane only

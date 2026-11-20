@@ -18,7 +18,7 @@
 //! - [`TokenMode::Passthrough`]: the browser's `Authorization` goes to the
 //!   server unchanged, and so does `X-Forwarded-Proto` of the TLS proxy in
 //!   front of `narsor-web` (a server in network mode lists `narsor-web` in
-//!   `trusted_proxies`).
+//!   `server.tls.trusted_proxies`).
 //!
 //! # Other sites and DNS rebinding
 //!

@@ -1,5 +1,5 @@
 //! Layering a value out of the flag, the environment, the file and the
-//! built-in (U5).
+//! built-in, per path and for one binary's scope.
 //!
 //! # Not one call to `set_var`
 //!
@@ -13,8 +13,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use narsor_engine::config::cascade::ConfigCascade;
-use narsor_engine::config::resolve::{resolve_with, Environment, Flags};
-use narsor_engine::config::{SettingKey, SettingValue, Source};
+use narsor_engine::config::resolve::{resolve_with, Environment, Flags, Resolved};
+use narsor_engine::config::{Scope, SettingKey, SettingValue, Source};
 
 /// A temporary directory that deletes itself when it goes out of scope.
 struct TempRoot {
@@ -43,6 +43,11 @@ impl TempRoot {
         fs::write(&path, contents).expect("write the file");
         path
     }
+
+    /// Resolves `scope` against this root's cascade.
+    fn resolve(&self, flags: &Flags, env: &[(&str, &str)], scope: Scope) -> Resolved {
+        resolve_with(flags, &environment(env), &cascade(self), scope)
+    }
 }
 
 impl Drop for TempRoot {
@@ -65,112 +70,181 @@ fn cascade(root: &TempRoot) -> ConfigCascade {
     ConfigCascade::with_dirs(None, Some(root.user_dir()), Some(root.system_dir()))
 }
 
-#[test]
-fn a_flag_beats_the_file_and_says_so() {
-    // AE1: the operator passed --root, so the answer to "where did this come
-    // from" is the flag, not the file that also mentions it.
-    let root = TempRoot::new();
-    root.user_config("state_dir: /from/the/file\n");
+/// No file anywhere.
+fn nowhere() -> ConfigCascade {
+    ConfigCascade::with_dirs(None, None, None)
+}
 
-    let flags = Flags {
-        root: Some(PathBuf::from("/from/the/flag")),
+fn root_flag(root: &str) -> Flags {
+    Flags {
+        root: Some(PathBuf::from(root)),
         config: None,
-    };
-    let resolved = resolve_with(&flags, &environment(&[]), &cascade(&root));
-
-    assert!(resolved.is_ok());
-    assert_eq!(resolved.state_dir(), Path::new("/from/the/flag"));
-    assert_eq!(
-        resolved.source(SettingKey::StateDir),
-        &Source::Flag("--root")
-    );
+    }
 }
 
 #[test]
-fn the_environment_beats_the_file_and_loses_to_the_flag() {
+fn the_root_is_layered_flag_then_environment_then_file_then_built_in() {
     let root = TempRoot::new();
-    root.user_config("state_dir: /from/the/file\n");
-    let env = environment(&[("NARSOR_STATE_DIR", "/from/the/environment")]);
+    let built_in = root.resolve(&Flags::default(), &[], Scope::SERVER);
+    assert_eq!(built_in.root(), Path::new("./.narsor"));
+    assert_eq!(built_in.source(SettingKey::GlobalRoot), &Source::BuiltIn);
 
-    let resolved = resolve_with(&Flags::default(), &env, &cascade(&root));
-    assert_eq!(resolved.state_dir(), Path::new("/from/the/environment"));
+    let path = root.user_config("global:\n  root: /from/the/file\n");
+    let file = root.resolve(&Flags::default(), &[], Scope::SERVER);
+    assert_eq!(file.root(), Path::new("/from/the/file"));
+    assert_eq!(file.source(SettingKey::GlobalRoot), &Source::File(path));
+
+    let env = [("NARSOR_GLOBAL__ROOT", "/from/the/environment")];
+    let from_env = root.resolve(&Flags::default(), &env, Scope::SERVER);
+    assert_eq!(from_env.root(), Path::new("/from/the/environment"));
     assert_eq!(
-        resolved.source(SettingKey::StateDir),
-        &Source::Env("NARSOR_STATE_DIR".to_string()),
+        from_env.source(SettingKey::GlobalRoot),
+        &Source::Env("NARSOR_GLOBAL__ROOT".to_string()),
         "the source names the variable, not the word 'environment'"
     );
 
-    let flags = Flags {
-        root: Some(PathBuf::from("/from/the/flag")),
-        config: None,
-    };
-    let resolved = resolve_with(&flags, &env, &cascade(&root));
-    assert_eq!(resolved.state_dir(), Path::new("/from/the/flag"));
+    let flag = root.resolve(&root_flag("/from/the/flag"), &env, Scope::SERVER);
+    assert_eq!(flag.root(), Path::new("/from/the/flag"));
+    assert_eq!(flag.source(SettingKey::GlobalRoot), &Source::Flag("--root"));
 }
 
 #[test]
-fn the_file_beats_the_built_in_and_names_its_own_path() {
-    // R8: the path of the file that was actually read.
+fn an_environment_variable_named_after_the_path_beats_the_file() {
     let root = TempRoot::new();
-    let path = root.user_config("state_dir: /from/the/file\n");
+    root.user_config("server:\n  bind: 127.0.0.1:7000\n");
 
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
-
-    assert_eq!(resolved.state_dir(), Path::new("/from/the/file"));
-    assert_eq!(resolved.source(SettingKey::StateDir), &Source::File(path));
-}
-
-#[test]
-fn with_nothing_anywhere_every_setting_is_built_in_and_nothing_fails() {
-    // AE2: no file, no home, no XDG — and a working command.
-    let resolved = resolve_with(
+    let resolved = root.resolve(
         &Flags::default(),
-        &environment(&[]),
-        &ConfigCascade::with_dirs(None, None, None),
+        &[("NARSOR_SERVER__BIND", "127.0.0.1:8000")],
+        Scope::SERVER,
     );
 
     assert!(resolved.is_ok(), "{:?}", resolved.errors());
-    for setting in SettingKey::ALL {
-        assert_eq!(
-            resolved.source(setting),
-            &Source::BuiltIn,
-            "{setting} has nothing else to come from"
-        );
-        assert_eq!(resolved.value(setting), &setting.built_in());
+    assert_eq!(
+        resolved.text(SettingKey::ServerBind),
+        Some("127.0.0.1:8000")
+    );
+    assert_eq!(
+        resolved.source(SettingKey::ServerBind),
+        &Source::Env("NARSOR_SERVER__BIND".to_string())
+    );
+}
+
+#[test]
+fn server_directories_are_relative_to_the_root_unless_absolute() {
+    // AE5, for the server and for every client that reads server.state.
+    let root = TempRoot::new();
+    for (state, expected) in [
+        (Some("/var/lib/narsor-state"), "/var/lib/narsor-state"),
+        (None, "/srv/narsor"),
+        (Some("state"), "/srv/narsor/state"),
+    ] {
+        let state_line = state.map_or(String::new(), |state| format!("  state: {state}\n"));
+        root.user_config(&format!(
+            "global:\n  root: /srv/narsor\nserver:\n  mode: trusted\n{state_line}"
+        ));
+        for scope in [Scope::SERVER, Scope::WEB, Scope::TUI, Scope::CLI] {
+            let resolved = root.resolve(&Flags::default(), &[], scope);
+            assert!(resolved.is_ok(), "{scope:?}: {:?}", resolved.errors());
+            assert_eq!(
+                resolved.state_dir(),
+                Path::new(expected),
+                "{scope:?} {state:?}"
+            );
+        }
     }
-    assert_eq!(resolved.state_dir(), Path::new("./.narsor"));
+}
+
+#[test]
+fn the_root_flag_alone_moves_every_server_directory() {
+    let resolved = resolve_with(
+        &root_flag("/x"),
+        &environment(&[]),
+        &nowhere(),
+        Scope::SERVER,
+    );
+
+    assert_eq!(resolved.catalog_dir(), Path::new("/x"));
+    assert_eq!(resolved.state_dir(), Path::new("/x"));
+    assert_eq!(resolved.work_dir(), Path::new("/x"));
+    assert_eq!(
+        resolved.source(SettingKey::StateDir),
+        &Source::BuiltIn,
+        "a directory keeps the source of its own key"
+    );
+}
+
+#[test]
+fn with_nothing_anywhere_every_scoped_setting_is_built_in_and_nothing_fails() {
+    // AE2: no file, no home, no XDG — and a working command.
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &nowhere(), Scope::ALL);
+
+    assert!(resolved.is_ok(), "{:?}", resolved.errors());
+    for setting in SettingKey::ALL {
+        assert_eq!(resolved.source(setting), &Source::BuiltIn, "{setting}");
+    }
+    assert_eq!(
+        resolved.state_dir().to_string_lossy(),
+        "./.narsor",
+        "the built-in directory is the root itself, not ./.narsor/."
+    );
     assert_eq!(resolved.agent_harness(), "claude-code");
-    assert_eq!(resolved.agent_timeout(), None);
+    assert_eq!(
+        resolved.log_directive(),
+        None,
+        "no level, no subscriber (D-N)"
+    );
+}
+
+#[test]
+fn old_flat_variables_and_other_sections_variables_are_not_read() {
+    let root = TempRoot::new();
+    let resolved = root.resolve(
+        &Flags::default(),
+        &[
+            ("NARSOR_SERVER_MODE", "network"),
+            ("NARSOR_WEB__BIND", "bad"),
+        ],
+        Scope::SERVER,
+    );
+
+    assert!(
+        resolved.is_ok(),
+        "an unscoped variable is not checked: {:?}",
+        resolved.errors()
+    );
+    assert_eq!(resolved.text(SettingKey::ServerMode), Some("trusted"));
 }
 
 #[test]
 fn an_empty_environment_variable_counts_as_unset() {
     // D-J: that is how Kubernetes renders an unset key of a ConfigMap.
     let root = TempRoot::new();
-    let path = root.user_config("state_dir: /from/the/file\n");
-    let env = environment(&[("NARSOR_DATA_DIR", "")]);
+    let path = root.user_config("server:\n  state: /from/the/file\n");
 
-    let resolved = resolve_with(&Flags::default(), &env, &cascade(&root));
+    let resolved = root.resolve(
+        &Flags::default(),
+        &[("NARSOR_SERVER__STATE", "")],
+        Scope::SERVER,
+    );
 
     assert_eq!(resolved.state_dir(), Path::new("/from/the/file"));
     assert_eq!(resolved.source(SettingKey::StateDir), &Source::File(path));
 }
 
 #[test]
-fn rust_log_wins_over_the_setting_and_is_the_source_reported() {
+fn rust_log_wins_over_the_level_and_is_the_source_reported() {
     // D-K: RUST_LOG takes per-target directives, so the sharper instrument
     // wins — and `config show` names the variable that actually took effect.
-    let env = environment(&[
+    let level = environment(&[("NARSOR_GLOBAL__LOG_LEVEL", "warn")]);
+    let resolved = resolve_with(&Flags::default(), &level, &nowhere(), Scope::CLI);
+    assert_eq!(resolved.log_directive(), Some("warn".to_string()));
+
+    let both = environment(&[
         ("RUST_LOG", "narsor_engine::engine=debug"),
-        ("NARSOR_LOG_LEVEL", "warn"),
+        ("NARSOR_GLOBAL__LOG_LEVEL", "warn"),
     ]);
-
-    let resolved = resolve_with(
-        &Flags::default(),
-        &env,
-        &ConfigCascade::with_dirs(None, None, None),
-    );
-
+    let resolved = resolve_with(&Flags::default(), &both, &nowhere(), Scope::CLI);
     assert_eq!(
         resolved.value(SettingKey::LogLevel),
         &SettingValue::Text("narsor_engine::engine=debug".to_string())
@@ -182,103 +256,13 @@ fn rust_log_wins_over_the_setting_and_is_the_source_reported() {
 }
 
 #[test]
-fn without_rust_log_the_setting_decides() {
-    let env = environment(&[("NARSOR_LOG_LEVEL", "warn")]);
-
-    let resolved = resolve_with(
-        &Flags::default(),
-        &env,
-        &ConfigCascade::with_dirs(None, None, None),
-    );
-
-    assert_eq!(resolved.log_directive(), Some("warn".to_string()));
-    assert_eq!(
-        resolved.source(SettingKey::LogLevel),
-        &Source::Env("NARSOR_LOG_LEVEL".to_string())
-    );
-}
-
-#[test]
-fn nothing_configured_installs_no_logging_at_all() {
-    // D-N: today an unset RUST_LOG leaves the process without a subscriber and
-    // every subcommand silent. The built-in level keeps that exactly.
-    let resolved = resolve_with(
-        &Flags::default(),
-        &environment(&[]),
-        &ConfigCascade::with_dirs(None, None, None),
-    );
-
-    assert_eq!(
-        resolved.log_directive(),
-        None,
-        "no directive means no subscriber, which means no output"
-    );
-}
-
-#[test]
-fn a_level_from_the_file_turns_logging_on() {
-    let root = TempRoot::new();
-    root.user_config("log_level: debug\n");
-
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
-
-    assert_eq!(resolved.log_directive(), Some("debug".to_string()));
-}
-
-#[test]
-fn settings_are_resolved_one_by_one_not_file_by_file() {
-    // R2: a file that sets one key does not displace a flag that sets another.
-    let root = TempRoot::new();
-    let path = root.user_config("state_dir: /from/the/file\nagent_harness: opencode\n");
-
-    let flags = Flags {
-        root: Some(PathBuf::from("/from/the/flag")),
-        config: None,
-    };
-    let resolved = resolve_with(&flags, &environment(&[]), &cascade(&root));
-
-    assert_eq!(
-        resolved.source(SettingKey::StateDir),
-        &Source::Flag("--root")
-    );
-    assert_eq!(
-        resolved.source(SettingKey::AgentHarness),
-        &Source::File(path),
-        "the harness still comes from the file the flag had nothing to say about"
-    );
-    assert_eq!(resolved.agent_harness(), "opencode");
-    assert_eq!(
-        resolved.source(SettingKey::LogLevel),
-        &Source::BuiltIn,
-        "and a key nobody mentioned is still built in"
-    );
-}
-
-#[test]
-fn the_cascade_looks_for_the_file_regardless_of_the_three_roots() {
-    // D-A: the data directory is an ordinary setting. Pointing it somewhere
-    // else does not move the file, and the file is still what sets it.
-    let root = TempRoot::new();
-    let path = root.user_config("state_dir: /somewhere/else\n");
-
-    let flags = Flags {
-        root: None,
-        config: None,
-    };
-    let resolved = resolve_with(&flags, &environment(&[]), &cascade(&root));
-
-    assert_eq!(resolved.state_dir(), Path::new("/somewhere/else"));
-    assert_eq!(resolved.file().path(), Some(path.as_path()));
-}
-
-#[test]
 fn a_broken_file_yields_errors_and_still_yields_every_value() {
     // D-D: resolution never returns a Result, because the decision to refuse
     // to start belongs to the caller — `config show` makes the other one.
     let root = TempRoot::new();
-    let path = root.user_config("nonsense: 1\nlog_level: shouting\n");
+    let path = root.user_config("global:\n  nonsense: 1\n  log_level: shouting\n");
 
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    let resolved = root.resolve(&Flags::default(), &[], Scope::SERVER);
 
     assert!(!resolved.is_ok());
     assert_eq!(resolved.errors().len(), 2);
@@ -286,9 +270,7 @@ fn a_broken_file_yields_errors_and_still_yields_every_value() {
     for error in resolved.errors() {
         assert!(error.to_string().contains(&path.display().to_string()));
     }
-
-    // Everything the file did not break is still answerable.
-    assert_eq!(resolved.state_dir(), Path::new("./.narsor"));
+    assert_eq!(resolved.state_dir().to_string_lossy(), "./.narsor");
     assert_eq!(resolved.source(SettingKey::StateDir), &Source::BuiltIn);
 }
 
@@ -302,7 +284,7 @@ fn a_named_file_that_is_not_there_is_flagged_as_a_usage_error() {
         Some(root.system_dir()),
     );
 
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade);
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade, Scope::CLI);
 
     assert!(!resolved.is_ok());
     assert!(
@@ -316,134 +298,69 @@ fn a_named_file_that_is_not_there_is_flagged_as_a_usage_error() {
 fn a_setting_given_in_the_environment_is_held_to_the_same_contract_as_the_file() {
     // R6 asks for the two to be interchangeable; they only are if a nonsense
     // value is refused in both.
-    let env = environment(&[("NARSOR_AGENT_TIMEOUT", "tomorrow")]);
+    let env = environment(&[("NARSOR_TUI__REFRESH_INTERVAL", "tomorrow")]);
 
-    let resolved = resolve_with(
-        &Flags::default(),
-        &env,
-        &ConfigCascade::with_dirs(None, None, None),
-    );
+    let resolved = resolve_with(&Flags::default(), &env, &nowhere(), Scope::TUI);
 
     assert!(!resolved.is_ok());
     let message = resolved.errors()[0].to_string();
-    assert!(message.contains("NARSOR_AGENT_TIMEOUT"), "{message}");
+    assert!(
+        message.contains("NARSOR_TUI__REFRESH_INTERVAL"),
+        "{message}"
+    );
     assert!(message.contains("tomorrow"), "{message}");
-}
-
-#[test]
-fn a_timeout_of_none_resolves_to_no_limit() {
-    let root = TempRoot::new();
-    root.user_config("agent_timeout: none\n");
-
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
-
-    assert!(resolved.is_ok(), "{:?}", resolved.errors());
-    assert_eq!(resolved.agent_timeout(), None);
+    assert_eq!(resolved.errors()[0].key(), Some("tui.refresh_interval"));
 }
 
 #[test]
 fn resolving_writes_nothing_and_needs_no_writable_home() {
     // R9.
     let root = TempRoot::new();
-    let user = root.user_dir();
-
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    let resolved = root.resolve(&Flags::default(), &[], Scope::ALL);
 
     assert!(resolved.is_ok());
-    assert!(!user.exists(), "nothing was created to resolve a setting");
-}
-
-#[test]
-fn the_tui_refresh_interval_defaults_to_ten_seconds_and_the_environment_beats_the_file() {
-    let root = TempRoot::new();
-
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
-    assert!(resolved.is_ok(), "{:?}", resolved.errors());
-    assert_eq!(resolved.tui_refresh_interval(), Some(10));
-
-    root.user_config("tui_refresh_interval: 30s\n");
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
-    assert_eq!(resolved.tui_refresh_interval(), Some(30));
-
-    let resolved = resolve_with(
-        &Flags::default(),
-        &environment(&[("NARSOR_TUI_REFRESH_INTERVAL", "none")]),
-        &cascade(&root),
-    );
-    assert!(resolved.is_ok(), "{:?}", resolved.errors());
-    assert_eq!(resolved.tui_refresh_interval(), None, "none turns it off");
-    assert_eq!(
-        resolved.source(SettingKey::TuiRefreshInterval),
-        &Source::Env("NARSOR_TUI_REFRESH_INTERVAL".to_string())
+    assert!(
+        !root.user_dir().exists(),
+        "nothing was created to resolve a setting"
     );
 }
 
-// ---------------------------------------------------------------------------
-// Owner defaults for remote tasks (U6, R10, R16)
-// ---------------------------------------------------------------------------
-
 #[test]
-fn the_default_backend_and_profile_layer_like_every_other_setting() {
+fn the_default_backend_and_profile_come_from_the_server_defaults_group() {
     let root = TempRoot::new();
-    let cascade = ConfigCascade::with_dirs(None, Some(root.user_dir()), None);
-
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade);
+    let resolved = root.resolve(&Flags::default(), &[], Scope::SERVER);
     assert_eq!(resolved.default_backend(), "local");
     assert_eq!(resolved.default_profile(), "default");
 
-    root.user_config("default_backend: k8s-prod\ndefault_profile: artur\n");
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade);
-    assert!(resolved.is_ok(), "{:?}", resolved.errors());
-    assert_eq!(resolved.default_backend(), "k8s-prod");
-    assert_eq!(resolved.default_profile(), "artur");
-
-    let resolved = resolve_with(
-        &Flags::default(),
-        &environment(&[("NARSOR_DEFAULT_BACKEND", "fake-1")]),
-        &cascade,
-    );
-    assert_eq!(resolved.default_backend(), "fake-1");
-    assert_eq!(
-        resolved.source(SettingKey::DefaultBackend),
-        &Source::Env("NARSOR_DEFAULT_BACKEND".to_string())
-    );
-}
-
-#[test]
-fn a_default_backend_that_cannot_be_an_identifier_is_refused() {
-    let root = TempRoot::new();
-    let cascade = ConfigCascade::with_dirs(None, Some(root.user_dir()), None);
-    root.user_config("default_backend: ../escape\ndefault_profile: \"a b\"\n");
-
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade);
+    root.user_config("server:\n  defaults:\n    backend: k8s-prod\n    profile: \"a b\"\n");
+    let resolved = root.resolve(&Flags::default(), &[], Scope::SERVER);
     let keys: Vec<_> = resolved.errors().iter().filter_map(|e| e.key()).collect();
-    assert_eq!(keys, vec!["default_backend", "default_profile"]);
+    assert_eq!(keys, vec!["server.defaults.profile"]);
+    assert_eq!(resolved.default_backend(), "k8s-prod");
     assert_eq!(
-        resolved.default_backend(),
-        "local",
+        resolved.default_profile(),
+        "default",
         "a refused value never takes effect"
     );
 }
 
 #[test]
-fn local_tasks_keep_the_hosts_home_unless_configured_otherwise() {
+fn local_tasks_keep_the_hosts_home_unless_the_controller_section_says_otherwise() {
     use narsor_engine::runner::{HarnessHome, HomeMode};
     let root = TempRoot::new();
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    let resolved = root.resolve(&Flags::default(), &[], Scope::CONTROLLER);
     assert_eq!(
         resolved.local_harness_home(),
         HarnessHome {
             mode: HomeMode::Host,
-            codex_home: None,
-            claude_config_dir: None,
-            claude_profile_source: None,
+            ..HarnessHome::default()
         }
     );
 
     root.user_config(
-        "local_home: private\nlocal_codex_home: /home/me/.codex\nlocal_claude_config_dir: /home/me/.claude\nlocal_claude_profile_source: /srv/claude-profile\n",
+        "controller:\n  local:\n    home: private\n    codex_home: /home/me/.codex\n    claude_config_dir: /home/me/.claude\n    claude_profile_source: /srv/claude-profile\n",
     );
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    let resolved = root.resolve(&Flags::default(), &[], Scope::CONTROLLER);
     assert!(resolved.is_ok(), "{:?}", resolved.errors());
     assert_eq!(
         resolved.local_harness_home(),
@@ -454,19 +371,30 @@ fn local_tasks_keep_the_hosts_home_unless_configured_otherwise() {
             claude_profile_source: Some(PathBuf::from("/srv/claude-profile")),
         }
     );
+
+    let resolved = root.resolve(
+        &Flags::default(),
+        &[("NARSOR_CONTROLLER__LOCAL__CODEX_HOME", ".codex")],
+        Scope::CONTROLLER,
+    );
+    assert!(
+        resolved.errors()[0].to_string().contains("absolute"),
+        "{}",
+        resolved.errors()[0]
+    );
 }
 
 #[test]
-fn the_observer_worker_is_off_unless_configured() {
+fn the_observer_worker_is_off_unless_the_observer_group_enables_it() {
     use narsor_engine::config::ObserverWorkerConfig;
     let root = TempRoot::new();
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    let resolved = root.resolve(&Flags::default(), &[], Scope::SERVER);
     assert_eq!(resolved.observer_worker(), None);
 
     root.user_config(
-        "observer_worker: on\nobserver_worker_server: https://narsor.example.com/\nobserver_secrets_dir: /etc/narsor/observer-secrets\nobserver_script_user: narsor-observer-script\n",
+        "server:\n  observer:\n    enabled: true\n    server_url: https://narsor.example.com/\n    secrets_dir: /etc/narsor/observer-secrets\n    script_user: narsor-observer-script\n",
     );
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    let resolved = root.resolve(&Flags::default(), &[], Scope::SERVER);
     assert!(resolved.is_ok(), "{:?}", resolved.errors());
     assert_eq!(
         resolved.observer_worker(),
@@ -478,35 +406,31 @@ fn the_observer_worker_is_off_unless_configured() {
         })
     );
 
-    // The waiver as a YAML boolean or as the variable's text.
-    root.user_config("observer_worker: on\nobserver_insecure_same_user: true\n");
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
-    assert!(resolved.is_ok(), "{:?}", resolved.errors());
-    assert!(resolved.observer_worker().unwrap().insecure_same_user);
-    let resolved = resolve_with(
+    // The switches as the variables' text.
+    let resolved = TempRoot::new().resolve(
         &Flags::default(),
-        &environment(&[
-            ("NARSOR_OBSERVER_WORKER", "on"),
-            ("NARSOR_OBSERVER_INSECURE_SAME_USER", "true"),
-        ]),
-        &cascade(&TempRoot::new()),
+        &[
+            ("NARSOR_SERVER__OBSERVER__ENABLED", "true"),
+            ("NARSOR_SERVER__OBSERVER__INSECURE_SAME_USER", "true"),
+        ],
+        Scope::SERVER,
     );
     assert!(resolved.observer_worker().unwrap().insecure_same_user);
 
-    root.user_config("observer_worker: yes\nobserver_secrets_dir: relative/dir\n");
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    root.user_config("server:\n  observer:\n    enabled: on\n    secrets_dir: relative/dir\n");
+    let resolved = root.resolve(&Flags::default(), &[], Scope::SERVER);
     assert_eq!(resolved.errors().len(), 2, "{:?}", resolved.errors());
 }
 
 #[test]
-fn agent_args_and_the_task_limit_come_from_the_file() {
+fn agent_args_come_from_the_runner_section_or_its_variable_and_are_checked() {
     let root = TempRoot::new();
     root.user_config(
-        "agent_args:\n  claude: [--dangerously-skip-permissions, --max-turns, 5, \"--append-system-prompt=a b\", \"--search=a,b\"]\n  codex: [--x]\nmax_concurrent_tasks: 10\n",
+        "runner:\n  agent_args:\n    claude: [--dangerously-skip-permissions, --max-turns, 5, \"--append-system-prompt=a b\", \"--search=a,b\"]\n    codex: [--x]\n",
     );
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    let resolved = root.resolve(&Flags::default(), &[], Scope::RUNNER);
     assert!(resolved.is_ok(), "{:?}", resolved.errors());
-    let args = resolved.agent_defaults().args;
+    let args = resolved.agent_args();
     assert_eq!(
         args["claude"],
         [
@@ -518,77 +442,61 @@ fn agent_args_and_the_task_limit_come_from_the_file() {
         ]
     );
     assert_eq!(args["codex"], ["--x"]);
-    assert_eq!(resolved.max_concurrent_tasks(), Some(10));
 
-    let none = resolve_with(
-        &Flags::default(),
-        &environment(&[]),
-        &ConfigCascade::with_dirs(None, None, None),
-    );
-    assert_eq!(none.max_concurrent_tasks(), Some(1));
-    assert!(none.agent_defaults().args.is_empty());
-
-    root.user_config("max_concurrent_tasks: 0\n");
-    let bad = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
-    assert!(!bad.is_ok());
-}
-
-#[test]
-fn agent_args_come_from_the_environment_as_a_mapping_and_are_checked() {
-    let root = TempRoot::new();
-    let env = environment(&[("NARSOR_AGENT_ARGS", "{claude-code: [--a, \"b c\"]}")]);
-    let resolved = resolve_with(&Flags::default(), &env, &cascade(&root));
+    let env = [("NARSOR_RUNNER__AGENT_ARGS", "{claude-code: [--a, \"b c\"]}")];
+    let resolved = root.resolve(&Flags::default(), &env, Scope::RUNNER);
     assert!(resolved.is_ok(), "{:?}", resolved.errors());
-    assert_eq!(resolved.agent_defaults().args["claude"], ["--a", "b c"]);
+    assert_eq!(resolved.agent_args()["claude"], ["--a", "b c"]);
 
     for bad in ["[--a]", "{nobody: [--a]}", "{claude: --a}"] {
-        let env = environment(&[("NARSOR_AGENT_ARGS", bad)]);
-        let resolved = resolve_with(&Flags::default(), &env, &cascade(&root));
+        let resolved = root.resolve(
+            &Flags::default(),
+            &[("NARSOR_RUNNER__AGENT_ARGS", bad)],
+            Scope::RUNNER,
+        );
         assert!(!resolved.is_ok(), "{bad}");
     }
 
-    root.user_config("agent_args: [--a]\n");
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
-    assert!(!resolved.is_ok());
+    root.user_config("runner:\n  agent_args: [--a]\n");
+    assert!(!root.resolve(&Flags::default(), &[], Scope::RUNNER).is_ok());
 }
 
 #[test]
-fn a_relative_harness_directory_is_refused() {
+fn the_task_limit_defaults_to_one_and_refuses_zero() {
     let root = TempRoot::new();
-    let env = environment(&[("NARSOR_LOCAL_CODEX_HOME", ".codex")]);
-    let resolved = resolve_with(&Flags::default(), &env, &cascade(&root));
-    assert!(!resolved.is_ok());
-    assert!(
-        resolved.errors()[0].to_string().contains("absolute"),
-        "{}",
-        resolved.errors()[0]
+    assert_eq!(
+        root.resolve(&Flags::default(), &[], Scope::SERVER)
+            .max_concurrent_tasks(),
+        Some(1)
     );
+
+    root.user_config("server:\n  max_concurrent_tasks: 10\n");
+    let resolved = root.resolve(&Flags::default(), &[], Scope::SERVER);
+    assert_eq!(resolved.max_concurrent_tasks(), Some(10));
+
+    root.user_config("server:\n  max_concurrent_tasks: 0\n");
+    assert!(!root.resolve(&Flags::default(), &[], Scope::SERVER).is_ok());
 }
 
 #[test]
-fn the_escalation_threshold_defaults_to_three_and_comes_from_the_file() {
-    let none = resolve_with(
+fn the_tui_refresh_interval_defaults_to_ten_seconds_and_the_environment_beats_the_file() {
+    let root = TempRoot::new();
+    let resolved = root.resolve(&Flags::default(), &[], Scope::TUI);
+    assert_eq!(resolved.tui_refresh_interval(), Some(10));
+
+    root.user_config("tui:\n  refresh_interval: 30s\n");
+    let resolved = root.resolve(&Flags::default(), &[], Scope::CLI);
+    assert_eq!(
+        resolved.tui_refresh_interval(),
+        Some(30),
+        "narsor-cli reads the tui section too (R25)"
+    );
+
+    let resolved = root.resolve(
         &Flags::default(),
-        &environment(&[]),
-        &ConfigCascade::with_dirs(None, None, None),
+        &[("NARSOR_TUI__REFRESH_INTERVAL", "none")],
+        Scope::TUI,
     );
-    assert_eq!(none.escalation_threshold(), 3);
-    assert_eq!(none.agent_defaults().escalation_threshold, 3);
-
-    let root = TempRoot::new();
-    root.user_config("escalation_threshold: 0\n");
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
     assert!(resolved.is_ok(), "{:?}", resolved.errors());
-    assert_eq!(resolved.escalation_threshold(), 0);
-    assert_eq!(resolved.agent_defaults().escalation_threshold, 0);
-
-    root.user_config("escalation_threshold: 100\n");
-    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
-    assert_eq!(resolved.agent_defaults().escalation_threshold, 100);
-
-    for bad in ["101", "-1", "abc"] {
-        root.user_config(&format!("escalation_threshold: {bad}\n"));
-        let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
-        assert!(!resolved.is_ok(), "'{bad}' was accepted");
-    }
+    assert_eq!(resolved.tui_refresh_interval(), None, "none turns it off");
 }

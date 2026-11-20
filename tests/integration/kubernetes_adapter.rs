@@ -393,12 +393,12 @@ fn the_pod_has_one_runner_one_init_container_and_separate_volumes() {
         .as_str()
         .unwrap()
         .starts_with("/opt/narsor/bin:"));
-    assert_eq!(env[1]["name"], "NARSOR_AGENT_ARGS");
+    assert_eq!(env[1]["name"], "NARSOR_RUNNER__AGENT_ARGS");
     assert_eq!(
         env[1]["valueFrom"]["configMapKeyRef"],
         serde_json::json!({
             "name": "narsor-controller-config",
-            "key": "NARSOR_AGENT_ARGS",
+            "key": "NARSOR_RUNNER__AGENT_ARGS",
             "optional": true,
         })
     );

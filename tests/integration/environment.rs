@@ -1569,7 +1569,7 @@ fn a_network_resolver_has_no_built_in_local_backend() {
     assert_eq!(error.code(), "unknown_backend");
     let message = error.to_string();
     assert!(message.contains("network server"), "{message}");
-    assert!(!message.contains("default_backend"), "{message}");
+    assert!(!message.contains("server.defaults.backend"), "{message}");
 }
 
 #[test]
@@ -1590,7 +1590,10 @@ fn a_network_resolver_defaulting_to_local_names_the_setting() {
     )
     .without_builtin_local();
     let error = network.resolve(&intent("bare")).expect_err("refused");
-    assert!(error.to_string().contains("default_backend"), "{error}");
+    assert!(
+        error.to_string().contains("server.defaults.backend"),
+        "{error}"
+    );
 }
 
 #[test]

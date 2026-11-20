@@ -1,7 +1,7 @@
 //! Asking running tasks to stop when the limit of concurrent tasks is
 //! exceeded.
 //!
-//! The limit is the daemon's `max_concurrent_tasks` setting, shared by all
+//! The limit is the daemon's `server.max_concurrent_tasks` setting, shared by all
 //! backends. It can only be exceeded when the setting was lowered and the
 //! daemon restarted over tasks already holding slots, or when a backend that
 //! was unusable comes back. A backend the configuration cannot supply — it

@@ -2,7 +2,7 @@
 //!
 //! Two triggers, independent of each other:
 //!
-//! * **the periodic read** — every `tui_refresh_interval`, whatever the live
+//! * **the periodic read** — every `tui.refresh_interval`, whatever the live
 //!   stream is doing. It is what covers a `Lagged` or disconnected stream and
 //!   everything the stream does not carry at all;
 //! * **a relevant live event** — a status change, an input requested or

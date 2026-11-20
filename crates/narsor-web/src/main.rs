@@ -1,7 +1,7 @@
 //! `narsor-web`: the HTTP server of the browser interface.
 //!
 //! It serves the files of the interface and passes the owner API on to a
-//! `narsor-server`: the local daemon (`web_upstream: local`, discovered or
+//! `narsor-server`: the local daemon (`web.upstream: local`, discovered or
 //! launched like the CLI and the TUI do) or a server at a URL. The settings
 //! and their rules are in [`narsor_web::settings`], the proxy and its guards
 //! in [`narsor_web::gateway`].
@@ -14,10 +14,10 @@ use std::sync::Arc;
 use clap::Parser;
 use narsor_api_client::api::token::TokenSource;
 use narsor_api_client::api::{ensure_daemon_running, ApiClient, DiscoveryError};
-use narsor_shared::config::{self, Flags};
+use narsor_shared::config::{self, CheckReport, Flags};
 use narsor_web::gateway::{Gateway, Reconnect, Upstream};
 use narsor_web::launch;
-use narsor_web::settings::{TokenMode, Upstream as UpstreamSetting, WebSettings};
+use narsor_web::settings::{configure, TokenMode, Upstream as UpstreamSetting, WebSettings};
 use tokio::net::TcpListener;
 
 /// The file in the state directory that holds the session token.
@@ -42,6 +42,10 @@ struct Cli {
     /// A command that prints the server's token (for a URL upstream).
     #[arg(long, env = "NARSOR_TOKEN_COMMAND", value_name = "COMMAND")]
     token_command: Option<String>,
+    /// Checks the configuration, prints the report as JSON and exits 0 (no
+    /// problem) or 1, without starting anything (`narsor-cli config show`).
+    #[arg(long, hide = true)]
+    check_config: bool,
 }
 
 #[tokio::main]
@@ -65,15 +69,23 @@ async fn run(cli: Cli) -> Result<(), String> {
         root: cli.root.clone(),
         config: cli.config.clone(),
     };
-    let resolved = config::resolve(&flags, &config::resolve::environment_from_process());
-    if !resolved.is_ok() {
-        let faults: Vec<String> = resolved.errors().iter().map(ToString::to_string).collect();
-        return Err(format!(
-            "the configuration does not hold up:\n  {}",
-            faults.join("\n  ")
-        ));
+    let environment = config::resolve::environment_from_process();
+    let resolved = config::resolve(&flags, &environment, config::Scope::WEB);
+    if cli.check_config {
+        let problems = configure(&resolved).err().unwrap_or_default();
+        CheckReport::build("narsor-web", &resolved, &problems).print_and_exit();
     }
-    let settings = WebSettings::from_config(&resolved).map_err(|problems| problems.join("\n  "))?;
+    // R26: an un-migrated configuration runs on built-in values; say so.
+    if let Some(warning) = config::legacy::warning(&resolved, &environment) {
+        tracing::warn!("{warning}");
+    }
+    let settings = configure(&resolved).map_err(|problems| {
+        let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
+        format!(
+            "the configuration does not hold up:\n  {}",
+            problems.join("\n  ")
+        )
+    })?;
     let state = resolved.state_dir().to_path_buf();
 
     let upstream = upstream(&settings, &cli, &state, &flags).await?;
@@ -157,7 +169,7 @@ async fn upstream(
             if settings.token == TokenMode::Server && token_source(cli).is_none() {
                 return Err(format!(
                     "no token for {url}: set NARSOR_TOKEN, NARSOR_TOKEN_FILE (--token-file) or \
-                     NARSOR_TOKEN_COMMAND (--token-command), or set web_token: passthrough so the \
+                     NARSOR_TOKEN_COMMAND (--token-command), or set web.token: passthrough so the \
                      browser presents its own token"
                 ));
             }
@@ -173,8 +185,8 @@ async fn local_daemon(state: PathBuf, flags: Flags) -> Result<ApiClient, String>
         .await
         .map_err(|error| match error {
             DiscoveryError::NetworkMode => format!(
-                "{error}: set web_upstream to the server's URL and give narsor-web a token, or \
-                 set web_token: passthrough"
+                "{error}: set web.upstream to the server's URL and give narsor-web a token, or \
+                 set web.token: passthrough"
             ),
             other => format!("could not reach the narsor daemon: {other}"),
         })

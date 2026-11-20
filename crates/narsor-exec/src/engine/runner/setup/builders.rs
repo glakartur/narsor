@@ -71,15 +71,6 @@ impl Engine {
         self
     }
 
-    /// Returns the engine with the configured defaults for `agent` actions:
-    /// a fixed default harness and the time limit.
-    pub fn with_agent_defaults(self, defaults: AgentDefaults) -> Self {
-        self.with_agent_timeout(defaults.timeout_secs)
-            .with_agent_args(defaults.args)
-            .with_escalation_threshold(defaults.escalation_threshold)
-            .with_default_harness_source(Arc::new(defaults.harness))
-    }
-
     /// Returns the engine raising a step's model or effort after `threshold`
     /// consecutive failed attempts; `0` turns escalation off.
     pub fn with_escalation_threshold(mut self, threshold: u32) -> Self {

@@ -1,7 +1,7 @@
 //! Durable, live selection of the daemon's default agent harness.
 //!
 //! The configured value remains the fallback.  This module stores only an
-//! optional operator override in a small versioned envelope under `state_dir`.
+//! optional operator override in a small versioned envelope under `server.state`.
 //! A mutation holds one async mutex across validation, the blocking atomic
 //! write, and snapshot publication, so callers can never observe a value that
 //! was acknowledged but did not reach disk.

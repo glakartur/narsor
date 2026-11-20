@@ -11,8 +11,8 @@
 //!
 //! | What | Where |
 //! | --- | --- |
-//! | owner default backend (R10) | `PUT /control/v1/default-backend`, else setting `default_backend` |
-//! | owner default profile (R16) | setting `default_profile` |
+//! | owner default backend (R10) | `PUT /control/v1/default-backend`, else setting `server.defaults.backend` |
+//! | owner default profile (R16) | setting `server.defaults.profile` |
 //! | backends (R3) | `{catalog}/backends/{id}.yaml` — [`BackendRecord`] |
 //! | profiles (R16) | `{catalog}/profiles/{id}.yaml` — [`ProfileRecord`] |
 //! | runtime bundle, tools (R20) | `{catalog}/runtime.yaml` — [`RuntimeCatalog`] |

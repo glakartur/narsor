@@ -3,7 +3,7 @@
 //! A network installation belongs to exactly one OIDC identity, bound in one
 //! of two ways:
 //!
-//! * **by deployment configuration** — `owner_subject` names the subject of
+//! * **by deployment configuration** — `server.owner_subject` names the subject of
 //!   the configured issuer; the binding is (re)written at every start, so the
 //!   configuration stays the authority;
 //! * **by a one-time claim** — with no owner configured or recorded, the
@@ -143,8 +143,8 @@ pub enum OwnerStoreError {
     /// The recorded owner belongs to another issuer than the configured one,
     /// so nobody could ever act as the owner.
     #[error(
-        "the installation is owned by an identity of issuer '{recorded}', but oidc_issuer is \
-         '{configured}'; set owner_subject to rebind the owner to the new issuer"
+        "the installation is owned by an identity of issuer '{recorded}', but server.oidc.issuer \
+         is '{configured}'; set server.owner_subject to rebind the owner to the new issuer"
     )]
     IssuerMismatch {
         /// The recorded owner's issuer.
@@ -286,7 +286,7 @@ impl OwnerStore {
     /// Binds `identity` as the owner, replacing any previous one (R33).
     ///
     /// The previous owner is refused from the next request on. The only
-    /// caller in this version is startup with `owner_subject`; a future
+    /// caller in this version is startup with `server.owner_subject`; a future
     /// transfer flow is meant to go through here too.
     pub fn rebind(
         &self,

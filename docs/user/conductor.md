@@ -6,7 +6,7 @@ The conductor is the per-execution assistant that talks to the running workflow 
 
 The daemon runs a **conductor** beside every execution: an assistant on the
 installation's default harness (the operator's choice — `h` in the interface,
-`narsor-cli harness default set` — or else the one `agent_harness` names) that
+`narsor-cli harness default set` — or else the one `server.agent_harness` names) that
 reads the task and never writes it. There is no per-task choice: a changed
 default reaches the conductor of every task, running ones included, from its
 next invocation; the *Dyrygent* tab names the harness it runs on. It has one history per

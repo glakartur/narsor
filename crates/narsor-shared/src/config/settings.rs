@@ -24,8 +24,10 @@ use narsor_protocol::harness::{CLAUDE_CODE, HARNESSES};
 /// Extra harness arguments by harness name; each value is a sequence of argv tokens.
 pub type AgentArgs = std::collections::BTreeMap<String, Vec<String>>;
 
-/// Environment variable runners may receive from a backend's configuration map.
-pub const AGENT_ARGS_ENV: &str = "NARSOR_AGENT_ARGS";
+/// Environment variable runners may receive from a backend's configuration
+/// map: the derived name of `runner.agent_args` (see
+/// [`SettingKey::env_var`]; a unit test keeps the two equal).
+pub const AGENT_ARGS_ENV: &str = "NARSOR_RUNNER__AGENT_ARGS";
 
 /// Canonical configuration key for a known harness name or id.
 pub fn agent_args_key(harness: &str) -> Option<&'static str> {
@@ -70,18 +72,12 @@ pub const MODEL_TIERS: [&str; 4] = ["small", "medium", "large", "max"];
 /// Efforts from the cheapest to the strongest.
 pub const EFFORT_SCALE: [&str; 4] = ["low", "medium", "high", "max"];
 
-/// Failed attempts after which a step is raised, unless configured.
-pub const DEFAULT_ESCALATION_THRESHOLD: u32 = 3;
-
-/// The largest `escalation_threshold` the configuration accepts.
-pub const MAX_ESCALATION_THRESHOLD: u32 = 100;
-
 pub const LOG_OFF: &str = "off";
 
 /// The variable that carries a full `tracing` filter directive.
 ///
 /// It belongs to the registry rather than to the resolver because this module
-/// is where the names of the variables live. It beats `NARSOR_LOG_LEVEL`
+/// is where the names of the variables live. It beats `NARSOR_GLOBAL__LOG_LEVEL`
 /// because it is the more precise instrument: it takes per-target directives
 /// such as `narsor::engine=debug`, where the setting takes a bare level. There
 /// is no sense in the sharper tool losing (D-K).
@@ -112,12 +108,9 @@ pub const DEFAULT_LOCAL_HOME: &str = "host";
 /// The local HOME modes, as `narsor-runner --home` spells them.
 pub const LOCAL_HOME_MODES: [&str; 2] = ["host", "private"];
 
-/// The observer worker is not started: the default, so an installation
-/// runs no observer script until its operator decides to.
-pub const OBSERVER_WORKER_OFF: &str = "off";
-
-/// The server starts and supervises the observer worker.
-pub const OBSERVER_WORKER_ON: &str = "on";
+/// The built-in `global.root` (R23): the directory every unconfigured run
+/// has always used.
+pub const DEFAULT_ROOT: &str = "./.narsor";
 
 /// The server's security mode when nothing says otherwise (R36): the local
 /// daemon's loopback-only random-token mode, which is what every
@@ -136,7 +129,7 @@ pub const DEFAULT_SERVER_BIND: &str = "127.0.0.1:0";
 /// machine.
 pub const TLS_TERMINATION_NONE: &str = "none";
 
-/// TLS is terminated by a reverse proxy at one of `trusted_proxies`; the
+/// TLS is terminated by a reverse proxy at one of `server.tls.trusted_proxies`; the
 /// server accepts only connections from those addresses that say the client
 /// spoke HTTPS.
 pub const TLS_TERMINATION_PROXY: &str = "proxy";
@@ -145,7 +138,7 @@ pub const TLS_TERMINATION_PROXY: &str = "proxy";
 /// port, so the address of the browser interface can be bookmarked.
 pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:8484";
 
-/// `web_upstream` naming the local daemon of the state directory, which
+/// `web.upstream` naming the local daemon of the state directory, which
 /// `narsor-web` discovers or launches like the CLI and the TUI do.
 pub const WEB_UPSTREAM_LOCAL: &str = "local";
 
@@ -157,8 +150,84 @@ pub const WEB_TOKEN_SERVER: &str = "server";
 pub const WEB_TOKEN_PASSTHROUGH: &str = "passthrough";
 
 // ---------------------------------------------------------------------------
+// Sections
+// ---------------------------------------------------------------------------
+
+/// A top-level root of the configuration tree: `global` or the service that
+/// owns the settings below it.
+///
+/// A setting belongs to exactly one section, the first segment of its path.
+/// A binary reads `global` plus its own sections (see [`super::scope`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Section {
+    /// Settings every binary reads.
+    Global,
+    /// `narsor-server`.
+    Server,
+    /// `narsor-controller local`.
+    Controller,
+    /// `narsor-runner`.
+    Runner,
+    /// The terminal interface (`narsor`, and `narsor-cli tui`).
+    Tui,
+    /// `narsor-web`.
+    Web,
+    /// `narsor-cli`; it has no setting of its own yet.
+    Cli,
+}
+
+impl Section {
+    /// Every section, in the order `config show` prints them.
+    pub const ALL: [Section; 7] = [
+        Section::Global,
+        Section::Server,
+        Section::Controller,
+        Section::Runner,
+        Section::Tui,
+        Section::Web,
+        Section::Cli,
+    ];
+
+    /// The root key as it is written in the file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Section::Global => "global",
+            Section::Server => "server",
+            Section::Controller => "controller",
+            Section::Runner => "runner",
+            Section::Tui => "tui",
+            Section::Web => "web",
+            Section::Cli => "cli",
+        }
+    }
+
+    /// The prefix of the environment variables of this section's settings
+    /// (`NARSOR_SERVER__`).
+    pub fn env_prefix(self) -> String {
+        format!("{ENV_PREFIX}{}__", self.name().to_uppercase())
+    }
+
+    /// The section written under this root key, if there is one.
+    pub fn from_name(name: &str) -> Option<Section> {
+        Section::ALL
+            .into_iter()
+            .find(|section| section.name() == name)
+    }
+}
+
+impl fmt::Display for Section {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The registry
 // ---------------------------------------------------------------------------
+
+/// Keys of the flat layout that were removed rather than moved (R22): no
+/// setting replaces them.
+pub const REMOVED_FLAT_KEYS: [&str; 2] = ["agent_timeout", "escalation_threshold"];
 
 /// Every setting this version has.
 ///
@@ -167,43 +236,36 @@ pub const WEB_TOKEN_PASSTHROUGH: &str = "passthrough";
 /// the set grows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SettingKey {
+    /// The base directory of an installation; relative server directories
+    /// are joined to it. `--root` sets it.
+    GlobalRoot,
+    /// The logging level, when `RUST_LOG` does not say otherwise.
+    LogLevel,
     /// Where the workflow definitions and the repository registry are read
-    /// from. Shareable between processes, and mountable read-only.
+    /// from. Shareable between processes, and mountable read-only. Relative
+    /// to `global.root` unless absolute.
     CatalogDir,
     /// Where executions are kept. Separable for mounting, not for sharing.
+    /// Relative to `global.root` unless absolute.
     StateDir,
-    /// Where task workspaces — the git checkouts — are created. Local scratch.
+    /// Where task workspaces — the git checkouts — are created. Local
+    /// scratch. Relative to `global.root` unless absolute.
     WorkDir,
     /// The agent harness used by an `agent` action that names none itself.
     AgentHarness,
-    /// The time limit of an `agent` action that declares none itself.
-    AgentTimeout,
-    /// Extra command-line arguments of the harness runs, listed by harness
-    /// (`claude: [--flag]`). They win over the same arguments Narsor works
-    /// out itself.
-    AgentArgs,
     /// Most tasks processed at once, across all backends; `none` for no limit.
     MaxConcurrentTasks,
-    /// Consecutive failed attempts of an agent step after which its model or
-    /// effort is raised, within the step's ceiling; `0` turns it off.
-    EscalationThreshold,
-    /// The model tier (`small`, `medium`, `large`, `max`) the conductor runs
-    /// on; empty is the harness's own default.
-    ConductorModel,
-    /// The effort (`low`, `medium`, `high`, `max`) the conductor runs with;
-    /// empty is the harness's own default.
-    ConductorEffort,
-    /// The logging level, when `RUST_LOG` does not say otherwise.
-    LogLevel,
-    /// How often the terminal interface re-reads the daemon on its own
-    /// (KTD16), on top of the refreshes the live stream triggers.
-    TuiRefreshInterval,
     /// The execution backend a new remote task is pinned to when its request
     /// names none (R10). Changing it never moves an existing task.
     DefaultBackend,
     /// The user profile a new remote task uses when its request names none
     /// (R16).
     DefaultProfile,
+    /// Host directories a local-backend task may use as its workspace
+    /// (absolute paths). Empty refuses every local workspace: a task is
+    /// copied into its own storage, so which host directories it may read is
+    /// the owner's decision.
+    LocalWorkspaceRoots,
     /// `trusted` (loopback, random token) or `network` (OIDC, one owner).
     ServerMode,
     /// The address the daemon's API listens on.
@@ -222,11 +284,22 @@ pub enum SettingKey {
     /// Browser origins allowed to call the API; empty denies every
     /// cross-origin request.
     CorsAllowedOrigins,
-    /// Host directories a local-backend task may use as its workspace
-    /// (absolute paths). Empty refuses every local workspace: a task is
-    /// copied into its own storage, so which host directories it may read is
-    /// the owner's decision.
-    LocalWorkspaceRoots,
+    /// Whether the server starts the observer worker and supervises it, with
+    /// a key it makes at each start (D5).
+    ObserverEnabled,
+    /// The API's URL the observer worker and its scripts use; empty is the
+    /// server's own listening address, which network mode cannot use (its
+    /// requests must come through the TLS proxy).
+    ObserverServerUrl,
+    /// The observer worker's secrets directory: one file per secret name,
+    /// flat; an automation's script gets only the secrets the automation
+    /// declares. Empty: no secrets.
+    ObserverSecretsDir,
+    /// The system user observer scripts run as; must not be the server's.
+    ObserverScriptUser,
+    /// `true` runs observer scripts as the server's own user, without
+    /// isolation: for a trial only.
+    ObserverInsecureSameUser,
     /// Where HOME points for a local task's tools: `host` (the daemon's own,
     /// harness logins included) or `private` (on the task storage). Read on
     /// every runner start.
@@ -241,22 +314,19 @@ pub enum SettingKey {
     /// directory up to date with before every start; empty, or the
     /// configuration directory itself, copies nothing.
     LocalClaudeProfileSource,
-    /// Whether the server starts the observer worker (`off` or `on`) and
-    /// supervises it, with a key it makes at each start (D5).
-    ObserverWorker,
-    /// The API's URL the observer worker and its scripts use; empty is the
-    /// server's own listening address, which network mode cannot use (its
-    /// requests must come through the TLS proxy).
-    ObserverWorkerServer,
-    /// The observer worker's secrets directory: one file per secret name,
-    /// flat; an automation's script gets only the secrets the automation
-    /// declares. Empty: no secrets.
-    ObserverSecretsDir,
-    /// The system user observer scripts run as; must not be the server's.
-    ObserverScriptUser,
-    /// `true` runs observer scripts as the server's own user, without
-    /// isolation: for a trial only.
-    ObserverInsecureSameUser,
+    /// Extra command-line arguments of the harness runs, listed by harness
+    /// (`claude: [--flag]`). They win over the same arguments Narsor works
+    /// out itself.
+    AgentArgs,
+    /// The model tier (`small`, `medium`, `large`, `max`) the conductor runs
+    /// on; empty is the harness's own default.
+    ConductorModel,
+    /// The effort (`low`, `medium`, `high`, `max`) the conductor runs with;
+    /// empty is the harness's own default.
+    ConductorEffort,
+    /// How often the terminal interface re-reads the daemon on its own
+    /// (KTD16), on top of the refreshes the live stream triggers.
+    TuiRefreshInterval,
     /// The address `narsor-web` (the browser interface) listens on.
     WebBind,
     /// The server `narsor-web` passes the API to: `local` (the local daemon)
@@ -268,22 +338,19 @@ pub enum SettingKey {
 }
 
 impl SettingKey {
-    /// Every setting, in the order `config show` prints them.
-    pub const ALL: [SettingKey; 35] = [
+    /// Every setting, in the order `config show` prints them: grouped by
+    /// section, in the order of [`Section::ALL`].
+    pub const ALL: [SettingKey; 34] = [
+        SettingKey::GlobalRoot,
+        SettingKey::LogLevel,
         SettingKey::CatalogDir,
         SettingKey::StateDir,
         SettingKey::WorkDir,
         SettingKey::AgentHarness,
-        SettingKey::AgentTimeout,
-        SettingKey::AgentArgs,
         SettingKey::MaxConcurrentTasks,
-        SettingKey::EscalationThreshold,
-        SettingKey::ConductorModel,
-        SettingKey::ConductorEffort,
-        SettingKey::LogLevel,
-        SettingKey::TuiRefreshInterval,
         SettingKey::DefaultBackend,
         SettingKey::DefaultProfile,
+        SettingKey::LocalWorkspaceRoots,
         SettingKey::ServerMode,
         SettingKey::ServerBind,
         SettingKey::OidcIssuer,
@@ -292,45 +359,93 @@ impl SettingKey {
         SettingKey::TlsTermination,
         SettingKey::TrustedProxies,
         SettingKey::CorsAllowedOrigins,
-        SettingKey::LocalWorkspaceRoots,
+        SettingKey::ObserverEnabled,
+        SettingKey::ObserverServerUrl,
+        SettingKey::ObserverSecretsDir,
+        SettingKey::ObserverScriptUser,
+        SettingKey::ObserverInsecureSameUser,
         SettingKey::LocalHome,
         SettingKey::LocalCodexHome,
         SettingKey::LocalClaudeConfigDir,
         SettingKey::LocalClaudeProfileSource,
-        SettingKey::ObserverWorker,
-        SettingKey::ObserverWorkerServer,
-        SettingKey::ObserverSecretsDir,
-        SettingKey::ObserverScriptUser,
-        SettingKey::ObserverInsecureSameUser,
+        SettingKey::AgentArgs,
+        SettingKey::ConductorModel,
+        SettingKey::ConductorEffort,
+        SettingKey::TuiRefreshInterval,
         SettingKey::WebBind,
         SettingKey::WebUpstream,
         SettingKey::WebToken,
     ];
 
-    /// The three roots, in the order `config show` prints them.
+    /// The three server directories, which are joined to `global.root` when
+    /// they are relative.
     pub const ROOTS: [SettingKey; 3] = [
         SettingKey::CatalogDir,
         SettingKey::StateDir,
         SettingKey::WorkDir,
     ];
 
-    /// The key as it is written in the configuration file.
+    /// The path of the setting in the tree, segments joined by `.`.
+    ///
+    /// The one place a path is spelled: the segments, the section, the
+    /// environment variable and every message derive from it.
     pub fn key(self) -> &'static str {
         match self {
+            SettingKey::GlobalRoot => "global.root",
+            SettingKey::LogLevel => "global.log_level",
+            SettingKey::CatalogDir => "server.catalog",
+            SettingKey::StateDir => "server.state",
+            SettingKey::WorkDir => "server.work",
+            SettingKey::AgentHarness => "server.agent_harness",
+            SettingKey::MaxConcurrentTasks => "server.max_concurrent_tasks",
+            SettingKey::DefaultBackend => "server.defaults.backend",
+            SettingKey::DefaultProfile => "server.defaults.profile",
+            SettingKey::LocalWorkspaceRoots => "server.local_workspace_roots",
+            SettingKey::ServerMode => "server.mode",
+            SettingKey::ServerBind => "server.bind",
+            SettingKey::OidcIssuer => "server.oidc.issuer",
+            SettingKey::OidcAudience => "server.oidc.audience",
+            SettingKey::OwnerSubject => "server.owner_subject",
+            SettingKey::TlsTermination => "server.tls.termination",
+            SettingKey::TrustedProxies => "server.tls.trusted_proxies",
+            SettingKey::CorsAllowedOrigins => "server.cors_allowed_origins",
+            SettingKey::ObserverEnabled => "server.observer.enabled",
+            SettingKey::ObserverServerUrl => "server.observer.server_url",
+            SettingKey::ObserverSecretsDir => "server.observer.secrets_dir",
+            SettingKey::ObserverScriptUser => "server.observer.script_user",
+            SettingKey::ObserverInsecureSameUser => "server.observer.insecure_same_user",
+            SettingKey::LocalHome => "controller.local.home",
+            SettingKey::LocalCodexHome => "controller.local.codex_home",
+            SettingKey::LocalClaudeConfigDir => "controller.local.claude_config_dir",
+            SettingKey::LocalClaudeProfileSource => "controller.local.claude_profile_source",
+            SettingKey::AgentArgs => "runner.agent_args",
+            SettingKey::ConductorModel => "runner.conductor.model",
+            SettingKey::ConductorEffort => "runner.conductor.effort",
+            SettingKey::TuiRefreshInterval => "tui.refresh_interval",
+            SettingKey::WebBind => "web.bind",
+            SettingKey::WebUpstream => "web.upstream",
+            SettingKey::WebToken => "web.token",
+        }
+    }
+
+    /// The key of the flat layout this setting replaces, `None` for a setting
+    /// that had none (`global.root` was only the `--root` flag).
+    ///
+    /// The one list of the old names: the startup warning about an
+    /// un-migrated configuration (R26) and the comments `init` writes (R19)
+    /// both read it, so they cannot disagree.
+    pub fn former_key(self) -> Option<&'static str> {
+        Some(match self {
+            SettingKey::GlobalRoot => return None,
+            SettingKey::LogLevel => "log_level",
             SettingKey::CatalogDir => "catalog_dir",
             SettingKey::StateDir => "state_dir",
             SettingKey::WorkDir => "work_dir",
             SettingKey::AgentHarness => "agent_harness",
-            SettingKey::AgentTimeout => "agent_timeout",
-            SettingKey::AgentArgs => "agent_args",
             SettingKey::MaxConcurrentTasks => "max_concurrent_tasks",
-            SettingKey::EscalationThreshold => "escalation_threshold",
-            SettingKey::ConductorModel => "conductor_model",
-            SettingKey::ConductorEffort => "conductor_effort",
-            SettingKey::LogLevel => "log_level",
-            SettingKey::TuiRefreshInterval => "tui_refresh_interval",
             SettingKey::DefaultBackend => "default_backend",
             SettingKey::DefaultProfile => "default_profile",
+            SettingKey::LocalWorkspaceRoots => "local_workspace_roots",
             SettingKey::ServerMode => "server_mode",
             SettingKey::ServerBind => "server_bind",
             SettingKey::OidcIssuer => "oidc_issuer",
@@ -339,33 +454,61 @@ impl SettingKey {
             SettingKey::TlsTermination => "tls_termination",
             SettingKey::TrustedProxies => "trusted_proxies",
             SettingKey::CorsAllowedOrigins => "cors_allowed_origins",
-            SettingKey::LocalWorkspaceRoots => "local_workspace_roots",
+            SettingKey::ObserverEnabled => "observer_worker",
+            SettingKey::ObserverServerUrl => "observer_worker_server",
+            SettingKey::ObserverSecretsDir => "observer_secrets_dir",
+            SettingKey::ObserverScriptUser => "observer_script_user",
+            SettingKey::ObserverInsecureSameUser => "observer_insecure_same_user",
             SettingKey::LocalHome => "local_home",
             SettingKey::LocalCodexHome => "local_codex_home",
             SettingKey::LocalClaudeConfigDir => "local_claude_config_dir",
             SettingKey::LocalClaudeProfileSource => "local_claude_profile_source",
-            SettingKey::ObserverWorker => "observer_worker",
-            SettingKey::ObserverWorkerServer => "observer_worker_server",
-            SettingKey::ObserverSecretsDir => "observer_secrets_dir",
-            SettingKey::ObserverScriptUser => "observer_script_user",
-            SettingKey::ObserverInsecureSameUser => "observer_insecure_same_user",
+            SettingKey::AgentArgs => "agent_args",
+            SettingKey::ConductorModel => "conductor_model",
+            SettingKey::ConductorEffort => "conductor_effort",
+            SettingKey::TuiRefreshInterval => "tui_refresh_interval",
             SettingKey::WebBind => "web_bind",
             SettingKey::WebUpstream => "web_upstream",
             SettingKey::WebToken => "web_token",
-        }
+        })
     }
 
-    /// The setting written under that key, if there is one.
+    /// The segments of the path, from the section down to the leaf.
+    pub fn segments(self) -> impl Iterator<Item = &'static str> {
+        self.key().split('.')
+    }
+
+    /// The section that owns the setting: the first segment of its path.
+    pub fn section(self) -> Section {
+        let root = self.segments().next().expect("a path has a first segment");
+        Section::from_name(root).expect("every path starts with a section")
+    }
+
+    /// The setting at this dotted path, if there is one.
     pub fn from_key(key: &str) -> Option<SettingKey> {
         SettingKey::ALL.into_iter().find(|entry| entry.key() == key)
     }
 
-    /// The environment variable that carries it.
+    /// Whether this dotted path names a group of settings (a section or a
+    /// mapping inside one) rather than a setting.
+    pub fn is_group(path: &str) -> bool {
+        SettingKey::ALL.iter().any(|entry| {
+            entry
+                .key()
+                .strip_prefix(path)
+                .is_some_and(|rest| rest.starts_with('.'))
+        })
+    }
+
+    /// The environment variable that carries it: [`ENV_PREFIX`] plus the
+    /// upper-cased path segments joined by `__` (`server.oidc.issuer` is
+    /// `NARSOR_SERVER__OIDC__ISSUER`).
     ///
-    /// Derived mechanically from the key so that the mapping is total (R6) and
-    /// so that a new setting cannot arrive without one.
+    /// Derived mechanically from the path so that the mapping is total (R6)
+    /// and so that a new setting cannot arrive without one.
     pub fn env_var(self) -> String {
-        format!("{ENV_PREFIX}{}", self.key().to_uppercase())
+        let segments: Vec<String> = self.segments().map(str::to_uppercase).collect();
+        format!("{ENV_PREFIX}{}", segments.join("__"))
     }
 
     /// Whether the value is masked when printed.
@@ -375,20 +518,16 @@ impl SettingKey {
     /// guessed from the key's name (R11).
     pub fn is_sensitive(self) -> bool {
         match self {
-            SettingKey::CatalogDir
+            SettingKey::GlobalRoot
+            | SettingKey::LogLevel
+            | SettingKey::CatalogDir
             | SettingKey::StateDir
             | SettingKey::WorkDir
             | SettingKey::AgentHarness
-            | SettingKey::AgentTimeout
-            | SettingKey::AgentArgs
             | SettingKey::MaxConcurrentTasks
-            | SettingKey::EscalationThreshold
-            | SettingKey::ConductorModel
-            | SettingKey::ConductorEffort
-            | SettingKey::LogLevel
-            | SettingKey::TuiRefreshInterval
             | SettingKey::DefaultBackend
             | SettingKey::DefaultProfile
+            | SettingKey::LocalWorkspaceRoots
             | SettingKey::ServerMode
             | SettingKey::ServerBind
             | SettingKey::OidcIssuer
@@ -397,16 +536,19 @@ impl SettingKey {
             | SettingKey::TlsTermination
             | SettingKey::TrustedProxies
             | SettingKey::CorsAllowedOrigins
-            | SettingKey::LocalWorkspaceRoots
+            | SettingKey::ObserverEnabled
+            | SettingKey::ObserverServerUrl
+            | SettingKey::ObserverSecretsDir
+            | SettingKey::ObserverScriptUser
+            | SettingKey::ObserverInsecureSameUser
             | SettingKey::LocalHome
             | SettingKey::LocalCodexHome
             | SettingKey::LocalClaudeConfigDir
             | SettingKey::LocalClaudeProfileSource
-            | SettingKey::ObserverWorker
-            | SettingKey::ObserverWorkerServer
-            | SettingKey::ObserverSecretsDir
-            | SettingKey::ObserverScriptUser
-            | SettingKey::ObserverInsecureSameUser
+            | SettingKey::AgentArgs
+            | SettingKey::ConductorModel
+            | SettingKey::ConductorEffort
+            | SettingKey::TuiRefreshInterval
             | SettingKey::WebBind
             | SettingKey::WebUpstream
             | SettingKey::WebToken => false,
@@ -420,17 +562,17 @@ impl SettingKey {
     /// is silent (see `src/main.rs`). A built-in of `info` would turn logging
     /// on for every command at once and make `tui` create a data directory and
     /// a log file on every run — a change of behaviour no requirement asks for.
+    ///
+    /// The server directories are `.`, the root itself (R23), so an
+    /// unconfigured run writes where it always did.
     pub fn built_in(self) -> SettingValue {
         match self {
+            SettingKey::GlobalRoot => SettingValue::Path(PathBuf::from(DEFAULT_ROOT)),
             SettingKey::CatalogDir | SettingKey::StateDir | SettingKey::WorkDir => {
-                SettingValue::Path(PathBuf::from("./.narsor"))
+                SettingValue::Path(PathBuf::from("."))
             }
             SettingKey::AgentHarness => SettingValue::Text(CLAUDE_CODE.to_string()),
-            SettingKey::AgentTimeout => SettingValue::Duration(None),
             SettingKey::MaxConcurrentTasks => SettingValue::Text("1".to_string()),
-            SettingKey::EscalationThreshold => {
-                SettingValue::Text(DEFAULT_ESCALATION_THRESHOLD.to_string())
-            }
             SettingKey::LogLevel => SettingValue::Text(LOG_OFF.to_string()),
             SettingKey::TuiRefreshInterval => {
                 SettingValue::Duration(Some(DEFAULT_TUI_REFRESH_SECS))
@@ -441,8 +583,9 @@ impl SettingKey {
             SettingKey::ServerBind => SettingValue::Text(DEFAULT_SERVER_BIND.to_string()),
             SettingKey::TlsTermination => SettingValue::Text(TLS_TERMINATION_NONE.to_string()),
             SettingKey::LocalHome => SettingValue::Text(DEFAULT_LOCAL_HOME.to_string()),
-            SettingKey::ObserverWorker => SettingValue::Text(OBSERVER_WORKER_OFF.to_string()),
-            SettingKey::ObserverInsecureSameUser => SettingValue::Text("false".to_string()),
+            SettingKey::ObserverEnabled | SettingKey::ObserverInsecureSameUser => {
+                SettingValue::Text("false".to_string())
+            }
             SettingKey::WebBind => SettingValue::Text(DEFAULT_WEB_BIND.to_string()),
             SettingKey::WebUpstream => SettingValue::Text(WEB_UPSTREAM_LOCAL.to_string()),
             SettingKey::WebToken => SettingValue::Text(WEB_TOKEN_SERVER.to_string()),
@@ -460,7 +603,7 @@ impl SettingKey {
             | SettingKey::LocalCodexHome
             | SettingKey::LocalClaudeConfigDir
             | SettingKey::LocalClaudeProfileSource
-            | SettingKey::ObserverWorkerServer
+            | SettingKey::ObserverServerUrl
             | SettingKey::ObserverSecretsDir
             | SettingKey::ObserverScriptUser => SettingValue::Text(String::new()),
         }
@@ -480,9 +623,15 @@ impl SettingKey {
     /// Whether the value is a duration, which the file may also write as a
     /// bare number of seconds or as an explicit null.
     pub fn is_duration(self) -> bool {
+        matches!(self, SettingKey::TuiRefreshInterval)
+    }
+
+    /// Whether the value is a boolean, which the file may also write as a
+    /// YAML `true`/`false`.
+    pub fn is_bool(self) -> bool {
         matches!(
             self,
-            SettingKey::AgentTimeout | SettingKey::TuiRefreshInterval
+            SettingKey::ObserverEnabled | SettingKey::ObserverInsecureSameUser
         )
     }
 }
@@ -491,77 +640,6 @@ impl fmt::Display for SettingKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.key())
     }
-}
-
-// ---------------------------------------------------------------------------
-// Settings that used to exist
-// ---------------------------------------------------------------------------
-
-/// A key that was a setting once and is not one now.
-///
-/// Its own table rather than a variant of [`SettingKey`], because it is not a
-/// setting: it has no value, no source and no row in `config show`. What it
-/// has is a name that an operator may still have in a file or a deployment,
-/// and one job — to say what happened instead of being mistaken for a typo.
-///
-/// Both places that could see the name have to consult this. The file parser
-/// would otherwise answer with the generic "unknown key, known keys are …",
-/// which lists the successors without saying that they *are* successors. The
-/// environment is worse: resolution asks for one variable per known setting,
-/// so a retired variable is not looked up at all and would be ignored in
-/// complete silence — which is exactly the failure this table exists to
-/// prevent.
-pub const RETIRED_KEYS: &[RetiredKey] = &[RetiredKey {
-    key: "data_dir",
-    replacement: "It was split into 'catalog_dir' (workflow definitions and the repository \
-                  registry), 'state_dir' (executions) and 'work_dir' (task workspaces). Set \
-                  the ones you need, or pass --root to point all three at one directory.",
-}];
-
-/// One withdrawn setting and the sentence that explains it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetiredKey {
-    /// The key as it was written in the file.
-    pub key: &'static str,
-    /// What to do instead, as one sentence for an operator.
-    pub replacement: &'static str,
-}
-
-impl RetiredKey {
-    /// The environment variable that used to carry it.
-    pub fn env_var(&self) -> String {
-        format!("{ENV_PREFIX}{}", self.key.to_uppercase())
-    }
-
-    /// The whole message, for a key written in a file.
-    pub fn message(&self) -> String {
-        format!(
-            "Setting '{}' no longer exists. {}",
-            self.key, self.replacement
-        )
-    }
-
-    /// The whole message, for a variable found in the environment.
-    pub fn env_message(&self) -> String {
-        format!(
-            "Environment variable {} sets '{}', which no longer exists. {}",
-            self.env_var(),
-            self.key,
-            self.replacement
-        )
-    }
-}
-
-/// The retired setting written under this key, if there is one.
-pub fn retired(key: &str) -> Option<&'static RetiredKey> {
-    RETIRED_KEYS.iter().find(|entry| entry.key == key)
-}
-
-/// The retired setting this environment variable used to carry, if any.
-pub fn retired_env_var(variable: &str) -> Option<&'static RetiredKey> {
-    RETIRED_KEYS
-        .iter()
-        .find(|entry| entry.env_var() == variable)
 }
 
 // ---------------------------------------------------------------------------
@@ -690,111 +768,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_registry_holds_every_setting_the_requirements_name() {
-        let keys: Vec<&str> = SettingKey::ALL.iter().map(|key| key.key()).collect();
-        assert_eq!(
-            keys,
-            vec![
-                "catalog_dir",
-                "state_dir",
-                "work_dir",
-                "agent_harness",
-                "agent_timeout",
-                "agent_args",
-                "max_concurrent_tasks",
-                "escalation_threshold",
-                "conductor_model",
-                "conductor_effort",
-                "log_level",
-                "tui_refresh_interval",
-                "default_backend",
-                "default_profile",
-                "server_mode",
-                "server_bind",
-                "oidc_issuer",
-                "oidc_audience",
-                "owner_subject",
-                "tls_termination",
-                "trusted_proxies",
-                "cors_allowed_origins",
-                "local_workspace_roots",
-                "local_home",
-                "local_codex_home",
-                "local_claude_config_dir",
-                "local_claude_profile_source",
-                "observer_worker",
-                "observer_worker_server",
-                "observer_secrets_dir",
-                "observer_script_user",
-                "observer_insecure_same_user",
-                "web_bind",
-                "web_upstream",
-                "web_token"
-            ],
-            "the registry is the one place the settings live, and the three \
-             roots lead because that is the order `config show` prints"
-        );
-    }
-
-    #[test]
-    fn data_dir_is_retired_rather_than_forgotten() {
-        // It must not come back as a setting: a key that both exists and is
-        // withdrawn would be reported twice and resolved once.
-        assert_eq!(SettingKey::from_key("data_dir"), None);
-
-        let withdrawn = retired("data_dir").expect("data_dir is a retired key");
-        assert_eq!(withdrawn.env_var(), "NARSOR_DATA_DIR");
-        assert_eq!(
-            retired_env_var("NARSOR_DATA_DIR").map(|entry| entry.key),
-            Some("data_dir")
-        );
-
-        // The message names all three successors, which is the whole job.
-        for successor in ["catalog_dir", "state_dir", "work_dir"] {
-            assert!(
-                withdrawn.message().contains(successor),
-                "the message must name {successor}: {}",
-                withdrawn.message()
-            );
-            assert!(
-                withdrawn.env_message().contains(successor),
-                "the variable's message must name {successor} too"
-            );
-        }
-        assert!(withdrawn.env_message().contains("NARSOR_DATA_DIR"));
-    }
-
-    #[test]
-    fn no_retired_key_is_also_a_live_setting() {
-        for withdrawn in RETIRED_KEYS {
-            assert_eq!(
-                SettingKey::from_key(withdrawn.key),
-                None,
-                "'{}' cannot be both withdrawn and in force",
-                withdrawn.key
-            );
-        }
-    }
-
-    #[test]
-    fn every_setting_has_a_prefixed_upper_case_environment_variable() {
+    fn every_environment_variable_is_derived_from_the_path_and_distinct() {
+        let mut names = Vec::new();
         for key in SettingKey::ALL {
             let variable = key.env_var();
-            assert!(
-                variable.starts_with(ENV_PREFIX),
-                "{variable} must carry the {ENV_PREFIX} prefix"
-            );
+            let expected: Vec<String> = key.segments().map(str::to_uppercase).collect();
             assert_eq!(
                 variable,
-                variable.to_uppercase(),
-                "{variable} must be upper case"
+                format!("{ENV_PREFIX}{}", expected.join("__")),
+                "{key}: one `__` between each path segment"
             );
+            names.push(variable);
         }
-    }
+        assert_eq!(
+            SettingKey::OidcIssuer.env_var(),
+            "NARSOR_SERVER__OIDC__ISSUER"
+        );
+        assert_eq!(
+            SettingKey::AgentArgs.env_var(),
+            AGENT_ARGS_ENV,
+            "the runner contract variable is the derived name of runner.agent_args"
+        );
 
-    #[test]
-    fn the_environment_variable_names_are_all_distinct() {
-        let mut names: Vec<String> = SettingKey::ALL.iter().map(|key| key.env_var()).collect();
         names.sort();
         let before = names.len();
         names.dedup();
@@ -806,17 +801,44 @@ mod tests {
     }
 
     #[test]
-    fn every_key_resolves_back_to_its_setting() {
+    fn every_path_starts_with_its_section_and_no_leaf_is_also_a_group() {
         for key in SettingKey::ALL {
+            assert_eq!(
+                key.segments().next(),
+                Some(key.section().name()),
+                "{key}: the first segment is the section"
+            );
             assert_eq!(SettingKey::from_key(key.key()), Some(key));
+            assert!(
+                !SettingKey::is_group(key.key()),
+                "{key} is a setting and also a group of settings"
+            );
+            for other in SettingKey::ALL {
+                if other != key {
+                    assert_ne!(other.key(), key.key(), "{key} is registered twice");
+                }
+            }
         }
-        assert_eq!(SettingKey::from_key("nonsense"), None);
+        assert!(SettingKey::is_group("server.oidc"));
+        assert!(SettingKey::is_group("server"));
+        assert!(!SettingKey::is_group("server.oid"));
     }
 
     #[test]
-    fn the_built_in_logging_level_is_off_not_info() {
-        // D-N: `info` would turn logging on for every subcommand at once and
-        // make `tui` create a log file no one asked for.
+    fn the_built_in_directories_keep_todays_layout() {
+        // R23: the root is ./.narsor and each server directory is the root.
+        assert_eq!(
+            SettingKey::GlobalRoot.built_in(),
+            SettingValue::Path(PathBuf::from("./.narsor"))
+        );
+        for directory in SettingKey::ROOTS {
+            assert_eq!(
+                directory.built_in(),
+                SettingValue::Path(PathBuf::from(".")),
+                "{directory}"
+            );
+        }
+        // D-N: `info` would turn logging on for every subcommand at once.
         assert_eq!(
             SettingKey::LogLevel.built_in(),
             SettingValue::Text("off".to_string())
@@ -824,66 +846,22 @@ mod tests {
     }
 
     #[test]
-    fn the_built_in_values_are_the_ones_the_plan_names() {
-        for root in SettingKey::ROOTS {
-            assert_eq!(
-                root.built_in(),
-                SettingValue::Path(PathBuf::from("./.narsor")),
-                "{root} shares the one built-in root, so an unconfigured run \
-                 writes where it always did"
-            );
-        }
-        assert_eq!(
-            SettingKey::AgentHarness.built_in(),
-            SettingValue::Text("claude-code".to_string())
-        );
-        assert_eq!(
-            SettingKey::AgentTimeout.built_in(),
-            SettingValue::Duration(None),
-            "no limit, which is what an agent action without one gets today"
-        );
-        assert_eq!(
-            SettingKey::TuiRefreshInterval.built_in(),
-            SettingValue::Duration(Some(10)),
-            "KTD16: the interface re-reads the daemon every ten seconds"
-        );
-    }
-
-    #[test]
-    fn a_file_source_renders_the_path_and_a_built_in_renders_one_word() {
+    fn a_source_renders_its_concrete_origin_and_a_built_in_renders_one_word() {
         let file = Source::File(PathBuf::from("/etc/narsor/config.yaml"));
         assert_eq!(file.to_string(), "file (/etc/narsor/config.yaml)");
         assert_eq!(Source::BuiltIn.to_string(), "built-in");
         assert_eq!(Source::Flag("--root").to_string(), "flag (--root)");
         assert_eq!(
-            Source::Env("NARSOR_STATE_DIR".to_string()).to_string(),
-            "env (NARSOR_STATE_DIR)"
+            Source::Env("NARSOR_SERVER__STATE".to_string()).to_string(),
+            "env (NARSOR_SERVER__STATE)"
         );
     }
 
     #[test]
-    fn a_sensitive_entry_masks_its_value_and_leaves_its_source_alone() {
-        let value = SettingValue::Text("hunter2".to_string());
-        assert_eq!(render_value(&value, true), MASK);
-
-        // The source is a separate thing and is never touched by masking.
-        let source = Source::Env("NARSOR_SECRET".to_string());
-        assert_eq!(source.to_string(), "env (NARSOR_SECRET)");
-    }
-
-    #[test]
-    fn an_entry_that_is_not_sensitive_is_never_masked() {
-        // Even when the value looks like a secret: sensitivity is an attribute
-        // of the entry, never a guess about the value (D-M).
+    fn masking_is_an_attribute_of_the_entry_never_a_guess_about_the_value() {
         let value = SettingValue::Text("token-abc123".to_string());
+        assert_eq!(render_value(&value, true), MASK);
         assert_eq!(render_value(&value, false), "token-abc123");
-
-        for key in SettingKey::ALL {
-            assert!(
-                !key.is_sensitive(),
-                "{key} is not sensitive in this version"
-            );
-        }
     }
 
     #[test]

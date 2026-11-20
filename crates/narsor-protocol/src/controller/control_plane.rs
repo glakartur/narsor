@@ -31,7 +31,7 @@ pub struct SetDefaultBackendRequest {
     pub backend_id: Option<String>,
 }
 
-/// Most concurrent tasks the `max_concurrent_tasks` setting may allow. A sanity
+/// Most concurrent tasks the `server.max_concurrent_tasks` setting may allow. A sanity
 /// bound, not a scheduling policy: Narsor targets a handful of parallel tasks (R6).
 pub const MAX_CONCURRENT_TASKS_LIMIT: u32 = 1024;
 

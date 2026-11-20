@@ -1,6 +1,6 @@
 //! The daemon's observer worker: `narsor-observer-worker` as a child
 //! process the daemon starts and supervises when its configuration enables
-//! it (`observer_worker: on`; D5, PO5, U6).
+//! it (`server.observer.enabled: true`; D5, PO5, U6).
 //!
 //! # The key
 //!
@@ -14,7 +14,7 @@
 //!
 //! # What the child gets
 //!
-//! `--server` (the configured `observer_worker_server`, or the daemon's own
+//! `--server` (the configured `server.observer.server_url`, or the daemon's own
 //! address), the secrets directory and the script user or the waiver, each
 //! as a flag. None of the daemon's `NARSOR_*` variables reach it; the key
 //! is the one it gets. `RUST_LOG` follows the daemon's log level; the
@@ -40,6 +40,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use narsor_controller_runtime::Supervision;
+use narsor_engine::config::{Problem, Resolved, SettingKey};
 use narsor_engine::controller_protocol::credentials::BearerToken;
 use narsor_engine::controller_protocol::wire::OBSERVER_WORKER_KEY_ENV;
 #[cfg(doc)]
@@ -81,6 +82,78 @@ pub enum ScriptIsolation {
     SameUser,
 }
 
+/// The observer worker as the configuration asks for it, checked before
+/// anything starts; what needs the running API (its address, when no URL
+/// is configured) is added at start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObserverPlan {
+    /// The configured URL of the API, `None` for the daemon's own address.
+    pub server: Option<String>,
+    /// The secrets directory, `None` for none.
+    pub secrets_dir: Option<PathBuf>,
+    /// How scripts are isolated from the worker.
+    pub isolation: ScriptIsolation,
+}
+
+/// The observer worker the configuration enables (`server.observer.*`),
+/// `None` when it enables none, or every reason it could not run.
+///
+/// `network` is the server's mode: a network server's own address is not
+/// one the worker may use, its requests must come through the TLS proxy.
+pub fn observer_plan(
+    config: &Resolved,
+    network: bool,
+) -> Result<Option<ObserverPlan>, Vec<Problem>> {
+    let Some(worker) = config.observer_worker() else {
+        return Ok(None);
+    };
+    let enabled = SettingKey::ObserverEnabled.key();
+    let script_user = SettingKey::ObserverScriptUser.key();
+    let same_user = SettingKey::ObserverInsecureSameUser.key();
+    let server_url = SettingKey::ObserverServerUrl.key();
+    let mut problems = Vec::new();
+    let isolation = match (worker.script_user, worker.insecure_same_user) {
+        (Some(user), false) => Some(ScriptIsolation::User(user)),
+        (None, true) => Some(ScriptIsolation::SameUser),
+        (None, false) => {
+            problems.push(Problem::at(
+                SettingKey::ObserverScriptUser,
+                format!(
+                    "{enabled}: true needs {script_user}, the system user scripts run as (or \
+                     {same_user}: true, for a trial only)"
+                ),
+            ));
+            None
+        }
+        (Some(_), true) => {
+            problems.push(Problem::at(
+                SettingKey::ObserverInsecureSameUser,
+                format!(
+                    "{script_user} and {same_user}: true contradict each other; set one of them"
+                ),
+            ));
+            None
+        }
+    };
+    if network && worker.server.is_none() {
+        problems.push(Problem::at(
+            SettingKey::ObserverServerUrl,
+            format!(
+                "{enabled}: true in network mode needs {server_url}: the URL clients reach the \
+                 API at, through the TLS proxy"
+            ),
+        ));
+    }
+    match isolation {
+        Some(isolation) if problems.is_empty() => Ok(Some(ObserverPlan {
+            server: worker.server,
+            secrets_dir: worker.secrets_dir,
+            isolation,
+        })),
+        _ => Err(problems),
+    }
+}
+
 impl ObserverWorkerSettings {
     /// The child's command line and environment, with `key`. Only the key
     /// is a variable of the child's own; the rest are flags.
@@ -94,7 +167,7 @@ impl ObserverWorkerSettings {
             ScriptIsolation::User(user) => command.arg("--script-user").arg(user),
             ScriptIsolation::SameUser => command.arg("--insecure-same-user"),
         };
-        child_process::prepare(&mut command, self.log_directive.as_deref());
+        child_process::prepare(&mut command, self.log_directive.as_deref(), &[]);
         if matches!(self.isolation, ScriptIsolation::User(_)) {
             // SAFETY: the hook only calls `prctl`. It runs after the hook
             // of `prepare`, which cleared the ambient set.

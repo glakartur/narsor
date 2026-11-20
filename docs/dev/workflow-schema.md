@@ -429,7 +429,7 @@ action:
   type: agent
   harness: <claude-code|codex|github-copilot|opencode> # Optional — without it the installation harness:
                                       # the operator's choice (`narsor harness default set`, `h` in the TUI),
-                                      # otherwise the configuration (`agent_harness`, see README →
+                                      # otherwise the configuration (`server.agent_harness`, see README →
                                       # Configuration), and failing that `claude-code`.
                                       # Only an explicit `harness:` pins the action; without it the action
                                       # takes the default at the first attempt and keeps it to the end.

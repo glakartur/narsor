@@ -39,8 +39,17 @@
 //! harness login of the user's and a Git clone with none of the user's git
 //! credentials unless the user accepts their own with `--accept-host-home`;
 //! and it warns about all of this at start. Its HOME settings come from the
-//! flags, then the `NARSOR_LOCAL_*` variables, then the Narsor configuration
-//! file — which the daemon's child, started with `--no-config`, never reads.
+//! flags, then the `NARSOR_CONTROLLER__LOCAL__*` variables, then the
+//! `controller` section of the Narsor configuration file.
+//!
+//! # Started by the daemon
+//!
+//! The daemon hands its child the file that won its own cascade
+//! (`--config <file>`) or `--no-config` when none won, and only its
+//! `NARSOR_GLOBAL__*` and `NARSOR_CONTROLLER__*` variables (R21). The child
+//! reads its own section from them, the same way
+//! [`narsor_engine::config::local_controller::resolve`] does for the
+//! daemon's check before it starts.
 //!
 //! # Stopping
 //!
@@ -69,7 +78,9 @@ use backend::{LaunchCheck, LocalBackend, LocalBackendConfig};
 use narsor_controller_client::controller_runtime::load_or_enroll_with_options;
 use narsor_controller_client::{ClientOptions, ControllerClient};
 use narsor_controller_runtime::{Controller, ControllerConfig};
-use narsor_engine::config::{Flags, HarnessHome, HomeMode, Resolved, SettingKey, Source};
+use narsor_engine::config::{
+    local_controller, Flags, HarnessHome, HomeMode, Resolved, SettingKey, Source,
+};
 
 /// What the lock file's name adds to the credential file's.
 const LOCK_SUFFIX: &str = ".lock";
@@ -122,7 +133,8 @@ pub struct LocalArgs {
     #[arg(long, hide = true, value_name = "PID")]
     pub parent_pid: Option<u32>,
 
-    /// Read no configuration file: every setting comes from the flags.
+    /// Read no configuration file: every setting comes from the flags and
+    /// the `NARSOR_CONTROLLER__*` variables.
     #[arg(long, conflicts_with = "config")]
     pub no_config: bool,
 
@@ -132,7 +144,7 @@ pub struct LocalArgs {
     pub config: Option<PathBuf>,
 
     /// With a control plane beyond this machine: let tasks use your own
-    /// HOME (`--home host`, or `local_home: host` in the configuration),
+    /// HOME (`--home host`, or `controller.local.home: host` in the configuration),
     /// with your SSH keys, tokens and harness logins.
     #[arg(long)]
     pub accept_host_home: bool,
@@ -144,7 +156,7 @@ pub struct LocalArgs {
 }
 
 /// The HOME settings runners are started with (R17, R18; KTD15): each from
-/// its flag, else from `config` — its `NARSOR_LOCAL_*` variable, else the
+/// its flag, else from `config` — its `NARSOR_CONTROLLER__LOCAL__*` variable, else the
 /// configuration file. With a control plane beyond this machine the mode is
 /// `private` unless something set it, and `host` needs `--accept-host-home`;
 /// so do the harness directories — the user's own logins — which the
@@ -152,13 +164,12 @@ pub struct LocalArgs {
 fn resolve_home(
     args: &LocalArgs,
     place: ControlPlanePlace,
-    config: Option<&Resolved>,
+    config: &Resolved,
 ) -> Result<HarnessHome, ControllerError> {
-    let configured = config.map(Resolved::local_harness_home).unwrap_or_default();
-    // `local_home` has a built-in value (`host`); only one somebody set
+    let configured = config.local_harness_home();
+    // `controller.local.home` has a built-in value (`host`); only one somebody set
     // counts for a server that is not trusted.
-    let mode_set = config
-        .is_some_and(|config| !matches!(config.source(SettingKey::LocalHome), Source::BuiltIn));
+    let mode_set = !matches!(config.source(SettingKey::LocalHome), Source::BuiltIn);
     let mode = match (args.home, place) {
         (Some(mode), _) => mode,
         (None, ControlPlanePlace::Remote) if !mode_set => HomeMode::Private,
@@ -218,22 +229,38 @@ fn harness_directory_flag(args: &LocalArgs) -> Option<&'static str> {
     .find_map(|(flag, dir)| dir.is_some().then_some(flag))
 }
 
-/// The Narsor configuration as a hand-started controller reads it:
-/// `--config` or the usual search, then the `NARSOR_*` variables.
+/// The controller's section of the Narsor configuration: from `--config`,
+/// from no file at all with `--no-config`, else from the usual search; the
+/// `NARSOR_GLOBAL__*` and `NARSOR_CONTROLLER__*` variables win over the file.
 fn read_config(args: &LocalArgs) -> Result<Resolved, ControllerError> {
-    let flags = Flags {
-        root: None,
-        config: args.config.clone(),
-    };
-    let resolved = narsor_engine::config::resolve(
-        &flags,
-        &narsor_engine::config::resolve::environment_from_process(),
-    );
+    let resolved = resolve_config(args.config.as_deref(), args.no_config);
     if !resolved.is_ok() {
         let errors: Vec<String> = resolved.errors().iter().map(ToString::to_string).collect();
         return Err(ControllerError::usage(errors.join("\n")));
     }
     Ok(resolved)
+}
+
+/// The `local` scope of the configuration: from `file`, from no file at
+/// all with `no_config`, else from the cascade; and the process
+/// environment.
+fn resolve_config(file: Option<&Path>, no_config: bool) -> Resolved {
+    let environment = narsor_engine::config::resolve::environment_from_process();
+    if no_config || file.is_some() {
+        local_controller::resolve(file, &environment)
+    } else {
+        narsor_engine::config::resolve(&Flags::default(), &environment, local_controller::SCOPE)
+    }
+}
+
+/// `narsor-controller --check-config [--config <file>]`: checks the `local`
+/// scope of the configuration, prints the report as JSON and exits 0 (no
+/// problem) or 1, without starting anything (`narsor-cli config show`).
+pub fn check_command(file: Option<&Path>) -> ! {
+    let resolved = resolve_config(file, false);
+    let problems = narsor_engine::config::Problem::of_resolution(&resolved);
+    narsor_engine::config::CheckReport::build("narsor-controller", &resolved, &problems)
+        .print_and_exit()
 }
 
 /// Tells the user, before anything else happens, what serving a control
@@ -279,12 +306,13 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
         &connection.runner_control_plane,
         PLAIN_HTTP_BEYOND_LOOPBACK,
     )?;
-    let config = if args.no_config {
-        None
-    } else {
-        Some(read_config(&args)?)
-    };
-    let home = resolve_home(&args, place, config.as_ref())?;
+    let config = read_config(&args)?;
+    // R26: an un-migrated configuration runs on built-in values; say so.
+    let environment = narsor_engine::config::resolve::environment_from_process();
+    if let Some(warning) = narsor_engine::config::legacy::warning(&config, &environment) {
+        eprintln!("narsor-controller: warning: {warning}");
+    }
+    let home = resolve_home(&args, place, &config)?;
     if place == ControlPlanePlace::Remote {
         warn_untrusted(&connection.control_plane, &home);
     }
@@ -298,7 +326,7 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
         ControllerError::failure(format!("cannot configure the local backend: {error}"))
     })?;
     backend_config.runner_args = home.runner_args();
-    if let Some(path) = config.and_then(|resolved| resolved.file().path().map(Path::to_path_buf)) {
+    if let Some(path) = config.file().path().map(Path::to_path_buf) {
         backend_config.runner_args.push("--config".into());
         backend_config.runner_args.push(path.as_os_str().into());
     }
@@ -548,5 +576,89 @@ fn holder_pid(file: &mut fs::File) -> String {
     match read {
         Ok(_) if !text.trim().is_empty() => text.trim().to_string(),
         _ => "unknown".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controller::ConnectionArgs;
+    use narsor_engine::config::Environment;
+
+    fn args() -> LocalArgs {
+        LocalArgs {
+            connection: ConnectionArgs::default(),
+            storage: PathBuf::from("/storage"),
+            home: None,
+            codex_home: None,
+            claude_config_dir: None,
+            claude_profile_source: None,
+            lock_timeout_secs: 10,
+            parent_pid: None,
+            no_config: false,
+            config: None,
+            accept_host_home: false,
+            allow_env: Vec::new(),
+        }
+    }
+
+    /// The controller's configuration from a file holding `controller`
+    /// (none: no file) and `env`, as the daemon hands it over.
+    fn configuration(controller: Option<&str>, env: &[(&str, &str)]) -> Resolved {
+        let dir = std::env::temp_dir().join(format!(
+            "narsor-controller-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("create the directory");
+        let file = controller.map(|text| {
+            let path = dir.join("config.yaml");
+            fs::write(&path, format!("controller:\n  local:\n{text}")).expect("write the file");
+            path
+        });
+        let environment: Environment = env
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        let resolved = local_controller::resolve(file.as_deref(), &environment);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(resolved.is_ok(), "{:?}", resolved.errors());
+        resolved
+    }
+
+    #[test]
+    fn a_remote_control_plane_gets_a_private_home_unless_the_configuration_set_one() {
+        let remote = ControlPlanePlace::Remote;
+        // KTD15: the built-in `host` does not count for a remote server.
+        let home = resolve_home(&args(), remote, &configuration(None, &[])).unwrap();
+        assert_eq!(home.mode, HomeMode::Private);
+
+        let home = resolve_home(
+            &args(),
+            remote,
+            &configuration(Some("    home: private\n"), &[]),
+        )
+        .unwrap();
+        assert_eq!(home.mode, HomeMode::Private);
+
+        // A `host` somebody set counts, so it needs the acceptance.
+        let set_host = configuration(
+            Some("    home: private\n"),
+            &[("NARSOR_CONTROLLER__LOCAL__HOME", "host")],
+        );
+        let refused = resolve_home(&args(), remote, &set_host).unwrap_err();
+        assert!(
+            refused.message.contains("the configuration"),
+            "{}",
+            refused.message
+        );
+        let accepted = LocalArgs {
+            accept_host_home: true,
+            ..args()
+        };
+        assert_eq!(
+            resolve_home(&accepted, remote, &set_host).unwrap().mode,
+            HomeMode::Host
+        );
     }
 }

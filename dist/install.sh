@@ -11,9 +11,11 @@
 # Skrypt pobiera i weryfikuje archiwum, kopiuje binaria i (za zgodą) dopisuje
 # katalog do ~/.bashrc. Gdy działają już procesy Narsora, pyta, czy je zatrzymać
 # (--stop-running robi to bez pytania). --progress pokazuje pasek postępu
-# pobierania archiwum. Konfigurację tworzy `narsor-cli init`: pyta o katalog
-# główny danych (domyślnie ~/.narsor; w pliku trafiają catalog_dir, state_dir
-# i work_dir). Istniejącej konfiguracji nie rusza: obok zapisuje config.yaml.new.
+# pobierania archiwum.
+# `narsor-cli init` writes the configuration: it asks for the data root
+# directory (~/.narsor by default), writes it as global.root and writes
+# server.catalog, server.state and server.work relative to it. It does not touch an
+# existing configuration: it writes config.yaml.new next to it.
 set -euo pipefail
 
 repository="glakartur/narsor"

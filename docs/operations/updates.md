@@ -6,6 +6,81 @@ listed here need no special order. The update notes of the remote backends
 (automatic resume, the read-only runner) are in
 [Remote execution backends](remote-backends.md).
 
+## Update to the hierarchical configuration file
+
+This update changes the configuration file from one flat list of keys to a
+tree of sections, one section per program (`global`, `server`,
+`controller`, `runner`, `tui`, `web`). The environment variables change
+with it: `NARSOR_` plus the path of the setting, with `__` between the
+levels (`server.oidc.issuer` is `NARSOR_SERVER__OIDC__ISSUER`). See
+[Configuration](../user/configuration.md#the-tree-of-sections) for the
+tree and the full table of old and new names. The update is a hard
+cutover: there is no transition period and no migration tool.
+
+### What changes
+
+| Part | Before | After |
+|---|---|---|
+| Configuration file | Flat keys at the top level (`server_mode: network`) | Sections (`server: {mode: network}`). A flat key at the top level is an unknown root: it is ignored, not reported as an error. |
+| Environment variables | `NARSOR_<KEY>` (`NARSOR_SERVER_MODE`) | `NARSOR_<SECTION>__<KEY>` (`NARSOR_SERVER__MODE`). The old variables are ignored. |
+| Directories | Three separate paths; `--root` set all three; a relative path was relative to the working directory | `--root` sets `global.root` only; a relative `server.catalog`, `server.state` or `server.work` is resolved against it, an absolute one is used as is. The built-in values (`./.narsor`, and `.` for each directory) keep the old layout. |
+| Observer worker switch | `on` / `off` | `server.observer.enabled: true` / `false` |
+| Kubernetes runner arguments | ConfigMap key and variable `NARSOR_AGENT_ARGS` | `NARSOR_RUNNER__AGENT_ARGS`, in the controller ConfigMap and in the admission policy (`deploy/kubernetes/`) |
+| Removed settings | `agent_timeout`, `escalation_threshold` | Removed, not moved: nothing read them. An agent state without `timeout` has no limit unless its workflow sets one. |
+| Errors | Each program checked the whole file | Each program checks `global` and its own sections only, and refuses to start only on its own errors. The cross-key rules (network mode, observer worker) run before the server starts anything. |
+| `config show` | One table of all keys, JSON `version: 1` | One table merged from every program installed next to `narsor-cli`, grouped by section, with the programs that read each setting; JSON `version: 2` |
+
+**An un-migrated installation does not stop.** The old names are ignored,
+so a server that still has a flat file or old variables starts on the
+built-in values: trusted mode on loopback, the observer worker off, the
+default directories. `narsor-server` and `narsor-web` write a warning at
+start (a warning, not an error) that names every old key in the file and
+every old variable in the environment, with its new name. Do not rely on
+the warning: rewrite the configuration before the update.
+
+No file works for both versions: the old programs refuse the section
+names as unknown keys, and the new programs ignore the flat keys.
+
+### Before the update
+
+1. **Keep a copy of the old configuration file** for a rollback.
+2. **Rewrite the configuration file as a tree.** Use the table in
+   [Configuration](../user/configuration.md#old-and-new-names). Write
+   `server.observer.enabled: true` for the old `on`. Remove
+   `agent_timeout` and `escalation_threshold`. Alternatively, run
+   `narsor-cli init` of the new release in a temporary directory: it writes
+   a tree in which each commented default names the old key it replaces.
+3. **Rename the environment variables** in every service definition, shell
+   profile, container spec and ConfigMap that sets `NARSOR_*` settings.
+   Variables that are not settings keep their names (`NARSOR_SERVER`,
+   `NARSOR_TOKEN*`, `NARSOR_CONTROL_PLANE`, `NARSOR_ENROLLMENT_CODE`, …).
+4. **Kubernetes backend:** rename the key `NARSOR_AGENT_ARGS` of the
+   controller ConfigMap to `NARSOR_RUNNER__AGENT_ARGS` and apply the new
+   `deploy/kubernetes/admission-policy.yaml` together with the new
+   controller. An old admission policy refuses the new variable, and a new
+   policy refuses the old one.
+
+### Update order
+
+1. Stop the server (`narsor-server`) and `narsor-web`.
+2. Install all the new binaries in one directory. `config show` asks each
+   program next to `narsor-cli` for its check, so mixed versions give
+   wrong results.
+3. Put the rewritten configuration file in place and set the renamed
+   variables.
+4. Run `narsor-cli config show`. Each setting that you set must show the
+   source `file` or `env`, not `built-in`; every program must show `ok`
+   (or `not installed`). The command exits 1 when a program reports a
+   problem.
+5. Start the server, the controllers and `narsor-web`. Check that the
+   server and `narsor-web` do not write the warning about the old flat
+   layout.
+
+### Rollback
+
+Install the old binaries and put the copy of the old configuration file and
+the old variables back. The new file does not work with the old programs.
+
 ## Update to catalogue automations (D78)
 
 This update moves the configuration of observers from the state to the

@@ -15,7 +15,7 @@ use crate::{
         commands::{CliError, Result},
         prompt,
     },
-    config::{self, ConfigCascade, SettingKey, SettingValue},
+    config::{self, ConfigCascade, Scope, Section, SettingKey, SettingValue},
     domain::BackendId,
 };
 
@@ -127,7 +127,7 @@ pub fn run(options: InitOptions, global_config: Option<&Path>) -> Result<()> {
         None
     };
 
-    let contents = render_config(&validate_config(&target, &config)?.0, &config);
+    let contents = validate_config(&target, &config)?.0;
     prepare_config_directory(&target)?;
     if let Some(backend) = &workstation_backend {
         write_workstation_backend(backend)?;
@@ -346,10 +346,11 @@ fn prepare_config_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Renders the file and parses it back with every section in scope, so
+/// what is written is exactly what was checked.
 fn validate_config(path: &Path, config: &Value) -> Result<(String, config::FileValues)> {
-    let text = serde_yaml::to_string(config)
-        .map_err(|error| CliError::failure(format!("cannot encode configuration: {error}")))?;
-    let parsed = config::file::parse(path, &text)
+    let text = render_config(config);
+    let parsed = config::file::parse(path, &text, &Scope::ALL)
         .into_result()
         .map_err(|errors| {
             CliError::failure(
@@ -372,11 +373,6 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
         "Agent harness used by actions that name none.",
     ),
     (
-        SettingKey::AgentTimeout,
-        "none",
-        "Time limit of an agent action, e.g. 30m, 2h, or none.",
-    ),
-    (
         SettingKey::AgentArgs,
         "{}",
         "Extra arguments by harness, e.g. { claude: [--dangerously-skip-permissions] }; they win over Narsor's own.",
@@ -385,11 +381,6 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
         SettingKey::MaxConcurrentTasks,
         "none",
         "Tasks processed at once across all backends (replaces backend limits), or none.",
-    ),
-    (
-        SettingKey::EscalationThreshold,
-        "3",
-        "Failed attempts of an agent step after which its effort, then its model, is raised within its ceiling; 0 turns it off.",
     ),
     (
         SettingKey::ConductorModel,
@@ -462,12 +453,12 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
         "Address the server listens on.",
     ),
     (
-        SettingKey::ObserverWorker,
-        "off",
-        "on: the server starts the observer worker (needs observer_script_user; see the installation guide).",
+        SettingKey::ObserverEnabled,
+        "false",
+        "When true, the server starts the observer worker (needs server.observer.script_user; see the installation guide).",
     ),
     (
-        SettingKey::ObserverWorkerServer,
+        SettingKey::ObserverServerUrl,
         "\"\"",
         "API URL for the observer worker and its scripts; empty is the server's own address (not in network mode).",
     ),
@@ -503,39 +494,202 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
     ),
 ];
 
-/// The generated file: the settings chosen by the installer followed by the
-/// remaining ones as commented-out defaults.
-fn render_config(yaml: &str, config: &Value) -> String {
+/// Settings never suggested as commented defaults: `init` writes the root
+/// and the directories itself, and the network-mode ones belong to the
+/// server role only (trusted mode refuses them, so a commented default would
+/// mislead). Their descriptions go above them when the file writes them.
+const INSTALLER_SETTINGS: &[(SettingKey, &str)] = &[
+    (
+        SettingKey::GlobalRoot,
+        "Base directory of the installation; relative server directories are joined to it.",
+    ),
+    (
+        SettingKey::CatalogDir,
+        "Catalogue directory (workflows, backends, profiles), relative to global.root.",
+    ),
+    (
+        SettingKey::StateDir,
+        "Server state directory (database, daemon files), relative to global.root.",
+    ),
+    (
+        SettingKey::WorkDir,
+        "Directory for task workspaces, relative to global.root.",
+    ),
+    (
+        SettingKey::OidcIssuer,
+        "HTTPS OIDC issuer that signs the users' tokens (network mode).",
+    ),
+    (
+        SettingKey::OidcAudience,
+        "Audience the users' tokens must carry (network mode).",
+    ),
+    (
+        SettingKey::OwnerSubject,
+        "OIDC subject of the installation owner (network mode).",
+    ),
+    (
+        SettingKey::TlsTermination,
+        "Where TLS ends: proxy (a TLS-terminating proxy in front of the server).",
+    ),
+    (
+        SettingKey::TrustedProxies,
+        "Addresses or CIDRs of the TLS-terminating proxies the server trusts.",
+    ),
+];
+
+/// One setting of the generated file: written with a value, or shown as a
+/// commented-out default.
+struct Entry {
+    setting: SettingKey,
+    segments: Vec<&'static str>,
+    line: EntryLine,
+}
+
+enum EntryLine {
+    Written(String),
+    Default(&'static str),
+}
+
+impl Entry {
+    fn is_written(&self) -> bool {
+        matches!(self.line, EntryLine::Written(_))
+    }
+}
+
+/// The generated file: one tree in registry order, each section holding its
+/// written settings and, as comments in their place, the remaining defaults.
+/// A section or group with nothing written is itself commented out, so
+/// removing every `# ` in front of a key still gives a valid file.
+fn render_config(config: &Value) -> String {
     let mapping = config.as_mapping().expect("configuration mapping checked");
     let mut text = String::from(
         "# Narsor configuration generated by `narsor-cli init`.\n\
-         # Lines starting with # show the default value; remove the # to change it.\n\
-         # Every setting can also be given as a NARSOR_<NAME> environment variable.\n\n",
+         # Lines starting with `# key:` show the default value; remove the `# ` to change it.\n\
+         # Every setting can also be given as a NARSOR_<SECTION>__<KEY> environment variable;\n\
+         # a group adds one more level, e.g. NARSOR_SERVER__OIDC__ISSUER for server.oidc.issuer.\n",
     );
-    text.push_str(yaml);
-    text.push_str("\n# Optional settings (defaults shown)\n");
-    for (key, default, description) in OPTIONAL_SETTINGS {
-        if !mapping.contains_key(Value::String(key.key().to_string())) {
-            text.push_str(&format!("\n# {description}\n# {}: {default}\n", key.key()));
+    for section in Section::ALL {
+        let entries: Vec<Entry> = SettingKey::ALL
+            .into_iter()
+            .filter(|setting| setting.section() == section)
+            .filter_map(|setting| entry_of(mapping, setting))
+            .collect();
+        if !entries.is_empty() {
+            text.push('\n');
+            render_group(&mut text, &entries, 0);
         }
     }
     text
 }
 
+fn entry_of(mapping: &Mapping, setting: SettingKey) -> Option<Entry> {
+    let line = match setting_in(mapping, setting) {
+        Some(value) => EntryLine::Written(inline_yaml(value)),
+        None => EntryLine::Default(
+            OPTIONAL_SETTINGS
+                .iter()
+                .find(|(key, _, _)| *key == setting)
+                .map(|(_, default, _)| *default)?,
+        ),
+    };
+    Some(Entry {
+        setting,
+        segments: setting.segments().collect(),
+        line,
+    })
+}
+
+/// Renders entries that share their first `depth` segments, grouping the
+/// consecutive ones that share the next segment.
+fn render_group(text: &mut String, entries: &[Entry], depth: usize) {
+    let indent = "  ".repeat(depth);
+    let mut rest = entries;
+    while let Some(first) = rest.first() {
+        let name = first.segments[depth];
+        let size = rest
+            .iter()
+            .take_while(|entry| entry.segments[depth] == name)
+            .count();
+        let (group, next) = rest.split_at(size);
+        if first.segments.len() == depth + 1 {
+            text.push_str(&format!("{indent}# {}\n", comment_of(first.setting)));
+            match &first.line {
+                EntryLine::Written(value) => text.push_str(&format!("{indent}{name}: {value}\n")),
+                EntryLine::Default(default) => {
+                    text.push_str(&format!("{indent}# {name}: {default}\n"))
+                }
+            }
+        } else {
+            let mark = if group.iter().any(Entry::is_written) {
+                ""
+            } else {
+                "# "
+            };
+            text.push_str(&format!("{indent}{mark}{name}:\n"));
+            render_group(text, group, depth + 1);
+        }
+        rest = next;
+    }
+}
+
+/// The description of a setting followed by the flat key it replaces (R19).
+fn comment_of(setting: SettingKey) -> String {
+    let description = OPTIONAL_SETTINGS
+        .iter()
+        .find(|(key, _, _)| *key == setting)
+        .map(|(_, _, description)| *description)
+        .or_else(|| {
+            INSTALLER_SETTINGS
+                .iter()
+                .find(|(key, _)| *key == setting)
+                .map(|(_, description)| *description)
+        })
+        .unwrap_or_default();
+    match setting.former_key() {
+        Some(former) => format!("{description} Formerly `{former}`.")
+            .trim_start()
+            .to_string(),
+        None => description.to_string(),
+    }
+}
+
+/// A value on one line, in YAML flow style.
+fn inline_yaml(value: &Value) -> String {
+    match value {
+        Value::Sequence(items) => format!(
+            "[{}]",
+            items.iter().map(inline_yaml).collect::<Vec<_>>().join(", ")
+        ),
+        Value::Mapping(entries) if entries.is_empty() => "{}".to_string(),
+        Value::Mapping(entries) => format!(
+            "{{ {} }}",
+            entries
+                .iter()
+                .map(|(key, value)| format!("{}: {}", inline_yaml(key), inline_yaml(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        scalar => serde_yaml::to_string(scalar)
+            .map(|text| text.trim_end().to_string())
+            .unwrap_or_default(),
+    }
+}
+
+/// Writes `global.root` and the three server directories relative to it,
+/// so an init-ed installation keeps `catalog`, `state` and `work` under the
+/// root. A setting the environment already gives is left out.
 fn set_root_paths(config: &mut Value, root: &Path) -> Result<()> {
     let mapping = config
         .as_mapping_mut()
         .expect("configuration mapping checked");
-    for (key, directory) in [
-        (SettingKey::CatalogDir, "catalog"),
-        (SettingKey::StateDir, "state"),
-        (SettingKey::WorkDir, "work"),
+    for (key, value) in [
+        (SettingKey::GlobalRoot, root.to_string_lossy().into_owned()),
+        (SettingKey::CatalogDir, "catalog".to_string()),
+        (SettingKey::StateDir, "state".to_string()),
+        (SettingKey::WorkDir, "work".to_string()),
     ] {
         if environment_setting(key)?.is_none() {
-            mapping.insert(
-                Value::String(key.key().to_string()),
-                Value::String(root.join(directory).to_string_lossy().into_owned()),
-            );
+            insert_setting(mapping, key, Value::String(value));
         }
     }
     Ok(())
@@ -594,14 +748,14 @@ fn configure_server(
         parsed,
         SettingKey::ServerMode,
         "network",
-        "server_mode",
+        "server.mode",
     )?;
     require_fixed_setting(
         mapping,
         parsed,
         SettingKey::TlsTermination,
         "proxy",
-        "tls_termination",
+        "server.tls.termination",
     )?;
 
     let bind = get_or_prompt(
@@ -618,7 +772,7 @@ fn configure_server(
     if let Some(existing) = &existing_bind {
         if existing != &bind_value {
             return Err(CliError::usage(format!(
-                "server-bind '{bind}' contradicts the existing server_bind value '{existing}'"
+                "server-bind '{bind}' contradicts the existing server.bind value '{existing}'"
             )));
         }
     } else {
@@ -686,7 +840,7 @@ fn configure_server(
         .is_some_and(|existing| existing != &proxy_value)
     {
         return Err(CliError::usage(
-            "--trusted-proxy contradicts the existing trusted_proxies setting",
+            "--trusted-proxy contradicts the existing server.tls.trusted_proxies setting",
         ));
     }
     if proxy_setting.is_none() {
@@ -695,18 +849,15 @@ fn configure_server(
             .cloned()
             .map(Value::String)
             .collect::<Vec<_>>();
-        mapping.insert(
-            Value::String(SettingKey::TrustedProxies.key().to_string()),
+        insert_setting(
+            mapping,
+            SettingKey::TrustedProxies,
             Value::Sequence(sequence),
         );
     }
 
     let backend_id = select_backend_id(options.backend_id.as_deref(), non_interactive)?;
-    let catalog_dir = effective_setting(parsed, SettingKey::CatalogDir)?
-        .as_ref()
-        .and_then(SettingValue::as_path)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| CliError::failure("catalog_dir is missing after installer configuration"))?;
+    let catalog_dir = resolved_directory(parsed, SettingKey::CatalogDir)?;
     let backend_path = catalog_dir
         .join("backends")
         .join(format!("{backend_id}.yaml"));
@@ -720,6 +871,23 @@ fn configure_server(
         id: backend_id,
         catalog_dir,
     })
+}
+
+/// A server directory as the server will use it: a relative value is joined
+/// to `global.root`, the way configuration resolution does it.
+fn resolved_directory(parsed: &config::FileValues, setting: SettingKey) -> Result<PathBuf> {
+    let path_of = |setting: SettingKey| -> Result<PathBuf> {
+        Ok(effective_setting(parsed, setting)?
+            .unwrap_or_else(|| setting.built_in())
+            .as_path()
+            .map(Path::to_path_buf)
+            .unwrap_or_default())
+    };
+    let directory = path_of(setting)?;
+    if directory.is_absolute() {
+        return Ok(directory);
+    }
+    absolute_path(&path_of(SettingKey::GlobalRoot)?.join(directory))
 }
 
 fn require_fixed_setting(
@@ -795,10 +963,34 @@ fn effective_setting(
 }
 
 fn insert_text(mapping: &mut Mapping, setting: SettingKey, value: &str) {
-    mapping.insert(
-        Value::String(setting.key().to_string()),
-        Value::String(value.to_string()),
-    );
+    insert_setting(mapping, setting, Value::String(value.to_string()));
+}
+
+/// Writes one setting at its place in the tree, creating the sections and
+/// groups on the way.
+fn insert_setting(mapping: &mut Mapping, setting: SettingKey, value: Value) {
+    let segments: Vec<&str> = setting.segments().collect();
+    let (leaf, groups) = segments.split_last().expect("a path has a leaf");
+    let mut node = mapping;
+    for group in groups {
+        let entry = node
+            .entry(Value::String((*group).to_string()))
+            .or_insert_with(|| Value::Mapping(Mapping::new()));
+        if !entry.is_mapping() {
+            *entry = Value::Mapping(Mapping::new());
+        }
+        node = entry
+            .as_mapping_mut()
+            .expect("a group was just made a mapping");
+    }
+    node.insert(Value::String((*leaf).to_string()), value);
+}
+
+/// The raw value of one setting in the tree, if the mapping writes it.
+fn setting_in(mapping: &Mapping, setting: SettingKey) -> Option<&Value> {
+    let mut segments = setting.segments();
+    let first = mapping.get(segments.next()?)?;
+    segments.try_fold(first, |node, segment| node.as_mapping()?.get(segment))
 }
 
 fn reject_loopback_bind(bind: &str) -> Result<()> {
@@ -1182,85 +1374,139 @@ fn directories_outside(config_path: &Path, data_dir: &Path) -> Vec<String> {
     let Ok(Value::Mapping(mapping)) = serde_yaml::from_str::<Value>(&text) else {
         return Vec::new();
     };
-    [
-        SettingKey::CatalogDir,
-        SettingKey::StateDir,
-        SettingKey::WorkDir,
-    ]
-    .into_iter()
-    .filter_map(|key| mapping.get(key.key())?.as_str().map(PathBuf::from))
-    .filter(|path| !path.starts_with(data_dir))
-    .map(|path| path.display().to_string())
-    .collect()
+    let root = setting_in(&mapping, SettingKey::GlobalRoot)
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    SettingKey::ROOTS
+        .into_iter()
+        .filter_map(|key| setting_in(&mapping, key)?.as_str().map(PathBuf::from))
+        .filter_map(|path| match &root {
+            _ if path.is_absolute() => Some(path),
+            Some(root) => absolute_path(&root.join(path)).ok(),
+            // Relative to a root the file does not name: not ours to judge.
+            None => None,
+        })
+        .filter(|path| !path.starts_with(data_dir))
+        .map(|path| path.display().to_string())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Settings the generated file does not list as commented defaults: the
-    /// roots (always written) and the network-mode ones (written by the server
-    /// role, refused in trusted mode, so a commented default would mislead).
-    const NOT_COMMENTED: &[SettingKey] = &[
-        SettingKey::CatalogDir,
-        SettingKey::StateDir,
-        SettingKey::WorkDir,
-        SettingKey::OidcIssuer,
-        SettingKey::OidcAudience,
-        SettingKey::OwnerSubject,
-        SettingKey::TlsTermination,
-        SettingKey::TrustedProxies,
-    ];
+    const PATH: &str = "/etc/narsor/config.yaml";
 
     #[test]
     fn every_setting_is_written_or_listed_as_a_commented_default() {
         for setting in SettingKey::ALL {
             let commented = OPTIONAL_SETTINGS.iter().any(|(key, _, _)| *key == setting);
-            let excluded = NOT_COMMENTED.contains(&setting);
+            let installer = INSTALLER_SETTINGS.iter().any(|(key, _)| *key == setting);
             assert!(
-                commented != excluded,
+                commented != installer,
                 "{setting}: add it to OPTIONAL_SETTINGS (or, if it must not be suggested, to \
-                 NOT_COMMENTED) so `narsor-cli init` writes every setting"
+                 INSTALLER_SETTINGS) so `narsor-cli init` writes every setting"
             );
         }
     }
 
+    /// The file with the `# ` in front of every key removed, the way a user
+    /// switches all defaults on.
+    fn uncomment_all(text: &str) -> String {
+        text.lines()
+            .map(|line| {
+                let content = line.trim_start();
+                let indent = &line[..line.len() - content.len()];
+                match content.strip_prefix("# ") {
+                    Some(key_line) if is_key_line(key_line) => format!("{indent}{key_line}\n"),
+                    _ => format!("{line}\n"),
+                }
+            })
+            .collect()
+    }
+
+    fn is_key_line(text: &str) -> bool {
+        text.split_once(':').is_some_and(|(key, rest)| {
+            !key.is_empty()
+                && key.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                && (rest.is_empty() || rest.starts_with(' '))
+        })
+    }
+
     #[test]
-    fn each_commented_default_holds_up_on_its_own() {
-        // Uncommenting one line must give a valid file.
-        for (setting, default, _) in OPTIONAL_SETTINGS {
-            let parsed = config::file::parse(
-                Path::new("config.yaml"),
-                &format!("{}: {default}\n", setting.key()),
-            )
+    fn local_install_keeps_the_layout_and_every_default_can_be_switched_on() {
+        let mut config = Value::Mapping(Mapping::new());
+        set_root_paths(&mut config, Path::new("/srv/narsor")).unwrap();
+        let (text, written) = validate_config(Path::new(PATH), &config).unwrap();
+        assert_eq!(
+            written.get(SettingKey::GlobalRoot),
+            Some(&SettingValue::Path(PathBuf::from("/srv/narsor")))
+        );
+        assert_eq!(
+            written.get(SettingKey::CatalogDir),
+            Some(&SettingValue::Path(PathBuf::from("catalog")))
+        );
+        assert!(written.get(SettingKey::AgentHarness).is_none());
+
+        let uncommented = uncomment_all(&text);
+        for scope in [
+            Scope::SERVER,
+            Scope::WEB,
+            Scope::TUI,
+            Scope::CLI,
+            Scope::RUNNER,
+            Scope::CONTROLLER,
+        ] {
+            let parsed = config::file::parse(Path::new(PATH), &uncommented, &scope);
+            assert!(
+                parsed.is_ok(),
+                "{scope:?}: {:?}\n{uncommented}",
+                parsed.errors
+            );
+        }
+        let all = config::file::parse(Path::new(PATH), &uncommented, &Scope::ALL)
             .into_result()
-            .unwrap_or_else(|errors| panic!("{setting}: {errors:?}"));
-            assert!(parsed.get(*setting).is_some(), "{setting}");
+            .unwrap();
+        for (setting, _, _) in OPTIONAL_SETTINGS {
+            assert!(all.get(*setting).is_some(), "{setting} is not switched on");
         }
     }
 
     #[test]
-    fn commented_defaults_are_valid_settings() {
+    fn server_role_writes_network_settings_uncommented() {
         let mut config = Value::Mapping(Mapping::new());
-        config.as_mapping_mut().unwrap().insert(
-            Value::String("catalog_dir".into()),
-            Value::String("/data/catalog".into()),
-        );
-        let rendered = render_config("catalog_dir: /data/catalog\n", &config);
-        let uncommented: String = rendered
-            .lines()
-            .filter_map(|line| line.strip_prefix("# "))
-            .filter(|line| {
-                line.split_once(": ")
-                    .is_some_and(|(key, _)| SettingKey::from_key(key).is_some())
-            })
-            .map(|line| format!("{line}\n"))
-            .collect();
-        assert!(uncommented.contains("agent_timeout: none"));
-        let parsed = config::file::parse(Path::new("config.yaml"), &uncommented).into_result();
-        assert!(parsed.is_ok(), "{parsed:?}");
-        assert!(config::file::parse(Path::new("config.yaml"), &rendered)
-            .into_result()
-            .is_ok());
+        set_root_paths(&mut config, Path::new("/srv/narsor")).unwrap();
+        let parsed = validate_config(Path::new(PATH), &config).unwrap().1;
+        let options = InitOptions {
+            role: Some(InitRole::Server),
+            non_interactive: true,
+            server_bind: Some("10.0.0.5:8080".to_string()),
+            oidc_issuer: Some("https://id.example.com".to_string()),
+            oidc_audience: Some("narsor".to_string()),
+            trusted_proxies: vec!["10.0.0.1".to_string()],
+            backend_id: Some("workstation".to_string()),
+            ..InitOptions::default()
+        };
+
+        let backend = configure_server(&mut config, &parsed, &options, true).unwrap();
+        let (text, written) = validate_config(Path::new(PATH), &config).unwrap();
+
+        assert_eq!(backend.catalog_dir, Path::new("/srv/narsor/catalog"));
+        for setting in [
+            SettingKey::ServerMode,
+            SettingKey::ServerBind,
+            SettingKey::OidcIssuer,
+            SettingKey::OidcAudience,
+            SettingKey::TlsTermination,
+            SettingKey::TrustedProxies,
+        ] {
+            assert!(written.get(setting).is_some(), "{setting} not written");
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let issuer = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("issuer: "))
+            .expect("issuer written");
+        assert!(lines[issuer - 1].contains("`oidc_issuer`"), "{text}");
     }
 }

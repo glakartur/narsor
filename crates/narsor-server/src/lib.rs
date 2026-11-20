@@ -9,3 +9,4 @@ pub mod instance_lock;
 pub mod local_controller;
 pub mod observer_worker;
 pub mod runtime;
+pub mod settings;

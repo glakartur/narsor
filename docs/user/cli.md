@@ -6,7 +6,7 @@ Reference for the `narsor-cli` command line: global options, every command, and 
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--root <DIRECTORY>` | `./.narsor` | The data directory: executions and workspaces. Used by the TUI and by CLI commands that need local state. |
+| `--root <DIRECTORY>` | `./.narsor` | Sets `global.root`, the base directory of the installation; a relative `server.state` is resolved against it (see [Configuration](configuration.md#directories-relative-to-the-root)). Used by the TUI and by CLI commands that need local state. |
 | `--config <FILE>` | searched for | The configuration file to read instead of searching. A path that is not there is a usage error, not a fall-through. |
 | `--server <URL>` | `NARSOR_SERVER`, else the local server | The control plane for `narsor` and `narsor-cli`: `https://` (plain `http://` only for loopback). See [Remote tasks](remote.md#remote-tasks-and-backends). |
 | `--token-file <FILE>`, `--token-command <CMD>` | `NARSOR_TOKEN_FILE`, `NARSOR_TOKEN_COMMAND`, `NARSOR_TOKEN` | Where the OIDC token for `--server` comes from; a file or command is read again after a `401`. Never a command-line value. |
@@ -79,9 +79,10 @@ Status: input_needed
 2. `globals.workspace: { type: local, path: … }` — the contents of that
    directory are copied into the workspace. The path must be absolute and, once
    symlinks and `..` are resolved, lie inside a directory listed in the
-   `local_workspace_roots` setting (a list; `NARSOR_LOCAL_WORKSPACE_ROOTS`,
-   comma-separated). **It is empty by default, which refuses every local
-   directory** — and the same applies to a `type: git` repository that is a
+   `server.local_workspace_roots` setting (a list;
+   `NARSOR_SERVER__LOCAL_WORKSPACE_ROOTS`, comma-separated). **It is empty by
+   default, which refuses every local directory** — and the same applies to a
+   `type: git` repository that is a
    plain local path. Symlinks are copied as links; one that leads outside the
    directory fails the task's provisioning instead of copying its target.
 3. No `workspace` section — an empty runner workspace is created after
@@ -239,18 +240,21 @@ Current state: completed
 
 ### `config show [--format table|json]`
 
-Every setting, its effective value and where that value came from. See
-[Configuration](configuration.md#configuration) for the layers, the file cascade and the
-environment variables.
+Every setting of every Narsor program installed next to `narsor-cli`, its
+effective value, where that value came from and which programs read it. Each
+program checks its own sections; `config show` merges the results and lists a
+program that is not installed as `not installed`. See
+[Configuration](configuration.md#seeing-what-is-in-force) for the layers, the
+file cascade and the environment variables.
 
 ```bash
 narsor-cli config show
-narsor-cli config show --format json | jq '.settings.data_dir.source'
+narsor-cli config show --format json | jq '.settings[] | select(.path == "server.state") | .source'
 ```
 
 It creates nothing, needs no writable home and no existing data directory, and
 it is the one command that still runs when the configuration file does not hold
-up.
+up. It exits 1 when any program reports a problem or cannot be checked.
 
 ### `repo`
 

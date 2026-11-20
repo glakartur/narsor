@@ -83,8 +83,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::conductor::ConductorRegistry;
-use crate::config::DEFAULT_ESCALATION_THRESHOLD;
-use crate::config::{AgentArgs, AgentDefaults};
+use crate::config::AgentArgs;
 use crate::domain::{
     effective_title, ActionConfig, ActionError, ActionResult, AnsweredBy, Artifact,
     ArtifactReference, ChoiceDefinition, DecisionMaker, DecisionProviderType, Event, EventData,
@@ -170,6 +169,11 @@ pub use step::step_memory::{
 /// A receiver that falls further behind than this loses the events in between
 /// and is told so by `RecvError::Lagged`; the engine itself never blocks on it.
 pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Consecutive failed attempts of an agent step after which its model or
+/// effort is raised, unless [`Engine::with_escalation_threshold`] says
+/// otherwise.
+pub const DEFAULT_ESCALATION_THRESHOLD: u32 = 3;
 
 /// Runs workflow executions against a store.
 ///

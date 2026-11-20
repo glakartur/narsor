@@ -93,7 +93,7 @@ pub enum SecretDeliveryMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendLimits {
-    /// Retired: the daemon's `max_concurrent_tasks` setting limits the tasks
+    /// Retired: the daemon's `server.max_concurrent_tasks` setting limits the tasks
     /// of all backends. Still read, so an older backend file loads, and
     /// ignored.
     #[serde(default, rename = "max_concurrent_tasks", skip_serializing)]

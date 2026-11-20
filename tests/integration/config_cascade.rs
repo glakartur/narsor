@@ -66,7 +66,7 @@ fn cascade(root: &TempRoot, named: Option<PathBuf>) -> ConfigCascade {
 #[test]
 fn a_file_in_the_user_directory_wins_and_carries_its_full_path() {
     let root = TempRoot::new();
-    let path = root.write("user/config.yaml", "log_level: info\n");
+    let path = root.write("user/config.yaml", "global:\n  log_level: info\n");
 
     let resolution = cascade(&root, None).resolve().expect("resolve");
 
@@ -80,8 +80,8 @@ fn a_file_in_the_user_directory_wins_and_carries_its_full_path() {
 fn the_user_file_wins_over_the_system_one_and_the_loser_is_named() {
     // AE5: the second file is not merged in, and it is not forgotten either.
     let root = TempRoot::new();
-    let user = root.write("user/config.yaml", "log_level: info\n");
-    let system = root.write("system/config.yaml", "log_level: debug\n");
+    let user = root.write("user/config.yaml", "global:\n  log_level: info\n");
+    let system = root.write("system/config.yaml", "global:\n  log_level: debug\n");
 
     let resolution = cascade(&root, None).resolve().expect("resolve");
 
@@ -101,9 +101,9 @@ fn the_user_file_wins_over_the_system_one_and_the_loser_is_named() {
 #[test]
 fn the_named_file_wins_over_both_directories() {
     let root = TempRoot::new();
-    let named = root.write("elsewhere/mine.yaml", "log_level: warn\n");
-    root.write("user/config.yaml", "log_level: info\n");
-    root.write("system/config.yaml", "log_level: debug\n");
+    let named = root.write("elsewhere/mine.yaml", "global:\n  log_level: warn\n");
+    root.write("user/config.yaml", "global:\n  log_level: info\n");
+    root.write("system/config.yaml", "global:\n  log_level: debug\n");
 
     let resolution = cascade(&root, Some(named.clone()))
         .resolve()
@@ -134,7 +134,7 @@ fn no_file_anywhere_is_a_silent_normal_state() {
 #[test]
 fn a_directory_that_does_not_exist_is_simply_skipped() {
     let root = TempRoot::new();
-    let system = root.write("system/config.yaml", "log_level: info\n");
+    let system = root.write("system/config.yaml", "global:\n  log_level: info\n");
 
     // The user directory is named but was never created.
     let resolution = cascade(&root, None).resolve().expect("resolve");
@@ -145,7 +145,7 @@ fn a_directory_that_does_not_exist_is_simply_skipped() {
 #[test]
 fn the_yml_spelling_is_found_too() {
     let root = TempRoot::new();
-    let path = root.write("user/config.yml", "log_level: info\n");
+    let path = root.write("user/config.yml", "global:\n  log_level: info\n");
 
     let resolution = cascade(&root, None).resolve().expect("resolve");
 
@@ -155,8 +155,8 @@ fn the_yml_spelling_is_found_too() {
 #[test]
 fn the_yaml_spelling_wins_over_the_yml_one_in_the_same_directory() {
     let root = TempRoot::new();
-    let yaml = root.write("user/config.yaml", "log_level: info\n");
-    let yml = root.write("user/config.yml", "log_level: debug\n");
+    let yaml = root.write("user/config.yaml", "global:\n  log_level: info\n");
+    let yml = root.write("user/config.yml", "global:\n  log_level: debug\n");
 
     let resolution = cascade(&root, None).resolve().expect("resolve");
 
@@ -218,7 +218,7 @@ fn a_file_that_cannot_be_read_says_so_rather_than_claiming_it_is_missing() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = TempRoot::new();
-    let path = root.write("user/config.yaml", "log_level: info\n");
+    let path = root.write("user/config.yaml", "global:\n  log_level: info\n");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("drop the permissions");
 
     let outcome = cascade(&root, None).resolve();
@@ -240,7 +240,7 @@ fn a_file_that_cannot_be_read_says_so_rather_than_claiming_it_is_missing() {
 #[test]
 fn a_named_file_that_is_not_there_is_a_usage_error_not_a_fall_through() {
     let root = TempRoot::new();
-    let user = root.write("user/config.yaml", "log_level: info\n");
+    let user = root.write("user/config.yaml", "global:\n  log_level: info\n");
     let missing = root.path().join("nope.yaml");
 
     let error = cascade(&root, Some(missing.clone()))
@@ -259,7 +259,7 @@ fn a_named_file_that_is_not_there_is_a_usage_error_not_a_fall_through() {
 #[test]
 fn a_broken_candidate_below_the_winner_does_not_stop_the_start() {
     let root = TempRoot::new();
-    let user = root.write("user/config.yaml", "log_level: info\n");
+    let user = root.write("user/config.yaml", "global:\n  log_level: info\n");
     fs::create_dir_all(root.system_dir().join("config.yaml")).expect("create the directory");
 
     let resolution = cascade(&root, None)
@@ -289,7 +289,7 @@ fn the_winning_path_is_absolute_even_when_the_directory_was_relative() {
     // "config.yaml". A relative XDG_CONFIG_HOME is against the spec but is
     // accepted by the code around this, so it has to be handled here.
     let root = TempRoot::new();
-    root.write("user/config.yaml", "log_level: info\n");
+    root.write("user/config.yaml", "global:\n  log_level: info\n");
 
     let relative = pathdiff_from_cwd(&root.user_dir());
     let resolution = ConfigCascade::with_dirs(None, Some(relative), None)
@@ -328,7 +328,8 @@ fn a_config_map_symlink_chain_is_reported_by_the_path_that_was_mounted() {
     let system = root.system_dir();
     let snapshot = system.join("..2026_09_24_10_00_00.1234");
     fs::create_dir_all(&snapshot).expect("create the snapshot directory");
-    fs::write(snapshot.join("config.yaml"), "log_level: info\n").expect("write the file");
+    fs::write(snapshot.join("config.yaml"), "global:\n  log_level: info\n")
+        .expect("write the file");
     std::os::unix::fs::symlink(&snapshot, system.join("..data")).expect("link ..data");
     std::os::unix::fs::symlink(
         Path::new("..data").join("config.yaml"),

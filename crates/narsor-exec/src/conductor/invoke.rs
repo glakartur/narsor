@@ -146,7 +146,7 @@ pub struct HarnessInvoker {
 }
 
 /// The model tier and the effort the conductor runs with. Both come from the
-/// daemon's configuration (`conductor_model`, `conductor_effort`); a field
+/// daemon's configuration (`runner.conductor.model`, `runner.conductor.effort`); a field
 /// that is not set leaves the choice to the harness.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConductorProfile {

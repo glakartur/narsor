@@ -22,7 +22,6 @@ pub mod step_profile;
 pub mod timeline;
 pub mod timeline_file;
 
-pub use crate::config::AgentDefaults;
 pub use decision::{
     check_label, decide, permitted_labels, permitted_outputs, DecisionError, DecisionOutcome,
     DecisionRequest,
@@ -34,9 +33,9 @@ pub use runner::{
     plan_operator_transition, record_manual_transition, step_failure, terminal_status, ActionKind,
     Engine, EngineError, LastAgentStep, ManualTransition, OperatorTransition, OutputDecisionUndo,
     OutputRejection, OutputRescue, PendingStep, Recovery, RunHandle, StepFailure, TransitionPlan,
-    UndoneOutputDecision, EVENT_CHANNEL_CAPACITY, METADATA_CONDUCTOR_RETRY_KEY,
-    METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY, METADATA_OUTPUT_RESCUE_KEY,
-    METADATA_STEP_FAILURE_KEY, METADATA_STEP_LOCALS_KEY,
+    UndoneOutputDecision, DEFAULT_ESCALATION_THRESHOLD, EVENT_CHANNEL_CAPACITY,
+    METADATA_CONDUCTOR_RETRY_KEY, METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY,
+    METADATA_OUTPUT_RESCUE_KEY, METADATA_STEP_FAILURE_KEY, METADATA_STEP_LOCALS_KEY,
 };
 pub use timeline::{
     build_timeline, ConversationState, EventLink, Position, PositionStatus, Timeline,

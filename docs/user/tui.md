@@ -274,7 +274,7 @@ itself. It goes on by a comment (agent), *Uruchom od nowa* (script step) or
 | `H` | history: archived tasks | `narsor-cli task list --archived` |
 | `R` | repositories: `a` registers, `d` removes (`!`) | `narsor-cli task repo list` / `add` / `remove` (the same registry on any server; `narsor-cli repo …` is the local one) |
 | `h` | the installation's default agent harness: choose one, or go back to the configured one | `narsor-cli harness default set <harness>` / `reset` (`narsor-cli harness default` shows it) |
-| `L` | the limit of tasks processed at once: one more or one less, until the daemon restarts (then `max_concurrent_tasks` applies again) | `max_concurrent_tasks` in the configuration |
+| `L` | the limit of tasks processed at once: one more or one less, until the daemon restarts (then `server.max_concurrent_tasks` applies again) | `server.max_concurrent_tasks` in the configuration |
 | `O` | automation queues, read-only: the queues of the catalogue with their number of entries, a mark on a queue that does not run, and the catalogue files that cannot be used; in a queue its automations (description, scripts, state, runs, errors) and the tasks that wait on it. A task with a queue entry has one mark on its row. See [Automations and queues](observers.md#9-queue-views) | `narsor-cli queue list` / `show`; to change a queue or an automation, change its catalogue file |
 | the header | what the connection offers | `narsor-cli task capabilities` |
 
@@ -311,10 +311,10 @@ did not arrive.
 data is greyed and marked with its age (`stan sprzed 40s`), actions that change
 state are blocked with the reason, and drafts and forms stay. The stream always
 resumes from the last event applied. Events of a task patch its row at once, the
-rest is read again after a short delay, and every `tui_refresh_interval` (10 s
+rest is read again after a short delay, and every `tui.refresh_interval` (10 s
 by default, `none` turns it off; see [Configuration](configuration.md#configuration)). A runner
 report that changes no state, question or attention does not start a read, so the
-current step of a task refreshes every `tui_refresh_interval`. A read
+current step of a task refreshes every `tui.refresh_interval`. A read
 never changes the selection, the focus, the tab, the cursors, the following of
 the current step or a draft.
 

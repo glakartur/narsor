@@ -166,7 +166,7 @@ async fn the_usage_limits_are_read_at_start_and_again_after_fifteen_seconds() {
 #[tokio::test]
 async fn the_usage_limits_are_read_when_the_list_is_never_read_again() {
     let usage = UsageDouble::answering(claude_usage());
-    // `NARSOR_TUI_REFRESH_INTERVAL=none`: no period for the list.
+    // `NARSOR_TUI__REFRESH_INTERVAL=none`: no period for the list.
     let mut app = app_reading(&usage);
     assert_eq!(app.next_refresh_due(), None);
 

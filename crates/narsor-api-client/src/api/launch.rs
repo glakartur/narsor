@@ -108,35 +108,59 @@ where
 #[cfg(debug_assertions)]
 const EXE_OVERRIDE_ENV: &str = "NARSOR_TEST_DAEMON_EXE";
 
+/// The server binary [`resolve_exe`] looks for next to this executable.
+const SERVER_NAME: &str = "narsor-server";
+
 /// Resolves the executable [`spawn_detached`] re-execs: in a
 /// `debug_assertions` build, the override set by
 /// [`set_exe_override_for_tests`] if one was set, otherwise
-/// the sibling `narsor-server`. A release build only ever resolves that sibling — the
-/// override does not exist in that build at all (see [`EXE_OVERRIDE_ENV`]).
+/// the sibling `narsor-server` ([`sibling_executable`]). A release build
+/// only ever resolves that sibling — the override does not exist in that
+/// build at all (see [`EXE_OVERRIDE_ENV`]).
 fn resolve_exe() -> io::Result<std::path::PathBuf> {
     #[cfg(debug_assertions)]
     if let Ok(path) = std::env::var(EXE_OVERRIDE_ENV) {
         return Ok(std::path::PathBuf::from(path));
     }
-    let client_exe = std::env::current_exe()?;
-    let server_name = if cfg!(windows) {
-        "narsor-server.exe"
-    } else {
-        "narsor-server"
-    };
-    let adjacent = client_exe.with_file_name(server_name);
-    if adjacent.is_file() {
-        return Ok(adjacent);
+    match sibling_executable(SERVER_NAME)? {
+        Some(path) => Ok(path),
+        // The missing binary is reported by the spawn, naming the path.
+        None => Ok(std::env::current_exe()?.with_file_name(executable_name(SERVER_NAME))),
     }
-    // Cargo integration tests run from `target/<profile>/deps`; workspace
-    // binaries under test are one directory above their test harnesses.
-    if let Some(profile_dir) = client_exe.parent().and_then(|deps| deps.parent()) {
-        let workspace_binary = profile_dir.join(server_name);
+}
+
+/// The executable `name` installed next to this one, `None` when there is
+/// none.
+///
+/// Only the directory of `current_exe()` is searched, never `PATH`: a
+/// sibling is part of the same installation. A `debug_assertions` build
+/// also looks one directory up, because Cargo integration tests run from
+/// `target/<profile>/deps` and the workspace binaries under test are one
+/// directory above their test harnesses.
+pub fn sibling_executable(name: &str) -> io::Result<Option<std::path::PathBuf>> {
+    let client_exe = std::env::current_exe()?;
+    let name = executable_name(name);
+    let adjacent = client_exe.with_file_name(&name);
+    if adjacent.is_file() {
+        return Ok(Some(adjacent));
+    }
+    #[cfg(debug_assertions)]
+    if let Some(profile_dir) = client_exe.parent().and_then(Path::parent) {
+        let workspace_binary = profile_dir.join(&name);
         if workspace_binary.is_file() {
-            return Ok(workspace_binary);
+            return Ok(Some(workspace_binary));
         }
     }
-    Ok(adjacent)
+    Ok(None)
+}
+
+/// The file name of the executable `name` on this platform.
+fn executable_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
 }
 
 /// Path of the sibling server executable used by explicit client lifecycle

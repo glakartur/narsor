@@ -79,11 +79,11 @@ pub enum LaunchError {
     #[error(
         "backend 'local' is not available: a network server has no built-in local backend{}; \
          register a backend of kind 'local' under another id",
-        if *from_default { " (it is the configured 'default_backend'; set default_backend to \
-         another backend)" } else { "" }
+        if *from_default { " (it is the configured 'server.defaults.backend'; set \
+         server.defaults.backend to another backend)" } else { "" }
     )]
     NoBuiltinLocal {
-        /// Whether the task named no backend and `default_backend` chose it.
+        /// Whether the task named no backend and `server.defaults.backend` chose it.
         from_default: bool,
     },
     /// The backend record is unusable (limits, secrets, harnesses…).
@@ -280,7 +280,7 @@ pub trait LaunchResolver: Send + Sync {
     /// from configuration on every call, like [`Self::check_backend`].
     fn slot_release_timings(&self, backend: &BackendId) -> Result<SlotReleaseTimings, LaunchError>;
 
-    /// The configured `default_backend` — the fallback when the owner has
+    /// The configured `server.defaults.backend` — the fallback when the owner has
     /// not chosen one through the control plane (R10).
     fn configured_default_backend(&self) -> String;
 

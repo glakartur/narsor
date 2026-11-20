@@ -11,12 +11,13 @@
 //!
 //! # The observer worker
 //!
-//! With `observer_worker: on` the daemon starts `narsor-observer-worker`
-//! once its API listens, after the local controller, and stops it
-//! first at shutdown, while the API still takes its results
-//! ([`crate::observer_worker`]). A configuration that cannot start it
-//! (no script user and no waiver, network mode without
-//! `observer_worker_server`) stops the daemon at start.
+//! With `server.observer.enabled: true` the daemon starts
+//! `narsor-observer-worker` once its API listens, after the local
+//! controller, and stops it first at shutdown, while the API still takes
+//! its results ([`crate::observer_worker`]). A configuration that cannot
+//! start it (no script user and no waiver, network mode without
+//! `server.observer.server_url`) is refused by the configuration step
+//! ([`crate::settings::configure`]), before anything starts.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -29,16 +30,15 @@ use crate::api::{ApiHandle, ApiServices, ServerSecurity};
 use crate::auth_gate::NetworkAuth;
 use crate::local_controller::{controller_program, LocalController, LocalControllerSettings};
 use crate::observer_worker::{
-    worker_program, ObserverWorker, ObserverWorkerSettings, ScriptIsolation,
+    worker_program, ObserverPlan, ObserverWorker, ObserverWorkerSettings,
 };
-use narsor_engine::auth::{
-    OidcVerifier, OwnerStore, SecurityPlan, SecuritySettings, StartupOwnership,
-};
-use narsor_engine::config::Resolved;
+use crate::settings::ServerSettings;
+use narsor_engine::auth::{OidcVerifier, OwnerStore, SecurityPlan, StartupOwnership};
+use narsor_engine::config::{local_controller, Resolved, SettingKey};
 use narsor_engine::controller_protocol::{AutoResumePass, ProtocolService};
 use narsor_engine::engine::HarnessRegistry;
 use narsor_engine::environment::{BackendKind, BackendRecord, EnvironmentCatalog};
-use narsor_engine::launch::{CatalogLaunchResolver, HarnessDefaults, OwnerDefaults};
+use narsor_engine::launch::{CatalogLaunchResolver, HarnessDefaults};
 use narsor_engine::observers::{stored_observers_warning, ObserverStore};
 use narsor_engine::orchestration::ControlPlane;
 use narsor_engine::persistence::{DaemonInfo, DefaultHarnessSelector};
@@ -84,7 +84,10 @@ const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// sender — `kill -TERM <pid>` works too, deliberately, since the discovery
 /// file already publishes the PID). Never returns early on its own (R3):
 /// the only way out is that signal.
-pub async fn run_daemon(config: &Resolved) -> Result<()> {
+///
+/// `settings` is what [`crate::settings::configure`] made of `config`:
+/// every rule between the settings already held.
+pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<()> {
     let paths = narsor_engine::persistence::StatePaths::new(config.state_dir());
     // One daemon per state directory, held until this function returns. A
     // predecessor that is still shutting down is waited for: two daemons
@@ -97,10 +100,13 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     )
     .await
     .map_err(|error| CliError::failure(error.to_string()))?;
-    // Before anything is touched: a security configuration that does not
-    // hold up must stop the daemon, not leave it half started (U7).
-    let security = server_security(config, &paths)?;
-    let runs_local_controller = security.runs_local_controller();
+    let runs_local_controller = settings.runs_local_controller();
+    let ServerSettings {
+        security,
+        observer,
+        owner_defaults,
+    } = settings;
+    let security = server_security(security, &paths)?;
 
     let control_plane = recover_orchestration_at_startup(ControlPlane::new(paths.clone()));
 
@@ -109,7 +115,6 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     } else {
         refuse_declared_local_backend(config.catalog_dir())?;
     }
-    let defaults = config.agent_defaults();
     // A harness without a model for a tier is a configuration error found
     // here, not a step that fails hours into a task.
     HarnessRegistry::defaults()
@@ -121,7 +126,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         .map(str::to_owned)
         .collect();
     let selector = Arc::new(
-        DefaultHarnessSelector::load(paths.clone(), supported, defaults.harness.clone())
+        DefaultHarnessSelector::load(paths.clone(), supported, config.agent_harness().to_string())
             .await
             .map_err(|error| {
                 CliError::failure(format!("could not load default harness selection: {error}"))
@@ -130,12 +135,11 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     // Tasks resolve against the same catalogue and start on the same live
     // default harness a local harnessless step would use; their runners
     // follow it afterwards, through the control plane's answers (U7).
-    let owner_defaults = OwnerDefaults::from_config(config);
     if !runs_local_controller && owner_defaults.default_backend == LOCAL_BACKEND_ID {
+        let key = SettingKey::DefaultBackend;
         tracing::warn!(
-            "daemon: default_backend is '{LOCAL_BACKEND_ID}', which a network server does not \
-             have; a task that names no backend is refused until default_backend names another \
-             backend"
+            "daemon: {key} is '{LOCAL_BACKEND_ID}', which a network server does not have; a \
+             task that names no backend is refused until {key} names another backend"
         );
     }
     let launch = CatalogLaunchResolver::new(
@@ -185,7 +189,9 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         CliError::failure(format!("could not start the daemon's API server: {error}"))
     })?;
 
-    let observer_worker = observer_worker_settings(config, &api_handle, runs_local_controller)?;
+    let observer_worker = observer
+        .map(|plan| observer_worker_settings(plan, config, &api_handle))
+        .transpose()?;
 
     let info = DaemonInfo {
         pid: std::process::id(),
@@ -336,58 +342,32 @@ fn local_controller_settings(
             .join("local-controller")
             .join("credential"),
         storage: config.work_dir().join("local-controller"),
-        // Every runner the controller starts reads it anew: a launch
-        // setting of the backend, not part of the task.
-        harness_args: config.local_harness_home().runner_args(),
+        // The controller reads its own section (R21) from the file this
+        // daemon read, on every start: a restart reads the file again.
+        config_args: local_controller::config_args(config.file().path()),
+        forwarded_env_prefixes: local_controller::forwarded_prefixes(),
         log_directive: config.log_directive(),
     })
 }
 
-/// What the daemon starts its observer worker with, `None` when the
-/// configuration does not enable it. Refuses a configuration the worker
-/// could not run with, before anything starts.
+/// What the daemon starts its observer worker with: the checked `plan`,
+/// with the API's own address when no URL is configured (only a trusted
+/// server gets this far without one).
 fn observer_worker_settings(
+    plan: ObserverPlan,
     config: &Resolved,
     api: &ApiHandle,
-    trusted: bool,
-) -> Result<Option<ObserverWorkerSettings>> {
-    let Some(worker) = config.observer_worker() else {
-        return Ok(None);
-    };
-    let isolation = match (worker.script_user, worker.insecure_same_user) {
-        (Some(user), false) => ScriptIsolation::User(user),
-        (None, true) => ScriptIsolation::SameUser,
-        (None, false) => {
-            return Err(CliError::failure(
-                "observer_worker: on needs observer_script_user, the system user scripts run \
-                 as (or observer_insecure_same_user: true, for a trial only)",
-            ))
-        }
-        (Some(_), true) => {
-            return Err(CliError::failure(
-                "observer_script_user and observer_insecure_same_user: true contradict each \
-                 other; set one of them",
-            ))
-        }
-    };
-    let server = match worker.server {
-        Some(server) => server,
-        None if trusted => format!("http://{}", api.addr()),
-        None => {
-            return Err(CliError::failure(
-                "observer_worker: on in network mode needs observer_worker_server: the URL \
-                 clients reach the API at, through the TLS proxy",
-            ))
-        }
-    };
-    Ok(Some(ObserverWorkerSettings {
+) -> Result<ObserverWorkerSettings> {
+    Ok(ObserverWorkerSettings {
         program: worker_program().map_err(CliError::failure)?,
-        server,
-        secrets_dir: worker.secrets_dir,
-        isolation,
+        server: plan
+            .server
+            .unwrap_or_else(|| format!("http://{}", api.addr())),
+        secrets_dir: plan.secrets_dir,
+        isolation: plan.isolation,
         log_directive: config.log_directive(),
         supervision: narsor_controller_runtime::Supervision::default(),
-    }))
+    })
 }
 
 /// How often the daemon re-evaluates queue admission on its own (U10).
@@ -443,27 +423,23 @@ pub fn run_periodic_pass(control: &ProtocolService) -> AutoResumePass {
     resumed
 }
 
-/// The server's security mode from the configuration (U7), or a failure
-/// naming every problem.
+/// The server's security from its checked `plan` (U7).
 ///
 /// In network mode this also opens the installation's ownership records:
 /// with no owner configured or recorded, a fresh one-time claim code is
 /// printed to stderr (the daemon's log in a container) and stored `0600`
 /// beside them for the operator.
 fn server_security(
-    config: &Resolved,
+    plan: SecurityPlan,
     paths: &narsor_engine::persistence::StatePaths,
 ) -> Result<ServerSecurity> {
-    let plan = SecuritySettings::from_config(config)
-        .validate()
-        .map_err(|error| CliError::failure(error.to_string()))?;
     let network = match plan {
         SecurityPlan::Trusted { bind, cors } => return Ok(ServerSecurity::Trusted { bind, cors }),
         SecurityPlan::Network(network) => network,
     };
     let issuer = network.oidc.issuer.clone();
     let verifier = OidcVerifier::new(network.oidc)
-        .map_err(|error| CliError::failure(format!("oidc_issuer: {error}")))?;
+        .map_err(|error| CliError::failure(format!("{}: {error}", SettingKey::OidcIssuer)))?;
     let (owners, ownership) = OwnerStore::open(paths, &issuer, network.owner_subject.as_deref())
         .map_err(|error| {
             CliError::failure(format!(
