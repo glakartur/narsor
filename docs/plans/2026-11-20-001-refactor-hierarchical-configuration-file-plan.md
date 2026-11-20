@@ -1,7 +1,7 @@
 ---
 title: "refactor: Hierarchical configuration file, one section per service"
 type: refactor
-status: active
+status: completed
 date: 2026-11-20
 origin: docs/brainstorms/2026-11-20-hierarchical-configuration-file-requirements.md
 ---
