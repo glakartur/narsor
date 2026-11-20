@@ -708,6 +708,39 @@ pub fn archived(id: &str, title: &str, hours: i64) -> TaskSummary {
     offered(task)
 }
 
+/// The run the archive of `task` kept, as the control plane serves it: the
+/// header row of each of `positions`, with no attempts and no conversation.
+pub fn archived_timeline(task: &str, positions: Vec<Position>) -> TimelineResponse {
+    let positions = positions
+        .into_iter()
+        .map(|mut position| {
+            position.action_execution_id = None;
+            position.attempts.clear();
+            position.harness_session_id = None;
+            position.conversation = ConversationState::NotCreated {
+                reason: "storage usunięty przy archiwizacji".to_string(),
+            };
+            position
+        })
+        .collect();
+    let mut response = timeline(task, positions, None);
+    response.freshness = Freshness::Stale;
+    response.execution_status = Some(narsor_protocol::api::ExecutionStatusDto::Completed);
+    response
+}
+
+/// A step of an archived run: done by `harness` with `model`, at `cost` USD.
+pub fn archived_step(state: &str, harness: &str, model: &str, cost: f64) -> Position {
+    let mut step = position(state, PositionStatus::Succeeded);
+    step.harness = Some(harness.to_string());
+    step.model = Some(model.to_string());
+    step.usage = Some(narsor_protocol::api::PositionUsage {
+        cost_usd: Some(cost),
+        ..Default::default()
+    });
+    step
+}
+
 // ---------------------------------------------------------------------------
 // The installation's default harness (U5)
 // ---------------------------------------------------------------------------
