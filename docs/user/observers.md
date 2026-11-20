@@ -60,7 +60,7 @@ or records an error                (secrets masked)
    soon after it is due. The run gets a token that is valid only for this
    run and only until the run's deadline.
 3. The worker starts the script with a clean environment (with
-   `observer_insecure_same_user: true`, with the server's environment, as
+   `server.observer.insecure_same_user: true`, with the server's environment, as
    a runner's agent). The script reads
    its input on stdin (section 5).
 4. A `check` script makes its effects with `narsor-cli task create` and
@@ -589,14 +589,14 @@ and `out` in *Przebieg*.
 An automation names its secrets in `automation.yaml`
 (`secrets: [{name, env}]`). The control plane keeps only these names. The
 values are files in the secrets directory of the worker (the setting
-`observer_secrets_dir`), one file for each name, in one flat directory:
+`server.observer.secrets_dir`), one file for each name, in one flat directory:
 `{secrets directory}/{name}` (see
 [installation](../operations/installation.md#run-the-observer-worker)).
 
 - The script gets a secret only as the variable `env`, and only the
   secrets that its automation declares. It does not get the environment of
   the worker, and not the worker key. Exception: with
-  `observer_insecure_same_user: true` the script also gets the server's
+  `server.observer.insecure_same_user: true` the script also gets the server's
   environment (`HOME`, `PATH`, the tools' logins), but never a `NARSOR_*`
   variable; then an automation may use, for example, the login of `glab`
   instead of a secret.

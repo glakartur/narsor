@@ -114,17 +114,27 @@ through the discovery file, which must belong to you with mode `0600`.
 ### Network mode
 
 ```yaml
-# ~/.config/narsor/config.yaml (or NARSOR_<KEY> environment variables)
-server_mode: network
-server_bind: 0.0.0.0:8080            # what the proxy connects to
-oidc_issuer: https://login.example.com/realms/dev
-oidc_audience: narsor-api            # the token's `aud` must contain this
-owner_subject: ""                    # optional: bind the owner by config
-tls_termination: proxy
-trusted_proxies:                     # IPs or CIDRs of the proxy; never "everything"
-  - 10.0.0.12
-cors_allowed_origins: []             # browser origins allowed to call the API
+# ~/.config/narsor/config.yaml (or NARSOR_SERVER__<KEY> environment variables,
+# e.g. NARSOR_SERVER__OIDC__ISSUER)
+server:
+  mode: network
+  bind: 0.0.0.0:8080                 # what the proxy connects to
+  owner_subject: ""                  # optional: bind the owner by config
+  cors_allowed_origins: []           # browser origins allowed to call the API
+  oidc:
+    issuer: https://login.example.com/realms/dev
+    audience: narsor-api             # the token's `aud` must contain this
+  tls:
+    termination: proxy
+    trusted_proxies:                 # IPs or CIDRs of the proxy; never "everything"
+      - 10.0.0.12
 ```
+
+In network mode the server refuses to start without `server.oidc.issuer`,
+`server.oidc.audience`, `server.tls.termination: proxy` and
+`server.tls.trusted_proxies`, and it reports all the missing ones at once.
+In trusted mode leave the `oidc` and `tls` groups out: the server refuses a
+setting that it would ignore.
 
 **OIDC.** Tokens are validated against the issuer's discovery document and
 JWKS (refreshed on an unknown key id, rate-limited), with exact issuer and
@@ -132,7 +142,7 @@ audience, an asymmetric algorithm allow list (no `none`, no HMAC), signature,
 `exp`/`nbf` and a 30 s leeway. The owner is identified by the immutable pair
 `(iss, sub)` — never by e-mail or name.
 
-**Owner.** Either set `owner_subject` (the owner is bound at startup), or
+**Owner.** Either set `server.owner_subject` (the owner is bound at startup), or
 leave it empty: the daemon then prints a one-time **claim code** and stores it
 `0600` at `{state}/auth/claim-code`. The first user who presents a valid
 token together with the code owns the installation:
@@ -149,7 +159,7 @@ The claim is atomic and the code is spent by it; every other identity gets
 enrollment and revocation).
 
 **Trusted proxy and TLS.** In network mode the daemon speaks plain HTTP and
-accepts requests only from `trusted_proxies`, and only when the proxy says
+accepts requests only from `server.tls.trusted_proxies`, and only when the proxy says
 the client spoke HTTPS. The proxy must:
 
 * terminate TLS and set `X-Forwarded-Proto: https` on **every hop** — with a
@@ -164,7 +174,7 @@ the client spoke HTTPS. The proxy must:
   when the token it was opened with expires; clients reconnect with a fresh
   token and resume from their cursor.
 
-**CORS.** Empty `cors_allowed_origins` sends no CORS headers at all, so
+**CORS.** Empty `server.cors_allowed_origins` sends no CORS headers at all, so
 browsers refuse every cross-origin call. List exact origins
 (`https://narsor-web.example.com`) only for a web client you run.
 
@@ -179,7 +189,7 @@ accepted for a loopback host only).
 
 ## 3. Catalogue: backends, profiles, runtime, repositories
 
-Everything below lives under the catalogue directory (`catalog_dir`) of the
+Everything below lives under the catalogue directory (`server.catalog`) of the
 control plane and is read when a task is **created**: the result is sealed
 into the task's immutable launch spec and never re-read for that task.
 
@@ -190,7 +200,7 @@ into the task's immutable launch spec and never re-read for that task.
 | Runtime bundle and tool images | `{catalog}/runtime.yaml` |
 | Repository base image | `{catalog}/repositories/{id}.yaml`, key `base_image` |
 | Workflow image | workflow `globals.image` |
-| Default backend / profile | settings `default_backend` (default `local`), `default_profile` (default `default`); the owner can override the backend at runtime |
+| Default backend / profile | settings `server.defaults.backend` (default `local`), `server.defaults.profile` (default `default`); the owner can override the backend at runtime |
 | Automations and queues | `{catalog}/automations/{name}/` (`automation.yaml`, `check.sh`, optional `in.sh`, `out.sh`), `{catalog}/queues/{name}.yaml`; read at every run, not sealed into a task (see [Automations and queues](../user/observers.md#2-the-catalogue-files)) |
 
 ### Backend
@@ -268,7 +278,7 @@ a pin: a running task follows the installation's default harness (see
 ### The catalogue in a ConfigMap
 
 When the control plane runs in a Pod, the catalogue can come from one
-ConfigMap, copied into `catalog_dir` by an init container at every start of
+ConfigMap, copied into `server.catalog` by an init container at every start of
 the Pod (so the ConfigMap wins). A ConfigMap key cannot hold `/`, so the
 key names the target file:
 
@@ -315,7 +325,7 @@ The values of the automations' secrets are not in the ConfigMap: see
 backend or a profile cannot use them, and an automation cannot use a
 backend secret. An automation names its secrets in `automation.yaml`
 (`secrets: [{name, env}]`). The values are files in the secrets directory
-of the observer worker (`observer_secrets_dir`), one flat directory with
+of the observer worker (`server.observer.secrets_dir`), one flat directory with
 one file for each name, readable by the server's user only (see
 [installation](installation.md#run-the-observer-worker)). For each run the
 worker gives the script only the secrets its automation declares, as
@@ -323,11 +333,11 @@ environment variables, and masks their values in the logs it reports.
 
 On Kubernetes, keep the values in one Secret whose keys are the secret
 names (`kubectl create secret generic narsor-observer-secrets
---from-file=gitlab-token=…`). Do not point `observer_secrets_dir` at the
+--from-file=gitlab-token=…`). Do not point `server.observer.secrets_dir` at the
 Secret volume: a Secret volume is open to all users of the Pod, and the
 worker refuses such a directory. Copy the files in the init container into
 a `0700` directory on an in-memory `emptyDir` (mode `0600` files), and set
-`observer_secrets_dir` to it, as `deploy/kind/server.yaml` does. Mount the
+`server.observer.secrets_dir` to it, as `deploy/kind/server.yaml` does. Mount the
 Secret with `defaultMode: 0440` so the Pod's user reads it through
 `fsGroup`. A change of the Secret applies at the next start of the Pod.
 
@@ -698,7 +708,7 @@ unreadable, and 0 or more than 86400 makes the backend unusable with a clear
 message. The control plane reads them again at every decision, so a change
 applies without a restart.
 
-* `max_concurrent_tasks` in the daemon configuration is one global task
+* `server.max_concurrent_tasks` in the daemon configuration is one global task
   budget shared by every backend (default `1`; `none` is unlimited). A slot
   is held by work, not by a live process alone. Slots are held by tasks in
   `Provisioning`, `Running`, `PauseRequested`, `Interrupted`, `Unknown`,
@@ -1055,14 +1065,14 @@ a runner follows no redirect either.
 trusted, so the controller checks every launch spec before anything of the
 task is created:
 
-* tasks get a private HOME on task storage. `--home host` (or `local_home:
-  host` in the configuration, or `NARSOR_LOCAL_HOME=host`) needs
+* tasks get a private HOME on task storage. `--home host` (or `controller.local.home:
+  host` in the configuration, or `NARSOR_CONTROLLER__LOCAL__HOME=host`) needs
   `--accept-host-home`: tasks would then see your SSH keys, tokens and
   harness logins. `--codex-home`, `--claude-config-dir` and
   `--claude-profile-source` point at your own harness logins, so they need
   `--accept-host-home` too; without it the configuration file's
-  `local_codex_home`, `local_claude_config_dir` and
-  `local_claude_profile_source` are not used;
+  `controller.local.codex_home`, `controller.local.claude_config_dir` and
+  `controller.local.claude_profile_source` are not used;
 * with a private HOME the runner and everything it starts inherit none of
   your logins from the controller's environment: no `CODEX_HOME`,
   `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`,
@@ -1091,10 +1101,16 @@ These checks keep the server from choosing what the runner touches. They do
 not keep a task's own code — what its harness runs — from reading the user's
 files.
 
-**Configuration.** Started by hand, the controller reads the Narsor
-configuration file (`--config`, else the usual search) for the HOME settings
-only: a flag wins over a `NARSOR_LOCAL_*` variable, which wins over the file.
-`--no-config` reads no file.
+**Configuration.** Started by hand, the controller reads the `global` and
+`controller` sections of the Narsor configuration file (`--config`, else the
+usual search) for the HOME settings only: a flag wins over a
+`NARSOR_CONTROLLER__LOCAL__*` variable, which wins over the file.
+`--no-config` reads no file; the `NARSOR_GLOBAL__*` and
+`NARSOR_CONTROLLER__*` variables still apply. The local controller that a
+trusted-mode server starts reads the file that won the server's own search
+(or none) and gets only the server's `NARSOR_GLOBAL__*` and
+`NARSOR_CONTROLLER__*` variables; the server checks the controller's
+sections before it starts and refuses to start on their errors.
 
 **Losing the computer.** Revoke its identity at once:
 `narsor-cli controller list`, then `narsor-cli controller revoke <id>`. Its

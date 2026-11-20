@@ -48,7 +48,7 @@ analyze:
 `harness` is **optional**. An action that names none uses the installation's
 default harness: the operator's choice (`narsor-cli harness default set <harness>`,
 or `h` in the TUI) when there is one, otherwise the configured
-`agent_harness`, and failing that the built-in `claude-code` — so a workflow
+`server.agent_harness`, and failing that the built-in `claude-code` — so a workflow
 without it is portable and still passes `validate`. The other side of that
 bargain: its behaviour then depends on the environment, and the same file may
 run a different agent on a laptop than in a container. Read the effective value
@@ -58,7 +58,7 @@ workflow meant to run reproducibly should declare `harness:` explicitly.
 ```bash
 narsor-cli harness default               # get: effective, configured, override, supported (--json: as JSON)
 narsor-cli harness default set codex     # the operator's choice, until changed or reset
-narsor-cli harness default reset         # back to the configured agent_harness
+narsor-cli harness default reset         # back to the configured server.agent_harness
 ```
 
 **A change of the default reaches work already under way**, not only new
@@ -75,9 +75,9 @@ reports it in its runner view (`default_harness_unavailable` in `narsor-cli task
 show --json`; one line in the TUI's details) — information, not a failure of a
 step.
 
-`timeout` on an agent state works the same way: declared, it wins; absent, the
-configured `agent_timeout` applies. Script and human states are untouched by
-that setting — a script state that declares no limit still has none.
+`timeout` on an agent state is that state's limit. There is no configured
+fallback: an agent state that declares none, in a workflow that sets no
+default of its own, has no limit — the same as a script or human state.
 
 An agent that needs a person's answer without changing workflow stage returns
 `{"status":"awaiting_input","question":"...","options":["..."]}` rather than an output label.

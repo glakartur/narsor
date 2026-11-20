@@ -13,7 +13,7 @@ binary; nothing else is installed and the build needs no Node toolchain.
 
 ## Setups
 
-| Setup | `narsor-web` runs | `web_upstream` | `web_token` |
+| Setup | `narsor-web` runs | `web.upstream` | `web.token` |
 |---|---|---|---|
 | Everything on your computer | on your computer | `local` (default): the local daemon, discovered or launched like the CLI and TUI do | `server` (default) |
 | Your computer in front of a remote server | on your computer | `https://narsor.example.com` | `server`, with the server's token from `NARSOR_TOKEN_FILE`, `NARSOR_TOKEN_COMMAND` or `NARSOR_TOKEN` |
@@ -21,19 +21,20 @@ binary; nothing else is installed and the build needs no Node toolchain.
 
 ```bash
 narsor-web --open          # the default setup: the local daemon, browser opened
-NARSOR_WEB_UPSTREAM=https://narsor.example.com \
+NARSOR_WEB__UPSTREAM=https://narsor.example.com \
 NARSOR_TOKEN_COMMAND='my-oidc-token' narsor-web --open
 ```
 
-The settings (`web_bind`, `web_upstream`, `web_token`) are in the shared
-[configuration](configuration.md); `narsor-cli config show` lists them.
+The settings are the `web` section of the shared
+[configuration](configuration.md) (`web.bind`, `web.upstream`, `web.token`);
+`narsor-cli config show` lists them.
 `narsor-web` accepts `--root` and `--config` like the other programs.
 
-`web_bind` must be a loopback address (default `127.0.0.1:8484`).
+`web.bind` must be a loopback address (default `127.0.0.1:8484`).
 `narsor-web` does not serve TLS yet, and a browser treats plain HTTP as a
 secure context only on loopback. To reach the interface from other machines,
 put a TLS proxy in front of a loopback `narsor-web`. A server in network mode
-then lists the address of `narsor-web` in `trusted_proxies`; `narsor-web`
+then lists the address of `narsor-web` in `server.tls.trusted_proxies`; `narsor-web`
 passes the proxy's `X-Forwarded-Proto` on in the `passthrough` mode.
 
 ## Tokens

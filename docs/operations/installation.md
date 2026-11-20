@@ -65,11 +65,14 @@ prints `narsor-cli 1.2.3` for the release tagged `v1.2.3`. The archive's
 `manifest.json` carries the same version, and the installer refuses an
 archive whose version does not match the tag it asked for.
 
-The data directory is a root: the configuration gets
-`catalog_dir: ROOT/catalog`, `state_dir: ROOT/state` and `work_dir: ROOT/work`,
-followed by the other settings as commented-out defaults (remove the `#` to
-change one). The number of tasks processed in parallel is the global
-`max_concurrent_tasks` setting (default 1).
+The data directory is the root: the configuration gets `global.root: ROOT`
+and the `server` section with the relative directories `catalog`, `state`
+and `work` (they resolve to `ROOT/catalog`, `ROOT/state`, `ROOT/work`),
+followed by the other settings as commented-out defaults inside
+their sections (remove the `#` to change one; each comment names the flat key
+the setting replaces). The number of tasks processed in parallel is the
+`server.max_concurrent_tasks` setting (default 1). The file is a tree of
+sections, one per program; see [Configuration](../user/configuration.md#the-tree-of-sections).
 
 If a configuration file already exists, it is left untouched. The installer
 writes `config.yaml.new` next to it with the default values and does not ask
@@ -198,8 +201,8 @@ the imported profile. If none is set, local-daemon discovery remains in use.
 
 ## Start the server and workstation controller
 
-Server installation configures `server_mode: network`, proxy TLS termination,
-the trusted proxy list, and a separate `kind: local`,
+Server installation configures `server.mode: network`, the `server.oidc`
+group, proxy TLS termination and the trusted proxy list (`server.tls`), and a separate `kind: local`,
 `trust_scope: workstation` backend in the catalogue. It prints commands to
 start the server with the selected config file and the controller separately.
 No systemd unit or Kubernetes resources are installed; the VM's existing
@@ -212,7 +215,7 @@ account and no unrelated credentials.
 
 Run the owner commands from an installed CLI (`--with-frontend` adds it to the
 server host) with `NARSOR_SERVER` set to the corporate HTTPS URL and the owner's
-local token source configured. If no `owner_subject` was configured, claim the
+local token source configured. If no `server.owner_subject` was configured, claim the
 server's one-time owner code before creating the workstation enrollment code:
 
 ```bash
@@ -249,31 +252,36 @@ supervises it. How to write an automation and a queue is in
 observers stored in the state to catalogue automations, read
 [Updates](updates.md#update-to-catalogue-automations-d78).
 
-**Enable the worker.** The worker is off by default. Set these settings in
-the server's configuration file (or as `NARSOR_<NAME>` environment
-variables):
+**Enable the worker.** The worker is off by default. Set the
+`server.observer` group in the server's configuration file (or the
+`NARSOR_SERVER__OBSERVER__<KEY>` environment variables, for example
+`NARSOR_SERVER__OBSERVER__ENABLED=true`):
 
 | setting | value |
 | --- | --- |
-| `observer_worker` | `on` starts the worker; `off` (default) does not |
-| `observer_script_user` | the system user that runs the scripts; not the server's user, not `root` |
-| `observer_secrets_dir` | the absolute path of the secrets directory; empty: no secrets |
-| `observer_worker_server` | the URL the worker and its scripts use for the API; empty: the server's own address (trusted mode only) |
-| `observer_insecure_same_user` | `true` runs the scripts as the server's own user, with the server's environment (as a runner runs its agent); for a trial or a single-user machine only |
+| `server.observer.enabled` | `true` starts the worker; `false` (default) does not |
+| `server.observer.script_user` | the system user that runs the scripts; not the server's user, not `root` |
+| `server.observer.secrets_dir` | the absolute path of the secrets directory; empty: no secrets |
+| `server.observer.server_url` | the URL the worker and its scripts use for the API; empty: the server's own address (trusted mode only) |
+| `server.observer.insecure_same_user` | `true` runs the scripts as the server's own user, with the server's environment (as a runner runs its agent); for a trial or a single-user machine only |
 
 ```yaml
-observer_worker: on
-observer_script_user: narsor-observer-script
-observer_secrets_dir: /etc/narsor/observer-secrets
-# Network mode only: the URL of the TLS proxy.
-observer_worker_server: https://narsor.example.com
+server:
+  observer:
+    enabled: true
+    script_user: narsor-observer-script
+    secrets_dir: /etc/narsor/observer-secrets
+    # Network mode only: the URL of the TLS proxy.
+    server_url: https://narsor.example.com
 ```
 
-The server refuses to start when `observer_worker` is `on` and neither
-`observer_script_user` nor `observer_insecure_same_user: true` is set, or
-both are set. In network mode the server refuses to start without
-`observer_worker_server`: every request must come through the TLS proxy, the
-worker's requests too.
+The server refuses to start when `server.observer.enabled` is `true` and
+neither `server.observer.script_user` nor
+`server.observer.insecure_same_user: true` is set, or both are set. In
+network mode the server refuses to start without
+`server.observer.server_url`: every request must come through the TLS proxy,
+the worker's requests too. These checks run before the server starts
+anything, and `narsor-cli config show` reports them too.
 
 The server finds `narsor-observer-worker` in its own directory, as it finds
 `narsor-controller`. Scripts call `narsor-cli` for their effects (task
@@ -334,7 +342,7 @@ script process before the script starts, so a script has none of them.
 Limits of the server's service (`MemoryMax`, `TasksMax`) apply to the
 server, the worker and all scripts together.
 
-With `observer_insecure_same_user: true` scripts run as the server's own
+With `server.observer.insecure_same_user: true` scripts run as the server's own
 user. A script can then read the worker key, every secret and the server's
 state. The worker writes a warning at start. Do not use it in
 production.
@@ -364,7 +372,7 @@ exactly these variables:
 | one per secret | the value of a secret that the automation declares |
 
 With a script user, nothing of the worker's own environment is passed on,
-the worker key included (for `observer_insecure_same_user: true`, see
+the worker key included (for `server.observer.insecure_same_user: true`, see
 above). The script reads the
 run's input as JSON on stdin and prints its result on stdout. It runs in a
 process group of its own: at its time limit (5 minutes for `check`,

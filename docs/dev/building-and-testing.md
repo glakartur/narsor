@@ -134,16 +134,19 @@ codex exec [--model <model>] --sandbox <read-only|workspace-write> \
 to its sessions — `codex` in `~/.codex/auth.json`, Claude Code in
 `~/.claude/.credentials.json` — so which `HOME` the runner gives a task decides
 whether the harness is logged in. A local task keeps the daemon's own `HOME` by
-default (`local_home: host`), with the same logins as the console. `local_home:
-private` gives every local task a fresh `HOME` on its own storage instead;
-`local_codex_home` and `local_claude_config_dir` (absolute paths, exported as
+default (`controller.local.home: host`), with the same logins as the
+console. `controller.local.home: private` gives every local task a fresh
+`HOME` on its own storage instead; `controller.local.codex_home` and
+`controller.local.claude_config_dir` (absolute paths, exported as
 `CODEX_HOME` and `CLAUDE_CONFIG_DIR`) then point the harnesses at a login
-directory of your choice. `local_claude_profile_source` (an absolute path,
-empty by default) names a Claude Code profile the runner merges into
-Claude's configuration directory before every start; it copies nothing when
-it is empty or the configuration directory itself, and it needs either
-`local_claude_config_dir` or `local_home: private` (then
-`$HOME/.claude` on the task storage). The runner reads these on every start — they are
+directory of your choice. `controller.local.claude_profile_source` (an
+absolute path, empty by default) names a Claude Code profile the runner
+merges into Claude's configuration directory before every start; it copies
+nothing when it is empty or the configuration directory itself, and it
+needs either `controller.local.claude_config_dir` or
+`controller.local.home: private` (then `$HOME/.claude` on the task
+storage). These settings belong to the `controller` section: the local
+controller reads them, not the server. The runner reads these on every start — they are
 the backend's settings, not part of a task — so switching them leaves a
 running task's earlier sessions behind. Inherited `ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY` and `CODEX_API_KEY` are always dropped, so a harness never
