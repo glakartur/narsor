@@ -50,6 +50,8 @@ impl Outcome {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum DetailJob {
     Timeline,
+    /// The run an archived task kept, read for its history entry.
+    ArchivedTimeline,
     Conductor,
     Events,
     Attempt(String),

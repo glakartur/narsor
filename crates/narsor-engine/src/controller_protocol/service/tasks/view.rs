@@ -132,13 +132,10 @@ pub(super) fn current_position(timeline: &Timeline) -> Option<String> {
         .map(|position| position.label.clone())
 }
 
-/// The transitions an owner can ask for out of the state the runner last
-/// reported: read from the sealed workflow snapshot, only while the task is
-/// running (nothing else can carry one out).
-pub(super) fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
-    if record.runner_state != RunnerState::Running {
-        return None;
-    }
+/// The sealed workflow of the task and the state of it the runner last
+/// reported; `None` while there is no such report or the workflow cannot be
+/// read.
+fn reported_state(record: &TaskRecord) -> Option<(WorkflowDefinition, &str)> {
     let current = record
         .runner
         .as_ref()?
@@ -147,7 +144,37 @@ pub(super) fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer>
         .current_state
         .as_deref()?;
     let definition = record.launch_spec.definition().ok()?;
+    Some((definition, current))
+}
+
+/// The transitions an owner can ask for out of the state the runner last
+/// reported: read from the sealed workflow snapshot, only while the task is
+/// running (nothing else can carry one out).
+pub(super) fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
+    if record.runner_state != RunnerState::Running {
+        return None;
+    }
+    let (definition, current) = reported_state(record)?;
     transition_offer(&definition, current)
+}
+
+/// Whether the execution of the task sits in a terminal state of its sealed
+/// workflow (D80): the runner reported a terminal execution status, and the
+/// state it reported is marked `terminal` in the workflow. A terminal status
+/// alone is not enough: a failed step ends the execution as failed while its
+/// state is not a terminal one.
+pub(crate) fn at_workflow_terminal_state(record: &TaskRecord) -> bool {
+    let terminal_status = record
+        .runner
+        .as_ref()
+        .is_some_and(|runner| runner.snapshot.execution_status.is_terminal());
+    terminal_status
+        && reported_state(record).is_some_and(|(definition, current)| {
+            definition
+                .states
+                .get(current)
+                .is_some_and(|state| state.terminal)
+        })
 }
 
 /// Every step of the workflow, for the stop in which the owner may choose
@@ -242,15 +269,23 @@ pub(super) fn task_title(record: &TaskRecord) -> Option<String> {
     effective_title(record.launch_spec.title.as_deref(), generated.as_deref())
 }
 
-/// The workspace rows a task shows: what its runner reported, else what the
-/// launch spec knows, which is all there is while the task waits in the
-/// queue. The workspaces keep the launch spec's order.
+/// The workspace rows a task shows: what was frozen when it was archived,
+/// else what its runner reported, else what the launch spec knows, which is
+/// all there is while the task waits in the queue. The workspaces keep the
+/// launch spec's order.
 pub fn task_workspaces(record: &TaskRecord) -> Vec<WorkspaceHeader> {
-    let reported = record
+    let frozen = record
+        .archived_run
+        .as_ref()
+        .map(|run| run.workspaces.as_slice());
+    let last_reported = record
         .runner
         .as_ref()
-        .map(|runner| runner.snapshot.workspaces.as_slice())
-        .filter(|workspaces| !workspaces.is_empty());
+        .map(|runner| runner.snapshot.workspaces.as_slice());
+    let reported = [frozen, last_reported]
+        .into_iter()
+        .flatten()
+        .find(|workspaces| !workspaces.is_empty());
     match reported {
         // A remote runner's word is not trusted with a terminal.
         Some(workspaces) => workspaces

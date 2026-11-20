@@ -10,12 +10,13 @@ use crate::api::ConversationResponse;
 use crate::config::Flags;
 use crate::domain::{without_unsafe_chars, Event};
 use crate::tui::conversation::{classify, unclassified_preview};
-use narsor_protocol::api::{ConversationState, Position, PositionStatus};
+use narsor_protocol::api::{ConversationState, Position};
 use narsor_protocol::chat::ChatElement;
 
 use super::daemon_access::{client_error, daemon_client, load_execution_summary};
 use super::open_matters::{print_conductor_matters, print_pending_input};
 use super::{CliError, Result};
+use crate::cli::task_text::position_status_name;
 
 /// How often `events --follow` looks for new entries in the log.
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(250);
@@ -240,17 +241,6 @@ pub(crate) fn print_position(position: &Position) {
             )
         }
         ConversationState::NoRecord => println!("    no conversation record (old log)"),
-    }
-}
-
-/// The schema spelling of a position's status.
-fn position_status_name(status: PositionStatus) -> &'static str {
-    match status {
-        PositionStatus::Succeeded => "succeeded",
-        PositionStatus::Failed => "failed",
-        PositionStatus::Interrupted => "interrupted",
-        PositionStatus::InProgress => "in_progress",
-        PositionStatus::AwaitingDecision => "awaiting_decision",
     }
 }
 

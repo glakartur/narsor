@@ -138,8 +138,16 @@ even when following the current step; going back catches up. *Przebieg* and
 the whole one narrowed to that entry into the step, so the workflow choices
 (`WYBÓR WORKFLOW`) made in the step show in both, and the one-line parts (the
 headers and the choices) are clipped with `…` in a narrow window while the text
-wraps. The history's
-details work the same way, without following.
+wraps.
+
+**The history's details** (`H`) show what the archive kept. The header is the
+one of an active task, with the total cost. *Przebieg* shows one row per step
+(harness, model, effort, tokens, subagents, cost and conductor cost); the steps
+cannot be picked or opened, and nothing is followed. The step conversations,
+the events and the conductor went away with the storage, so *Rozmowa*,
+*Zdarzenia* and *Dyrygent* say `storage usunięty przy archiwizacji`. *Przebieg*
+says it only when the task has no kept run at all. When the read of the run
+fails, *Przebieg* shows why; select the entry again to read it again.
 
 In the conversation, the entries of one subagent form **one collapsed group**,
 placed at the subagent's first entry even when main-agent entries come between
@@ -262,7 +270,7 @@ itself. It goes on by a comment (agent), *Uruchom od nowa* (script step) or
 | the panel: *Przejście ręczne* | manual transition; with a reason, a forced jump (override) where the workflow allows it. A `schema: v2` workflow in the unified shape allows it from every state that is not terminal. A workflow in the older shape allows it only from a state with `allow_manual_override: true` | `narsor-cli task transition [--override --reason]` |
 | the panel: *Wybierz krok* | go on from any step of the workflow, a finished workflow too; for an agent step you may add a comment | — |
 | the panel: *Uruchom od nowa* | start again the script step of a stopped task, an interrupted task or a failed provisioning | `narsor-cli task start` |
-| the panel: *Archiwizuj* (`! nieodwracalne`) | archive | `narsor-cli task archive` |
+| the panel: *Archiwizuj* (`! nieodwracalne`) | archive; only when the run reached a terminal state of its workflow (move a stuck task there with *Przejście ręczne* first) | `narsor-cli task archive` |
 | `o` | open a pull request link of a workspace in the browser | — |
 | `c` | write to the agent, in one step; it is the conversation's, not the panel's: the server picks what it does by the way the task is stopped — a question: a message in the same session; an approval or a permission: a refusal with your note, never an approval; a stop: the note goes to the agent and the task resumes. A text that was not sent stays as a draft of the task | — |
 | `c` (*Dyrygent*) | write to the conductor | `narsor-cli task conductor chat` |
@@ -327,6 +335,7 @@ the current step or a draft.
 | List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `Ctrl+.` (or `.`) action panel, `n` `z` `H` `R`, `Ctrl+↑` `Ctrl+↓` `m`, `o` `c` `r`, `h` default harness, `L` task limit |
 | Details | `[` / `]` tabs, `Tab` content ↔ panel, `Ctrl+.` (or `.`) action panel, `h` default harness, `L` task limit (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step |
+| — *Przebieg* in the history | `Esc` list (the steps of an archived run cannot be picked or opened) |
 | — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry (a subagent's group `▸` / `▾` too), `v` raw entry, `Ctrl+V` raw all |
 | — the other tabs | `Esc` list, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` to the end and follow |
 | Panel | `Tab` actions ↔ fields, `Enter` send, `Ctrl+J` new line (also `Shift+Enter` / `Alt+Enter` where the terminal reports modifiers), `Esc` fold (with the server's forms: next form), `1`–`9` choose, `[` / `]` previous / next waiting (not with the server's forms) |

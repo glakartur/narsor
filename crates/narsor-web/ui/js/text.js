@@ -176,6 +176,37 @@ export function usageLine(sum) {
   return parts.length ? parts.join(' · ') : null;
 }
 
+/**
+ * The second line of a *Przebieg* step: harness, model, effort, cost,
+ * tokens, subagents. A figure the harness did not report is left out.
+ */
+export function stepDetails(position) {
+  const usage = position.usage;
+  return [
+    position.harness,
+    position.model,
+    position.effort,
+    typeof usage?.cost_usd === 'number' ? money(usage.cost_usd) : null,
+    usage?.total ? tokens({ input: usage.total.input ?? 0, output: usage.total.output ?? 0 }) : null,
+    usage?.subagent_count ? `◈ ${usage.subagent_count}` : null,
+  ].filter(Boolean).join(' · ');
+}
+
+export const STORAGE_DELETED = 'storage usunięty przy archiwizacji';
+
+/**
+ * What the history shows of an archived task's run, from its timeline read
+ * `{data, error, loading}`: a loading or error text, the "storage deleted"
+ * text when no timeline came back, else the usage row and the timeline.
+ */
+export function archivedRun(read) {
+  if (read.loading) return { kind: 'loading', text: 'wczytuję…' };
+  if (read.error) return { kind: 'error', text: read.error };
+  const timeline = read.data?.timeline ?? null;
+  if (!timeline?.positions?.length) return { kind: 'missing', text: STORAGE_DELETED };
+  return { kind: 'steps', usage: usageLine(sumUsage(timeline.positions)), timeline };
+}
+
 /** Whether a conversation read stops after `page`, asked `from`. */
 export function pagingDone(page, from) {
   if (page?.status !== 'recorded') return true;

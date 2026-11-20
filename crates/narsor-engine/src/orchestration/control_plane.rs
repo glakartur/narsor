@@ -19,11 +19,11 @@
 use super::error::{OrchestrationError, Result};
 use super::lifecycle::{command_effect, observation_effect, CommandEffect, ObservationEffect};
 use super::model::{
-    slot_release_extension_threshold, ArchiveTombstone, BackendLease, CommandActor, CommandOutcome,
-    CommandReceipt, CommandRequest, ControllerReport, LeaseToken, MaterialChange, NewTask,
-    Observation, ObservedState, OwnerCommand, ReaderLease, ReportOutcome, ResumeState, RunnerState,
-    SlotReleaseClass, SlotReleaseReason, TaskAssignment, TaskEvent, TaskEventKind, TaskRecord,
-    WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
+    slot_release_extension_threshold, ArchiveTombstone, ArchivedRun, BackendLease, CommandActor,
+    CommandOutcome, CommandReceipt, CommandRequest, ControllerReport, LeaseToken, MaterialChange,
+    NewTask, Observation, ObservedState, OwnerCommand, ReaderLease, ReportOutcome, ResumeState,
+    RunnerState, SlotReleaseClass, SlotReleaseReason, TaskAssignment, TaskEvent, TaskEventKind,
+    TaskRecord, WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
 };
 use super::resume::{
     auto_resume_key, count_loss, loss_from_history, owner_slot_release_key, slot_release_key,
@@ -212,6 +212,7 @@ impl ControlPlane {
             watched_gate: None,
             exiting_gates: Vec::new(),
             provenance: request.provenance,
+            archived_run: None,
             last_event: TaskEvent {
                 sequence: 1,
                 task_id: request.task_id.clone(),
@@ -1194,6 +1195,13 @@ fn archive(record: &mut TaskRecord, idempotency_key: &str, now: DateTime<Utc>) {
         completed_at: never_created.then_some(now),
         resources_never_created: never_created,
     });
+    // Frozen with the tombstone, so no later report reaches it (R8).
+    if record.archived_run.is_none() {
+        record.archived_run = record
+            .runner
+            .as_ref()
+            .map(|runner| ArchivedRun::of(&runner.snapshot));
+    }
     if never_created {
         record.runner_state = RunnerState::Archived;
     }

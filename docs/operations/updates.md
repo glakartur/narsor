@@ -6,6 +6,48 @@ listed here need no special order. The update notes of the remote backends
 (automatic resume, the read-only runner) are in
 [Remote execution backends](remote-backends.md).
 
+## Update to archive only at a terminal state (D80)
+
+This update changes when the owner can archive a task, and what an
+archived task keeps. The owner's offer and the owner API take *Archiwizuj*
+only when the run reached a state that its workflow marks terminal. The
+archive keeps a copy of the step rows (harness, model, effort, tokens and
+cost) and of the workspace headers, and the history shows them. The stored
+data needs no migration: a task archived before the update shows the last
+timeline its runner reported.
+
+### What changes
+
+| Area | Before | After |
+|---|---|---|
+| Archive offer | In every state of the task. | Only at a terminal state of the workflow. Elsewhere the server refuses the archive with `action_unavailable` and a reason. |
+| Archived task | The history says that the storage was deleted. | The timeline read returns the step rows frozen at the archive. |
+
+### Before the update
+
+1. **Find the tasks that you want to archive and that did not finish.**
+   After the update, a task that waits, runs, is queued or stopped in a
+   step that is not terminal cannot be archived. Archive these tasks
+   before the update, or after it move each one to a terminal state with
+   a manual transition first (an interrupted task: start it again, then
+   move it).
+
+### Update order
+
+1. Update the server (`narsor-server`) first. The offer and the frozen
+   run snapshot live in the control plane; the runners and controllers do
+   not change.
+2. Then update the clients (`narsor`, `narsor-cli`, `narsor-web`). An older
+   client follows the new offer, so it shows archive only where the server
+   offers it, but it keeps showing "storage deleted" for an archived task
+   instead of its step rows.
+
+### Rollback
+
+An older server ignores the frozen run snapshot on the record and offers
+archive in every state again. The tasks archived with the new server stay
+archived.
+
 ## Update to the hierarchical configuration file
 
 This update changes the configuration file from one flat list of keys to a

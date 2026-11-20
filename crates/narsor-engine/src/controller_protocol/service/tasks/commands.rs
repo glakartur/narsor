@@ -3,8 +3,10 @@
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::ProtocolService;
 use crate::controller_protocol::wire::*;
-use crate::domain::TaskId;
-use crate::orchestration::{CommandActor, CommandRequest, MoveTarget, OwnerRef, RunnerState};
+use crate::domain::{BackendId, TaskId};
+use crate::orchestration::{
+    CommandActor, CommandOutcome, CommandRequest, MoveTarget, OwnerRef, RunnerState,
+};
 
 /// Refuses an owner's idempotency key that starts with a prefix only a
 /// policy or an observer may use ([`crate::orchestration::RESERVED_KEY_PREFIXES`]).
@@ -46,7 +48,8 @@ impl ProtocolService {
         if !is_retry {
             self.require_owner_command_available(&record, command, request.expected_generation)?;
         }
-        let outcome = self.control.command_with_capacity_from(
+        let outcome = self.apply_command_on(
+            &record.assignment.backend_id,
             &record.task_id,
             CommandRequest {
                 command,
@@ -54,26 +57,8 @@ impl ProtocolService {
                 expected_generation: request.expected_generation,
                 actor: CommandActor::Owner,
             },
-            || self.scheduling_policy(&record.assignment.backend_id),
         )?;
-        if command == crate::orchestration::OwnerCommand::Archive {
-            // Archive removes the task's materials too (U9) — also on a
-            // replay, which finishes a purge a crash may have cut short.
-            self.purge_materials(&record.task_id);
-            // Its gate can never be answered now (R19). The archived record
-            // says whether its exit scripts still run once (R18): their
-            // entry then stays until they did.
-            self.drop_queue_entry_of(&outcome.task);
-            // A task archived at a gate with exit scripts runs them once.
-            self.wake_observer_claims();
-        }
-        let mut task = outcome.task;
-        if !outcome.replayed {
-            self.notify(&record.task_id);
-            // An archive can release a slot for queued work on any backend.
-            self.reschedule_all();
-            task = self.control.task(&record.task_id)?;
-        }
+        let task = outcome.task;
         let queued_for_slot = outcome.receipt.command == crate::orchestration::OwnerCommand::Resume
             && outcome.receipt.runner_state_after == RunnerState::Queued;
         Ok(OwnerCommandResponse {
@@ -81,6 +66,56 @@ impl ProtocolService {
             receipt: outcome.receipt,
             replayed: outcome.replayed,
             queued_for_slot,
+        })
+    }
+
+    /// Applies a command through the control plane with every effect that
+    /// follows it, without the owner's offer check. Its only production
+    /// caller is [`Self::command`], which checks the offer first (through
+    /// [`Self::apply_command_on`]); tests call it to reach what the control
+    /// plane still takes but the owner's offer no longer allows, such as an
+    /// archive at a gate, which runs the gate's exit scripts once (D78, D80).
+    pub fn apply_command(
+        &self,
+        task_id: &TaskId,
+        request: CommandRequest,
+    ) -> ProtocolResult<CommandOutcome> {
+        let backend_id = self.control.task(task_id)?.assignment.backend_id;
+        self.apply_command_on(&backend_id, task_id, request)
+    }
+
+    /// [`Self::apply_command`] for a task of `backend_id`, whose capacity
+    /// the command may take.
+    fn apply_command_on(
+        &self,
+        backend_id: &BackendId,
+        task_id: &TaskId,
+        request: CommandRequest,
+    ) -> ProtocolResult<CommandOutcome> {
+        let command = request.command;
+        let outcome = self
+            .control
+            .command_with_capacity_from(task_id, request, || self.scheduling_policy(backend_id))?;
+        if command == crate::orchestration::OwnerCommand::Archive {
+            // Archive removes the task's materials too (U9) — also on a
+            // replay, which finishes a purge a crash may have cut short.
+            self.purge_materials(task_id);
+            // Its gate can never be answered now (R19). The archived record
+            // says whether its exit scripts still run once (R18): their
+            // entry then stays until they did.
+            self.drop_queue_entry_of(&outcome.task);
+            // A task archived at a gate with exit scripts runs them once.
+            self.wake_observer_claims();
+        }
+        if outcome.replayed {
+            return Ok(outcome);
+        }
+        self.notify(task_id);
+        // An archive can release a slot for queued work on any backend.
+        self.reschedule_all();
+        Ok(CommandOutcome {
+            task: self.control.task(task_id)?,
+            ..outcome
         })
     }
 

@@ -827,6 +827,225 @@ fn repeating_archive_converges_on_the_tombstone_and_keeps_the_audit_trail() {
     assert_eq!(events[0].kind, TaskEventKind::Created);
 }
 
+/// A timeline of `steps` finished steps, each with the attempt, session and
+/// event-link data that points into task storage, and the usage and cost
+/// that outlive it.
+fn reported_timeline(steps: &[(&str, f64)]) -> narsor_protocol::api::Timeline {
+    let positions: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .map(|(index, (state, cost))| {
+            serde_json::json!({
+                "label": format!("{state} #1"),
+                "state_id": state,
+                "visit": 1,
+                "action_execution_id": format!("act-{index}"),
+                "action_type": "agent",
+                "status": "succeeded",
+                "started_at": "2026-10-03T12:00:00Z",
+                "ended_at": "2026-10-03T12:05:00Z",
+                "error": null,
+                "resumed_harness_session": "session-0",
+                "harness_session_interrupted": false,
+                "retry_pending": false,
+                "conversation": { "state": "recorded" },
+                "session_number": 1,
+                "attempts": [format!("act-{index}")],
+                "harness": "claude-code",
+                "model": "claude-opus",
+                "effort": "high",
+                "harness_session_id": format!("session-{index}"),
+                "usage": {
+                    "total": { "input": 1000, "output": 200 },
+                    "cost_usd": cost,
+                    "conductor_cost_usd": 0.01
+                }
+            })
+        })
+        .collect();
+    serde_json::from_value(serde_json::json!({
+        "positions": positions,
+        "links": { "7": { "link": "position", "value": "plan #1" } },
+        "default_position": "plan #1"
+    }))
+    .expect("a timeline")
+}
+
+fn workspace_header(branch: &str) -> narsor_engine::domain::WorkspaceHeader {
+    narsor_engine::domain::WorkspaceHeader {
+        name: "code".into(),
+        repo: "narsor".into(),
+        branch: Some(branch.into()),
+        pr: Some("42".into()),
+        ..Default::default()
+    }
+}
+
+/// The task's runner reports a finished run with `timeline` and `branch`.
+fn report_finished_run(
+    fx: &Fixture,
+    id: &str,
+    timeline: narsor_protocol::api::Timeline,
+    branch: &str,
+) {
+    let record = fx.control.task(&task(id)).unwrap();
+    let launch_generation = launch_generation_of(&record);
+    let mut snapshot = safe_point_snapshot(
+        record
+            .runner
+            .as_ref()
+            .map_or(1, |runner| runner.snapshot.snapshot_sequence + 1),
+    );
+    snapshot.execution_status = ExecutionStatus::Completed;
+    snapshot.execution_cursor.execution_id = Some("exec-1".into());
+    snapshot.execution_cursor.current_state = Some("completed".into());
+    snapshot.timeline = Some(timeline);
+    snapshot.workspaces = vec![workspace_header(branch)];
+    fx.control
+        .record_runner_snapshot(
+            &task(id),
+            &format!("pod-g{launch_generation}"),
+            launch_generation,
+            snapshot,
+        )
+        .expect("runner snapshot");
+}
+
+/// The workflow of [`archive_freezes_the_step_headers_and_no_later_report_changes_them`]:
+/// three agent steps that end in the terminal state `completed`.
+const THREE_STEPS: &str = r#"
+schema: v2
+name: three-steps
+version: 1
+states:
+  plan:
+    action: { type: script, command: "true" }
+    exit: { next: implement }
+  implement:
+    action: { type: script, command: "true" }
+    exit: { next: review }
+  review:
+    action: { type: script, command: "true" }
+    exit: { next: completed }
+  completed: {}
+terminal_states: { completed: completed }
+"#;
+
+#[test]
+fn archive_freezes_the_step_headers_and_no_later_report_changes_them() {
+    // The whole flow (D80): the run completes in a terminal state, the owner
+    // archives it through the offer, a later runner report arrives, and the
+    // timeline read still returns the frozen step rows with their cost.
+    let fx = Fixture::new();
+    let definition = narsor_engine::workflow::load_from_str(THREE_STEPS).unwrap();
+    let spec = TaskLaunchSpec::new(
+        definition.id.clone(),
+        definition.version,
+        serde_json::json!({}),
+        git_workspace(),
+        narsor_engine::domain::ResolvedEnvironment::harness_only("claude-code"),
+        narsor_engine::domain::ResourceProfile::new(1000, 2048),
+    )
+    .with_definition(&definition)
+    .unwrap();
+    let owner = OwnerRef::new("oidc:https://issuer|artur");
+    fx.control
+        .create_task(NewTask::new(
+            task("task-1"),
+            owner.clone(),
+            backend_id("k8s"),
+            spec,
+        ))
+        .unwrap();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.observe("task-1", &lease, Observation::StartAccepted)
+        .unwrap();
+    fx.observe("task-1", &lease, Observation::RunnerReady)
+        .unwrap();
+    let service = narsor_engine::controller_protocol::ProtocolService::new(
+        fx.reopen(),
+        crate::environment_support::seeded_resolver(fx.root.path()),
+    );
+    let archive = |key: &str| {
+        service
+            .command(
+                &owner,
+                "task-1",
+                narsor_engine::controller_protocol::OwnerCommandRequest {
+                    command: OwnerCommand::Archive,
+                    idempotency_key: key.into(),
+                    expected_generation: None,
+                },
+            )
+            .expect("the owner's archive")
+    };
+    let steps = [("plan", 0.25), ("implement", 1.5), ("review", 0.75)];
+    report_finished_run(&fx, "task-1", reported_timeline(&steps), "feat/x");
+
+    archive("archive-1");
+    // A report still accepted while the task is archiving, and a repeated
+    // archive, leave the frozen copy as it was.
+    report_finished_run(
+        &fx,
+        "task-1",
+        reported_timeline(&[("other", 9.0)]),
+        "feat/y",
+    );
+    archive("archive-2");
+
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert!(record.runner_state.is_archival());
+    let last_reported = &record.runner.as_ref().unwrap().snapshot;
+    assert_eq!(last_reported.workspaces, vec![workspace_header("feat/y")]);
+    let frozen = record.archived_run.as_ref().expect("a frozen run");
+    assert_eq!(frozen.workspaces, vec![workspace_header("feat/x")]);
+    assert_eq!(
+        narsor_engine::controller_protocol::service::task_workspaces(&record)[0]
+            .branch
+            .as_deref(),
+        Some("feat/x")
+    );
+    let served = service
+        .timeline(&owner, "task-1")
+        .expect("the timeline read");
+    let timeline = served.timeline.as_ref().expect("the frozen timeline");
+    assert_eq!(Some(timeline), frozen.timeline.as_ref());
+    let reported = reported_timeline(&steps);
+    assert_eq!(timeline.positions.len(), 3);
+    assert!(timeline.links.is_empty());
+    for (frozen, reported) in timeline.positions.iter().zip(&reported.positions) {
+        assert_eq!(frozen.label, reported.label);
+        assert_eq!(frozen.status, reported.status);
+        assert_eq!(
+            (frozen.started_at, frozen.ended_at),
+            (reported.started_at, reported.ended_at)
+        );
+        assert_eq!(
+            (&frozen.harness, &frozen.model, &frozen.effort),
+            (&reported.harness, &reported.model, &reported.effort)
+        );
+        assert_eq!(frozen.usage, reported.usage);
+        assert!(frozen.attempt_ids().is_empty(), "{frozen:?}");
+        assert_eq!(frozen.resumed_harness_session, None);
+        assert_eq!(frozen.harness_session_id, None);
+        assert!(matches!(
+            frozen.conversation,
+            narsor_protocol::api::ConversationState::NotCreated { .. }
+        ));
+    }
+}
+
+#[test]
+fn archiving_a_task_whose_runner_never_reported_freezes_nothing() {
+    let fx = Fixture::new();
+    fx.create("task-1");
+
+    let record = fx.command("task-1", OwnerCommand::Archive, "archive-1");
+
+    assert_eq!(record.runner_state, RunnerState::Archived);
+    assert_eq!(record.archived_run, None);
+}
+
 #[test]
 fn creating_a_task_is_idempotent_but_a_different_request_conflicts() {
     let fx = Fixture::new();

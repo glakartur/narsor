@@ -4,17 +4,27 @@
 //! ```text
 //! │ Historia            │ NAR-9  Poprawka raportów                  fix-bug v1 │
 //! │ ✓ NAR-9    archiwum │ ✓ done · zarchiwizowane                              │
-//! │ ✓ NAR-7    archiwum │  Przebieg   Rozmowa   Zdarzenia   Dyrygent   Info    │
-//! │                     │ storage usunięty przy archiwizacji                   │
+//! │ ✓ NAR-7    archiwum │ razem $1.20 · ✨ $1.20                                │
+//! │                     │  Przebieg   Rozmowa   Zdarzenia   Dyrygent   Info    │
+//! │                     │ ✓ ✨ plan #1     $0.80                                │
+//! │                     │      opus  claude                                    │
+//! │                     │ ✓ ✨ review #1   $0.40                                │
+//! │                     │      sonnet  claude                                  │
 //! ```
 //!
 //! # Read only
 //!
 //! The tabs are the ones of the details of a task, over the same state
-//! ([`TaskDetail`]); nothing here sends anything. An archived task is its
-//! [`TaskSummary`]: its storage went away with the archiving, so *Przebieg*,
-//! *Rozmowa*, *Zdarzenia* and *Dyrygent* say so, and *Info* shows what the
-//! control plane kept. `Esc` goes back to the list of tasks.
+//! ([`TaskDetail`]); nothing here sends anything but reads. An archived task
+//! is its [`TaskSummary`] and the run the archive kept: selecting an entry
+//! reads its timeline once ([`TaskApp::start_history_read`]) into that
+//! entry's own details, so the header has the total cost and *Przebieg* the
+//! header row of every step. The steps cannot be picked or opened: their
+//! conversations went away with the storage, as did the events and the
+//! conductor, so *Rozmowa*, *Zdarzenia* and *Dyrygent* say so. A failed read
+//! says why on *Przebieg*, and the next selection of the entry reads again.
+//! *Info* shows what the control plane kept. `Esc` goes back to the list of
+//! tasks.
 
 use std::collections::BTreeMap;
 
@@ -23,14 +33,14 @@ use ratatui::text::Line;
 use ratatui::Frame;
 
 use crate::api::ClientError;
-use crate::controller_protocol::{TaskListResponse, TaskSummary};
+use crate::controller_protocol::{TaskListResponse, TaskSummary, TimelineResponse};
 
 use super::super::keymap::{self, Action, Context, Stack};
 use super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
-use super::background::{JobKey, OpeningKind, Outcome};
+use super::background::{DetailJob, JobKey, OpeningKind, Outcome};
 use super::detail::{
-    edge_layout, fit_cells, render_view, title_is_cut, KeysAt, StepLevel, TaskDetail, ViewOptions,
+    edge_layout, fit_cells, render_view, title_is_cut, KeysAt, TaskDetail, ViewOptions,
 };
 use super::list::{history_row_text, title_of, RowText, StateIcon};
 use super::notify::Severity;
@@ -69,9 +79,6 @@ pub struct History {
     entries: Vec<TaskSummary>,
     selected: usize,
     tab: DetailTab,
-    /// The level of the focus on *Przebieg* of the details, as in the task
-    /// details but without following: the run is over.
-    step_focus: StepLevel,
     details: BTreeMap<String, TaskDetail>,
     /// The first row of the list in view, kept between frames so that a new
     /// read does not scroll the list.
@@ -85,7 +92,6 @@ impl History {
             entries: Vec::new(),
             selected: 0,
             tab: DetailTab::Progress,
-            step_focus: StepLevel::default(),
             details: BTreeMap::new(),
             top: 0,
         };
@@ -108,10 +114,6 @@ impl History {
             .retain(|key, _| self.entries.iter().any(|task| key_of(task) == *key));
         for detail in self.details.values_mut() {
             detail.invalidate();
-        }
-        // Another selected entry starts its details on the timeline.
-        if self.selected_entry().map(key_of) != kept {
-            self.back_to_axis();
         }
     }
 
@@ -140,11 +142,6 @@ impl History {
         self.tab
     }
 
-    /// The level of the focus on *Przebieg* of the details.
-    pub fn step_focus(&self) -> StepFocus {
-        self.step_focus.get()
-    }
-
     /// What the details of the selected entry remember, once shown or read.
     pub fn selected_detail(&self) -> Option<&TaskDetail> {
         let key = key_of(self.selected_entry()?);
@@ -152,14 +149,28 @@ impl History {
     }
 
     fn step(&mut self, by: isize) {
-        let last = self.entries.len().saturating_sub(1);
-        self.selected = self.selected.saturating_add_signed(by).min(last);
+        self.select(self.selected.saturating_add_signed(by));
+    }
+
+    /// Selects the entry at `index` (the last one past the end). An entry
+    /// whose last read failed reads again once it is selected anew.
+    fn select(&mut self, index: usize) {
+        let index = index.min(self.entries.len().saturating_sub(1));
+        if index == self.selected {
+            return;
+        }
+        self.selected = index;
+        if let Some(detail) = self.selected_detail_mut() {
+            if detail.progress.failure().is_some() {
+                detail.progress.invalidate();
+            }
+        }
     }
 
     fn on_detail_action(&mut self, action: Action) {
-        let (tab, step) = (self.tab, self.step_focus());
+        let tab = self.tab;
         if let Some(detail) = self.selected_detail_mut() {
-            detail.on_action(tab, step, action);
+            detail.on_action(tab, StepFocus::Axis, action);
         }
     }
 
@@ -174,28 +185,9 @@ impl History {
         )
     }
 
-    /// `Enter` / `→` on the timeline: into the selected step's conversation,
-    /// when it has one to show.
-    fn enter_step(&mut self) {
-        let Some(key) = self.selected_entry().map(key_of) else {
-            return;
-        };
-        let detail = self
-            .details
-            .entry(key.clone())
-            .or_insert_with(|| TaskDetail::new(&key));
-        self.step_focus.enter(detail);
-    }
-
-    /// Back on the timeline, every entry's timeline letting its step go.
-    fn back_to_axis(&mut self) {
-        self.step_focus.back_to_axis(&mut self.details);
-    }
-
-    /// `[` / `]`: the tab `by` places along, on its timeline.
+    /// `[` / `]`: the tab `by` places along.
     fn shift_tab(&mut self, by: isize) {
         self.tab = self.tab.shifted(by);
-        self.back_to_axis();
     }
 }
 
@@ -248,7 +240,7 @@ impl TaskApp {
             View::History(history) => Some(detail_keys(
                 Context::HistoryDetails,
                 history.tab,
-                history.step_focus(),
+                StepFocus::Axis,
             )),
             _ => None,
         }
@@ -267,7 +259,7 @@ impl TaskApp {
             Action::Help => self.help_open = true,
             Action::Quit => self.on_quit(),
             Action::Back if context == Context::History => self.close_view(),
-            Action::Back => self.focus_history(Focus::List),
+            Action::Back => self.focus = Focus::List,
             Action::SwitchFocus => {
                 self.focus = if self.focus == Focus::List {
                     Focus::Details
@@ -275,9 +267,7 @@ impl TaskApp {
                     Focus::List
                 };
             }
-            Action::Open => self.focus_history(Focus::Details),
-            Action::EnterStep => self.with_history(History::enter_step),
-            Action::LeaveStep => self.with_history(History::back_to_axis),
+            Action::Open => self.focus = Focus::Details,
             Action::ChooseHarness => return Request::OpenHarness,
             Action::PrevTab => self.with_history(|history| history.shift_tab(-1)),
             Action::NextTab => self.with_history(|history| history.shift_tab(1)),
@@ -288,8 +278,8 @@ impl TaskApp {
                     match action {
                         Action::Down => history.step(1),
                         Action::Up => history.step(-1),
-                        Action::Top => history.selected = 0,
-                        _ => history.selected = history.entries.len().saturating_sub(1),
+                        Action::Top => history.select(0),
+                        _ => history.select(usize::MAX),
                     }
                 }
             }
@@ -302,18 +292,66 @@ impl TaskApp {
         Request::None
     }
 
+    /// Starts the read of the run the selected entry's archive kept, when
+    /// that entry has not got it yet. The answer goes to the entry it was
+    /// read for, wherever the selection is by then.
+    pub(super) fn start_history_read(&mut self) {
+        let View::History(history) = &mut self.view else {
+            return;
+        };
+        let Some(task) = history.selected_entry() else {
+            return;
+        };
+        let (task_id, revision) = (key_of(task), task.revision);
+        let Some(detail) = history.selected_detail_mut() else {
+            return;
+        };
+        if !detail.progress.needs_read(revision) {
+            return;
+        }
+        let client = self.client.clone();
+        self.background.start(
+            JobKey::Detail(task_id.clone(), DetailJob::ArchivedTimeline),
+            async move {
+                let result = client.control_timeline(&task_id).await;
+                Outcome::new(move |app: &mut TaskApp| app.on_history_timeline(&task_id, result))
+            },
+        );
+    }
+
+    /// Takes the read of an archived task's timeline into its history entry.
+    /// An entry that left the history, or a history that closed, drops it.
+    pub fn on_history_timeline(
+        &mut self,
+        task_id: &str,
+        result: Result<TimelineResponse, ClientError>,
+    ) {
+        let result = self.settle(result);
+        let View::History(history) = &mut self.view else {
+            return;
+        };
+        let Some(revision) = history
+            .entries
+            .iter()
+            .find(|task| key_of(task) == task_id)
+            .map(|task| task.revision)
+        else {
+            return;
+        };
+        let progress = &mut history
+            .details
+            .entry(task_id.to_string())
+            .or_insert_with(|| TaskDetail::new(task_id))
+            .progress;
+        progress.apply(revision, result);
+        progress.drop_selection();
+    }
+
     /// Does `change` to the history, while it is open.
     fn with_history(&mut self, change: impl FnOnce(&mut History)) {
         if let View::History(history) = &mut self.view {
             change(history);
         }
-    }
-
-    /// Puts the keys on the history's list or on its details, which start on
-    /// the timeline.
-    fn focus_history(&mut self, focus: Focus) {
-        self.focus = focus;
-        self.with_history(History::back_to_axis);
     }
 
     /// `Esc` from a view that has its own screen: back to the list of tasks.
@@ -409,7 +447,7 @@ pub fn render_details(
     } = look;
     let tab = history.tab;
     let keys = if focused {
-        KeysAt::Content(history.step_focus())
+        KeysAt::Content(StepFocus::Axis)
     } else {
         KeysAt::Elsewhere
     };
@@ -450,6 +488,7 @@ pub fn render_details(
         details_opened: true,
         loading: false,
         title_cut: title_is_cut(task, &edge),
+        closed_run: true,
     };
     render_view(frame, inner, view, styles, options, None);
 }

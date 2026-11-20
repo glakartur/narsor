@@ -7,7 +7,7 @@ import {
   branchText, notice, pullRequest, queueEntryMark, queuePositions, queueText, readiness, secondsBetween, shortAge,
   shortIdentifier, stateIcon, statusWord, stepIcon, titleOf,
 } from '../model.js';
-import { sumUsage, usageLine } from '../text.js';
+import { STORAGE_DELETED, sumUsage, usageLine } from '../text.js';
 import { AnswerPanel } from './answer.js';
 import { useRead } from './read.js';
 import { Conductor } from './tabs/conductor.js';
@@ -51,7 +51,20 @@ function statusParts(task, places, timeline) {
   return parts.sort((a, b) => order[a.role] - order[b.role]);
 }
 
-function Workspaces({ task }) {
+/**
+ * The status row: the state's icon and word, then `parts` (`{ text, role }`)
+ * each after a separator, then whatever `children` add.
+ */
+export function StatusRow({ task, parts, children }) {
+  const icon = stateIcon(task);
+  return html`<div class="status-row">
+    <span class=${`role-${icon.role}`}><span aria-hidden="true">${icon.glyph}</span> ${statusWord(task)}</span>
+    ${parts.map((part) => html`<span class="muted"> · </span><span class=${`role-${part.role}`}>${part.text}</span>`)}
+    ${children}
+  </div>`;
+}
+
+export function Workspaces({ task }) {
   return (task.workspaces ?? []).map((workspace) => {
     const pr = pullRequest(workspace);
     const branches = branchText(workspace);
@@ -68,7 +81,7 @@ function Workspaces({ task }) {
 }
 
 function Unstarted({ task, places }) {
-  if (readiness(task) === 'archived') return html`<p class="empty">storage usunięty przy archiwizacji</p>`;
+  if (readiness(task) === 'archived') return html`<p class="empty">${STORAGE_DELETED}</p>`;
   const place = places.get(task.task_id);
   return html`<p class="empty">jeszcze nie wystartowało, ${place ? `#${place} ` : ''}w kolejce</p>`;
 }
@@ -83,7 +96,6 @@ export function Details(props) {
 
 function DetailsBody({ store, state, task, now, onBack, onActions, onQueue }) {
   const api = store.api;
-  const icon = stateIcon(task);
   const mark = queueEntryMark(task);
   const note = notice(task);
   const places = queuePositions(state.tasks ?? []);
@@ -116,12 +128,10 @@ function DetailsBody({ store, state, task, now, onBack, onActions, onQueue }) {
         </div>
         <div class="details-meta">
           <${Workspaces} task=${task} />
-          <div class="status-row">
-            <span class=${`role-${icon.role}`}><span aria-hidden="true">${icon.glyph}</span> ${statusWord(task)}</span>
-            ${statusParts(task, places, timeline).map((part) => html`<span class="muted"> · </span><span class=${`role-${part.role}`}>${part.text}</span>`)}
+          <${StatusRow} task=${task} parts=${statusParts(task, places, timeline)}>
             ${mark && html`<span class="muted"> · </span><button class="link queue-mark" title=${`${mark.text} — otwórz kolejkę`}
               aria-label=${`${mark.text} — otwórz kolejkę`} onClick=${() => onQueue?.(mark.queue)}>${mark.glyph}</button>`}
-          </div>
+          </${StatusRow}>
           ${usage && html`<div class="usage-row muted mono">${usage}</div>`}
           ${note && html`<p class=${`notice role-${note.role}`}>${note.text}</p>`}
           ${timelineRead.error && html`<p class="tab-note role-attention">${timelineRead.error}</p>`}

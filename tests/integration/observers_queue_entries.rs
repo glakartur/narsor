@@ -855,8 +855,10 @@ fn the_pass_drops_an_entry_whose_episode_is_gone() {
 }
 
 #[test]
-fn the_owners_archive_removes_the_entry_at_once() {
-    // R19, also for a queue no automation runs for.
+fn an_archive_at_the_gate_removes_the_entry_at_once() {
+    // R19, also for a queue no automation runs for. The owner's offer has no
+    // archive at a gate (D80); the control plane's own archive still comes
+    // this way.
     let fx = Fixture::new();
     let task = fx.task("task-1");
     wait_at(&fx.service, &task, "input-1", &review_gate(QUEUE));
@@ -864,19 +866,17 @@ fn the_owners_archive_removes_the_entry_at_once() {
 
     let archived = fx
         .service
-        .command(
-            &owner(),
-            task.as_str(),
-            OwnerCommandRequest {
-                command: OwnerCommand::Archive,
-                idempotency_key: "archive-1".into(),
-                expected_generation: None,
-            },
+        .apply_command(
+            &task,
+            CommandRequest::new(OwnerCommand::Archive, "archive-1"),
         )
         .unwrap();
 
     assert!(fx.entries(QUEUE).is_empty());
-    assert_eq!(archived.task.queue_entry, None);
+    assert_eq!(
+        fx.service.summarize(&archived.task).unwrap().queue_entry,
+        None
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@ narsor-cli task create --file ./my-workflow.yaml --input name=value   # a workfl
 narsor-cli task list [--archived] [--json]        # queue position (#n), `?`/`!` attention mark, backend, lifecycle, title; --archived: the history
 narsor-cli task move <task> --before|--after <other> | --top | --bottom   # reorder a queued task
 narsor-cli task show <task> [--json]              # title and links, what it waits on, observations with their age, timeline, conversation
-narsor-cli task pause|resume|start|archive <task> # archive deletes the workload and its storage
+narsor-cli task pause|resume|start|archive <task> # archive (only at a terminal state of the workflow) deletes the workload and its storage
 narsor-cli task input <task> --field reason=ok [--artifact name=path] [--variable k=v] [--label L] [--waiting-id ID]   # answer the input the runner waits for
 narsor-cli task interrupt <task>                      # cut short the step the runner works on
 narsor-cli task transition <task> <state> [--override --reason <why>]   # manual transition; an override is audited
@@ -31,6 +31,14 @@ narsor-cli task repo list|add|remove              # the control plane's reposito
 narsor-cli task workflows | validate <path> | capabilities   # the catalogue, a file's violations, what the server offers
 narsor [--server URL]                         # the TUI over the same control plane
 ```
+
+For an archived task, `task show` prints the run kept at archive: the total
+usage (`Usage      razem $…`) and one line per step (label, status, action
+type, start → end), with an indented line for the harness, model, effort,
+tokens, subagents, cost and conductor cost the harness reported. A figure the
+harness did not report is left out, never shown as `$0`. A task archived
+without any reported timeline prints `Timeline   storage deleted at archive,
+no steps were kept`. `task steps` is unchanged.
 
 Without `--server` these use the local daemon (trusted mode). For a network
 deployment pass `--server https://…` (or `NARSOR_SERVER`) and an OIDC access

@@ -5798,8 +5798,8 @@ mod task_app_actions_render {
     use narsor_engine::domain::ExecutionStatus;
 
     use crate::task_app_support::{
-        header_workspace, listing, queued, task, titled, with_controller, with_header_workspaces,
-        with_pr, with_runner, with_transitions,
+        header_workspace, listing, task, titled, with_controller, with_header_workspaces, with_pr,
+        with_runner, with_transitions,
     };
 
     fn press(app: &mut TaskApp, code: KeyCode) {
@@ -5842,7 +5842,6 @@ mod task_app_actions_render {
             "krok 1 z 2",
             "Pauza",
             "Stop",
-            "Archiwizuj",
             "Opis",
             "skończy krok",
         ] {
@@ -5852,8 +5851,10 @@ mod task_app_actions_render {
             );
         }
         // Only what can be done now: nothing greyed out with a reason. A
-        // comment and a move are not entries of the panel.
+        // comment and a move are not entries of the panel; a run that has
+        // not reached a terminal state is not archived (D80).
         for missing in [
+            "Archiwizuj",
             "Zwolnij slot",
             "niedostępne",
             "Napisz do agenta",
@@ -5870,7 +5871,7 @@ mod task_app_actions_render {
         let rows: Vec<&str> = screen.lines().collect();
         let list = rows
             .iter()
-            .position(|row| row.contains("Archiwizuj"))
+            .position(|row| row.contains("Stop"))
             .expect("the list");
         let description = rows
             .iter()
@@ -5896,11 +5897,10 @@ mod task_app_actions_render {
         );
 
         press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('j'));
         let buffer = draw(120, 40, |frame| {
             layout::render(frame, &mut app, &Styles::new(false), Instant::now())
         });
-        assert_action_number(&buffer, "Archiwizuj", 3);
+        assert_action_number(&buffer, "Stop", 2);
         assert!(!rows(&buffer)[row_of(&buffer, "Pauza")].contains("| 1 |"));
     }
 
@@ -5999,20 +5999,6 @@ mod task_app_actions_render {
             confirm.contains("! nieodwracalne") && confirm.contains("Enter wyślij"),
             "{confirm}"
         );
-    }
-
-    #[test]
-    fn a_queued_task_offers_only_the_archive() {
-        let mut app = TaskApp::new(
-            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
-            "local",
-            None,
-        );
-        app.load(listing(vec![queued("a", 1)], "c"));
-        press(&mut app, KeyCode::Char('.'));
-        let screen = draw_app(&mut app, 120, 40, false);
-        assert!(screen.contains("Archiwizuj"), "{screen}");
-        assert!(!screen.contains("Pauza"), "{screen}");
     }
 
     #[test]
@@ -6395,8 +6381,8 @@ mod task_app_create_render {
     use narsor_engine::domain::ParamType;
 
     use crate::task_app_support::{
-        archived, capabilities, catalogue, catalogue_workflow, listing, queued, registry,
-        repository, titled, with_workspaces, workflow_input, workspace,
+        archived, archived_step, archived_timeline, capabilities, catalogue, catalogue_workflow,
+        listing, queued, registry, repository, titled, with_workspaces, workflow_input, workspace,
     };
 
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
@@ -6999,7 +6985,7 @@ mod task_app_create_render {
             "archiwum",
             "NAR-8",
             "Przebieg",
-            "storage usunięty przy archiwizacji",
+            "wczytuję przebieg",
         ] {
             assert!(screen.contains(expected), "{expected}:\n{screen}");
         }
@@ -7048,6 +7034,84 @@ mod task_app_create_render {
             cell(&details, 3, selected + 2),
             ("─".to_string(), Color::DarkGray)
         );
+    }
+
+    #[test]
+    fn ae3_the_history_shows_the_archived_runs_total_cost_and_every_step() {
+        let mut app = app();
+        keys(&mut app, "H");
+        app.open_history(listing(vec![archived("old", "NAR-9", 5)], "c"));
+        app.on_history_timeline(
+            "old",
+            Ok(archived_timeline(
+                "old",
+                vec![
+                    archived_step("plan", "claude", "opus", 0.4),
+                    archived_step("implement", "codex", "gpt-5", 0.6),
+                    archived_step("review", "claude", "sonnet", 0.2),
+                ],
+            )),
+        );
+        press(&mut app, KeyCode::Enter);
+        let screen = draw_app(&mut app, 130, 30, false);
+        for expected in [
+            "razem $1.20",
+            "plan #1",
+            "implement #1",
+            "review #1",
+            "$0.40",
+            "$0.60",
+            "$0.20",
+            "opus",
+            "gpt-5",
+            "sonnet",
+            "codex",
+        ] {
+            assert!(screen.contains(expected), "{expected}:\n{screen}");
+        }
+        for absent in [
+            "storage usunięty",
+            "podąża",
+            "rozmowa kroku",
+            "brak rozmowy",
+        ] {
+            assert!(!screen.contains(absent), "{absent}:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn an_archived_task_without_a_kept_run_says_its_storage_is_gone() {
+        let mut app = app();
+        keys(&mut app, "H");
+        app.open_history(listing(vec![archived("old", "NAR-9", 5)], "c"));
+        let mut nothing_kept = archived_timeline("old", Vec::new());
+        nothing_kept.timeline = None;
+        app.on_history_timeline("old", Ok(nothing_kept));
+        let screen = draw_app(&mut app, 130, 30, false);
+        assert!(
+            screen.contains("storage usunięty przy archiwizacji"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn a_failed_read_of_the_archived_run_says_why_not_that_the_storage_is_gone() {
+        let mut app = app();
+        keys(&mut app, "H");
+        app.open_history(listing(vec![archived("old", "NAR-9", 5)], "c"));
+        app.on_history_timeline(
+            "old",
+            Err(narsor::api::ClientError::Degraded {
+                code: "busy".to_string(),
+                message: "serwer zajęty".to_string(),
+            }),
+        );
+        let screen = draw_app(&mut app, 130, 30, false);
+        assert!(
+            screen.contains("nie udało się wczytać przebiegu: serwer zajęty"),
+            "{screen}"
+        );
+        assert!(!screen.contains("storage usunięty"), "{screen}");
     }
 
     /// The first screen rows of the selected history entry and of the other

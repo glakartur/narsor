@@ -238,7 +238,9 @@ the gate starts to wait ─▶ in (each automation that has one) ─▶ the step
   the new one. A runner of an older version refuses the restart of a
   waiting gate, and the refusal is shown.
 - **The task ends at the gate.** When a task is cancelled, archived or
-  deleted while it waits at the gate, `out` runs once in the background. It
+  deleted while it waits at the gate, `out` runs once in the background.
+  (The owner archives a task only at a terminal state of its workflow, not
+  at a gate; an archive at the gate comes only from the control plane.) It
   does not hold the end of the task; a failure is in the task history.
 - **No new run.** Pause, an interrupted runner, auto-resume and a restart of
   the runner keep the episode: `in` and `out` do not run again.

@@ -19,7 +19,9 @@ use crate::controller_protocol::{
     CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
 };
 use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
+use crate::task_usage_text::{self, step_cells};
 use crate::tui::task_app::list::{attention_of, Attention};
+use narsor_protocol::api::{Position, PositionStatus};
 use narsor_protocol::controller::PendingInputRefView;
 use narsor_protocol::controller::{
     AttentionItem, AttentionKind, ConversationAttemptSummary, GateAutomationPhase, GateHookView,
@@ -825,8 +827,24 @@ pub fn detail_lines(
         lines.push(ToneLine::new(text, tone));
     }
 
+    let archived = task.state == TaskState::Archived;
     if let Some(timeline) = timeline {
         match &timeline.timeline {
+            Some(steps) if archived => {
+                lines.push(ToneLine::new(
+                    format!(
+                        "Timeline   {} step(s), kept at archive",
+                        steps.positions.len()
+                    ),
+                    Tone::Normal,
+                ));
+                if let Some(usage) = task_usage_text::sum(&steps.positions)
+                    .and_then(|usage| task_usage_text::line(&usage, true))
+                {
+                    lines.push(ToneLine::new(format!("Usage      {usage}"), Tone::Normal));
+                }
+                lines.extend(steps.positions.iter().flat_map(step_lines));
+            }
             Some(steps) => {
                 let mut text = format!("Timeline   {} step(s)", steps.positions.len());
                 if let Some(position) = &steps.default_position {
@@ -843,6 +861,10 @@ pub fn detail_lines(
                 };
                 lines.push(ToneLine::new(text, tone));
             }
+            None if archived => lines.push(ToneLine::new(
+                "Timeline   storage deleted at archive, no steps were kept",
+                Tone::Muted,
+            )),
             None => lines.push(ToneLine::new("Timeline   not reported yet", Tone::Muted)),
         }
     }
@@ -851,6 +873,88 @@ pub fn detail_lines(
         lines.extend(conversation_lines(now, conversation));
     }
     lines
+}
+
+/// A step status as people read it.
+pub fn position_status_name(status: PositionStatus) -> &'static str {
+    match status {
+        PositionStatus::Succeeded => "succeeded",
+        PositionStatus::Failed => "failed",
+        PositionStatus::Interrupted => "interrupted",
+        PositionStatus::InProgress => "in_progress",
+        PositionStatus::AwaitingDecision => "awaiting_decision",
+    }
+}
+
+/// The lines of one step, as the TUI's *Przebieg* row shows it: the label,
+/// the status, the action type and the times; under it, indented, the
+/// harness, model, effort, tokens, subagents, cost and conductor cost; then
+/// the error. A figure the harness did not report is left out (no `$0`), and
+/// a step that reported none has no second line.
+pub fn step_lines(position: &Position) -> Vec<ToneLine> {
+    let tone = match position.status {
+        PositionStatus::Failed => Tone::Error,
+        PositionStatus::Interrupted => Tone::Warning,
+        _ => Tone::Normal,
+    };
+    let mut lines = vec![ToneLine::new(
+        format!(
+            "  {}  {}  {}  {}",
+            position.label,
+            position_status_name(position.status),
+            position.action_type.as_deref().unwrap_or("-"),
+            step_times(position.started_at, position.ended_at)
+        ),
+        tone,
+    )];
+    let cells = step_cells(position.usage.as_ref());
+    let tokens = [cells.input, cells.output].join(" ");
+    let subagents = [
+        cells.subagent_count,
+        cells.subagent_input,
+        cells.subagent_output,
+        cells.subagent_total,
+    ]
+    .join(" ");
+    let details: Vec<String> = [
+        position.harness.clone(),
+        position.model.clone(),
+        position.effort.clone(),
+        Some(tokens),
+        Some(subagents),
+        Some(cells.cost),
+        Some(cells.conductor_cost),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
+    .filter(|part| !part.is_empty())
+    .collect();
+    if !details.is_empty() {
+        lines.push(ToneLine::new(
+            format!("      {}", details.join(" · ")),
+            Tone::Muted,
+        ));
+    }
+    if let Some(error) = &position.error {
+        lines.push(ToneLine::new(format!("      error: {error}"), Tone::Error));
+    }
+    lines
+}
+
+/// `2026-11-13 12:00:00 → 12:04:10`: the end shows its date only when it
+/// differs from the start's; `-` for a time not reported.
+fn step_times(started: Option<DateTime<Utc>>, ended: Option<DateTime<Utc>>) -> String {
+    const FULL: &str = "%Y-%m-%d %H:%M:%S";
+    let start = started.map_or_else(|| "-".to_string(), |at| at.format(FULL).to_string());
+    let end = match (started, ended) {
+        (_, None) => "-".to_string(),
+        (Some(start), Some(end)) if start.date_naive() == end.date_naive() => {
+            end.format("%H:%M:%S").to_string()
+        }
+        (_, Some(end)) => end.format(FULL).to_string(),
+    };
+    format!("{start} → {end}")
 }
 
 fn presence(present: bool) -> &'static str {

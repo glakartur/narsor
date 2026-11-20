@@ -5,14 +5,34 @@ use crate::controller_protocol::error::ProtocolResult;
 use crate::controller_protocol::service::ProtocolService;
 use crate::controller_protocol::wire::*;
 use crate::domain::TaskId;
-use crate::orchestration::{OwnerRef, TaskEvent};
+use crate::engine::Timeline;
+use crate::orchestration::{archived_timeline, OwnerRef, TaskEvent, TaskRecord};
+
+/// The timeline a task serves: the last one its runner reported, or for an
+/// archived task the copy frozen at archive, else (a task archived before
+/// that copy was kept) its last reported one trimmed the same way. Either
+/// comes from the record alone; no storage is read.
+pub(crate) fn served_timeline(record: &TaskRecord) -> Option<Timeline> {
+    let reported = record
+        .runner
+        .as_ref()
+        .and_then(|runner| runner.snapshot.timeline.as_ref());
+    if !record.runner_state.is_archival() {
+        return reported.cloned();
+    }
+    match &record.archived_run {
+        Some(run) => run.timeline.clone(),
+        None => reported.map(archived_timeline),
+    }
+}
 
 impl ProtocolService {
-    /// The last timeline the task's runner reported.
+    /// The task's timeline ([`served_timeline`]).
     pub fn timeline(&self, owner: &OwnerRef, task_id: &str) -> ProtocolResult<TimelineResponse> {
         let record = self.owned_task(owner, task_id)?;
         let now = self.control.now();
         let runner = record.runner.as_ref();
+        let timeline = served_timeline(&record);
         Ok(TimelineResponse {
             freshness: match runner {
                 Some(runner) => self.runner_freshness(&record, runner, now)?,
@@ -22,10 +42,8 @@ impl ProtocolService {
             execution_status: runner.map(|runner| runner.snapshot.execution_status),
             current_state: runner
                 .and_then(|runner| runner.snapshot.execution_cursor.current_state.clone()),
-            current_position: runner
-                .and_then(|runner| runner.snapshot.timeline.as_ref())
-                .and_then(current_position),
-            timeline: runner.and_then(|runner| runner.snapshot.timeline.clone()),
+            current_position: timeline.as_ref().and_then(current_position),
+            timeline,
             task_id: record.task_id.to_string(),
         })
     }

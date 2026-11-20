@@ -170,3 +170,8 @@ pub const CONVERSATION_RECORD_UNREADABLE: &str = "conversation_record_unreadable
 
 pub const CONVERSATION_RECORD_UNREADABLE_PREFIX: &str =
     "the conversation record could not be read: ";
+
+/// Why an archived task has nothing to show of what lived in its storage:
+/// the conversation of a step, the events, the conductor. The server puts it
+/// on every step of an archived run; clients say it on the tabs it emptied.
+pub const STORAGE_DELETED_AT_ARCHIVE: &str = "storage usunięty przy archiwizacji";

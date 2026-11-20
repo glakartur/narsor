@@ -69,7 +69,9 @@ use crate::controller_protocol::{
 };
 use crate::task_usage_text::{self, TaskUsage};
 use narsor_protocol::api::{ConversationState, Position};
-use narsor_protocol::controller::{ExecutionCursor, QueueReason, TaskState};
+use narsor_protocol::controller::{
+    ExecutionCursor, QueueReason, TaskState, STORAGE_DELETED_AT_ARCHIVE,
+};
 
 use super::super::keymap::Action;
 use super::super::scroll::one_line;
@@ -437,12 +439,13 @@ pub fn readiness(task: &TaskSummary) -> Readiness {
     }
 }
 
-/// What *Przebieg*, *Rozmowa* and *Zdarzenia* say when there is nothing to
-/// show, or `None` when there is.
+/// What *Przebieg*, *Rozmowa*, *Zdarzenia* and *Dyrygent* say when there is
+/// nothing to show, or `None` when there is. *Przebieg* of a history entry
+/// asks [`closed_run_message`] instead: the archive kept its run.
 pub fn unstarted_message(task: &TaskSummary, queue_place: Option<usize>) -> Option<String> {
     match readiness(task) {
         Readiness::Started => None,
-        Readiness::Archived => Some("storage usunięty przy archiwizacji".to_string()),
+        Readiness::Archived => Some(STORAGE_DELETED_AT_ARCHIVE.to_string()),
         Readiness::NotStarted => {
             let place = match queue_place {
                 Some(place) => format!("#{place} w kolejce"),
@@ -451,6 +454,16 @@ pub fn unstarted_message(task: &TaskSummary, queue_place: Option<usize>) -> Opti
             Some(format!("jeszcze nie wystartowało, {place}"))
         }
     }
+}
+
+/// What *Przebieg* of an archived task says instead of its steps: only an
+/// answer without any timeline means the run is gone. While the read is under
+/// way or failed, the tab itself says so.
+pub fn closed_run_message(progress: &Progress) -> Option<String> {
+    progress
+        .timeline()
+        .is_some_and(|response| response.timeline.is_none())
+        .then(|| STORAGE_DELETED_AT_ARCHIVE.to_string())
 }
 
 /// Whether the terminal named by the environment draws OSC 8 hyperlinks.
@@ -680,8 +693,10 @@ impl TaskApp {
     /// runs is not started again. Call it after a key, an event, a refresh and
     /// an answer: what an answer makes due starts then.
     pub fn start_detail_reads(&mut self) {
-        // The history reads nothing: an archived task's storage is gone.
+        // The history reads only the run the archive kept, into its own
+        // entries: an archived task's storage is gone.
         if matches!(self.view, super::View::History(_)) {
+            self.start_history_read();
             return;
         }
         let Some(task) = self.list.selected() else {
@@ -1094,6 +1109,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         details_opened: view.details_opened,
         loading,
         title_cut: title_is_cut(view.task, &edge),
+        closed_run: false,
     };
     render_view(frame, inner, view, styles, options, panel.as_deref_mut());
     app.restore_action_panel(panel);
@@ -1131,6 +1147,9 @@ pub(super) struct ViewOptions {
     pub(super) loading: bool,
     /// The frame's edge cuts the title, so the header says it in full.
     pub(super) title_cut: bool,
+    /// A history entry: *Przebieg* shows the run the archive kept, with
+    /// nothing to follow and no step to open.
+    pub(super) closed_run: bool,
 }
 
 /// Draws `view` — the details of a task, or of an entry of the history —
@@ -1153,6 +1172,7 @@ pub(super) fn render_view(
         details_opened,
         loading,
         title_cut,
+        closed_run,
     } = options;
     let content_keys = match keys {
         KeysAt::Content(step) => Some(step),
@@ -1264,6 +1284,7 @@ pub(super) fn render_view(
             styles.of(segment_role).add_modifier(Modifier::BOLD),
         );
         let label = (view.tab == DetailTab::Progress
+            && !closed_run
             && !view.detail.progress.positions().is_empty())
         .then(|| {
             if view.detail.progress.follows() {
@@ -1295,7 +1316,11 @@ pub(super) fn render_view(
         return;
     }
 
-    let unstarted = unstarted_message(view.task, view.queue_place);
+    let unstarted = if closed_run && view.tab == DetailTab::Progress {
+        closed_run_message(&view.detail.progress)
+    } else {
+        unstarted_message(view.task, view.queue_place)
+    };
     match (view.tab, unstarted) {
         (
             DetailTab::Progress

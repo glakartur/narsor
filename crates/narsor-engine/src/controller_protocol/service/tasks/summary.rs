@@ -129,6 +129,11 @@ impl ProtocolService {
         if record.resume_message.is_some() {
             actions.retain(|offer| offer.id != TaskActionId::Comment);
         }
+        // Archive only at a terminal state of the workflow (D80), which only
+        // the record knows.
+        if super::actions::archive_reason(record).is_some() {
+            actions.retain(|offer| offer.id != TaskActionId::Archive);
+        }
         summary.actions = Some(actions);
         // After the actions: the panel reads the same summary and the offer.
         summary.panel = super::panel::offer_forms(&summary);

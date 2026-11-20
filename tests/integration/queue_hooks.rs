@@ -21,14 +21,14 @@ use std::time::Duration as StdDuration;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_engine::automations::HookPhase;
 use narsor_engine::controller_protocol::{
-    ClaimedObserverRun, OwnerCommandRequest, ProtocolError, ProtocolService, RunOutcome, RunReport,
-    SubmitInputRequest, SubmitOperatorCommandRequest,
+    ClaimedObserverRun, ProtocolError, ProtocolService, RunOutcome, RunReport, SubmitInputRequest,
+    SubmitOperatorCommandRequest,
 };
 use narsor_engine::domain::TaskId;
 use narsor_engine::observers::{queue_entry_id, ScriptExit};
 use narsor_engine::orchestration::{
-    Clock, ControlPlane, GateAutomationPhase, OperatorCommand, OperatorCommandRequest,
-    OwnerCommand, OwnerRef, TaskEventKind,
+    Clock, CommandRequest, ControlPlane, GateAutomationPhase, OperatorCommand,
+    OperatorCommandRequest, OwnerCommand, OwnerRef, TaskEventKind,
 };
 use narsor_engine::persistence::StatePaths;
 use narsor_protocol::api::HumanInputDeliveryDto;
@@ -47,6 +47,19 @@ const IN_OUT: &[HookPhase] = &[HookPhase::In, HookPhase::Out];
 
 fn owner() -> OwnerRef {
     OwnerRef::new("owner")
+}
+
+/// Archives `task` while it waits at the gate. The owner's offer takes an
+/// archive only at a terminal state of the workflow (D80), so an archive at
+/// a gate comes from inside the control plane, which still runs the gate's
+/// exit scripts once (D78).
+fn archive_at_the_gate(fx: &Fixture, task: &TaskId) {
+    fx.service
+        .apply_command(
+            task,
+            CommandRequest::new(OwnerCommand::Archive, "archive-1"),
+        )
+        .unwrap();
 }
 
 /// The code of a coded refusal; panics on any other.
@@ -766,17 +779,7 @@ fn a_task_archived_at_the_gate_ends_at_once_and_runs_out_once() {
     let fx = Fixture::new(&[(LABEL, IN_OUT)]);
     let task = ready_gate(&fx);
 
-    fx.service
-        .command(
-            &owner(),
-            task.as_str(),
-            OwnerCommandRequest {
-                command: OwnerCommand::Archive,
-                idempotency_key: "archive-1".into(),
-                expected_generation: None,
-            },
-        )
-        .unwrap();
+    archive_at_the_gate(&fx, &task);
     assert!(fx.service.control_plane().task(&task).unwrap().has_ended());
     let out = fx.claim_hook(HookPhase::Out, LABEL, EPISODE);
     assert_eq!(out.input.exit.as_ref().unwrap().author, "task_end");
@@ -1025,17 +1028,7 @@ fn a_missing_entry_of_an_episode_with_pending_out_is_added_back() {
         let fx = Fixture::new(&[(LABEL, IN_OUT)]);
         let task = ready_gate(&fx);
         if archived {
-            fx.service
-                .command(
-                    &owner(),
-                    task.as_str(),
-                    OwnerCommandRequest {
-                        command: OwnerCommand::Archive,
-                        idempotency_key: "archive-1".into(),
-                        expected_generation: None,
-                    },
-                )
-                .unwrap();
+            archive_at_the_gate(&fx, &task);
         } else {
             past_gates(&fx.service, &task);
             wait_at(&fx.service, &task, "input-2", &review_gate(QUEUE));
@@ -1122,7 +1115,7 @@ enum Trigger {
     CheckDecides,
     /// The owner restarts the gate step through the operator route.
     OperatorRestarts,
-    /// The owner archives the task at the gate.
+    /// The task is archived at the gate, from inside the control plane (D80).
     Archive,
 }
 
@@ -1247,17 +1240,7 @@ fn trigger_setup(trigger: Trigger) -> (Fixture, Fire) {
             (
                 fx,
                 Box::new(move |fx| {
-                    fx.service
-                        .command(
-                            &owner(),
-                            task.as_str(),
-                            OwnerCommandRequest {
-                                command: OwnerCommand::Archive,
-                                idempotency_key: "archive-1".into(),
-                                expected_generation: None,
-                            },
-                        )
-                        .unwrap();
+                    archive_at_the_gate(fx, &task);
                 }),
             )
         }

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import * as model from '../ui/js/model.js';
+import { archivedRun, stepDetails } from '../ui/js/text.js';
 
 const NOW = '2026-11-13T12:00:00Z';
 
@@ -172,4 +173,34 @@ test('the Polish plural of tasks follows the number', () => {
   assert.deepEqual([1, 2, 5, 12, 22, 25].map(model.tasksWord), [
     'zadanie', 'zadania', 'zadań', 'zadań', 'zadania', 'zadań',
   ]);
+});
+
+test('an archived task shows its total cost and one row per reported step', () => {
+  const step = (label, usage) => ({ label, status: 'succeeded', harness: 'claude-code', model: 'opus', usage });
+  const read = {
+    loading: false,
+    error: null,
+    data: { timeline: { positions: [step('plan', { cost_usd: 0.5 }), step('build', { cost_usd: 1.25, subagent_count: 2 }), step('review', null)] } },
+  };
+
+  const run = archivedRun(read);
+
+  assert.equal(run.kind, 'steps');
+  assert.match(run.usage, /^razem \$1\.75/);
+  assert.deepEqual(run.timeline.positions.map(stepDetails), [
+    'claude-code · opus · $0.50',
+    'claude-code · opus · $1.25 · ◈ 2',
+    'claude-code · opus',
+  ]);
+});
+
+test('an archived task without a timeline says its storage was deleted, a failed read says why', () => {
+  assert.deepEqual(archivedRun({ loading: false, error: null, data: { timeline: null } }), {
+    kind: 'missing',
+    text: 'storage usunięty przy archiwizacji',
+  });
+  assert.deepEqual(archivedRun({ loading: false, error: 'brak połączenia z serwerem', data: null }), {
+    kind: 'error',
+    text: 'brak połączenia z serwerem',
+  });
 });
