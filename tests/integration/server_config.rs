@@ -138,6 +138,16 @@ fn a_broken_section_stops_its_own_binary_and_the_server_that_starts_its_controll
 }
 
 #[test]
+fn docker_mode_with_a_host_home_somebody_set_stops_the_server_that_starts_its_controller() {
+    let docker = ConfigFile::new("controller:\n  local:\n    mode: docker\n");
+    assert_eq!(docker.server_problems(&[]), Vec::<String>::new());
+    assert_names(
+        &docker.server_problems(&[("NARSOR_CONTROLLER__LOCAL__HOME", "host")]),
+        &["controller.local.mode", "controller.local.home"],
+    );
+}
+
+#[test]
 fn the_controller_gets_the_winning_file_and_only_its_own_sections_variables() {
     let prefixes = local_controller::forwarded_prefixes();
     let names = [

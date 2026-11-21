@@ -16,6 +16,9 @@
 # directory (~/.narsor by default), writes it as global.root and writes
 # server.catalog, server.state and server.work relative to it. It does not touch an
 # existing configuration: it writes config.yaml.new next to it.
+# For the local role it also asks for the work mode of local tasks (process or
+# docker); `--local-mode process|docker` answers that question and is passed
+# to `narsor-cli init` like the other init options.
 set -euo pipefail
 
 repository="glakartur/narsor"
@@ -52,6 +55,7 @@ Instalacja:
              [--with-frontend] [--update-bashrc] [--non-interactive]
              [--stop-running] [--progress]
              [opcje narsor-cli init, np. --data-dir, --config-file]
+             (init options include --local-mode process|docker for the local role)
 Odinstalowanie:
   install.sh --uninstall [--purge] [--bin-dir KATALOG]
              [--data-dir KATALOG] [--config-file PLIK] [--non-interactive]

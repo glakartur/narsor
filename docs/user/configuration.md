@@ -106,6 +106,9 @@ controller:
     codex_home: ""
     claude_config_dir: ""
     claude_profile_source: ""
+    mode: process              # process (built-in: on the host) or docker (in a container; needs the local daemon, HOME is private)
+    docker:
+      update_interval: 24h     # how long a built task image is used before its component versions are checked again; `none` never checks
 runner:
   agent_args:                  # by harness (claude, codex, opencode, copilot); only the running harness's list is added to its command
     claude: [--dangerously-skip-permissions, --effort, high]  # one list entry is one argument, spaces included; win over Narsor's own values of the same flag
@@ -165,6 +168,8 @@ its new one; the program still starts on the values it found.
 | `controller.local.codex_home` | `NARSOR_CONTROLLER__LOCAL__CODEX_HOME` | empty |
 | `controller.local.claude_config_dir` | `NARSOR_CONTROLLER__LOCAL__CLAUDE_CONFIG_DIR` | empty |
 | `controller.local.claude_profile_source` | `NARSOR_CONTROLLER__LOCAL__CLAUDE_PROFILE_SOURCE` | empty |
+| `controller.local.mode` | `NARSOR_CONTROLLER__LOCAL__MODE` (`process` or `docker`) | `process` |
+| `controller.local.docker.update_interval` | `NARSOR_CONTROLLER__LOCAL__DOCKER__UPDATE_INTERVAL` | `24h` |
 | `runner.agent_args` | `NARSOR_RUNNER__AGENT_ARGS` (a mapping, e.g. `{claude: [--effort, high]}`) | empty |
 | `runner.conductor.model` | `NARSOR_RUNNER__CONDUCTOR__MODEL` | empty |
 | `runner.conductor.effort` | `NARSOR_RUNNER__CONDUCTOR__EFFORT` | empty |
@@ -206,11 +211,25 @@ script gets only the secrets its automation declares in `automation.yaml`
 and queues themselves are files of the catalogue (`{catalog}/automations/`,
 `{catalog}/queues/`), not settings.
 
-The `controller` section holds the HOME settings of `narsor-controller
-local`. The controller that a trusted-mode server starts reads the same file
+The `controller` section holds the HOME settings and the work mode of
+`narsor-controller local`. The controller that a trusted-mode server starts reads the same file
 that the server found, and gets only the server's `NARSOR_GLOBAL__*` and
 `NARSOR_CONTROLLER__*` variables; the server checks the `controller` section
-before it starts and refuses to start on its errors. See
+before it starts and refuses to start on its errors.
+
+`controller.local.mode` sets how a local task's runner runs: `process` (a
+process on the host) or `docker` (a container on the local Docker daemon).
+The controller reads it when it starts. In Docker mode the HOME of the tools
+is always the private HOME on task storage: when `controller.local.home` is
+not set, Docker mode uses `private`; an explicitly set
+`controller.local.home: host` (or `--home host`) with `mode: docker` stops
+the controller and the server. Docker mode needs the local daemon as the
+control plane: a controller started by hand for a control plane beyond this
+machine refuses to start in Docker mode.
+`controller.local.docker.update_interval` sets how long a built task image
+is used before the controller checks its component versions again; `none`
+never checks again. See [Local tasks in Docker](local-docker.md) for the
+task image, the token store and the limits of the Docker mode, and
 [Remote execution backends](../operations/remote-backends.md) for a
 controller started by hand.
 
@@ -430,9 +449,12 @@ With the built-in directories, everything is under the root (`global.root`,
 │   └── artifacts/{artifact_id}/    # files produced by actions
 ├── orchestration/                  # durable queued tasks, their order (rank), leases
 ├── local-controller/credential     # the daemon-owned local controller's identity
+├── local-controller/secrets/       # the token store of the Docker mode (`secret set`), 0700
+├── local-controller/images/        # the Docker mode's task image cache and refresh marker
 ├── local-controller/storage/{task_id}/   # under `server.work` (the root by default)
 │   ├── state/                      # execution history once the runner initializes it
 │   └── workspace/                  # provisioned only after scheduler admission
+├── local-controller/tasks/{task_id}.json # under `server.work`: last runner kind and image of a task
 └── narsor.log                # only written by `tui`, and only with RUST_LOG set
 ```
 

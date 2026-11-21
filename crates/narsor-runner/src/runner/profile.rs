@@ -128,7 +128,7 @@ pub fn merge_profile(source: &Path, work: &Path, base: &Path) -> Result<(), Runn
         }
     }
 
-    replace_base(base, &source_files)
+    replace_tree(base, &source_files)
 }
 
 /// The version of a file changed both by the harness and in the source.
@@ -211,15 +211,15 @@ pub fn merge_json(
 }
 
 /// One file of a profile tree.
-struct ProfileFile {
-    bytes: Vec<u8>,
-    executable: bool,
+pub(super) struct ProfileFile {
+    pub(super) bytes: Vec<u8>,
+    pub(super) executable: bool,
 }
 
 /// Every regular file under `root`, by its path relative to `root`,
 /// following symbolic links (a Secret volume is made of them) and skipping
 /// the volume's own entries.
-fn read_tree(root: &Path) -> Result<BTreeMap<PathBuf, ProfileFile>, RunnerError> {
+pub(super) fn read_tree(root: &Path) -> Result<BTreeMap<PathBuf, ProfileFile>, RunnerError> {
     fn walk(
         root: &Path,
         dir: &Path,
@@ -270,7 +270,7 @@ fn read_local(path: &Path) -> Result<Option<Vec<u8>>, RunnerError> {
 
 /// Writes a profile file readable by its owner only — it may hold a login —
 /// through a sibling temporary file, so the harness never reads half of it.
-fn write_private(
+pub(super) fn write_private(
     root: &Path,
     path: &Path,
     bytes: &[u8],
@@ -306,7 +306,7 @@ fn remove_file(path: &Path) -> Result<(), RunnerError> {
     }
 }
 
-fn create_private_dir(path: &Path) -> Result<(), RunnerError> {
+pub(super) fn create_private_dir(path: &Path) -> Result<(), RunnerError> {
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -314,11 +314,15 @@ fn create_private_dir(path: &Path) -> Result<(), RunnerError> {
         .map_err(|source| RunnerError::io(path, source))
 }
 
-/// Records the source as the base of the next start: written aside, then
-/// swapped in, so a crash leaves either the old base or the new one.
-fn replace_base(base: &Path, files: &BTreeMap<PathBuf, ProfileFile>) -> Result<(), RunnerError> {
-    let name = base.file_name().unwrap_or_default().to_string_lossy();
-    let partial = base.with_file_name(format!("{name}.partial"));
+/// Replaces the directory `target` with exactly `files` (for the merge, the
+/// source recorded as the base of the next start): written aside, then
+/// swapped in, so a crash leaves either the old tree or the new one.
+pub(super) fn replace_tree(
+    target: &Path,
+    files: &BTreeMap<PathBuf, ProfileFile>,
+) -> Result<(), RunnerError> {
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    let partial = target.with_file_name(format!("{name}.partial"));
     remove_tree(&partial)?;
     create_private_dir(&partial)?;
     for (relative, file) in files {
@@ -329,11 +333,11 @@ fn replace_base(base: &Path, files: &BTreeMap<PathBuf, ProfileFile>) -> Result<(
             file.executable,
         )?;
     }
-    remove_tree(base)?;
-    fs::rename(&partial, base).map_err(|source| RunnerError::io(base, source))
+    remove_tree(target)?;
+    fs::rename(&partial, target).map_err(|source| RunnerError::io(target, source))
 }
 
-fn remove_tree(path: &Path) -> Result<(), RunnerError> {
+pub(super) fn remove_tree(path: &Path) -> Result<(), RunnerError> {
     match fs::remove_dir_all(path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
             Err(RunnerError::io(path, error))

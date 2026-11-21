@@ -12,12 +12,13 @@
 //! its API, and refuse to start on its errors, without starting it.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::cascade::ConfigCascade;
+use super::check::Problem;
 use super::resolve::{self, Environment, Flags, Resolved};
 use super::scope::Scope;
-use super::settings::ENV_PREFIX;
+use super::settings::{SettingKey, Source, ENV_PREFIX};
 
 /// The controller's scope.
 pub const SCOPE: Scope = Scope::CONTROLLER;
@@ -65,6 +66,14 @@ pub fn config_args(file: Option<&Path>) -> Vec<OsString> {
     }
 }
 
+/// The credential file of the local controller of a server whose state
+/// directory (`server.state`) is `state_dir`. Its directory also holds the
+/// controller's token store, which `narsor-cli secret set` reaches through
+/// it.
+pub fn credential_file(state_dir: &Path) -> PathBuf {
+    state_dir.join("local-controller").join("credential")
+}
+
 /// The controller's configuration from `file` (none: no file at all) and
 /// the variables of `environment` the controller reads.
 ///
@@ -79,4 +88,54 @@ pub fn resolve(file: Option<&Path>, environment: &Environment) -> Resolved {
         &cascade,
         SCOPE,
     )
+}
+
+/// How the local backend runs a task's runner (`controller.local.mode`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LocalMode {
+    /// A `narsor-runner` process on the host, as local tasks have always run.
+    #[default]
+    Process,
+    /// A `narsor-runner` in a Docker container on the local daemon, built
+    /// from the task image the control plane sealed into the task.
+    Docker,
+}
+
+impl LocalMode {
+    /// The word in configuration.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LocalMode::Process => "process",
+            LocalMode::Docker => "docker",
+        }
+    }
+}
+
+/// The rules between the controller's settings that need nothing but the
+/// configuration: the controller refuses to start on them, its
+/// `--check-config` reports them, and a trusted server checks them before
+/// it starts its controller.
+///
+/// A container always runs with a private HOME on task storage (KTD5), so a
+/// `host` HOME somebody set explicitly cannot go with Docker mode. The
+/// built-in `host` does not count: Docker mode replaces it.
+pub fn problems(config: &Resolved) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    let home_source = config.source(SettingKey::LocalHome);
+    if config.local_mode() == LocalMode::Docker
+        && config.text(SettingKey::LocalHome) == Some("host")
+        && !matches!(home_source, Source::BuiltIn)
+    {
+        problems.push(Problem::at(
+            SettingKey::LocalHome,
+            format!(
+                "{} is 'docker' but {} is 'host' (from {home_source}): a container always runs \
+                 with a private HOME on task storage. Remove {} or set it to 'private'",
+                SettingKey::LocalMode,
+                SettingKey::LocalHome,
+                SettingKey::LocalHome,
+            ),
+        ));
+    }
+    problems
 }

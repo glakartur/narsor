@@ -108,6 +108,17 @@ pub const DEFAULT_LOCAL_HOME: &str = "host";
 /// The local HOME modes, as `narsor-runner --home` spells them.
 pub const LOCAL_HOME_MODES: [&str; 2] = ["host", "private"];
 
+/// How the local backend runs a task's runner when nothing says otherwise:
+/// as a process on the host, the way local tasks have always run.
+pub const DEFAULT_LOCAL_MODE: &str = "process";
+
+/// The local work modes: a host process, or a Docker container.
+pub const LOCAL_MODES: [&str; 2] = ["process", "docker"];
+
+/// How long a built task image is trusted before the controller checks its
+/// component versions again, when nothing says otherwise: one day.
+pub const DEFAULT_DOCKER_UPDATE_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
 /// The built-in `global.root` (R23): the directory every unconfigured run
 /// has always used.
 pub const DEFAULT_ROOT: &str = "./.narsor";
@@ -314,6 +325,12 @@ pub enum SettingKey {
     /// directory up to date with before every start; empty, or the
     /// configuration directory itself, copies nothing.
     LocalClaudeProfileSource,
+    /// How the local backend runs a task's runner: `process` (on the host)
+    /// or `docker` (in a container). Read when the controller starts.
+    LocalMode,
+    /// How long a built task image is used before the controller checks
+    /// its component versions again (Docker mode); `none` never checks.
+    LocalDockerUpdateInterval,
     /// Extra command-line arguments of the harness runs, listed by harness
     /// (`claude: [--flag]`). They win over the same arguments Narsor works
     /// out itself.
@@ -340,7 +357,7 @@ pub enum SettingKey {
 impl SettingKey {
     /// Every setting, in the order `config show` prints them: grouped by
     /// section, in the order of [`Section::ALL`].
-    pub const ALL: [SettingKey; 34] = [
+    pub const ALL: [SettingKey; 36] = [
         SettingKey::GlobalRoot,
         SettingKey::LogLevel,
         SettingKey::CatalogDir,
@@ -368,6 +385,8 @@ impl SettingKey {
         SettingKey::LocalCodexHome,
         SettingKey::LocalClaudeConfigDir,
         SettingKey::LocalClaudeProfileSource,
+        SettingKey::LocalMode,
+        SettingKey::LocalDockerUpdateInterval,
         SettingKey::AgentArgs,
         SettingKey::ConductorModel,
         SettingKey::ConductorEffort,
@@ -418,6 +437,8 @@ impl SettingKey {
             SettingKey::LocalCodexHome => "controller.local.codex_home",
             SettingKey::LocalClaudeConfigDir => "controller.local.claude_config_dir",
             SettingKey::LocalClaudeProfileSource => "controller.local.claude_profile_source",
+            SettingKey::LocalMode => "controller.local.mode",
+            SettingKey::LocalDockerUpdateInterval => "controller.local.docker.update_interval",
             SettingKey::AgentArgs => "runner.agent_args",
             SettingKey::ConductorModel => "runner.conductor.model",
             SettingKey::ConductorEffort => "runner.conductor.effort",
@@ -436,7 +457,9 @@ impl SettingKey {
     /// both read it, so they cannot disagree.
     pub fn former_key(self) -> Option<&'static str> {
         Some(match self {
-            SettingKey::GlobalRoot => return None,
+            SettingKey::GlobalRoot
+            | SettingKey::LocalMode
+            | SettingKey::LocalDockerUpdateInterval => return None,
             SettingKey::LogLevel => "log_level",
             SettingKey::CatalogDir => "catalog_dir",
             SettingKey::StateDir => "state_dir",
@@ -545,6 +568,8 @@ impl SettingKey {
             | SettingKey::LocalCodexHome
             | SettingKey::LocalClaudeConfigDir
             | SettingKey::LocalClaudeProfileSource
+            | SettingKey::LocalMode
+            | SettingKey::LocalDockerUpdateInterval
             | SettingKey::AgentArgs
             | SettingKey::ConductorModel
             | SettingKey::ConductorEffort
@@ -583,6 +608,10 @@ impl SettingKey {
             SettingKey::ServerBind => SettingValue::Text(DEFAULT_SERVER_BIND.to_string()),
             SettingKey::TlsTermination => SettingValue::Text(TLS_TERMINATION_NONE.to_string()),
             SettingKey::LocalHome => SettingValue::Text(DEFAULT_LOCAL_HOME.to_string()),
+            SettingKey::LocalMode => SettingValue::Text(DEFAULT_LOCAL_MODE.to_string()),
+            SettingKey::LocalDockerUpdateInterval => {
+                SettingValue::Duration(Some(DEFAULT_DOCKER_UPDATE_INTERVAL_SECS))
+            }
             SettingKey::ObserverEnabled | SettingKey::ObserverInsecureSameUser => {
                 SettingValue::Text("false".to_string())
             }
@@ -623,7 +652,10 @@ impl SettingKey {
     /// Whether the value is a duration, which the file may also write as a
     /// bare number of seconds or as an explicit null.
     pub fn is_duration(self) -> bool {
-        matches!(self, SettingKey::TuiRefreshInterval)
+        matches!(
+            self,
+            SettingKey::TuiRefreshInterval | SettingKey::LocalDockerUpdateInterval
+        )
     }
 
     /// Whether the value is a boolean, which the file may also write as a

@@ -592,10 +592,11 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             }
         }
 
-        SettingKey::TuiRefreshInterval => {
+        SettingKey::TuiRefreshInterval | SettingKey::LocalDockerUpdateInterval => {
             // The spelled-out word means "no limit" (for the refresh: no
-            // periodic read at all), so a value inherited from /etc/narsor/
-            // can be revoked and not only replaced.
+            // periodic read at all; for the image: never check again), so a
+            // value inherited from /etc/narsor/ can be revoked and not only
+            // replaced.
             if text.trim().eq_ignore_ascii_case(NO_LIMIT) {
                 return Ok(SettingValue::Duration(None));
             }
@@ -751,6 +752,8 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
         }
 
         SettingKey::LocalHome => one_of(text, "local HOME mode", &settings::LOCAL_HOME_MODES),
+
+        SettingKey::LocalMode => one_of(text, "local work mode", &settings::LOCAL_MODES),
 
         SettingKey::ObserverEnabled | SettingKey::ObserverInsecureSameUser => {
             one_of(text, "boolean", &["false", "true"])

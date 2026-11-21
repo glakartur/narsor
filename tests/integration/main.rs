@@ -68,6 +68,7 @@ mod profile_step_flow;
 mod queue_hooks;
 mod registry;
 mod schema_loading;
+mod secret_store;
 mod server_config;
 mod step_profile_flow;
 mod task_labels;

@@ -390,7 +390,7 @@ impl BackendRecord {
 
 /// Whether `name` is usable as a secret, tool or skill reference: the same
 /// conservative character set identifiers use.
-pub(crate) fn is_reference_name(name: &str) -> bool {
+pub fn is_reference_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= crate::domain::MAX_IDENTIFIER_LEN
         && !name.starts_with('.')

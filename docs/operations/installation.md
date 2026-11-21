@@ -74,6 +74,23 @@ the setting replaces). The number of tasks processed in parallel is the
 `server.max_concurrent_tasks` setting (default 1). The file is a tree of
 sections, one per program; see [Configuration](../user/configuration.md#the-tree-of-sections).
 
+For the `local` role, `narsor-cli init` also asks for the **work mode for
+local tasks**: `process` (the default: tasks run on the host as your user) or
+`docker` (tasks run in a hardened container; needs rootful Docker). Pass
+`--local-mode process|docker` to answer without the question; in
+non-interactive mode without the option the mode stays `process` and nothing
+is written. When you choose `docker`, `init` checks the Docker daemon, writes
+`controller.local.mode: docker` and, when the catalogue has no
+`runtime.yaml` yet, creates one with the example task image (Debian with
+`base-tools` and `claude-code`) and its component scripts. An existing
+`runtime.yaml` is never changed. If Docker is not ready, the interactive
+question asks whether to write the docker mode anyway (default: no, use
+`process`); an explicit `--local-mode docker` is written with a warning. The
+`server` role refuses `--local-mode docker`: its workstation controller serves
+the network server, and the Docker mode needs the local daemon as the control
+plane. See [Local tasks in Docker](../user/local-docker.md) for the next
+steps (the Claude Code token and the tools of the image).
+
 If a configuration file already exists, it is left untouched. The installer
 writes `config.yaml.new` next to it with the default values and does not ask
 for the data directory (use `--data-dir` to choose another root); compare the
@@ -93,7 +110,8 @@ curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install
 ```
 
 For `local` and `frontend`, the installer needs `--role` and `--bin-dir` in
-non-interactive mode; `--data-dir` defaults to `~/.narsor`. For `server`, also supply:
+non-interactive mode; `--data-dir` defaults to `~/.narsor`. For `local`, add
+`--local-mode docker` to run local tasks in containers. For `server`, also supply:
 
 * `--server-bind` with an address reachable by the corporate proxy, not a
   loopback address;

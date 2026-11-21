@@ -91,6 +91,7 @@ pub mod cli;
 mod commands;
 mod conductor;
 pub mod home;
+pub mod home_sources;
 pub mod init;
 mod materials;
 pub mod preflight;
@@ -139,7 +140,7 @@ use narsor_protocol::controller::{
 pub use home::{HarnessHome, HomeMode};
 pub use init::{initialize, Initialization};
 pub use preflight::{BaseImageContract, ContractViolation};
-pub use secrets::{MountedSecrets, ProcessEnvironment};
+pub use secrets::{MountedSecrets, ProcessEnvironment, SecretGrant};
 pub use storage::{SessionRecord, TaskStorage};
 
 /// Variable naming the directory of delivered materials (U9).
@@ -177,6 +178,9 @@ pub enum RunnerError {
     /// The Claude Code profile could not be brought into the work directory.
     #[error("Claude profile preparation failed: {0}")]
     Profile(String),
+    /// A home source could not be copied into the private HOME.
+    #[error("home source preparation failed: {0}")]
+    HomeSource(String),
     /// The Engine's store failed.
     #[error(transparent)]
     Persistence(#[from] PersistenceError),
@@ -293,8 +297,14 @@ pub struct RunnerConfig {
     pub credential_file: PathBuf,
     /// The read-only directory of mounted secrets, one file per reference.
     pub secrets_dir: Option<PathBuf>,
+    /// Mounted secrets the backend grants beside the ones the environment
+    /// names (`--deliver-secret`).
+    pub secret_grants: Vec<secrets::SecretGrant>,
     /// Which HOME and harness configuration every action sees.
     pub harness_home: HarnessHome,
+    /// Read-only sources copied into the private HOME at every start
+    /// ([`home_sources`]).
+    pub home_sources: Vec<home_sources::HomeSource>,
     /// Runner configuration's extra command-line arguments, keyed by harness.
     pub agent_args: narsor_exec::config::AgentArgs,
     /// The model tier and effort the conductor runs with.
@@ -380,7 +390,8 @@ pub async fn run(
         .await);
     }
 
-    let secrets = MountedSecrets::new(config.secrets_dir.clone());
+    let secrets =
+        MountedSecrets::new(config.secrets_dir.clone()).with_grants(config.secret_grants.clone());
     let private_home = storage.home_dir();
     let home = (config.harness_home.mode == HomeMode::Private).then_some(private_home.as_path());
     let mut environment = match secrets.materialize(&spec.environment, home) {
@@ -419,7 +430,15 @@ pub async fn run(
         .await);
     }
 
-    match harness_variables(&config.harness_home, &storage) {
+    let prepared = harness_variables(&config.harness_home, &storage).and_then(|variables| {
+        home_sources::prepare_home_sources(
+            &config.home_sources,
+            config.harness_home.mode,
+            &private_home,
+        )
+        .map(|()| variables)
+    });
+    match prepared {
         Ok(variables) => environment.task.extend(variables),
         Err(error) => {
             return Ok(report_problem(

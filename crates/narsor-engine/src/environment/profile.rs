@@ -18,19 +18,33 @@
 //! to bump it still yields a different environment identity.
 //!
 //! The runtime catalogue, `{catalog}/runtime.yaml`, names the Narsor runtime
-//! bundle and the tool packages profiles may pick from:
+//! bundle, the tool packages profiles may pick from, and the global task
+//! image (KTD8):
 //!
 //! ```yaml
-//! bundle: ghcr.io/narsor/runtime@sha256:…
+//! bundle: ghcr.io/narsor/runtime@sha256:…   # needed by backends that run images
 //! tools:
 //!   gh: { reference: ghcr.io/narsor/tools/gh:2.60, digest_policy: resolve }
+//! task_image:
+//!   base: debian:trixie-slim
+//!   secrets: [{ name: db-password, env: DATABASE_PASSWORD }] # every task
+//!   components:
+//!     - name: glab
+//!       install: components/glab.sh          # a path inside the catalogue,
+//!       version: { inline: "glab --version" } # or the script text itself
+//!       secrets: [{ name: gitlab-token, env: GITLAB_TOKEN }]
+//!       home: [{ from: ~/.config/glab-cli, to: .config/glab-cli }]
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::domain::{canonical_sha256, ImageSpec, ResolvedProfile};
+use crate::domain::{
+    canonical_sha256, ComponentSecret, HomeSource, ImageReference, ImageSpec, ResolvedProfile,
+    SecretDelivery, TaskImage, TaskImageComponent,
+};
 
 use super::backend::is_reference_name;
 
@@ -127,23 +141,31 @@ impl ProfileRecord {
     }
 }
 
-/// The runtime bundle and the tool packages (R20).
+/// The runtime bundle, the tool packages (R20) and the global task image
+/// (KTD8).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeCatalog {
-    /// The Narsor runtime bundle OCI image.
-    pub bundle: ImageSpec,
+    /// The Narsor runtime bundle OCI image. Every backend that runs images
+    /// needs it; the local backend does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<ImageSpec>,
     /// Tool package images, by tool name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tools: BTreeMap<String, ImageSpec>,
+    /// The global task image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_image: Option<TaskImageConfig>,
 }
 
 impl RuntimeCatalog {
     /// Every problem with the catalogue, empty when it is usable.
     pub fn problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
-        if let Err(error) = self.bundle.check() {
-            problems.push(format!("bundle: {error}"));
+        if let Some(bundle) = &self.bundle {
+            if let Err(error) = bundle.check() {
+                problems.push(format!("bundle: {error}"));
+            }
         }
         for (name, image) in &self.tools {
             if !is_reference_name(name) {
@@ -153,6 +175,512 @@ impl RuntimeCatalog {
                 problems.push(format!("tools.{name}: {error}"));
             }
         }
+        if let Some(task_image) = &self.task_image {
+            problems.extend(task_image.problems());
+        }
         problems
+    }
+}
+
+/// Environment variables the runner's contract or its scrub owns, which a
+/// component secret may never be delivered as. The names of the harness API
+/// keys repeat `narsor_shared::config::API_KEY_ENVS`, which the runner
+/// removes from every harness environment.
+fn reserved_env_problem(name: &str) -> Option<String> {
+    let reserved = name.starts_with("LD_")
+        || name.starts_with("NARSOR_")
+        || narsor_shared::config::API_KEY_ENVS.contains(&name);
+    reserved.then(|| format!("environment variable '{name}' is reserved for the runner"))
+}
+
+/// The global task image as `runtime.yaml` writes it: a base and the
+/// components installed on it, in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskImageConfig {
+    /// The base image. Only its syntax is checked here: the local Docker
+    /// mode lets `docker` pull a tag itself, and a backend that runs images
+    /// applies the digest policy when it falls back to it (KTD9).
+    pub base: ImageSpec,
+    /// The components, in installation order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<ComponentConfig>,
+    /// Token store entries every task of the image receives, independent
+    /// of any component.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<ComponentSecretConfig>,
+}
+
+/// One component of the task image as `runtime.yaml` writes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentConfig {
+    /// Name, `[a-z0-9][a-z0-9-]*`, unique in the definition.
+    pub name: String,
+    /// The install script.
+    pub install: ScriptSource,
+    /// The script that prints the version to install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<ScriptSource>,
+    /// Token store entries the component needs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<ComponentSecretConfig>,
+    /// Host configuration copied into the private HOME.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub home: Vec<HomeSourceConfig>,
+}
+
+/// A component script: a bare string is a path relative to the catalogue
+/// directory, `{ inline: … }` is the script text itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ScriptSource {
+    /// A file inside the catalogue directory.
+    Path(String),
+    /// The script text.
+    Inline {
+        /// The text.
+        inline: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for ScriptSource {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Inline {
+            inline: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Path(String),
+            Inline(Inline),
+        }
+        match Either::deserialize(deserializer).map_err(|_| {
+            serde::de::Error::custom(
+                "a script is a path relative to the catalogue, or a mapping with 'inline' \
+                 and the script text",
+            )
+        })? {
+            Either::Path(path) => Ok(Self::Path(path)),
+            Either::Inline(Inline { inline }) => Ok(Self::Inline { inline }),
+        }
+    }
+}
+
+/// One token store entry the task image or one of its components needs, as
+/// `runtime.yaml` writes it: `{ name, env: VAR }` or
+/// `{ name, file: path/under/home }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentSecretConfig {
+    /// The token store entry.
+    pub name: String,
+    /// Deliver as this environment variable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// Deliver as this file, relative to the private HOME.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+}
+
+impl ComponentSecretConfig {
+    fn delivery(&self) -> Result<SecretDelivery, String> {
+        match (&self.env, &self.file) {
+            (Some(env), None) => Ok(SecretDelivery::Env(env.clone())),
+            (None, Some(file)) => Ok(SecretDelivery::File(file.clone())),
+            _ => Err("set exactly one of 'env' and 'file'".to_string()),
+        }
+    }
+
+    /// Adds the problems of the entry at `field` to `problems`, and refuses
+    /// a target (an environment variable or a file) that an entry checked
+    /// before already delivers: `targets` maps each target to that entry.
+    fn check(
+        &self,
+        field: &str,
+        targets: &mut BTreeMap<String, String>,
+        problems: &mut Vec<String>,
+    ) {
+        if !is_reference_name(&self.name) {
+            problems.push(format!(
+                "{field}.name: '{}' is not a usable name",
+                self.name
+            ));
+        }
+        let delivery = match self.delivery() {
+            Ok(delivery) => delivery,
+            Err(problem) => return problems.push(format!("{field}: {problem}")),
+        };
+        let problem = delivery.problem().or_else(|| match &delivery {
+            SecretDelivery::Env(name) => reserved_env_problem(name),
+            SecretDelivery::File(_) => None,
+        });
+        if let Some(problem) = problem {
+            return problems.push(format!("{field}: {problem}"));
+        }
+        let target = delivery.to_string();
+        match targets.get(&target) {
+            Some(first) => {
+                problems.push(format!("{field}: {target} is already delivered by {first}"))
+            }
+            None => {
+                targets.insert(target, field.to_string());
+            }
+        }
+    }
+
+    fn sealed(&self) -> Option<ComponentSecret> {
+        Some(ComponentSecret {
+            name: self.name.clone(),
+            delivery: self.delivery().ok()?,
+        })
+    }
+}
+
+/// Host configuration copied into the private HOME, as `runtime.yaml`
+/// writes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomeSourceConfig {
+    /// An absolute host path, or one that starts with `~`; the controller
+    /// expands `~`.
+    pub from: String,
+    /// The target, relative to the private HOME.
+    pub to: String,
+}
+
+impl TaskImageConfig {
+    /// Every problem with the definition, empty when it is usable. Each one
+    /// names its field.
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if let Err(error) = ImageReference::parse(&self.base.reference) {
+            problems.push(format!("task_image.base: {error}"));
+        }
+        let mut targets = BTreeMap::new();
+        for (index, secret) in self.secrets.iter().enumerate() {
+            secret.check(
+                &format!("task_image.secrets[{index}]"),
+                &mut targets,
+                &mut problems,
+            );
+        }
+        let mut names = BTreeSet::new();
+        for (index, component) in self.components.iter().enumerate() {
+            let field = format!("task_image.components[{index}]");
+            if !is_component_name(&component.name) {
+                problems.push(format!(
+                    "{field}.name: '{}' must match [a-z0-9][a-z0-9-]*",
+                    component.name
+                ));
+            } else if !names.insert(component.name.as_str()) {
+                problems.push(format!(
+                    "{field}.name: '{}' is listed twice",
+                    component.name
+                ));
+            }
+            let scripts = std::iter::once(("install", Some(&component.install)))
+                .chain(std::iter::once(("version", component.version.as_ref())));
+            for (script_field, script) in scripts {
+                if let Some(problem) = script.and_then(ScriptSource::problem) {
+                    problems.push(format!("{field}.{script_field}: {problem}"));
+                }
+            }
+            for (secret_index, secret) in component.secrets.iter().enumerate() {
+                secret.check(
+                    &format!("{field}.secrets[{secret_index}]"),
+                    &mut targets,
+                    &mut problems,
+                );
+            }
+            for (home_index, home) in component.home.iter().enumerate() {
+                let field = format!("{field}.home[{home_index}]");
+                if let Some(problem) = home_from_problem(&home.from) {
+                    problems.push(format!("{field}.from: {problem}"));
+                }
+                if !is_relative_inside(&home.to) {
+                    problems.push(format!(
+                        "{field}.to: '{}' must be a relative path inside the private HOME, \
+                         without '.' or '..' components",
+                        home.to
+                    ));
+                }
+            }
+        }
+        problems
+    }
+
+    /// The definition as a task seals it, with the text of every script
+    /// read from under `catalog_root`. A script outside the catalogue
+    /// directory (through a symbolic link, too) is refused. Call it on a
+    /// definition without [`Self::problems`].
+    pub fn seal(&self, catalog_root: &Path) -> Result<TaskImage, Vec<String>> {
+        let mut problems = Vec::new();
+        let mut components = Vec::new();
+        for (index, component) in self.components.iter().enumerate() {
+            let field = format!("task_image.components[{index}]");
+            let mut load = |script_field: &str, script: &ScriptSource| {
+                script
+                    .text(catalog_root)
+                    .map_err(|problem| problems.push(format!("{field}.{script_field}: {problem}")))
+                    .ok()
+            };
+            let install = load("install", &component.install);
+            // `None` when the script failed to load; `Some(None)` when the
+            // component has no version script.
+            let version = match &component.version {
+                Some(script) => load("version", script).map(Some),
+                None => Some(None),
+            };
+            let secrets = component
+                .secrets
+                .iter()
+                .filter_map(ComponentSecretConfig::sealed)
+                .collect();
+            let home = component
+                .home
+                .iter()
+                .map(|home| HomeSource {
+                    from: home.from.clone(),
+                    to: home.to.clone(),
+                })
+                .collect();
+            if let (Some(install), Some(version)) = (install, version) {
+                components.push(TaskImageComponent {
+                    name: component.name.clone(),
+                    install,
+                    version,
+                    secrets,
+                    home,
+                });
+            }
+        }
+        if problems.is_empty() {
+            Ok(TaskImage {
+                base: self.base.clone(),
+                components,
+                secrets: self
+                    .secrets
+                    .iter()
+                    .filter_map(ComponentSecretConfig::sealed)
+                    .collect(),
+            })
+        } else {
+            Err(problems)
+        }
+    }
+}
+
+impl ScriptSource {
+    fn problem(&self) -> Option<String> {
+        match self {
+            ScriptSource::Path(path) if !is_relative_inside(path) => Some(format!(
+                "script path '{path}' must be relative to the catalogue, without '.' or '..' \
+                 components"
+            )),
+            ScriptSource::Inline { inline } if inline.trim().is_empty() => {
+                Some("the inline script is blank".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn text(&self, catalog_root: &Path) -> Result<String, String> {
+        let path = match self {
+            ScriptSource::Inline { inline } => return Ok(inline.clone()),
+            ScriptSource::Path(path) => path,
+        };
+        let unreadable = |error: std::io::Error| format!("script '{path}' cannot be read: {error}");
+        let root = catalog_root.canonicalize().map_err(unreadable)?;
+        let file = root.join(path).canonicalize().map_err(unreadable)?;
+        if !file.starts_with(&root) {
+            return Err(format!(
+                "script '{path}' lies outside the catalogue directory"
+            ));
+        }
+        std::fs::read_to_string(&file).map_err(unreadable)
+    }
+}
+
+fn is_component_name(name: &str) -> bool {
+    name.bytes()
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Whether `path` is a non-empty relative path made only of normal
+/// components.
+fn is_relative_inside(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && !path.chars().any(char::is_control)
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+/// Why a home source's host path cannot be used, if it cannot. It must be
+/// absolute or start with `~`, and must name neither a filesystem root nor
+/// the Docker socket: either would hand the task the whole host.
+fn home_from_problem(from: &str) -> Option<String> {
+    let path = Path::new(from);
+    if !(from.starts_with('/') || from == "~" || from.starts_with("~/")) {
+        return Some(format!(
+            "'{from}' must be an absolute path or start with '~/'"
+        ));
+    }
+    if from.chars().any(char::is_control)
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+    {
+        return Some(format!("'{from}' must not contain '.' or '..' components"));
+    }
+    if !path
+        .components()
+        .any(|part| matches!(part, Component::Normal(_)))
+    {
+        return Some(format!("'{from}' is a filesystem root"));
+    }
+    if path.file_name().is_some_and(|name| name == "docker.sock") {
+        return Some(format!("'{from}' is the Docker socket"));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime(yaml: &str) -> RuntimeCatalog {
+        serde_yaml::from_str(yaml).expect("runtime.yaml parses")
+    }
+
+    const VALID_COMPONENT: &str = concat!(
+        "    - name: glab\n",
+        "      install: components/glab.sh\n",
+        "      version: { inline: \"glab --version\" }\n",
+        "      secrets: [{ name: gitlab-token, env: GITLAB_TOKEN }, { name: netrc, file: .netrc }]\n",
+        "      home: [{ from: ~/.config/glab-cli, to: .config/glab-cli }]\n",
+    );
+
+    #[test]
+    fn a_runtime_with_only_a_task_image_is_valid() {
+        let runtime = runtime(&format!(
+            "task_image:\n  base: debian:trixie-slim\n  \
+             secrets: [{{ name: db-password, env: DATABASE_PASSWORD }}]\n  \
+             components:\n{VALID_COMPONENT}"
+        ));
+        assert!(runtime.bundle.is_none());
+        assert_eq!(runtime.problems(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_unusable_task_image_is_refused_with_the_field_it_names() {
+        let cases = [
+            (
+                "components: [{ name: one, install: ../outside.sh }]",
+                "components[0].install",
+            ),
+            (
+                "components: [{ name: one, install: /etc/profile }]",
+                "components[0].install",
+            ),
+            ("components: [{ name: Glab, install: a.sh }]", "components[0].name"),
+            (
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t, env: PATH }] }]",
+                "components[0].secrets[0]",
+            ),
+            (
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t, env: LD_PRELOAD }] }]",
+                "components[0].secrets[0]",
+            ),
+            (
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t, env: NARSOR_TOKEN }] }]",
+                "components[0].secrets[0]",
+            ),
+            (
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t, env: ANTHROPIC_API_KEY }] }]",
+                "components[0].secrets[0]",
+            ),
+            (
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t, env: 1X }] }]",
+                "components[0].secrets[0]",
+            ),
+            (
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t, file: ../x }] }]",
+                "components[0].secrets[0]",
+            ),
+            (
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t }] }]",
+                "components[0].secrets[0]",
+            ),
+            (
+                "components: [{ name: one, install: a.sh, home: [{ from: ~/.x, to: ../x }] }]",
+                "components[0].home[0].to",
+            ),
+            (
+                "components: [{ name: one, install: a.sh, home: [{ from: /, to: x }] }]",
+                "components[0].home[0].from",
+            ),
+            (
+                "components: [{ name: one, install: a.sh, home: [{ from: /var/run/docker.sock, to: x }] }]",
+                "components[0].home[0].from",
+            ),
+            (
+                "components: [{ name: one, install: a.sh, home: [{ from: relative/x, to: x }] }]",
+                "components[0].home[0].from",
+            ),
+            (
+                "secrets: [{ name: t, env: NARSOR_TOKEN }]",
+                "secrets[0]",
+            ),
+            (
+                "secrets: [{ name: t, env: X, file: x }]",
+                "secrets[0]",
+            ),
+        ];
+        for (body, field) in cases {
+            let problems = runtime(&format!(
+                "task_image:\n  base: debian:trixie-slim\n  {body}\n"
+            ))
+            .problems();
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.starts_with(&format!("task_image.{field}"))),
+                "{body}: {problems:?}"
+            );
+        }
+
+        let duplicates = [
+            (
+                "components: [{ name: one, install: a.sh }, { name: one, install: b.sh }]",
+                "task_image.components[1].name: 'one' is listed twice",
+            ),
+            (
+                "secrets: [{ name: db, env: DB_PASSWORD }]\n  components: \
+                 [{ name: one, install: a.sh, secrets: [{ name: db2, env: DB_PASSWORD }] }]",
+                "task_image.components[0].secrets[0]: env DB_PASSWORD is already delivered by \
+                 task_image.secrets[0]",
+            ),
+            (
+                "components: [{ name: one, install: a.sh, secrets: [{ name: a, file: .netrc }] }, \
+                 { name: two, install: b.sh, secrets: [{ name: b, file: .netrc }] }]",
+                "task_image.components[1].secrets[0]: file ~/.netrc is already delivered by \
+                 task_image.components[0].secrets[0]",
+            ),
+        ];
+        for (body, problem) in duplicates {
+            let duplicate = runtime(&format!(
+                "task_image:\n  base: debian:trixie-slim\n  {body}\n"
+            ));
+            assert_eq!(duplicate.problems(), vec![problem.to_string()], "{body}");
+        }
     }
 }

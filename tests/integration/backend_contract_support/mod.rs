@@ -42,6 +42,7 @@
 #![allow(dead_code)]
 
 pub mod fake;
+pub mod local_docker;
 pub mod stub_runner;
 
 use std::fs;

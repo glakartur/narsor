@@ -14,6 +14,7 @@ install it.
 - [Remote tasks and backends](user/remote.md) — the control plane from the user's side.
 - [Automations and queues](user/observers.md) — catalogue scripts that create tasks from Jira and serve decision gates of PR/MR reviews (entry, check and exit scripts).
 - [Configuration](user/configuration.md) — the config file and the on-disk layout.
+- [Local tasks in Docker](user/local-docker.md) — the Docker work mode of the local backend: task image, tokens, limits.
 
 ## Operations (`docs/operations/`)
 

@@ -29,11 +29,29 @@ cargo build --workspace --bins --release
 
 Ignored tests drive the real `claude` binary (they cost money and need
 credentials), start `narsor-controller` processes, start the stub runner
-processes of the local backend contract suite (`backend_contract::local`), or
-need a live Kubernetes cluster (the smoke test also requires its documented
-`NARSOR_K8S_SMOKE_*` environment variables). The default `cargo test` and CI do
-not run them; run `cargo test -p narsor --test integration backend_contract --
---include-ignored` after a change to the local backend.
+processes of the local backend contract suites (`backend_contract::local`,
+`backend_contract::local_docker`), or need a live Kubernetes cluster (the
+smoke test also requires its documented `NARSOR_K8S_SMOKE_*` environment
+variables). The default `cargo test` and CI do not run them; run `cargo test
+-p narsor --test integration backend_contract -- --include-ignored` after a
+change to the local backend.
+
+The Docker work mode of the local backend has its contract target in
+`tests/integration/backend_contract_support/local_docker.rs`. It needs **no
+Docker daemon**: the adapter talks to `FakeDocker`
+(`crates/narsor-controller/src/local/docker_fake.rs`), which builds images
+in memory and, for a started container, runs the container's program — the
+stub runner mounted at the runner's path — as a host process with the
+container's arguments and only its environment. Killing that process is
+`docker kill`; `remove_container` is `docker rm -f`. So the whole suite, and
+`backend_contract::a_container_removed_from_outside_is_resumed_on_the_same_image`,
+drive the real container path of the adapter (preflight, background build,
+per-task record, `docker run` request, observe and remove by name). They
+cannot prove that an image builds or that the runner starts in it, nor the
+mounts, the user and the hardening of a real `docker run`: unit tests check
+the `docker` argument lists, and a change there is checked by hand on a real
+daemon (a task with a small `task_image` and a `script` step; see
+`docs/user/local-docker.md`). No committed test calls the `docker` CLI.
 
 ### The browser interface (`crates/narsor-web`)
 

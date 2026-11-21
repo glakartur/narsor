@@ -1,7 +1,9 @@
-//! The backend contract suite (U4) run against the in-memory fake adapter
-//! and the local adapter — the same scenarios, unchanged, for both (AE2).
-//! The local adapter's runners are the suite's stub runner processes, not
-//! the real `narsor-runner`.
+//! The backend contract suite (U4) run against the in-memory fake adapter,
+//! the local adapter and the local adapter in the Docker work mode on an
+//! in-memory Docker — the same scenarios, unchanged, for all (AE2). The
+//! local adapter's runners are the suite's stub runner processes, not the
+//! real `narsor-runner`; in the Docker work mode the fake Docker runs them
+//! as its containers' processes.
 //!
 //! The suite itself lives in `backend_contract_support` so other adapters'
 //! test crates (U5's Kubernetes adapter against a mock API) expand it too.
@@ -169,6 +171,52 @@ contract_suite!(
     crate::backend_contract::LocalTarget,
     ignore = "starts runner processes and kills their process groups; run with --include-ignored"
 );
+
+contract_suite!(
+    local_docker,
+    crate::backend_contract_support::local_docker::LocalDockerTarget,
+    ignore = "starts runner processes and kills their process groups; run with --include-ignored"
+);
+
+/// D58 with containers: a container removed from outside (`docker rm -f`)
+/// is observed as absent, and the automatic resume starts a new container
+/// on the image the task last ran on, without a second build.
+#[ignore = "starts runner processes and kills their process groups; run with --include-ignored"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_container_removed_from_outside_is_resumed_on_the_same_image() {
+    use backend_contract_support::local_docker::LocalDockerTarget;
+    use backend_contract_support::Harness;
+    use narsor_engine::orchestration::{Observation, RunnerState};
+
+    let mut h = Harness::<LocalDockerTarget>::new()
+        .await
+        .expect("the fake Docker runs anywhere");
+    h.start_controller();
+    h.running("task-1").await;
+    let first = h
+        .target
+        .container_of(&h.resources("task-1"))
+        .expect("the task's container");
+
+    narsor_controller::local::docker::DockerTransport::remove_container(&*h.target.docker, &first)
+        .expect("remove the container");
+    h.wait_for("the replacement container", |h| {
+        h.counters().workloads_created == 2 && h.runner_state("task-1") == RunnerState::Running
+    })
+    .await;
+
+    assert!(
+        h.reported("task-1")
+            .contains(&Observation::WorkloadLost { state_known: true }),
+        "the removed container is observed as lost"
+    );
+    let runs = h.target.docker.runs();
+    assert_eq!(runs.len(), 2, "one container per start");
+    assert_eq!(runs[0].name, first);
+    assert_ne!(runs[1].name, first, "a new container");
+    assert_eq!(runs[1].image, runs[0].image, "the same image id");
+    assert_eq!(h.target.docker.builds().len(), 1, "no second build");
+}
 
 // ---------------------------------------------------------------------------
 // Local adapter specifics

@@ -20,12 +20,17 @@
 //!   HOME ([`super::HomeMode::Host`]) refuses it rather than write a link
 //!   into a HOME that is not the task's.
 //!
+//! A backend may also grant secrets the task's environment does not name
+//! ([`SecretGrant`], `--deliver-secret`): the runner delivers them the same
+//! way and does not need to know why the backend granted them.
+//!
 //! The Git clone credential (R39) is used the same way: by path, through a
 //! credential helper that reads the file itself
 //! ([`crate::workspace::clone_pinned_commit`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use crate::domain::{ResolvedEnvironment, SecretDelivery, SecretReference, SecretValue};
 
@@ -73,25 +78,78 @@ impl ProcessEnvironment {
     }
 }
 
+/// A mounted secret the backend asks the runner to deliver beside the ones
+/// the task's environment names (`--deliver-secret`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretGrant {
+    /// The file name in the secrets directory.
+    pub name: String,
+    /// How its tool expects it.
+    pub delivery: SecretDelivery,
+}
+
+impl FromStr for SecretGrant {
+    type Err = String;
+
+    /// Parses `<name>=env:<VARIABLE>` or `<name>=file:<path relative to
+    /// HOME>`. The name is before the first `=`, so a path may hold one.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let malformed = || format!("'{value}' is not <name>=env:<VARIABLE> or <name>=file:<path>");
+        let (name, delivery) = value.split_once('=').ok_or_else(malformed)?;
+        let delivery = match delivery.split_once(':') {
+            Some(("env", variable)) => SecretDelivery::Env(variable.to_string()),
+            Some(("file", path)) => SecretDelivery::File(path.to_string()),
+            _ => return Err(malformed()),
+        };
+        if !is_plain_name(name) {
+            return Err(format!(
+                "'{value}': the secret name must be one plain path component"
+            ));
+        }
+        if let Some(problem) = delivery.problem() {
+            return Err(format!("'{value}': {problem}"));
+        }
+        Ok(Self {
+            name: name.to_string(),
+            delivery,
+        })
+    }
+}
+
 /// The mounted secrets of a task.
 #[derive(Debug, Clone)]
 pub struct MountedSecrets {
     dir: Option<PathBuf>,
+    grants: Vec<SecretGrant>,
 }
 
 impl MountedSecrets {
     /// Secrets mounted under `dir`, or none at all.
     pub fn new(dir: Option<PathBuf>) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            grants: Vec::new(),
+        }
+    }
+
+    /// Also delivers `grants`, the secrets the backend names itself.
+    pub fn with_grants(mut self, grants: Vec<SecretGrant>) -> Self {
+        self.grants = grants;
+        self
     }
 
     /// The mounted file of `reference`, checked to exist.
     pub fn file(&self, reference: &SecretReference) -> Result<PathBuf, RunnerError> {
+        self.named_file(&reference.name)
+    }
+
+    /// The mounted file of the secret `name`, checked to exist.
+    fn named_file(&self, name: &str) -> Result<PathBuf, RunnerError> {
         let missing = |detail: String| RunnerError::Secret {
-            name: reference.name.clone(),
+            name: name.to_string(),
             detail,
         };
-        if !is_plain_name(&reference.name) {
+        if !is_plain_name(name) {
             return Err(missing(
                 "a secret reference name must be one plain path component".to_string(),
             ));
@@ -101,16 +159,16 @@ impl MountedSecrets {
                 "no secrets directory was mounted (--secrets-dir)".to_string(),
             ));
         };
-        let path = dir.join(&reference.name);
+        let path = dir.join(name);
         if !path.is_file() {
             return Err(missing(format!("'{}' is not mounted", path.display())));
         }
         Ok(path)
     }
 
-    /// Makes every secret of `environment` reachable for its tool, below
-    /// the private `home` (`None` keeps the host's HOME), and returns what
-    /// the process environment must hold.
+    /// Makes every secret of `environment`, and every granted one, reachable
+    /// for its tool, below the private `home` (`None` keeps the host's
+    /// HOME), and returns what the process environment must hold.
     ///
     /// Fails before any work when a referenced secret is not mounted: a
     /// tool that finds no credential half-way through a task is a worse
@@ -120,20 +178,36 @@ impl MountedSecrets {
         environment: &ResolvedEnvironment,
         home: Option<&Path>,
     ) -> Result<ProcessEnvironment, RunnerError> {
+        let references = environment
+            .secrets
+            .iter()
+            .map(|reference| (reference.name.as_str(), &reference.delivery));
+        let grants = self
+            .grants
+            .iter()
+            .map(|grant| (grant.name.as_str(), &grant.delivery));
+        self.materialize_named(references.chain(grants), home)
+    }
+
+    fn materialize_named<'a>(
+        &self,
+        references: impl IntoIterator<Item = (&'a str, &'a SecretDelivery)>,
+        home: Option<&Path>,
+    ) -> Result<ProcessEnvironment, RunnerError> {
         let mut process = ProcessEnvironment {
             home: home.map(Path::to_path_buf),
             secrets: Vec::new(),
             task: Vec::new(),
         };
-        for reference in &environment.secrets {
-            if let Some(problem) = reference.delivery.problem() {
+        for (name, delivery) in references {
+            if let Some(problem) = delivery.problem() {
                 return Err(RunnerError::Secret {
-                    name: reference.name.clone(),
+                    name: name.to_string(),
                     detail: problem,
                 });
             }
-            let file = self.file(reference)?;
-            match &reference.delivery {
+            let file = self.named_file(name)?;
+            match delivery {
                 SecretDelivery::Env(name) => {
                     let value = fs::read_to_string(&file)
                         .map_err(|source| RunnerError::io(&file, source))?;
@@ -146,7 +220,7 @@ impl MountedSecrets {
                     Some(home) => link_into_home(home, relative, &file)?,
                     None => {
                         return Err(RunnerError::Secret {
-                            name: reference.name.clone(),
+                            name: name.to_string(),
                             detail: "file delivery needs the private HOME (--home private)"
                                 .to_string(),
                         })
@@ -277,6 +351,50 @@ mod tests {
         assert!(process
             .variables()
             .any(|(name, value)| name == "CODEX_API_KEY" && value == "sk-1"));
+    }
+
+    /// A backend grants secrets the environment does not name; the runner
+    /// delivers them like the environment's and refuses a grant that is not
+    /// mounted.
+    #[test]
+    fn granted_secrets_are_delivered_like_the_environments() {
+        let (_dir, secrets) = mounted(&[("gitlab-token", "glpat-1\n")]);
+        let environment = ResolvedEnvironment::harness_only("claude-code");
+        let grants = vec!["gitlab-token=env:GITLAB_TOKEN".parse().unwrap()];
+
+        let process = secrets
+            .with_grants(grants.clone())
+            .materialize(&environment, None)
+            .unwrap();
+        assert!(process
+            .variables()
+            .any(|(name, value)| name == "GITLAB_TOKEN" && value == "glpat-1"));
+
+        let (_empty, none_mounted) = mounted(&[]);
+        let error = none_mounted
+            .with_grants(grants)
+            .materialize(&environment, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("gitlab-token"), "{error}");
+    }
+
+    #[test]
+    fn a_grant_is_parsed_or_refused_with_its_text() {
+        let file: SecretGrant = "gh-hosts=file:.config/gh/hosts.yml".parse().unwrap();
+        assert_eq!(
+            file.delivery,
+            SecretDelivery::File(".config/gh/hosts.yml".into())
+        );
+        for refused in [
+            "token",
+            "token=GH_TOKEN",
+            "../x=env:A",
+            "t=env:HOME",
+            "t=file:/etc/x",
+        ] {
+            let error = refused.parse::<SecretGrant>().unwrap_err();
+            assert!(error.contains(refused), "{refused}: {error}");
+        }
     }
 
     /// R19: an `env` secret becomes the tool's variable and a `file` secret

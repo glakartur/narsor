@@ -445,7 +445,10 @@ pub fn plan(
         ));
     }
     let base_image = environment.base_image.as_ref().ok_or_else(|| {
-        rejected("the task has no base image; a Kubernetes task runs in its repository's image")
+        rejected(
+            "the task has no base image; a Kubernetes task runs in its workflow's image, its \
+             repository's image or the global task image of runtime.yaml (task_image)",
+        )
     })?;
     let base_image = check_image("base image", base_image, config)?;
     if !environment.step_images.is_empty() {

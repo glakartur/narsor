@@ -4,6 +4,7 @@ use std::{
     io::{self, IsTerminal, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -12,7 +13,7 @@ use serde_yaml::{Mapping, Value};
 
 use crate::{
     cli::{
-        commands::{CliError, Result},
+        commands::{controller_program, CliError, Result},
         prompt,
     },
     config::{self, ConfigCascade, Scope, Section, SettingKey, SettingValue},
@@ -30,6 +31,47 @@ pub enum InitRole {
     Frontend,
     Server,
 }
+
+/// How the local controller runs tasks (`controller.local.mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LocalWorkMode {
+    /// On the host, as the user.
+    Process,
+    /// In a hardened container on the local Docker daemon.
+    Docker,
+}
+
+/// Asks whether the Docker daemon can run the docker work mode: the
+/// daemon's version, or why not.
+type DockerCheck<'a> = &'a dyn Fn() -> std::result::Result<String, String>;
+
+/// The secret the example task image gives Claude Code its token from.
+const CLAUDE_TOKEN_SECRET: &str = "claude-token";
+
+/// The example catalogue's task image (docs/user/local-docker.md).
+const EXAMPLE_RUNTIME: &str = include_str!("../../examples/catalog/runtime.yaml");
+
+/// The scripts of the components `init` keeps from the example task image,
+/// by their path in the catalogue.
+const TASK_IMAGE_SCRIPTS: &[(&str, &str)] = &[
+    (
+        "components/base-tools.sh",
+        include_str!("../../examples/catalog/components/base-tools.sh"),
+    ),
+    (
+        "components/claude-code/install.sh",
+        include_str!("../../examples/catalog/components/claude-code/install.sh"),
+    ),
+    (
+        "components/claude-code/version.sh",
+        include_str!("../../examples/catalog/components/claude-code/version.sh"),
+    ),
+];
+
+/// Where the example's components `init` leaves out begin: they need tokens
+/// a new installation does not have, and a task refuses to start without
+/// them.
+const EXAMPLE_OPTIONAL_COMPONENTS: &str = "    - name: glab\n";
 
 fn role_name(role: InitRole) -> &'static str {
     match role {
@@ -76,6 +118,11 @@ pub struct InitOptions {
     /// Unique catalogue ID for the same-VM workstation backend.
     #[arg(long, value_name = "ID")]
     backend_id: Option<String>,
+
+    /// How local tasks run (local role): process (on the host as your user)
+    /// or docker (in a hardened container; needs rootful Docker).
+    #[arg(long, value_enum, value_name = "MODE")]
+    local_mode: Option<LocalWorkMode>,
 }
 
 #[derive(Debug, Default, Args)]
@@ -94,13 +141,21 @@ pub struct PurgeOptions {
 }
 
 pub fn run(options: InitOptions, global_config: Option<&Path>) -> Result<()> {
+    run_with(options, global_config, &controller_docker_check)
+}
+
+fn run_with(
+    options: InitOptions,
+    global_config: Option<&Path>,
+    docker_check: DockerCheck<'_>,
+) -> Result<()> {
     let role = select_role(options.role, options.non_interactive)?;
     let config_path = select_config_path(
         options.config_file.clone(),
         global_config,
         options.non_interactive,
     )?;
-    let keep_existing = config_exists(&config_path)?;
+    let keep_existing = path_exists(&config_path)?;
     let target = if keep_existing {
         let mut name = config_path.as_os_str().to_owned();
         name.push(".new");
@@ -112,10 +167,30 @@ pub fn run(options: InitOptions, global_config: Option<&Path>) -> Result<()> {
         options.data_dir.clone(),
         options.non_interactive || keep_existing,
     )?;
+    let local_mode = select_local_mode(
+        role,
+        options.local_mode,
+        options.non_interactive,
+        docker_check,
+    )?;
 
     let mut config = Value::Mapping(Mapping::new());
     set_root_paths(&mut config, &data_dir)?;
     let parsed = validate_config(&target, &config)?.1;
+    // Docker mode needs its task image in the catalogue the file names.
+    let docker_catalog = match local_mode {
+        LocalWorkMode::Docker => {
+            insert_text(
+                config
+                    .as_mapping_mut()
+                    .expect("configuration mapping checked"),
+                SettingKey::LocalMode,
+                "docker",
+            );
+            Some(resolved_directory(&parsed, SettingKey::CatalogDir)?)
+        }
+        LocalWorkMode::Process => None,
+    };
     let workstation_backend = if role == InitRole::Server {
         Some(configure_server(
             &mut config,
@@ -137,6 +212,10 @@ pub fn run(options: InitOptions, global_config: Option<&Path>) -> Result<()> {
     } else {
         write_new_atomic(&target, contents.as_bytes(), 0o600)?;
     }
+    let task_image_written = docker_catalog
+        .as_deref()
+        .map(write_task_image)
+        .transpose()?;
 
     println!("Configured the {} role.", role_name(role));
     if keep_existing {
@@ -152,18 +231,170 @@ pub fn run(options: InitOptions, global_config: Option<&Path>) -> Result<()> {
     if let Some(backend) = &workstation_backend {
         print_server_commands(backend, &target)?;
     }
+    if let (Some(catalog), Some(written)) = (&docker_catalog, task_image_written) {
+        print_docker_steps(catalog, written);
+    }
     Ok(())
 }
 
-fn config_exists(path: &Path) -> Result<bool> {
+fn path_exists(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(CliError::failure(format!(
-            "cannot inspect configuration '{}': {error}",
+            "cannot inspect '{}': {error}",
             path.display()
         ))),
     }
+}
+
+/// The work mode of local tasks. Only the local role runs the built-in
+/// local controller; the server role's workstation controller serves the
+/// network server, which the docker work mode refuses (it needs the local
+/// daemon as the control plane).
+///
+/// An explicit `--local-mode docker` is kept when Docker is not ready (with
+/// a warning); a docker mode chosen at the prompt is confirmed first.
+fn select_local_mode(
+    role: InitRole,
+    selected: Option<LocalWorkMode>,
+    non_interactive: bool,
+    docker_check: DockerCheck<'_>,
+) -> Result<LocalWorkMode> {
+    match (role, selected) {
+        (InitRole::Local, _) => {}
+        (InitRole::Frontend, Some(_)) => {
+            return Err(CliError::usage(
+                "--local-mode applies to the local role; the frontend role runs no tasks",
+            ))
+        }
+        (InitRole::Server, Some(LocalWorkMode::Docker)) => {
+            return Err(CliError::usage(
+                "--local-mode docker applies to the local role: the server role's workstation \
+                 controller serves the network server, and the docker work mode needs the local \
+                 daemon as the control plane",
+            ))
+        }
+        (InitRole::Frontend | InitRole::Server, _) => return Ok(LocalWorkMode::Process),
+    }
+    let ask = selected.is_none() && !non_interactive && prompt::is_available();
+    let mode = match selected {
+        Some(mode) => mode,
+        None if ask => {
+            let modes = [
+                (
+                    LocalWorkMode::Process,
+                    "process",
+                    "on the host as your user",
+                ),
+                (
+                    LocalWorkMode::Docker,
+                    "docker",
+                    "in a hardened container; needs rootful Docker",
+                ),
+            ];
+            let items: Vec<(&str, &str)> =
+                modes.iter().map(|(_, name, text)| (*name, *text)).collect();
+            modes[prompt::select("Work mode for local tasks", &items)?].0
+        }
+        None => LocalWorkMode::Process,
+    };
+    if mode == LocalWorkMode::Process {
+        return Ok(mode);
+    }
+    match docker_check() {
+        Ok(version) => {
+            println!("Docker {version} is ready for the docker work mode.");
+            Ok(LocalWorkMode::Docker)
+        }
+        Err(reason) if ask => {
+            eprintln!("Docker is not ready: {reason}");
+            let choices = [
+                ("No", "use the process mode"),
+                (
+                    "Yes",
+                    "write the docker mode; fix Docker before the first task",
+                ),
+            ];
+            Ok(
+                match prompt::select("Write docker mode anyway?", &choices)? {
+                    1 => LocalWorkMode::Docker,
+                    _ => LocalWorkMode::Process,
+                },
+            )
+        }
+        Err(reason) => {
+            eprintln!("warning: Docker is not ready: {reason}");
+            eprintln!(
+                "warning: the docker mode is written as asked; local tasks do not start until Docker works"
+            );
+            Ok(LocalWorkMode::Docker)
+        }
+    }
+}
+
+/// `narsor-controller local docker check`, run next to this executable: the
+/// same check the controller makes before a Docker-mode task.
+fn controller_docker_check() -> std::result::Result<String, String> {
+    let program = controller_program("it checks Docker").map_err(|error| error.message)?;
+    let output = Command::new(&program)
+        .args(["local", "docker", "check"])
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", program.display()))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// The task image `init` writes: the example's, without the components
+/// that need tokens beyond Claude Code's.
+fn initial_runtime() -> String {
+    let kept = EXAMPLE_RUNTIME
+        .split_once(EXAMPLE_OPTIONAL_COMPONENTS)
+        .map_or(EXAMPLE_RUNTIME, |(kept, _)| kept);
+    kept.replacen(
+        "# The runtime catalogue: copy it to {catalog}/runtime.yaml.",
+        "# The runtime catalogue, written by `narsor-cli init` from the example catalogue.",
+        1,
+    )
+}
+
+/// Writes the task image into `catalog` when it has no `runtime.yaml`;
+/// false when one exists. An existing file is never replaced.
+fn write_task_image(catalog: &Path) -> Result<bool> {
+    let runtime = catalog.join("runtime.yaml");
+    if path_exists(&runtime)? {
+        return Ok(false);
+    }
+    for (path, script) in TASK_IMAGE_SCRIPTS {
+        let target = catalog.join(path);
+        if path_exists(&target)? {
+            println!("Left unchanged: {}", target.display());
+        } else {
+            write_new_atomic(&target, script.as_bytes(), 0o644)?;
+        }
+    }
+    write_new_atomic(&runtime, initial_runtime().as_bytes(), 0o644)?;
+    Ok(true)
+}
+
+fn print_docker_steps(catalog: &Path, runtime_written: bool) {
+    let runtime = catalog.join("runtime.yaml");
+    if runtime_written {
+        println!("Task image: {}", runtime.display());
+    } else {
+        println!("Existing task image left unchanged: {}", runtime.display());
+    }
+    println!("\nNext steps for the docker work mode:");
+    println!("  1. claude setup-token   (prints a long-lived token; save it to a file)");
+    println!("  2. narsor-cli secret set {CLAUDE_TOKEN_SECRET} < token-file");
+    println!(
+        "  3. Add the tools your tasks need to {}",
+        runtime.display()
+    );
+    println!("See docs/user/local-docker.md.");
 }
 
 fn select_role(role: Option<InitRole>, non_interactive: bool) -> Result<InitRole> {
@@ -438,6 +669,16 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
         "Claude Code profile copied into local tasks before each start.",
     ),
     (
+        SettingKey::LocalMode,
+        "process",
+        "How local tasks run: process (on the host) or docker (in a container; HOME is private).",
+    ),
+    (
+        SettingKey::LocalDockerUpdateInterval,
+        "24h",
+        "How long a built task image is used before its component versions are checked again, or none.",
+    ),
+    (
         SettingKey::CorsAllowedOrigins,
         "[]",
         "Browser origins allowed to call the API.",
@@ -585,18 +826,28 @@ fn render_config(config: &Value) -> String {
 fn entry_of(mapping: &Mapping, setting: SettingKey) -> Option<Entry> {
     let line = match setting_in(mapping, setting) {
         Some(value) => EntryLine::Written(inline_yaml(value)),
-        None => EntryLine::Default(
-            OPTIONAL_SETTINGS
-                .iter()
-                .find(|(key, _, _)| *key == setting)
-                .map(|(_, default, _)| *default)?,
-        ),
+        None => EntryLine::Default(default_of(mapping, setting)?),
     };
     Some(Entry {
         setting,
         segments: setting.segments().collect(),
         line,
     })
+}
+
+/// The commented default of a setting. With the docker mode written, the
+/// HOME suggested is `private`: a container never gets the host's HOME, and
+/// an uncommented `host` would stop the daemon.
+fn default_of(mapping: &Mapping, setting: SettingKey) -> Option<&'static str> {
+    let docker =
+        setting_in(mapping, SettingKey::LocalMode).and_then(Value::as_str) == Some("docker");
+    if setting == SettingKey::LocalHome && docker {
+        return Some("private");
+    }
+    OPTIONAL_SETTINGS
+        .iter()
+        .find(|(key, _, _)| *key == setting)
+        .map(|(_, default, _)| *default)
 }
 
 /// Renders entries that share their first `depth` segments, grouping the
@@ -1508,5 +1759,170 @@ mod tests {
             .position(|line| line.trim_start().starts_with("issuer: "))
             .expect("issuer written");
         assert!(lines[issuer - 1].contains("`oidc_issuer`"), "{text}");
+    }
+
+    /// A scratch installation: the data and the configuration file under
+    /// one temporary directory, removed on drop.
+    struct Installation {
+        root: PathBuf,
+    }
+
+    impl Installation {
+        fn new(name: &str) -> Self {
+            let root = env::temp_dir().join(format!("narsor-init-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn config(&self) -> PathBuf {
+            self.root.join("config.yaml")
+        }
+
+        fn catalog(&self) -> PathBuf {
+            self.root.join("data/catalog")
+        }
+
+        fn init(
+            &self,
+            role: InitRole,
+            local_mode: Option<LocalWorkMode>,
+            docker_check: DockerCheck<'_>,
+        ) -> Result<()> {
+            let options = InitOptions {
+                role: Some(role),
+                non_interactive: true,
+                data_dir: Some(self.root.join("data")),
+                config_file: Some(self.config()),
+                local_mode,
+                ..InitOptions::default()
+            };
+            run_with(options, None, docker_check)
+        }
+
+        /// The local work mode the written file sets, if any.
+        fn written_mode(&self, file: &Path) -> Option<SettingValue> {
+            let text = fs::read_to_string(file).unwrap();
+            config::file::parse(file, &text, &Scope::ALL)
+                .into_result()
+                .unwrap()
+                .get(SettingKey::LocalMode)
+                .cloned()
+        }
+    }
+
+    impl Drop for Installation {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn docker_ready() -> std::result::Result<String, String> {
+        Ok("27.0.1".to_string())
+    }
+
+    fn docker_missing() -> std::result::Result<String, String> {
+        Err("docker not found".to_string())
+    }
+
+    fn docker_never_checked() -> std::result::Result<String, String> {
+        panic!("Docker must not be checked")
+    }
+
+    #[test]
+    fn explicit_docker_mode_writes_the_setting_and_a_task_image_the_controller_can_seal() {
+        for (case, check) in [
+            ("ready", docker_ready as fn() -> _),
+            ("unavailable", docker_missing),
+        ] {
+            let install = Installation::new(&format!("docker-{case}"));
+
+            install
+                .init(InitRole::Local, Some(LocalWorkMode::Docker), &check)
+                .unwrap();
+
+            assert_eq!(
+                install.written_mode(&install.config()),
+                Some(SettingValue::Text("docker".to_string())),
+                "{case}"
+            );
+            let text = fs::read_to_string(install.config()).unwrap();
+            let all_on = uncomment_all(&text);
+            config::file::parse(&install.config(), &all_on, &Scope::ALL)
+                .into_result()
+                .unwrap_or_else(|errors| panic!("{case}: {errors:?}\n{all_on}"));
+            assert!(all_on.contains("home: private"), "{case}: {all_on}");
+
+            let catalog = install.catalog();
+            let runtime: narsor_engine::environment::RuntimeCatalog =
+                serde_yaml::from_str(&fs::read_to_string(catalog.join("runtime.yaml")).unwrap())
+                    .unwrap();
+            assert_eq!(runtime.problems(), Vec::<String>::new(), "{case}");
+            let task_image = runtime.task_image.expect("task image written");
+            let names: Vec<&str> = task_image
+                .components
+                .iter()
+                .map(|component| component.name.as_str())
+                .collect();
+            assert_eq!(names, ["base-tools", "claude-code"], "{case}");
+            assert!(
+                task_image.seal(&catalog).is_ok(),
+                "{case}: the component scripts are in the catalogue"
+            );
+            assert!(initial_runtime().contains(&format!("name: {CLAUDE_TOKEN_SECRET}")));
+        }
+    }
+
+    #[test]
+    fn rerun_keeps_the_configuration_and_an_existing_task_image() {
+        let install = Installation::new("rerun");
+        fs::write(install.config(), "global:\n  root: /elsewhere\n").unwrap();
+        fs::create_dir_all(install.catalog()).unwrap();
+        let custom = b"task_image:\n  base: alpine:3\n  components: []\n";
+        fs::write(install.catalog().join("runtime.yaml"), custom).unwrap();
+
+        install
+            .init(InitRole::Local, Some(LocalWorkMode::Docker), &docker_ready)
+            .unwrap();
+
+        assert_eq!(
+            fs::read(install.catalog().join("runtime.yaml")).unwrap(),
+            custom
+        );
+        assert!(!install.catalog().join("components").exists());
+        assert_eq!(
+            fs::read_to_string(install.config()).unwrap(),
+            "global:\n  root: /elsewhere\n"
+        );
+        assert_eq!(
+            install.written_mode(&install.root.join("config.yaml.new")),
+            Some(SettingValue::Text("docker".to_string()))
+        );
+    }
+
+    #[test]
+    fn without_a_chosen_mode_tasks_stay_on_the_host() {
+        let install = Installation::new("process");
+
+        install
+            .init(InitRole::Local, None, &docker_never_checked)
+            .unwrap();
+
+        assert_eq!(install.written_mode(&install.config()), None);
+        assert!(!install.catalog().join("runtime.yaml").exists());
+    }
+
+    #[test]
+    fn docker_mode_is_refused_for_roles_without_the_local_controller() {
+        for role in [InitRole::Server, InitRole::Frontend] {
+            let install = Installation::new(&format!("refused-{}", role_name(role)));
+
+            let error = install
+                .init(role, Some(LocalWorkMode::Docker), &docker_never_checked)
+                .unwrap_err();
+
+            assert!(error.message.contains("--local-mode"), "{}", error.message);
+            assert!(!install.config().exists());
+        }
     }
 }

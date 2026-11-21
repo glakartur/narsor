@@ -8,6 +8,8 @@
 //!               [--launch-spec <file>] [--secrets-dir <dir>] \
 //!               [--home private|host] [--codex-home <dir>] \
 //!               [--claude-config-dir <dir>] [--claude-profile-source <dir>]
+//!               [--home-source <source>=<target>]...
+//!               [--deliver-secret <name>=env:<VAR>|file:<path>]...
 //!               [--pinned-git-credential-only] [--read-only]
 //! ```
 //!
@@ -30,6 +32,12 @@
 //! * `--claude-profile-source` — the Claude Code profile (in Kubernetes the
 //!   read-only mount of the profile Secret) merged into Claude's work
 //!   directory before every start; see [`super::profile`].
+//! * `--home-source` — repeatable: a read-only file or directory copied over
+//!   `<target>` (relative to the private HOME) at every start, replacing
+//!   what was there; see [`super::home_sources`]. Refused with `--home host`.
+//! * `--deliver-secret` — repeatable: a file of `--secrets-dir` delivered
+//!   as an environment variable or a file below the private HOME, beside
+//!   the secrets the task's environment names; see [`super::secrets`].
 //!
 //! * `--pinned-git-credential-only` — a Git workspace is cloned with none of
 //!   the user's own git configuration, SSH keys or agent, over `https`
@@ -63,6 +71,8 @@ use clap::Args;
 
 use crate::domain::TaskId;
 
+use super::home_sources::HomeSource;
+use super::secrets::SecretGrant;
 use super::{
     run, BaseImageContract, HarnessHome, HomeMode, ProcessEnvironment, RunnerConfig, RunnerError,
     RunnerExit, RunnerTiming, PROBLEM_OWNER_DECISION,
@@ -143,10 +153,22 @@ pub struct RunnerArgs {
     #[arg(long, value_name = "DIRECTORY")]
     pub claude_profile_source: Option<PathBuf>,
 
+    /// A file of `--secrets-dir` to deliver beside the secrets the task's
+    /// environment names, as `<name>=env:<VARIABLE>` or
+    /// `<name>=file:<path relative to HOME>`; repeatable.
+    #[arg(long = "deliver-secret", value_name = "NAME=env:VAR|file:PATH")]
+    pub secret_grants: Vec<SecretGrant>,
+
+    /// A read-only file or directory copied over a target relative to the
+    /// private HOME at every start, as `<source>=<target>`; repeatable.
+    #[arg(long = "home-source", value_name = "SOURCE=TARGET")]
+    pub home_sources: Vec<HomeSource>,
+
     /// Only answer reads of the storage (conversation pages, events, the
     /// conductor's chat) and change nothing on it: no preparation,
     /// initialization, session, snapshot or work. `--launch-spec`,
-    /// `--secrets-dir`, `--home` and the harness directories are ignored.
+    /// `--secrets-dir`, `--home`, the harness directories, the home sources
+    /// and the granted secrets are ignored.
     #[arg(long)]
     pub read_only: bool,
 
@@ -249,12 +271,14 @@ pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
         control_plane: required(args.control_plane, "--control-plane")?,
         credential_file: required(args.credential_file, "--credential-file")?,
         secrets_dir: args.secrets_dir,
+        secret_grants: args.secret_grants,
         harness_home: HarnessHome {
             mode: args.home,
             codex_home: args.codex_home,
             claude_config_dir: args.claude_config_dir,
             claude_profile_source: args.claude_profile_source,
         },
+        home_sources: args.home_sources,
         agent_args: resolved.agent_args(),
         conductor_profile: narsor_exec::conductor::ConductorProfile {
             model: resolved.conductor_model(),
@@ -374,6 +398,28 @@ mod tests {
                 claude_config_dir: Some("/srv/claude".into()),
                 claude_profile_source: Some("/srv/profile".into()),
             }
+        );
+    }
+
+    #[test]
+    fn home_sources_are_repeatable() {
+        let config = config(&[
+            "--home-source",
+            "/srv/skills=.claude/skills",
+            "--home-source",
+            "/srv/gitconfig=.gitconfig",
+        ]);
+        let targets: Vec<_> = config
+            .home_sources
+            .iter()
+            .map(|source| (source.source.clone(), source.target.clone()))
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                ("/srv/skills".into(), ".claude/skills".into()),
+                ("/srv/gitconfig".into(), ".gitconfig".into()),
+            ]
         );
     }
 
