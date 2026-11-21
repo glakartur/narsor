@@ -72,6 +72,7 @@ mod registry;
 mod schema_loading;
 mod secret_store;
 mod server_config;
+mod state_ownership;
 mod step_profile_flow;
 mod task_labels;
 mod task_workspaces;
