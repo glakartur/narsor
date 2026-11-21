@@ -465,6 +465,10 @@ pub enum ImageSource {
         /// Tool name.
         tool: String,
     },
+    /// The base of the global task image in `runtime.yaml` (`task_image`),
+    /// the last fallback on a backend that runs images. Only a task image
+    /// without components is used this way (KTD9).
+    GlobalTaskImage,
 }
 
 /// An image pinned to a digest, with where it came from.
@@ -835,6 +839,59 @@ pub struct ResolvedProfile {
     pub tools: Vec<String>,
 }
 
+/// The global task image as it was sealed into a task (KTD8).
+///
+/// The control plane reads `task_image` from `runtime.yaml` at task creation
+/// and seals it here with the script *text*, never a path, so a later edit
+/// of the catalogue changes only tasks created after it (R18). The local
+/// controller builds an image from it in Docker mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskImage {
+    /// The base image the components are installed on, as configured.
+    pub base: ImageSpec,
+    /// The components, in installation order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<TaskImageComponent>,
+}
+
+/// One component of a [`TaskImage`]: one layer of the built image.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskImageComponent {
+    /// Name, unique in the definition (`[a-z0-9][a-z0-9-]*`).
+    pub name: String,
+    /// The text of the install script.
+    pub install: String,
+    /// The text of the script that prints the version to install, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Secrets from the controller's token store the component needs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<ComponentSecret>,
+    /// Host configuration copied into the task's private HOME.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub home: Vec<HomeSource>,
+}
+
+/// One secret a [`TaskImageComponent`] needs: a token store name and how
+/// the runner receives it. Never a value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentSecret {
+    /// The name of the entry in the controller's token store.
+    pub name: String,
+    /// How the runner receives the value.
+    pub delivery: SecretDelivery,
+}
+
+/// Host configuration copied into the task's private HOME.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeSource {
+    /// The host path as configured. A leading `~` is expanded by the
+    /// controller, not by the control plane.
+    pub from: String,
+    /// The target, relative to the private HOME.
+    pub to: String,
+}
+
 /// Every pinned component a task's runner environment is made of (KTD5).
 ///
 /// Built once at task creation and never re-resolved for that task: a later
@@ -862,6 +919,12 @@ pub struct ResolvedEnvironment {
     /// Credentials the controller injects, as references only, by name.
     #[serde(default)]
     pub secrets: Vec<SecretReference>,
+    /// The global task image from `runtime.yaml`, sealed on the local
+    /// backend when the catalogue defines one (KTD8). Left out of the
+    /// serialized form when absent, so the identity of a task without it
+    /// does not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_image: Option<TaskImage>,
     /// `sha256:` hash of every field above (R21).
     pub identity: String,
 }
@@ -886,6 +949,7 @@ impl ResolvedEnvironment {
             },
             harness: harness.into(),
             secrets: Vec::new(),
+            task_image: None,
             identity: String::new(),
         }
         .sealed()
@@ -1014,6 +1078,35 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_task_image_enters_the_identity_only_when_present() {
+        let plain = ResolvedEnvironment::harness_only("claude-code");
+        let stored = serde_json::to_value(&plain).unwrap();
+        assert!(stored.get("task_image").is_none());
+        let reread: ResolvedEnvironment = serde_json::from_value(stored).unwrap();
+        assert!(
+            reread.identity_is_valid(),
+            "a spec sealed before task_image still reads"
+        );
+
+        let mut with_image = plain.clone();
+        with_image.task_image = Some(TaskImage {
+            base: ImageSpec::pinned("debian:trixie-slim"),
+            components: vec![TaskImageComponent {
+                name: "glab".to_string(),
+                install: "apt-get install -y glab\n".to_string(),
+                version: None,
+                secrets: Vec::new(),
+                home: Vec::new(),
+            }],
+        });
+        let with_image = with_image.sealed();
+        assert_ne!(with_image.identity, plain.identity);
+        let mut edited = with_image.clone();
+        edited.task_image.as_mut().unwrap().components[0].install = "other\n".to_string();
+        assert_ne!(edited.sealed().identity, with_image.identity);
     }
 
     #[test]

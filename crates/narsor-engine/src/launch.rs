@@ -14,9 +14,14 @@
 //!   `server.defaults.backend`. An existing task never re-resolves, so changing the
 //!   default moves no task.
 //! * **Base image** — a step's `image` wins over the workflow's
-//!   `globals.image`, which wins over the repository's `base_image` (R15).
-//!   The step overrides are recorded separately, each with its
-//!   [`ImageSource`].
+//!   `globals.image`, which wins over the repository's `base_image` (R15,
+//!   deprecated: it logs a warning). On a backend that runs images the
+//!   global task image of `runtime.yaml` is the last fallback, and only
+//!   when it has no components (KTD9). The step overrides are recorded
+//!   separately, each with its [`ImageSource`].
+//! * **Task image** — a task on a backend that runs no images seals the
+//!   global task image of `runtime.yaml`, scripts included, when the
+//!   catalogue defines one (KTD8).
 //! * **Harness** — the request, else the profile, else the live default
 //!   harness selection. Since U7 this is only the task's *fallback* (R42
 //!   reversed): a running task follows the installation's live default,
@@ -679,6 +684,10 @@ impl CatalogLaunchResolver {
         let (repository, workspace) =
             self.workspace(intent, &definition, &backend_id, &backend, &mut secrets)?;
 
+        let runtime = self.runtime()?;
+        let task_image = runtime
+            .as_ref()
+            .and_then(|runtime| runtime.task_image.as_ref());
         let base_image = match (&definition.globals.image, &repository) {
             (Some(image), _) => Some(self.resolve_image(
                 "globals.image",
@@ -687,17 +696,44 @@ impl CatalogLaunchResolver {
                     workflow: definition.id.clone(),
                 },
             )?),
-            (None, Some(entry)) => match &entry.base_image {
-                Some(image) => Some(self.resolve_image(
-                    &format!("repository '{}' base_image", entry.id),
+            (
+                None,
+                Some(RepositoryEntry {
+                    id,
+                    base_image: Some(image),
+                    ..
+                }),
+            ) => {
+                tracing::warn!(
+                    repository = %id,
+                    workflow = %definition.id,
+                    "repository base_image is deprecated; set 'globals.image' in the workflow \
+                     or the global task image in runtime.yaml"
+                );
+                Some(self.resolve_image(
+                    &format!("repository '{id}' base_image"),
                     image,
                     ImageSource::Repository {
-                        repository: entry.id.clone(),
+                        repository: id.clone(),
                     },
-                )?),
-                None => None,
+                )?)
+            }
+            _ => match task_image {
+                Some(global) if backend.kind.runs_container_images() => {
+                    if !global.components.is_empty() {
+                        return Err(LaunchError::TaskImageNeedsBuild {
+                            backend: backend_id.to_string(),
+                            workflow: definition.id.clone(),
+                        });
+                    }
+                    Some(self.resolve_image(
+                        "runtime.yaml task_image.base",
+                        &global.base,
+                        ImageSource::GlobalTaskImage,
+                    )?)
+                }
+                _ => None,
             },
-            (None, None) => None,
         };
         if base_image.is_none() && backend.kind.runs_container_images() {
             return Err(LaunchError::MissingBaseImage {
@@ -706,6 +742,17 @@ impl CatalogLaunchResolver {
                 workflow: definition.id.clone(),
             });
         }
+        // The local controller builds its Docker-mode image from the sealed
+        // definition, so a local task carries it whatever the mode is now:
+        // a later mode switch still finds it (KTD8).
+        let sealed_task_image = match task_image {
+            Some(global) if !backend.kind.runs_container_images() => Some(
+                global
+                    .seal(&self.catalog_root)
+                    .map_err(LaunchError::InvalidRuntime)?,
+            ),
+            _ => None,
+        };
 
         let mut state_ids: Vec<_> = definition.states.keys().collect();
         state_ids.sort();
@@ -725,11 +772,11 @@ impl CatalogLaunchResolver {
         }
 
         let profile = self.profile(intent)?;
-        let runtime = self.runtime()?;
-        let runtime_bundle = match (&runtime, backend.kind.runs_container_images()) {
-            (Some(runtime), true) => Some(self.resolve_image(
+        let bundle = runtime.as_ref().and_then(|runtime| runtime.bundle.as_ref());
+        let runtime_bundle = match (bundle, backend.kind.runs_container_images()) {
+            (Some(bundle), true) => Some(self.resolve_image(
                 "runtime.yaml bundle",
-                &runtime.bundle,
+                bundle,
                 ImageSource::RuntimeBundle,
             )?),
             (None, true) => return Err(LaunchError::MissingRuntimeBundle(backend_id.to_string())),
@@ -770,6 +817,7 @@ impl CatalogLaunchResolver {
             profile: profile.resolve(),
             harness,
             secrets: secrets.0.into_values().collect(),
+            task_image: sealed_task_image,
             identity: String::new(),
         };
         let inputs = match &intent.inputs {

@@ -79,13 +79,17 @@ pub fn seed_catalog(root: &Path) {
     }
     catalog
         .save_runtime(&RuntimeCatalog {
-            bundle: ImageSpec::pinned(format!("ghcr.io/narsor/runtime@{}", digest('b'))),
+            bundle: Some(ImageSpec::pinned(format!(
+                "ghcr.io/narsor/runtime@{}",
+                digest('b')
+            ))),
             tools: [(
                 "gh".to_string(),
                 ImageSpec::pinned(format!("ghcr.io/narsor/tools/gh@{}", digest('c'))),
             )]
             .into_iter()
             .collect(),
+            task_image: None,
         })
         .expect("save runtime");
     let workflows = root.join("workflows");

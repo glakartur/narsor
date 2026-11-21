@@ -309,6 +309,199 @@ fn a_local_backend_needs_no_image_and_no_runtime_bundle() {
     assert_eq!(error.code(), "missing_base_image");
 }
 
+// ---------------------------------------------------------------------------
+// Global task image (KTD8, KTD9)
+// ---------------------------------------------------------------------------
+
+/// Writes `runtime.yaml` with the seeded bundle and `task_image`.
+fn write_task_image(root: &TempRoot, task_image: &str) {
+    fs::write(
+        root.path().join("runtime.yaml"),
+        format!(
+            "bundle: ghcr.io/narsor/runtime@{}\ntask_image:\n{task_image}",
+            digest('b')
+        ),
+    )
+    .expect("write runtime.yaml");
+}
+
+fn on_local(workflow: &str) -> LaunchIntent {
+    LaunchIntent {
+        backend: Some("local".to_string()),
+        ..intent(workflow)
+    }
+}
+
+#[test]
+fn a_local_task_seals_the_global_task_image_with_its_script_text() {
+    let root = TempRoot::new();
+    root.write_workflow("bare", &workflow_yaml("bare", None));
+    let without = root.resolve(&on_local("bare")).unwrap().spec.environment;
+    assert!(without.task_image.is_none());
+
+    fs::create_dir_all(root.path().join("components")).unwrap();
+    fs::write(
+        root.path().join("components/glab.sh"),
+        "apt-get install -y glab\n",
+    )
+    .unwrap();
+    write_task_image(
+        &root,
+        "  base: debian:trixie-slim\n  components:\n    \
+         - { name: glab, install: components/glab.sh, \
+             secrets: [{ name: gitlab-token, env: GITLAB_TOKEN }] }\n    \
+         - { name: tools, install: { inline: \"echo tools\" }, version: { inline: \"echo 1\" } }\n",
+    );
+
+    let environment = root.resolve(&on_local("bare")).unwrap().spec.environment;
+    let task_image = environment.task_image.as_ref().expect("sealed task image");
+    assert_eq!(task_image.base, ImageSpec::pinned("debian:trixie-slim"));
+    let sealed: Vec<_> = task_image
+        .components
+        .iter()
+        .map(|c| (c.name.as_str(), c.install.as_str(), c.version.as_deref()))
+        .collect();
+    assert_eq!(
+        sealed,
+        [
+            ("glab", "apt-get install -y glab\n", None),
+            ("tools", "echo tools", Some("echo 1")),
+        ]
+    );
+    assert_eq!(
+        task_image.components[0].secrets[0].delivery,
+        SecretDelivery::Env("GITLAB_TOKEN".to_string())
+    );
+    assert!(
+        environment.base_image.is_none(),
+        "a local task runs no image"
+    );
+    assert_ne!(environment.identity, without.identity);
+
+    // A script that leaves the catalogue through a link is refused.
+    let outside = std::env::temp_dir().join(format!("narsor-outside-{}.sh", uuid::Uuid::new_v4()));
+    fs::write(&outside, "echo outside\n").unwrap();
+    std::os::unix::fs::symlink(&outside, root.path().join("components/link.sh")).unwrap();
+    write_task_image(
+        &root,
+        "  base: debian:trixie-slim\n  components:\n    \
+         - { name: link, install: components/link.sh }\n",
+    );
+    let error = root
+        .resolve(&on_local("bare"))
+        .expect_err("escaping script");
+    let _ = fs::remove_file(&outside);
+    assert_eq!(error.code(), "invalid_runtime", "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("task_image.components[0].install"),
+        "{error}"
+    );
+}
+
+/// A `v2` workflow over two registered repositories that pins no image.
+const TWO_REPOSITORIES: &str = "schema: v2\nname: two\nversion: 1\nglobals:\n  workspaces:\n    \
+code: { primary: true, repository: app }\n    docs: { repository: handbook }\n\
+states:\n  done:\n    description: done\nterminal_states: [done]\n";
+
+fn two_repository_root(app: RepositoryEntry) -> TempRoot {
+    let root = TempRoot::new();
+    root.registry().add(app).unwrap();
+    root.registry()
+        .add(RepositoryEntry::new(
+            "handbook",
+            "https://example.com/handbook.git",
+        ))
+        .unwrap();
+    root.write_workflow("two", TWO_REPOSITORIES);
+    root
+}
+
+fn global_task_image(root: &TempRoot, components: &str) {
+    write_task_image(
+        root,
+        &format!(
+            "  base: \"ghcr.io/acme/global@{}\"\n{components}",
+            digest('7')
+        ),
+    );
+}
+
+#[test]
+fn an_image_backend_falls_back_to_a_global_task_image_without_components() {
+    let root = two_repository_root(RepositoryEntry::new("app", "https://example.com/app.git"));
+    global_task_image(&root, "");
+
+    let launch = root.resolve(&intent("two")).expect("global image");
+    let base = launch.spec.environment.base_image.expect("base image");
+    assert_eq!(base.pinned, format!("ghcr.io/acme/global@{}", digest('7')));
+    assert_eq!(base.source, ImageSource::GlobalTaskImage);
+    assert!(
+        launch.spec.environment.task_image.is_none(),
+        "an image backend runs the base, it does not build the definition"
+    );
+}
+
+#[test]
+fn a_workflow_or_repository_image_wins_over_the_global_task_image() {
+    let root = two_repository_root(
+        RepositoryEntry::new("app", "https://example.com/app.git")
+            .with_base_image(ImageSpec::pinned(pinned('d'))),
+    );
+    global_task_image(&root, "");
+
+    let base = root
+        .resolve(&intent("two"))
+        .unwrap()
+        .spec
+        .environment
+        .base_image
+        .expect("base image");
+    assert_eq!(
+        base.source,
+        ImageSource::Repository {
+            repository: "app".to_string()
+        }
+    );
+
+    root.write_workflow(
+        "two",
+        &TWO_REPOSITORIES.replace(
+            "globals:\n",
+            &format!("globals:\n  image: \"{}\"\n", pinned('e')),
+        ),
+    );
+    let base = root
+        .resolve(&intent("two"))
+        .unwrap()
+        .spec
+        .environment
+        .base_image
+        .expect("base image");
+    assert_eq!(
+        base.source,
+        ImageSource::Workflow {
+            workflow: "two".to_string()
+        }
+    );
+}
+
+#[test]
+fn a_global_task_image_with_components_is_refused_on_an_image_backend() {
+    let root = two_repository_root(RepositoryEntry::new("app", "https://example.com/app.git"));
+    global_task_image(
+        &root,
+        "  components:\n    - { name: glab, install: { inline: \"echo glab\" } }\n",
+    );
+
+    let error = root
+        .resolve(&intent("two"))
+        .expect_err("needs a built image");
+    assert_eq!(error.code(), "task_image_needs_build", "{error}");
+    assert!(error.to_string().contains("globals.image"), "{error}");
+}
+
 #[test]
 fn a_local_workspace_is_sealed_only_for_the_local_backend() {
     let root = TempRoot::new();

@@ -137,8 +137,9 @@ pub enum LaunchError {
     InvalidCommit(#[from] GitIdentityError),
     /// No base image anywhere, on a backend that runs images (R15, AE11).
     #[error(
-        "no base image for backend '{backend}': register one on repository {} or set \
-         'globals.image' in workflow '{workflow}'",
+        "no base image for backend '{backend}': set 'globals.image' in workflow '{workflow}', \
+         register one on repository {}, or define a global 'task_image' without components \
+         in runtime.yaml",
         repository.as_deref().map(|id| format!("'{id}'")).unwrap_or_else(|| "(none)".to_string())
     )]
     MissingBaseImage {
@@ -146,6 +147,20 @@ pub enum LaunchError {
         backend: String,
         /// Repository, when there is one.
         repository: Option<String>,
+        /// Workflow.
+        workflow: String,
+    },
+    /// The only image is the global task image, and it has components,
+    /// which only the local Docker mode builds (KTD9).
+    #[error(
+        "backend '{backend}' runs container images, but the only image for workflow \
+         '{workflow}' is the global task image in runtime.yaml, and its components are built \
+         only by the local Docker mode; build an image with them, push it to a registry and \
+         name it in 'globals.image' of workflow '{workflow}'"
+    )]
+    TaskImageNeedsBuild {
+        /// Backend.
+        backend: String,
         /// Workflow.
         workflow: String,
     },
@@ -242,6 +257,7 @@ impl LaunchError {
             LaunchError::InvalidWorkspaceChoice(_) => "invalid_workspace_choice",
             LaunchError::InvalidCommit(_) => "invalid_commit",
             LaunchError::MissingBaseImage { .. } => "missing_base_image",
+            LaunchError::TaskImageNeedsBuild { .. } => "task_image_needs_build",
             LaunchError::InvalidImage { .. } => "invalid_image",
             LaunchError::UnresolvedImage { .. } => "unresolved_image",
             LaunchError::MissingRuntimeBundle(_) => "missing_runtime_bundle",
