@@ -73,7 +73,7 @@ fn only_a_loader_failure_reads_as_a_runner_that_cannot_run_in_the_image() {
             true,
         ),
         (
-            "runner failed: cannot read /x/launch-spec.json: No such file or directory",
+            "runner failed: cannot read /x/credential: No such file or directory",
             false,
         ),
         (
@@ -272,17 +272,34 @@ mod containers {
             self.launch(key, self.environment())
         }
 
-        /// Observes until the workload leaves `Starting`.
+        /// Observes until the workload leaves `Starting`, issuing the fresh
+        /// credential its start asks for as the controller would.
         async fn settled(&self, task: &TaskResources) -> Option<WorkloadState> {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 let observed = self.backend_ref().observe(task).await.unwrap().workload;
+                self.issue_wanted_credential(task, FRESH_CREDENTIAL);
                 match &observed {
                     Some(state) if state.phase == WorkloadPhase::Starting => {
                         assert!(Instant::now() < deadline, "still starting");
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                     _ => return observed,
+                }
+            }
+        }
+
+        /// Hands the backend `credential` when it asked for one of `task`.
+        fn issue_wanted_credential(&self, task: &TaskResources, credential: &str) {
+            let specs = self.backend_ref().launch_specs().expect("shared");
+            for generation in 1..=2 {
+                if let Some(incarnation) = specs.credential_request(&task.task_id, generation) {
+                    specs.provide_credential(
+                        &task.task_id,
+                        generation,
+                        &incarnation,
+                        narsor_controller_runtime::backend::RunnerCredential::new(credential),
+                    );
                 }
             }
         }
@@ -310,6 +327,10 @@ mod containers {
             self.backend_ref().store.read_task_record(task)
         }
     }
+
+    /// The credential the test's "controller" issues when a container
+    /// starts.
+    const FRESH_CREDENTIAL: &str = "nsr.fresh";
 
     fn arg_after<'a>(run: &'a RunRequest, flag: &str) -> Vec<&'a str> {
         run.args
@@ -888,6 +909,52 @@ mod containers {
 
         assert_eq!(state.phase, WorkloadPhase::Running);
         assert_eq!(fixture.docker.runs().len(), 1);
+    }
+
+    /// The image build can outlast the credential issued at creation: the
+    /// container starts only with a fresh one, issued for the same
+    /// incarnation when the start asks for it, in the file the runner reads.
+    /// The workload directory holds no launch spec, only its digest in the
+    /// arguments (R5).
+    #[tokio::test]
+    async fn a_container_starts_with_a_credential_issued_at_its_start() {
+        let fixture = Fixture::new();
+        fixture.store().set("claude-token", "t").unwrap();
+        let task = fixture.task("task-1");
+        let launch = fixture.default_launch("task-1");
+        fixture
+            .backend_ref()
+            .provision(&task, &launch)
+            .await
+            .unwrap();
+        let specs = fixture.backend_ref().launch_specs().expect("shared");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while specs.credential_request(&task.task_id, 1).is_none() {
+            assert!(Instant::now() < deadline, "no credential was asked for");
+            fixture.backend_ref().observe(&task).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(fixture.docker.runs().is_empty(), "no start without it");
+        assert_eq!(
+            specs.credential_request(&task.task_id, 1).as_deref(),
+            Some(launch.incarnation.as_str())
+        );
+
+        let state = fixture.settled(&task).await.unwrap();
+
+        assert_eq!(state.phase, WorkloadPhase::Running);
+        let dir = fixture.backend_ref().store.workload_dir(&task, Role::Work);
+        assert_eq!(
+            fs::read_to_string(dir.join("credential")).unwrap(),
+            FRESH_CREDENTIAL
+        );
+        let run = &fixture.docker.runs()[0];
+        assert_eq!(
+            arg_after(run, "--launch-digest"),
+            [launch.launch_digest().unwrap()]
+        );
+        assert!(!run.args.iter().any(|arg| arg == "--launch-spec"));
+        assert!(!dir.join("launch-spec.json").exists());
     }
 
     /// A build that cannot reach Docker is tried again after a short

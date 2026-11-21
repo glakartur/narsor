@@ -1177,6 +1177,14 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
                 {
                     let _ = self.launch_spec(context).await?;
                 }
+                // A backend about to start its runner long after creation
+                // asked for a fresh credential while observing.
+                if let Some(incarnation) = self
+                    .launch_specs
+                    .credential_request(task_id, context.command.generation)
+                {
+                    self.issue_fresh_credential(context, incarnation).await?;
+                }
                 Ok(Some(observed))
             }
             Err(error) => {
@@ -1204,6 +1212,41 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
                 Ok(None)
             }
         }
+    }
+
+    /// Issues a fresh credential for `incarnation`, the one a backend is
+    /// about to start, and hands it to the backend. A refusal (a superseded
+    /// generation, a lost lease) hands nothing: the request stays and the
+    /// next observation tries again, or a newer command takes over. The
+    /// credential is never logged.
+    async fn issue_fresh_credential(
+        &self,
+        context: &TaskContext<'_>,
+        incarnation: String,
+    ) -> Result<(), Interrupt> {
+        let command = context.command;
+        let issued = self
+            .call(self.link.issue_runner_credential(
+                command.task_id.as_str(),
+                &RunnerCredentialRequest {
+                    lease_epoch: context.epoch,
+                    generation: command.generation,
+                    incarnation: incarnation.clone(),
+                },
+            ))
+            .await?;
+        match issued {
+            Ok(issued) => self.launch_specs.provide_credential(
+                &command.task_id,
+                command.generation,
+                &incarnation,
+                RunnerCredential::new(issued.credential),
+            ),
+            Err(reason) => {
+                tracing::debug!(task = %command.task_id, %reason, "controller: no fresh runner credential");
+            }
+        }
+        Ok(())
     }
 
     /// The task's launch spec for the command's generation: the one fetched
@@ -2074,6 +2117,33 @@ mod tests {
         assert_eq!(count(&rig.log, "fetch_launch_spec"), 1);
         assert_eq!(rig.backend.specs.get(&task, 2), Some(spec_json()));
         assert_eq!(count(&rig.log, "provision"), 0);
+    }
+
+    /// A backend about to start its runner long after creation (an image
+    /// build) asks for a fresh credential: the controller issues one for
+    /// that incarnation at its next observation and hands it over once.
+    #[tokio::test]
+    async fn a_credential_the_backend_asks_for_is_issued_for_its_incarnation() {
+        let mut rig = Rig::new(desired(
+            RunnerState::Provisioning,
+            DesiredAction::Provision,
+            false,
+        ));
+        let task = TaskId::parse("task-1").unwrap();
+        rig.backend.state().work = Some(workload(2, WorkloadPhase::Starting));
+        let specs = &rig.backend.specs;
+        assert!(specs
+            .take_credential_or_request(&task, 2, "task-1-g2")
+            .is_none());
+
+        rig.controller.step().await;
+
+        assert_eq!(count(&rig.log, "issue_runner_credential"), 1);
+        assert_eq!(count(&rig.log, "provision"), 0);
+        assert!(specs.credential_request(&task, 2).is_none());
+        assert!(specs
+            .take_credential_or_request(&task, 2, "task-1-g2")
+            .is_some());
     }
 
     #[test]

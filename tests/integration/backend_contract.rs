@@ -96,6 +96,56 @@ async fn the_launch_spec_is_served_to_the_lease_holder_for_the_current_generatio
     assert_eq!(spec, serde_json::to_value(contract_launch_spec()).unwrap());
 }
 
+/// R5: a working runner fetches its task's launch spec with its own
+/// credential; a reader never gets it, nor does the runner of a launch a
+/// later resume superseded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_launch_spec_is_served_to_the_current_working_runner_only() {
+    use backend_contract_support::Harness;
+    use narsor_engine::controller_protocol::RunnerClient;
+    use narsor_engine::orchestration::{OwnerCommand, RunnerState};
+    use narsor_shared::api_error::ClientError;
+
+    let Some(mut h) = Harness::<FakeTarget>::new().await else {
+        return;
+    };
+    h.start_controller();
+    h.running("task-1").await;
+    let task = h.resources("task-1");
+    let runner = |reader: bool| {
+        let credential = h
+            .target
+            .platform
+            .credential_of(&task, reader)
+            .expect("a launched runner");
+        RunnerClient::new(&h.url, credential)
+    };
+    let worker = runner(false);
+
+    let spec = worker.launch_spec().await.expect("the worker's spec");
+    assert_eq!(spec, serde_json::to_value(contract_launch_spec()).unwrap());
+
+    h.must("task-1", OwnerCommand::Pause, "pause-1");
+    h.wait_runner_state("task-1", RunnerState::Stopped).await;
+    h.lease_reader("task-1", 60);
+    h.running_reader("task-1").await;
+    let refused = runner(true)
+        .launch_spec()
+        .await
+        .expect_err("a reader is refused");
+    assert!(matches!(refused, ClientError::Forbidden), "{refused:?}");
+
+    h.must("task-1", OwnerCommand::Resume, "resume-1");
+    let superseded = worker
+        .launch_spec()
+        .await
+        .expect_err("an older launch is refused");
+    assert!(
+        matches!(superseded, ClientError::Unauthorized),
+        "{superseded:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The local adapter
 // ---------------------------------------------------------------------------

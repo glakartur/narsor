@@ -27,7 +27,8 @@
 //!    fetches the spec to create a workload or start a reader
 //!    (`GET /controller/v1/tasks/:id/launch-spec?generation=N`, refused for
 //!    a stale generation) and uses it only when its recomputed content
-//!    digest equals the command's.
+//!    digest equals the command's. It passes that digest to the runner
+//!    (`--launch-digest`), never the spec itself.
 //! 4. **Acknowledge** (`POST /controller/v1/acks`) the generation it has
 //!    taken over. Acknowledgements only ever raise; repeats are harmless.
 //! 5. **Reconcile and report** (`POST /controller/v1/reports`) resource UID,
@@ -54,7 +55,11 @@
 //!
 //! A runner holds a short-lived credential bound to its task, its launch
 //! generation and its incarnation. A newer incarnation's credential, a
-//! newer start/resume or archival makes it stop working. The runner posts
+//! newer start/resume or archival makes it stop working. On its first start
+//! a working runner fetches its task's launch spec (`GET
+//! /runner/v1/launch-spec`, refused to a reader) and accepts it only when
+//! its recomputed content digest equals the one its controller passed; later
+//! starts and the reader use the copy on task storage. The runner posts
 //! snapshots (`POST /runner/v1/snapshots`: cursors and summaries only),
 //! long-polls (`GET /runner/v1/poll`) for its directive and for owner
 //! answers to exactly the input request it waits on, acknowledges each

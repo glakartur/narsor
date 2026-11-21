@@ -252,6 +252,7 @@ where
     Router::new()
         .route("/runner/v1/snapshots", post(post_snapshot))
         .route("/runner/v1/poll", get(get_poll))
+        .route("/runner/v1/launch-spec", get(get_runner_launch_spec))
         .route(
             "/runner/v1/usage",
             post(post_usage).layer(usage_body_limit()),
@@ -883,6 +884,17 @@ async fn get_launch_spec(
 // ---------------------------------------------------------------------------
 // Runner handlers
 // ---------------------------------------------------------------------------
+
+/// The task's sealed launch spec, to its working runner (R5); a reader is
+/// refused. Its body is never logged.
+async fn get_runner_launch_spec(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+) -> ProtocolResult<Json<narsor_engine::domain::TaskLaunchSpec>> {
+    Ok(Json(
+        blocking(&service, move |s| s.runner_launch_spec(&identity)).await?,
+    ))
+}
 
 async fn post_snapshot(
     State(service): State<Service>,

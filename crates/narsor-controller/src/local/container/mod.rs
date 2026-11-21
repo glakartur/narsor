@@ -7,7 +7,10 @@
 //! while the image builds, then copies the task's secrets into the workload
 //! directory and starts the container (KTD5–KTD7, KTD10, KTD12). The launch
 //! spec it starts the container from is kept in memory ([`LaunchSpecs`]);
-//! after a controller restart the controller fetches it again. There is no
+//! after a controller restart the controller fetches it again. The runner
+//! fetches the spec itself (R5) with a credential issued when the container
+//! starts — an image build can outlast the one issued at creation — which
+//! the controller hands over through the same cache. There is no
 //! fallback to a host process (R4). The read-only runner (D63) stays a host
 //! process in both modes.
 //!
@@ -45,8 +48,8 @@ use narsor_model::domain::{SecretDelivery, TaskImage, TaskLaunchSpec, TaskReposi
 
 use super::backend::LocalBackendConfig;
 use super::workload::{
-    io_error, task_args, ContainerRecord, ExitRecord, LastRunner, Look, Role, TaskRecord,
-    WorkloadKind, WorkloadRecord, WorkloadStore, WORKLOAD_MARK_ENV,
+    io_error, task_args, write_credential, ContainerRecord, ExitRecord, LastRunner, Look, Role,
+    TaskRecord, WorkloadKind, WorkloadRecord, WorkloadStore, WORKLOAD_MARK_ENV,
 };
 use docker::{ContainerState, DockerError, DockerTransport, Mount, RunRequest, UserIds};
 use image::{definition_hash, BuildState, TaskImageBuilds, DEFINITION_LABEL, MANAGED_LABEL};
@@ -412,6 +415,18 @@ impl ContainerRunners {
             }
             Err(error) => return Err(docker_error(&error)),
         }
+        // The credential issued at creation may have run out while the image
+        // built: the runner starts with a fresh one, issued for the same
+        // incarnation at the controller's next observation of the task.
+        let Some(credential) = self.specs.take_credential_or_request(
+            &task.task_id,
+            record.launch_generation,
+            &record.incarnation,
+        ) else {
+            return Ok(Look::phase(WorkloadPhase::Starting));
+        };
+        write_credential(dir, &credential)
+            .map_err(|error| io_error("write the runner credential", error))?;
         let request = match self.run_request(mode, task, record, container, spec, dir, &image_id) {
             Ok(request) => request,
             Err(problem) => return Ok(ended(task, record, None, problem)),
@@ -519,6 +534,7 @@ impl ContainerRunners {
             task.task_id.as_str(),
             &storage,
             dir,
+            &spec.compute_digest(),
             &container.control_plane,
             &record.incarnation,
         );

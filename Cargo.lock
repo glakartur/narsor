@@ -2336,6 +2336,7 @@ dependencies = [
 name = "narsor-runner"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytes",
  "chrono",
  "clap",

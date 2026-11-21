@@ -335,6 +335,21 @@ impl TaskLaunchSpec {
         canonical_sha256(&content)
     }
 
+    /// Checks that the content digest, recomputed here, equals `pinned`: the
+    /// digest a controller checked and passed on (KTD3). The spec's own
+    /// `digest` field is not trusted, so a body changed under an unchanged
+    /// field is refused.
+    pub fn check_pinned_digest(&self, pinned: &str) -> Result<(), String> {
+        let digest = self.compute_digest();
+        if digest == pinned {
+            Ok(())
+        } else {
+            Err(format!(
+                "the launch spec has content digest {digest}, not the pinned digest {pinned}"
+            ))
+        }
+    }
+
     /// True when the stored digest matches the content and the environment
     /// identity matches the environment.
     pub fn digest_is_valid(&self) -> bool {

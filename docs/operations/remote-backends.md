@@ -970,6 +970,18 @@ Runner (behind the runner credential, its own task only):
 `GET /runner/v1/materials/:material`, `GET …/blobs/:sha256`,
 `POST …/ack`, and `POST /runner/v1/materials` to publish.
 
+**Launch spec.** No launch spec is mounted into a workload: the launch
+Secret on Kubernetes and the local workload directory hold only the runner
+credential. The controller passes the spec's content digest in the runner's
+arguments (`--launch-digest`). On its first start the working runner fetches
+the spec with its credential (`GET /runner/v1/launch-spec`; refused to a
+reader credential and to the credential of a launch a later start or resume
+superseded), recomputes the content digest and starts only when it equals
+`--launch-digest`; otherwise it reports the problem `launch_spec_invalid` and
+initializes nothing. Later starts and the reader use the copy on task
+storage. A runner that cannot reach the control plane on its first start
+retries, then reports the problem.
+
 ## 12. Smoke tests
 
 The ordinary test suite needs no cluster. Against a real cluster:

@@ -368,13 +368,14 @@ fn the_pod_has_one_runner_one_init_container_and_separate_volumes() {
         .map(|a| a.as_str().unwrap())
         .collect();
     assert_eq!(args[0], "--task-id");
+    let digest = launch.launch_digest().unwrap();
     for (flag, value) in [
         ("--task-id", "Task_1"),
         ("--task-storage", "/task"),
         ("--incarnation", launch.incarnation.as_str()),
         ("--control-plane", "https://narsor.example"),
         ("--credential-file", "/var/run/narsor/launch/credential"),
-        ("--launch-spec", "/var/run/narsor/launch/launch-spec.json"),
+        ("--launch-digest", digest.as_str()),
     ] {
         let at = args
             .iter()
@@ -385,6 +386,12 @@ fn the_pod_has_one_runner_one_init_container_and_separate_volumes() {
     assert!(
         !args.contains(&"--secrets-dir"),
         "no secrets, no secrets dir"
+    );
+    assert!(!args.contains(&"--launch-spec"), "no spec is mounted (R5)");
+    assert_eq!(
+        pod["metadata"]["annotations"]["narsor.dev/launch-spec-digest"],
+        digest.as_str(),
+        "the annotation names the digest the runner checks"
     );
     let env = runner["env"].as_array().unwrap();
     assert_eq!(env.len(), 2, "PATH and optional agent args: {env:?}");
@@ -1158,6 +1165,7 @@ fn the_reader_pod_mounts_the_storage_read_only_and_carries_nothing_for_work() {
         .map(|a| a.as_str().unwrap())
         .collect();
     assert!(args.contains(&"--read-only"), "{args:?}");
+    assert!(!args.contains(&"--launch-spec"), "{args:?}");
     for work_only in ["--secrets-dir", "--harness-home", "--claude-profile-source"] {
         assert!(
             !args.contains(&work_only),
@@ -1391,9 +1399,11 @@ async fn provision_creates_once_and_reconciles_by_name() {
         secret["stringData"]["credential"],
         "nsr.secret-runner-credential"
     );
-    let stored: TaskLaunchSpec =
-        serde_json::from_str(secret["stringData"]["launch-spec.json"].as_str().unwrap()).unwrap();
-    assert_eq!(serde_json::to_value(stored).unwrap(), launch.launch_spec);
+    assert_eq!(
+        secret["stringData"].as_object().unwrap().len(),
+        1,
+        "the credential only; the runner fetches the spec (R5)"
+    );
 
     let pvc = quiet.cluster.pvc(&task.storage).expect("the PVC");
     assert!(

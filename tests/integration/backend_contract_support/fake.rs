@@ -80,6 +80,8 @@ struct FakeStorage {
 struct FakeWorkload {
     state: WorkloadState,
     runner: Option<JoinHandle<()>>,
+    /// The runner credential it was launched with.
+    credential: String,
 }
 
 impl Drop for Platform {
@@ -153,6 +155,18 @@ impl FakeBackend {
         true
     }
 
+    /// The credential the task's workload (`reader`: its reader) was
+    /// launched with, while it exists: what a test presents as that runner.
+    pub fn credential_of(&self, task: &TaskResources, reader: bool) -> Option<String> {
+        let platform = self.lock();
+        let found = if reader {
+            platform.readers.get(&task.reader)
+        } else {
+            platform.workloads.get(&task.workload)
+        };
+        found.map(|workload| workload.credential.clone())
+    }
+
     fn lock(&self) -> MutexGuard<'_, Platform> {
         self.platform.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -205,6 +219,7 @@ impl FakeBackend {
             FakeWorkload {
                 state: state.clone(),
                 runner,
+                credential: launch.credential.expose().to_string(),
             },
         );
         Ok(Provisioned {
@@ -345,6 +360,7 @@ impl ExecutionBackend for FakeBackend {
             FakeWorkload {
                 state: state.clone(),
                 runner,
+                credential: launch.credential.expose().to_string(),
             },
         );
         Ok(ReaderStart {

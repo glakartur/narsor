@@ -288,9 +288,11 @@ pub struct RunnerConfig {
     pub task_id: TaskId,
     /// Where the task storage is mounted.
     pub storage: PathBuf,
-    /// The launch spec file the controller mounted, if any; required on
-    /// first start, optional once the storage holds its copy.
-    pub launch_spec: Option<PathBuf>,
+    /// The content digest of the launch spec the controller checked
+    /// (`--launch-digest`): what a fetched spec, and the storage's copy,
+    /// must recompute to. Required on the first start, when the spec is
+    /// fetched.
+    pub launch_digest: Option<String>,
     /// The control plane's base URL.
     pub control_plane: String,
     /// The read-only file holding this incarnation's credential.
@@ -342,7 +344,7 @@ pub async fn run(
     let mut link = Link::new(&config);
     let store = storage.store();
 
-    let spec = match load_spec(&config, &storage) {
+    let spec = match load_spec(&config, &storage, &mut link).await {
         Ok(spec) => spec,
         Err(error) => {
             return Ok(report_problem(
@@ -579,31 +581,77 @@ fn starting_harness(storage: &TaskStorage, spec: &TaskLaunchSpec) -> String {
     applied.unwrap_or_else(|| spec.environment.harness.clone())
 }
 
-/// Reads the mounted launch spec, or the storage's copy when none is
-/// mounted.
-fn load_spec(config: &RunnerConfig, storage: &TaskStorage) -> Result<TaskLaunchSpec, RunnerError> {
-    match &config.launch_spec {
-        Some(path) => {
-            let text =
-                std::fs::read_to_string(path).map_err(|source| RunnerError::io(path, source))?;
-            let spec: TaskLaunchSpec = serde_json::from_str(&text)
-                .map_err(|error| RunnerError::LaunchSpec(format!("{}: {error}", path.display())))?;
-            if !spec.digest_is_valid() {
-                return Err(RunnerError::LaunchSpec(format!(
-                    "{}: the digest does not match the content",
-                    path.display()
-                )));
-            }
-            Ok(spec)
+/// The task's launch spec: the storage's copy once it holds one, else the
+/// one the control plane serves (R5, KTD3). Either must recompute to the
+/// digest the controller passed; the spec's own `digest` field is never
+/// trusted alone. Nothing is written here: [`initialize`] copies a fetched
+/// spec onto the storage.
+async fn load_spec(
+    config: &RunnerConfig,
+    storage: &TaskStorage,
+    link: &mut Link,
+) -> Result<TaskLaunchSpec, RunnerError> {
+    let pinned = config.launch_digest.as_deref();
+    if let Some(spec) = storage.store().load_task_launch_spec(&config.task_id)? {
+        if let Some(pinned) = pinned {
+            spec.check_pinned_digest(pinned).map_err(|problem| {
+                RunnerError::LaunchSpec(format!("the storage's copy: {problem}"))
+            })?;
         }
-        None => storage
-            .store()
-            .load_task_launch_spec(&config.task_id)?
-            .ok_or_else(|| {
-                RunnerError::LaunchSpec(
-                    "none was mounted and the task storage was never initialized".to_string(),
-                )
-            }),
+        return Ok(spec);
+    }
+    let pinned = pinned.ok_or_else(|| {
+        RunnerError::LaunchSpec(
+            "the task storage was never initialized and no --launch-digest was given to fetch \
+             the spec with"
+                .to_string(),
+        )
+    })?;
+    let fetched = fetch_launch_spec(link, &config.timing).await?;
+    let spec: TaskLaunchSpec = serde_json::from_value(fetched).map_err(|error| {
+        RunnerError::LaunchSpec(format!(
+            "the control plane served a malformed spec: {error}"
+        ))
+    })?;
+    spec.check_pinned_digest(pinned).map_err(|problem| {
+        RunnerError::LaunchSpec(format!("the control plane served {problem}"))
+    })?;
+    if !spec.digest_is_valid() {
+        return Err(RunnerError::LaunchSpec(
+            "the control plane served a spec whose digest field or environment identity does \
+             not match its content"
+                .to_string(),
+        ));
+    }
+    Ok(spec)
+}
+
+/// Fetches the launch spec with the runner's credential, retrying with the
+/// link's backoff (a refusal re-reads the credential file) until the
+/// problem deadline passes. The spec is never logged.
+async fn fetch_launch_spec(
+    link: &mut Link,
+    timing: &RunnerTiming,
+) -> Result<serde_json::Value, RunnerError> {
+    let deadline = Instant::now() + timing.problem_report_deadline;
+    loop {
+        let error = match link.client() {
+            Some(client) => match client.launch_spec().await {
+                Ok(spec) => {
+                    link.succeeded();
+                    return Ok(spec);
+                }
+                Err(error) => error,
+            },
+            None => ClientError::Unauthorized,
+        };
+        link.failed(&error, timing);
+        if link.next_attempt >= deadline {
+            return Err(RunnerError::LaunchSpec(format!(
+                "the control plane did not serve it: {error}"
+            )));
+        }
+        tokio::time::sleep_until(link.next_attempt).await;
     }
 }
 

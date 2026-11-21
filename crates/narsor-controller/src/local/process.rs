@@ -218,11 +218,12 @@ impl ProcessRunners {
         launch: &WorkloadLaunch,
         dir: &Path,
         storage: &Path,
-    ) -> Vec<OsString> {
+    ) -> BackendResult<Vec<OsString>> {
         let mut args = task_args(
             launch.task_id.as_str(),
             storage,
             dir,
+            &launch.launch_digest()?,
             &launch.control_plane_url,
             &launch.incarnation,
         );
@@ -230,7 +231,7 @@ impl ProcessRunners {
             args.push("--read-only".into());
         }
         args.extend(self.config.runner_args.iter().map(Into::into));
-        args
+        Ok(args)
     }
 
     /// Starts the task's runner of `role` as a process in its own group,
@@ -244,6 +245,7 @@ impl ProcessRunners {
     ) -> BackendResult<WorkloadState> {
         use std::os::unix::process::CommandExt;
 
+        let args = self.runner_args(role, launch, &self.store.workload_dir(task, role), storage)?;
         let dir = self.store.prepare_workload_dir(task, role, launch)?;
         let log = fs::File::create(dir.join("runner.log"))
             .map_err(|error| io_error("create the runner log", error))?;
@@ -252,7 +254,7 @@ impl ProcessRunners {
             .map_err(|error| io_error("create the runner log", error))?;
         let uid = format!("local-{}", uuid::Uuid::new_v4().simple());
         let mut command = Command::new(&self.config.program);
-        command.args(self.runner_args(role, launch, &dir, storage));
+        command.args(args);
         // Nothing of the controller's own settings — its enrollment code
         // least of all — reaches the runner or the tools it starts (R12);
         // what the adapter sets itself is set below. `spawn` isolates it:

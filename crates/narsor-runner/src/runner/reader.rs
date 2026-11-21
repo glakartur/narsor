@@ -430,7 +430,7 @@ mod tests {
         RunnerConfig {
             task_id: task(),
             storage: PathBuf::from("/storage"),
-            launch_spec: None,
+            launch_digest: None,
             control_plane: "http://control-plane.invalid".to_string(),
             credential_file: PathBuf::from("/no-credential"),
             secrets_dir: None,

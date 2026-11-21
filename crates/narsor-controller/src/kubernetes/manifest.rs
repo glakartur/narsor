@@ -18,8 +18,9 @@
 //!   write whatever the runner does. Never beside the workload Pod: the
 //!   controller removes it first, and the claim is `ReadWriteOnce`;
 //! * a **Secret** `narsor-…-launch-…` per incarnation — the runner
-//!   credential and the launch spec, mounted read-only *outside* the task
-//!   storage and owned by the Pod, so the garbage collector removes it with
+//!   credential only, mounted read-only *outside* the task storage (the
+//!   runner fetches the launch spec itself and checks it against the
+//!   `--launch-digest` in its arguments, R5) and owned by the Pod, so the garbage collector removes it with
 //!   its Pod and the controller never needs permission to delete Secrets.
 //!
 //! Tool credentials are never copied: a projected volume maps each approved
@@ -74,7 +75,7 @@ pub const TASK_MOUNT: &str = "/task";
 pub const RUNTIME_MOUNT: &str = "/opt/narsor";
 /// Where each tool package is materialized: `{TOOLS_MOUNT}/{tool}`.
 pub const TOOLS_MOUNT: &str = "/opt/narsor-tools";
-/// The read-only launch material (credential, launch spec).
+/// The read-only launch material: the runner credential.
 pub const LAUNCH_MOUNT: &str = "/var/run/narsor/launch";
 /// The read-only tool secrets, one file per reference name.
 pub const SECRETS_MOUNT: &str = "/var/run/narsor/secrets";
@@ -92,10 +93,9 @@ pub const RUNNER_CONTAINER: &str = "runner";
 /// key of the same name.
 const RUNNER_ARGS_CONFIG_MAP: &str = "narsor-controller-config";
 const RUNNER_ARGS_CONFIG_KEY: &str = AGENT_ARGS_ENV;
-/// Key of the runner credential in the launch Secret.
+/// Key of the runner credential in the launch Secret, its only key: the
+/// runner fetches the launch spec itself (R5).
 pub const CREDENTIAL_KEY: &str = "credential";
-/// Key of the launch spec in the launch Secret.
-pub const LAUNCH_SPEC_KEY: &str = "launch-spec.json";
 /// The `PATH` after the bundle directories: the conventional system
 /// directories. Kubernetes cannot append to an image's own `PATH`, so the
 /// main container's `PATH` is spelled out in full.
@@ -121,7 +121,8 @@ pub const RESOURCE_KEY_ANNOTATION: &str = "narsor.dev/resource-key";
 pub const INCARNATION_ANNOTATION: &str = "narsor.dev/incarnation";
 /// Annotation: the pinned environment's identity (R21).
 pub const ENVIRONMENT_ANNOTATION: &str = "narsor.dev/environment-identity";
-/// Annotation: the launch spec's digest.
+/// Annotation: the launch spec's content digest, as the controller
+/// recomputed it; the runner gets the same value (`--launch-digest`).
 pub const SPEC_DIGEST_ANNOTATION: &str = "narsor.dev/launch-spec-digest";
 
 /// Longest tool name; it becomes part of a volume and container name.
@@ -380,8 +381,9 @@ pub struct SecretFile {
 /// A launch, validated: everything the Pod is built from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPlan {
-    /// Validated launch identity and digest copied from the typed spec.
+    /// Validated launch identity copied from the typed spec.
     pub environment_identity: String,
+    /// The spec's content digest, recomputed (not its `digest` field).
     pub spec_digest: String,
     /// The repository's pinned base image (`repo@sha256:…`).
     pub base_image: String,
@@ -546,7 +548,7 @@ pub fn plan(
 
     Ok(LaunchPlan {
         environment_identity: spec.environment.identity.clone(),
-        spec_digest: spec.digest.clone(),
+        spec_digest: spec.compute_digest(),
         base_image,
         runtime_bundle,
         tools,
@@ -712,8 +714,8 @@ pub fn pod(
         launch.control_plane_url.clone(),
         "--credential-file".into(),
         format!("{LAUNCH_MOUNT}/{CREDENTIAL_KEY}"),
-        "--launch-spec".into(),
-        format!("{LAUNCH_MOUNT}/{LAUNCH_SPEC_KEY}"),
+        "--launch-digest".into(),
+        plan.spec_digest.clone(),
     ];
     if !plan.secrets.is_empty() {
         // One projected source per Secret, each listing only the approved
@@ -862,8 +864,8 @@ pub fn reader_pod(
         launch.control_plane_url.as_str(),
         "--credential-file",
         &format!("{LAUNCH_MOUNT}/{CREDENTIAL_KEY}"),
-        "--launch-spec",
-        &format!("{LAUNCH_MOUNT}/{LAUNCH_SPEC_KEY}"),
+        "--launch-digest",
+        plan.spec_digest.as_str(),
         "--read-only",
     ]
     .into_iter()
@@ -948,8 +950,6 @@ pub fn launch_secret_of(
     launch: &WorkloadLaunch,
     pod_uid: &str,
 ) -> BackendResult<Value> {
-    let spec = serde_json::to_string(&launch.launch_spec)
-        .map_err(|error| rejected(format!("the launch spec does not serialize: {error}")))?;
     Ok(json!({
         "apiVersion": "v1",
         "kind": "Secret",
@@ -970,7 +970,6 @@ pub fn launch_secret_of(
         },
         "stringData": {
             CREDENTIAL_KEY: launch.credential.expose(),
-            LAUNCH_SPEC_KEY: spec,
         },
     }))
 }

@@ -5,7 +5,7 @@
 //! ```text
 //! narsor-runner --task-id <id> --task-storage <dir> --incarnation <id> \
 //!               --control-plane <url> --credential-file <file> \
-//!               [--launch-spec <file>] [--secrets-dir <dir>] \
+//!               [--launch-digest <sha256:...>] [--secrets-dir <dir>] \
 //!               [--home private|host] [--codex-home <dir>] \
 //!               [--claude-config-dir <dir>] [--claude-profile-source <dir>]
 //!               [--home-source <source>=<target>]...
@@ -15,9 +15,12 @@
 //!
 //! * `--task-storage` — the task's persistent volume (R9). Holds the Engine
 //!   state, the workspace and the private HOME, nothing else.
-//! * `--launch-spec` — the task's `TaskLaunchSpec` as JSON, mounted
-//!   read-only. Required on the first start; afterwards the copy on storage
-//!   is used and a mounted file must be identical to it.
+//! * `--launch-digest` — the content digest of the task's `TaskLaunchSpec`
+//!   that the controller checked. Required on the first start: the runner
+//!   then fetches the spec from the control plane with its credential and
+//!   accepts it only when its recomputed content digest equals this one.
+//!   Afterwards the copy on storage is used, and it must have this digest
+//!   too. No launch spec is ever mounted (R5).
 //! * `--credential-file` — the incarnation's runner credential, mounted
 //!   read-only *outside* the task storage and re-read after a refusal.
 //! * `--secrets-dir` — read-only, outside the task storage, one file per
@@ -116,9 +119,10 @@ pub struct RunnerArgs {
     )]
     pub task_storage: Option<PathBuf>,
 
-    /// The launch spec file (JSON); required on the first start.
-    #[arg(long, value_name = "FILE")]
-    pub launch_spec: Option<PathBuf>,
+    /// The content digest of the task's launch spec the controller checked;
+    /// required on the first start, when the spec is fetched.
+    #[arg(long, value_name = "DIGEST")]
+    pub launch_digest: Option<String>,
 
     /// The control plane's base URL, e.g. `https://narsor.example`.
     #[arg(long, value_name = "URL", required_unless_present = "check_config")]
@@ -166,7 +170,7 @@ pub struct RunnerArgs {
 
     /// Only answer reads of the storage (conversation pages, events, the
     /// conductor's chat) and change nothing on it: no preparation,
-    /// initialization, session, snapshot or work. `--launch-spec`,
+    /// initialization, session, snapshot or work. `--launch-digest`,
     /// `--secrets-dir`, `--home`, the harness directories, the home sources
     /// and the granted secrets are ignored.
     #[arg(long)]
@@ -267,7 +271,7 @@ pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
     Ok(RunnerConfig {
         task_id,
         storage: required(args.task_storage, "--task-storage")?,
-        launch_spec: args.launch_spec,
+        launch_digest: args.launch_digest,
         control_plane: required(args.control_plane, "--control-plane")?,
         credential_file: required(args.credential_file, "--credential-file")?,
         secrets_dir: args.secrets_dir,

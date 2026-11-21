@@ -270,6 +270,10 @@ Each working runner is one container, named after its workload and labelled
   `--pull never`, and your uid and gid (`--user`);
 - `--network host` — the runner reaches the local daemon on loopback, and the
   tools have the host's network;
+- a runner credential issued when the container starts (an image build can
+  take longer than the credential issued at task start lives), in the
+  workload directory; the runner fetches the task's launch spec from the
+  control plane with it;
 - mounts at the **same paths** as on the host: the task storage
   (read-write); the workload directory, the configuration file, the secrets
   directory, local workspace sources and home sources (read-only, home

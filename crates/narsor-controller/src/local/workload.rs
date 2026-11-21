@@ -9,7 +9,6 @@
 //! {root}/workloads/{workload}/        one live "workload" at most per task
 //!     workload.json                   incarnation, generation, pid or container
 //!     credential                      the runner credential, 0600, outside storage
-//!     launch-spec.json                the immutable launch spec, outside storage
 //!     runner.log                      the runner's stdout and stderr (process)
 //!     secrets/                        the task's secrets (container), 0700
 //! {root}/readers/{reader}/            the task's read-only runner (D63), same files
@@ -20,6 +19,9 @@
 //! deterministic name *is* the identity: a restarted controller finds the
 //! process or container again through `workload.json` instead of starting a
 //! second one.
+//!
+//! No launch spec is written here (R5): the runner gets the spec's digest
+//! (`--launch-digest`) and fetches the spec from the control plane itself.
 //!
 //! # Two kinds of record
 //!
@@ -48,7 +50,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use narsor_controller_runtime::backend::{
-    BackendError, BackendResult, TaskResources, WorkloadLaunch, WorkloadPhase,
+    BackendError, BackendResult, RunnerCredential, TaskResources, WorkloadLaunch, WorkloadPhase,
 };
 
 /// The environment variable every runner gets, set to its workload's uid:
@@ -287,16 +289,14 @@ impl WorkloadStore {
             .filter_map(|bytes| serde_json::from_slice::<WorkloadRecord>(&bytes).ok())
     }
 
-    /// Creates the workload directory with the credential and the launch
-    /// spec; a half-made one is removed again.
+    /// Creates the workload directory with the credential; a half-made one
+    /// is removed again.
     pub(super) fn prepare_workload_dir(
         &self,
         task: &TaskResources,
         role: Role,
         launch: &WorkloadLaunch,
     ) -> BackendResult<PathBuf> {
-        use std::os::unix::fs::OpenOptionsExt;
-
         // Written first and removed on failure: a half-made workload
         // directory without a record must not linger as "something exists".
         let dir = self.workload_dir(task, role);
@@ -309,20 +309,7 @@ impl WorkloadStore {
         // the directory and recording the process leaves: no workload.
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&staging).map_err(|error| io_error("create the workload", error))?;
-        let made = (|| -> io::Result<()> {
-            let mut credential = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(staging.join("credential"))?;
-            io::Write::write_all(&mut credential, launch.credential.expose().as_bytes())?;
-            fs::write(
-                staging.join("launch-spec.json"),
-                serde_json::to_vec(&launch.launch_spec).map_err(io::Error::other)?,
-            )?;
-            Ok(())
-        })();
-        if let Err(error) = made {
+        if let Err(error) = write_credential(&staging, &launch.credential) {
             let _ = fs::remove_dir_all(&staging);
             return Err(io_error("prepare the workload", error));
         }
@@ -331,12 +318,30 @@ impl WorkloadStore {
     }
 }
 
-/// The arguments every runner of a task gets: the files of its workload
-/// directory `dir`, its storage and whom it reports to.
+/// Writes `credential` as the `credential` file of the workload directory
+/// `dir`, readable by its owner only, replacing one already there.
+pub(super) fn write_credential(dir: &Path, credential: &RunnerCredential) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let temp = dir.join("credential.tmp");
+    let _ = fs::remove_file(&temp);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)?;
+    io::Write::write_all(&mut file, credential.expose().as_bytes())?;
+    fs::rename(&temp, dir.join("credential"))
+}
+
+/// The arguments every runner of a task gets: the credential file of its
+/// workload directory `dir`, its storage, the digest of the launch spec it
+/// fetches (or finds on storage) and whom it reports to.
 pub(super) fn task_args(
     task_id: &str,
     storage: &Path,
     dir: &Path,
+    launch_digest: &str,
     control_plane: &str,
     incarnation: &str,
 ) -> Vec<OsString> {
@@ -345,8 +350,8 @@ pub(super) fn task_args(
         task_id.into(),
         "--task-storage".into(),
         storage.into(),
-        "--launch-spec".into(),
-        dir.join("launch-spec.json").into(),
+        "--launch-digest".into(),
+        launch_digest.into(),
         "--control-plane".into(),
         control_plane.into(),
         "--credential-file".into(),

@@ -612,6 +612,7 @@ mod tests {
                 .backend
                 .process
                 .runner_args(role, &launch, &dir, &storage)
+                .unwrap()
         };
         assert!(args(Role::Read).iter().any(|arg| arg == "--read-only"));
         assert!(!args(Role::Work).iter().any(|arg| arg == "--read-only"));

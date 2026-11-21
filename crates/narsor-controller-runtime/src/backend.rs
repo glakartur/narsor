@@ -155,12 +155,27 @@ pub struct WorkloadLaunch {
     /// created it; an adapter may also refuse to act over a workload a newer
     /// lease holder created.
     pub lease_epoch: u64,
-    /// The immutable launch input, mounted read-only.
+    /// The immutable launch input the controller verified. A backend checks
+    /// and plans with it; the runner gets only its digest
+    /// ([`Self::launch_digest`]) and fetches the spec itself (R5).
     pub launch_spec: Value,
     /// Base URL the runner reaches the control plane at.
     pub control_plane_url: String,
     /// The incarnation's credential, mounted read-only outside storage.
     pub credential: RunnerCredential,
+}
+
+impl WorkloadLaunch {
+    /// The content digest of the launch spec, recomputed: the value the
+    /// runner is passed (`--launch-digest`) and checks the spec it fetches
+    /// against (KTD3). The controller checked it equals its command's.
+    pub fn launch_digest(&self) -> BackendResult<String> {
+        serde_json::from_value::<narsor_model::domain::TaskLaunchSpec>(self.launch_spec.clone())
+            .map(|spec| spec.compute_digest())
+            .map_err(|error| {
+                BackendError::rejected(format!("the launch spec is malformed: {error}"))
+            })
+    }
 }
 
 /// Validates the versioned top-level launch contract without importing the

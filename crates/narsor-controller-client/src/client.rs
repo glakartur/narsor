@@ -535,6 +535,14 @@ impl RunnerClient {
         self.transport.get("/runner/v1/poll", query, wait).await
     }
 
+    /// `GET /runner/v1/launch-spec`: the task's sealed launch spec, for a
+    /// working runner's first start. The caller checks its digest.
+    pub async fn launch_spec(&self) -> Result<serde_json::Value, ClientError> {
+        self.transport
+            .get("/runner/v1/launch-spec", &(), Duration::ZERO)
+            .await
+    }
+
     /// `POST /runner/v1/renew`.
     pub async fn renew(&self) -> Result<RunnerRenewResponse, ClientError> {
         self.transport

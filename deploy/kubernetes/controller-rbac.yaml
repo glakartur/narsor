@@ -3,8 +3,9 @@
 #
 # * no pods/exec, pods/attach, pods/portforward or pods/ephemeralcontainers —
 #   the controller never enters a workload (KTD3);
-# * Secrets: create only for each incarnation's launch Secret (runner
-#   credential + launch spec), owned by its Pod so the garbage collector
+# * Secrets: create only for each incarnation's launch Secret (the runner
+#   credential only; the runner fetches its launch spec from the control
+#   plane), owned by its Pod so the garbage collector
 #   deletes it; it can neither list nor delete a Secret. Creating Pods is
 #   still a secret-injection capability — the admission policy is what
 #   limits which Secrets a Pod may mount;

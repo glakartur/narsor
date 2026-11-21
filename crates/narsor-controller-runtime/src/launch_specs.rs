@@ -12,6 +12,13 @@
 //! controller restart the cache is empty: the backend asks for the spec
 //! ([`LaunchSpecs::get_or_request`]) and the controller fetches it at its
 //! next observation of the task. Nothing is stored on disk.
+//!
+//! The same cache hands such a backend a fresh runner credential when it
+//! finally starts the runner: an image build can outlast the credential
+//! issued at creation, so the backend asks for one
+//! ([`LaunchSpecs::take_credential_or_request`]) and the controller issues it
+//! for the same incarnation at its next observation of the task
+//! ([`LaunchSpecs::credential_request`], [`LaunchSpecs::provide_credential`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -20,7 +27,7 @@ use narsor_model::domain::TaskLaunchSpec;
 use narsor_protocol::identifier::TaskId;
 use serde_json::Value;
 
-use crate::backend::validate_launch_input;
+use crate::backend::{validate_launch_input, RunnerCredential};
 
 /// Verified launch specs per task and generation, and the ones a backend
 /// asked for. Clones share one cache.
@@ -35,6 +42,16 @@ struct Inner {
     specs: HashMap<TaskId, (u64, Value)>,
     /// Generations a backend needs the spec of and did not find.
     requested: HashMap<TaskId, u64>,
+    /// Fresh runner credentials a backend asked for, per task: the
+    /// generation and incarnation, and the credential once issued.
+    credentials: HashMap<TaskId, CredentialSlot>,
+}
+
+#[derive(Debug)]
+struct CredentialSlot {
+    generation: u64,
+    incarnation: String,
+    issued: Option<RunnerCredential>,
 }
 
 impl LaunchSpecs {
@@ -88,11 +105,72 @@ impl LaunchSpecs {
         self.lock().requested.get(task_id) == Some(&generation)
     }
 
+    /// For a backend about to start a runner: the fresh credential issued
+    /// for `incarnation` of `task_id` at `generation`, taken (it is handed
+    /// out once), or `None` after noting that one is wanted. The controller
+    /// issues a wanted credential at its next observation of the task.
+    pub fn take_credential_or_request(
+        &self,
+        task_id: &TaskId,
+        generation: u64,
+        incarnation: &str,
+    ) -> Option<RunnerCredential> {
+        let mut inner = self.lock();
+        if let Some(slot) = inner.credentials.get(task_id) {
+            if slot.generation == generation
+                && slot.incarnation == incarnation
+                && slot.issued.is_some()
+            {
+                return inner
+                    .credentials
+                    .remove(task_id)
+                    .and_then(|slot| slot.issued);
+            }
+        }
+        inner.credentials.insert(
+            task_id.clone(),
+            CredentialSlot {
+                generation,
+                incarnation: incarnation.to_string(),
+                issued: None,
+            },
+        );
+        None
+    }
+
+    /// The incarnation a backend wants a fresh credential for, when it asked
+    /// for one of `task_id` at `generation` that was not issued yet.
+    pub fn credential_request(&self, task_id: &TaskId, generation: u64) -> Option<String> {
+        self.lock()
+            .credentials
+            .get(task_id)
+            .filter(|slot| slot.generation == generation && slot.issued.is_none())
+            .map(|slot| slot.incarnation.clone())
+    }
+
+    /// Hands the backend the credential issued for its request of
+    /// `incarnation` of `task_id` at `generation`; nothing when the request
+    /// changed meanwhile.
+    pub fn provide_credential(
+        &self,
+        task_id: &TaskId,
+        generation: u64,
+        incarnation: &str,
+        credential: RunnerCredential,
+    ) {
+        if let Some(slot) = self.lock().credentials.get_mut(task_id) {
+            if slot.generation == generation && slot.incarnation == incarnation {
+                slot.issued = Some(credential);
+            }
+        }
+    }
+
     /// Keeps only the tasks `keep` accepts.
     pub(crate) fn retain(&self, keep: impl Fn(&TaskId) -> bool) {
         let mut inner = self.lock();
         inner.specs.retain(|task, _| keep(task));
         inner.requested.retain(|task, _| keep(task));
+        inner.credentials.retain(|task, _| keep(task));
     }
 }
 
@@ -103,14 +181,9 @@ pub fn verify_launch_spec(spec: &Value, expected: &str) -> Result<(), String> {
     validate_launch_input(spec)?;
     let typed: TaskLaunchSpec = serde_json::from_value(spec.clone())
         .map_err(|error| format!("control plane returned an invalid launch spec: {error}"))?;
-    let digest = typed.compute_digest();
-    if digest != expected {
-        return Err(format!(
-            "the launch spec the control plane returned has content digest {digest}, not the \
-             digest {expected} its command names"
-        ));
-    }
-    Ok(())
+    typed.check_pinned_digest(expected).map_err(|problem| {
+        format!("the control plane returned a launch spec its command does not name: {problem}")
+    })
 }
 
 #[cfg(test)]
