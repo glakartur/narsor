@@ -46,37 +46,52 @@ pub(super) fn print_open_matters(summary: &ExecutionSummary) {
 /// A problem input ([`ProblemKindDto::Output`]) is not repeated here: the
 /// pending input's form already says it.
 pub(super) fn print_conductor_matters(summary: &ExecutionSummary) {
+    for line in conductor_matter_lines(summary) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_conductor_matters`] prints.
+pub(super) fn conductor_matter_lines(summary: &ExecutionSummary) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(problem) = summary
         .problem
         .as_ref()
         .filter(|problem| problem.kind == ProblemKindDto::Failure)
     {
-        println!("Problem ({}): {}", problem.kind.name(), problem.reason);
+        lines.push(format!(
+            "Problem ({}): {}",
+            problem.kind.name(),
+            problem.reason
+        ));
         match &problem.episode {
             Some(episode) => {
-                println!("  Failure: {episode}");
-                println!(
+                lines.push(format!("  Failure: {episode}"));
+                lines.push(format!(
                     "  Restart with: narsor-cli task restart-step <TASK> --failure-key {episode} \
                      [--note TEXT]"
-                );
+                ));
             }
-            None => println!("  Restart with: narsor-cli task restart-step <TASK> [--note TEXT]"),
+            None => lines.push(
+                "  Restart with: narsor-cli task restart-step <TASK> [--note TEXT]".to_string(),
+            ),
         }
     }
     if let Some(annotation) = &summary.annotation {
-        println!("Conductor's summary: {}", annotation.summary);
+        lines.push(format!("Conductor's summary: {}", annotation.summary));
         if let Some(recommendation) = &annotation.recommendation {
-            println!("  Recommends: {recommendation}");
+            lines.push(format!("  Recommends: {recommendation}"));
         }
     }
     if let Some(activity) = &summary.conductor {
-        println!(
+        lines.push(format!(
             "Conductor working: {} ({}, since {})",
             activity.purpose.name(),
             activity.trigger.name(),
             activity.started_at.to_rfc3339()
-        );
+        ));
     }
+    lines
 }
 
 /// The question an execution is waiting on, as a form the operator can fill in.

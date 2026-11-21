@@ -30,6 +30,7 @@ mod builtin_workflows;
 mod claude_code_classification;
 mod cli_control_text;
 mod cli_conversation_text;
+mod cli_execution_reads;
 mod cli_queue;
 mod cli_task_create;
 mod cli_task_text;
