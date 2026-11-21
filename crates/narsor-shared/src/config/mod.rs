@@ -31,6 +31,7 @@ pub mod file;
 pub mod harness_home;
 pub mod legacy;
 pub mod local_controller;
+pub mod old_layout;
 pub mod resolve;
 pub mod scope;
 pub(crate) mod security_validation;

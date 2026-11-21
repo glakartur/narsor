@@ -79,6 +79,22 @@ pub fn root_args(state_root: &Path, work_root: Option<&Path>) -> Vec<OsString> {
     args
 }
 
+/// The migration-only `narsor-controller local` arguments naming the
+/// controller's old directories (KTD10): `--legacy-dir` the old
+/// `{state}/local-controller` (credential side; its path also gives the
+/// controller id, KTD8) and `--legacy-work-dir` the old
+/// `{work}/local-controller` (storage side), the same directory unless the
+/// roots were configured apart. A controller that migrated already ignores
+/// them.
+pub fn legacy_args(state_dir: &Path, work_dir: &Path) -> Vec<OsString> {
+    vec![
+        "--legacy-dir".into(),
+        state_dir.as_os_str().to_owned(),
+        "--legacy-work-dir".into(),
+        work_dir.as_os_str().to_owned(),
+    ]
+}
+
 /// The controller's configuration from `file` (none: no file at all) and
 /// the variables of `environment` the controller reads.
 ///

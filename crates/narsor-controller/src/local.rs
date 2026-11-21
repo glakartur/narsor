@@ -87,6 +87,7 @@ use untrusted::UntrustedServer;
 
 pub mod backend;
 pub mod container;
+pub mod layout_migration;
 pub mod paths;
 mod process;
 #[cfg(test)]
@@ -101,6 +102,7 @@ use narsor_controller_client::{ClientOptions, ControllerClient};
 use narsor_controller_runtime::{Controller, ControllerConfig};
 use narsor_shared::config::local_controller::{self, LocalMode};
 use narsor_shared::config::{Flags, HarnessHome, HomeMode, Resolved, SettingKey, Source};
+use narsor_shared::layout_move::Mover;
 use paths::{ControllerStatePaths, ControllerWorkPaths};
 
 /// Bound of the lease release on the way out: well inside the daemon's
@@ -131,6 +133,17 @@ pub struct LocalArgs {
     /// directories in its own directory below it. Required.
     #[arg(long, value_name = "DIRECTORY")]
     pub work_root: Option<PathBuf>,
+
+    /// Migration only (KTD10): the old `{state}/local-controller`
+    /// directory whose files this controller moves to its own directories
+    /// before it starts. Passed by the server; ignored once migrated.
+    #[arg(long, hide = true, value_name = "DIRECTORY")]
+    pub legacy_dir: Option<PathBuf>,
+
+    /// Migration only: the old `{work}/local-controller`, when not the
+    /// same as `--legacy-dir`.
+    #[arg(long, hide = true, value_name = "DIRECTORY", requires = "legacy_dir")]
+    pub legacy_work_dir: Option<PathBuf>,
 
     /// Refused: replaced by `--work-root`.
     #[arg(long, hide = true, value_name = "DIRECTORY")]
@@ -605,6 +618,18 @@ impl LocalArgs {
     }
 }
 
+impl LocalArgs {
+    /// The old directories to migrate from, when the server named them.
+    fn legacy_dirs(&self) -> Option<layout_migration::LegacyDirs> {
+        let state = self.legacy_dir.clone()?;
+        let work = self
+            .legacy_work_dir
+            .clone()
+            .unwrap_or_else(|| state.clone());
+        Some(layout_migration::LegacyDirs { state, work })
+    }
+}
+
 async fn run(args: LocalArgs) -> Result<(), ControllerError> {
     let LocalDirectories {
         state_root,
@@ -633,8 +658,17 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
     if place == ControlPlanePlace::Remote {
         warn_untrusted(&connection.control_plane, &home);
     }
-    let lock_path = state.credential_lock_file();
     let timeout = Duration::from_secs(args.lock_timeout_secs);
+    if let Some(legacy) = args.legacy_dirs() {
+        let (state, work) = (state.clone(), work.clone());
+        tokio::task::spawn_blocking(move || {
+            layout_migration::migrate(&legacy, &state, &work, Mover::new(), timeout)
+        })
+        .await
+        .map_err(|error| ControllerError::failure(error.to_string()))?
+        .map_err(ControllerError::failure)?;
+    }
+    let lock_path = state.credential_lock_file();
     let _lock = tokio::task::spawn_blocking(move || ControllerLock::acquire(&lock_path, timeout))
         .await
         .map_err(|error| ControllerError::failure(error.to_string()))??;
@@ -949,6 +983,8 @@ mod tests {
             connection: ConnectionArgs::default(),
             state_root: Some(PathBuf::from("/state")),
             work_root: Some(PathBuf::from("/work")),
+            legacy_dir: None,
+            legacy_work_dir: None,
             storage: None,
             credential_file: None,
             home: None,

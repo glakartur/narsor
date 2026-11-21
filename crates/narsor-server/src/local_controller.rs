@@ -109,6 +109,10 @@ pub struct LocalControllerSettings {
     pub state_root: PathBuf,
     /// The work root (`server.work`), handed on as `--work-root`.
     pub work_root: PathBuf,
+    /// The controller's old directories (state side, work side) while they
+    /// exist, handed on as `--legacy-dir` / `--legacy-work-dir` so the
+    /// controller moves its own files (KTD10).
+    pub legacy_dirs: Option<(PathBuf, PathBuf)>,
     /// The arguments naming the child's configuration file:
     /// `--config <file>` or `--no-config`.
     pub config_args: Vec<OsString>,
@@ -353,6 +357,13 @@ fn spawn(
             &settings.state_root,
             Some(&settings.work_root),
         ))
+        .args(
+            settings
+                .legacy_dirs
+                .as_ref()
+                .map(|(state, work)| local_controller::legacy_args(state, work))
+                .unwrap_or_default(),
+        )
         .arg("--lease-ttl-secs")
         .arg(
             ControllerConfig::new(String::new())

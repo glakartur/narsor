@@ -56,6 +56,7 @@ mod engine_unified_schema;
 mod environment;
 mod kubernetes_adapter;
 mod launch_spec_contract;
+mod layout_migration;
 mod observers_decide;
 mod observers_effects;
 mod observers_examples;

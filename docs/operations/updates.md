@@ -6,6 +6,146 @@ listed here need no special order. The update notes of the remote backends
 (automatic resume, the read-only runner) are in
 [Remote execution backends](remote-backends.md).
 
+## Update to a directory per program (state ownership)
+
+This update gives every program a directory of its own below the state
+root and the work root, and moves an existing installation there once, at
+the first start of the new `narsor-server`. The move is one way.
+
+### What changes
+
+| Area | Before | After |
+|---|---|---|
+| Built-in `server.state`, `server.work` | `.`: the `global.root` itself, next to the catalogue | `state` and `work` below `global.root` |
+| Server files (`auth/`, `orchestration/`, `materials/`, `observer-queues/`, `agent-harness.json`) | `{state}/` | `{state}/narsor-server/` |
+| Old log `narsor.log` | `{state}/narsor.log` | `{state}/narsor-server/narsor.log` (kept, nobody writes it) |
+| Discovery and autostart files | `{state}/daemon.json`, `daemon.lock`, `daemon.lock.guard` | `{state}/run/` (the old files are deleted) |
+| Local controller, credential side (`credential`, `credential.lock`, `secrets/`, `images/`) | `{state}/local-controller/` | `{state}/narsor-controller-local/` |
+| Local controller, storage side (`storage/`, `workloads/`, `readers/`) | `{work}/local-controller/` | `{work}/narsor-controller-local/` |
+| Per-task records of the local controller (`tasks/`) | `{work}/local-controller/tasks/` | `{state}/narsor-controller-local/tasks/` |
+| Web session (`web-session`, `web-open.html`) | `{state}/` | `{state}/narsor-web/` (the old files are deleted, a new session is made) |
+
+An explicit `server.state` or `server.work` (flag, environment or file)
+keeps its value: the files move below the same root. With the built-in
+values the old files are in `global.root` and move below
+`global.root/state` and `global.root/work`. The catalogue does not move.
+
+### What the migration does
+
+At start, before it reads any of its files, the new server:
+
+1. Takes the old `{old state}/daemon.instance.lock` without waiting. When
+   an old daemon holds it, the server stops and names the file. Nothing is
+   moved.
+2. Reads the old workload records of the local controller
+   (`{old work}/local-controller/workloads/` and `readers/`). When a runner
+   process (pid and start time) or a runner container still runs, the
+   server stops with "Stop all tasks first" and the recovery steps below.
+   Nothing is moved.
+3. Moves its own files, deletes the stale discovery and autostart files,
+   and writes the marker `{state}/narsor-server/layout-migrated`.
+4. Starts the local controller with `--legacy-dir <old state>/local-controller`
+   and `--legacy-work-dir <old work>/local-controller`. The controller takes
+   the old `credential.lock`, records its `controller-id` from the old
+   directory (so the Docker images it built earlier stay its own), moves its
+   entries, renames the Claude Code sessions of the tasks (see below) and
+   writes the marker `{state}/narsor-controller-local/layout-migrated`.
+   It removes the old `local-controller/` directories when they are empty.
+
+Within one filesystem each entry is renamed. Across filesystems it is
+copied, compared with the source, given its original modes again
+(`0600` files, `0700` directories), and then the source is deleted. A
+source that is a symbolic link is refused. A failed move stops the program
+and names the file; correct the cause and start again. A start after a
+crash finishes the move. A program that finds its marker does not migrate
+again.
+
+**Claude Code sessions.** The workspace of every task moves with its
+storage, and Claude Code finds a session by its working directory. In
+each task's private HOME on storage, the controller renames
+`home/.claude/projects/<key of the old path>` to the key of the new path,
+so a stopped task resumes its session. Not covered:
+
+- a task that ran with a host HOME (`controller.local.home: host`) or a
+  `CLAUDE_CONFIG_DIR` outside its storage: its sessions are in your own
+  `~/.claude/projects/` under the old path, and the task cannot resume them;
+- a path longer than 200 characters, which Claude Code shortens with a
+  hash: the controller logs a warning and leaves that session.
+
+A task in the Docker work mode sees its storage at the same path inside
+its container, so its sessions are renamed the same way.
+
+### Before the update
+
+1. **Back up the state root and the work root** (with the built-in values:
+   the whole `global.root`). The migration is one way: the backup is the
+   only rollback.
+2. **Stop all tasks and the server** (`narsor-server stop`). Make sure no
+   runner outlived it (see "Runners that still run").
+
+### Update order
+
+1. Update all binaries together (`narsor-server`, `narsor-controller`,
+   `narsor-runner`, `narsor-cli`, `narsor`, `narsor-web`,
+   `narsor-observer-worker`): they must sit next to each other and be of
+   the same version.
+2. Kubernetes: apply the new `controller-rbac.yaml` before you deploy the
+   new controller image (see
+   [Remote execution backends](remote-backends.md)).
+3. Start the server. The migration runs and the server logs what it moved.
+4. Then start the controllers on other machines.
+
+### Runners that still run
+
+When the server refuses with "Stop all tasks first", a runner of the old
+installation is still alive. To recover by hand:
+
+1. Kill the runner processes. Each one has the variable
+   `NARSOR_LOCAL_WORKLOAD_UID` in its environment, for example:
+   `grep -l NARSOR_LOCAL_WORKLOAD_UID /proc/[0-9]*/environ`.
+2. Remove the runner containers:
+   `docker rm -f $(docker ps -q --filter label=io.narsor.workload)`.
+3. Start the server again. After the migration the controller does not
+   find these runners, reports them lost, and the control plane resumes
+   the tasks (D58).
+
+### Controllers started by hand
+
+A controller started by hand (`narsor-controller local`) now takes
+`--state-root` (by default `$XDG_STATE_HOME/narsor`) and `--work-root` in
+place of `--credential-file` and `--storage`. Its credential is no longer
+found at the old place (`$XDG_STATE_HOME/narsor/workstation-controller/`),
+so it must enroll again with a new enrollment code. To keep the old
+credential and the task storages, stop the old controller and its runners,
+and start the new one once with the old directories:
+
+```bash
+narsor-controller local --control-plane https://narsor.example \
+  --work-root ~/narsor-laptop \
+  --legacy-dir "$XDG_STATE_HOME/narsor/workstation-controller" \
+  --legacy-work-dir ~/narsor-laptop
+```
+
+The controller does not check for live runners itself: only start it this
+way when no runner of the old controller runs.
+
+### After the update
+
+These old entries are left in place for you to delete by hand when you
+no longer need them:
+
+- `{old state}/executions/` and `{old state}/launch-specs/`: records of
+  the former in-process execution;
+- `{old state}/observers/`: records of the removed stored observers;
+- anything else left in an old `local-controller/` directory.
+
+### Rollback
+
+There is no rollback by downgrade: an older server does not find the
+moved files and starts as a new installation. To go back, stop the new
+server, restore the backup of the state and work roots, and install the
+older binaries.
+
 ## Update to archive only at a terminal state (D80)
 
 This update changes when the owner can archive a task, and what an

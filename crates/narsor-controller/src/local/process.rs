@@ -465,21 +465,6 @@ fn is_user_credential(name: &OsStr) -> bool {
             .any(|known| name == known.as_bytes())
 }
 
-/// Field 22 of `/proc/{pid}/stat`: when the process started.
-fn process_start_ticks(pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // The command name may hold spaces and parentheses; fields resume after
-    // the last ')'.
-    let rest = &stat[stat.rfind(')')? + 1..];
-    let mut fields = rest.split_whitespace();
-    let state = fields.next()?;
-    if state == "Z" {
-        return None;
-    }
-    // `rest` starts at field 3 (state); field 22 is 19 further on.
-    fields.nth(18)?.parse().ok()
-}
-
 /// Kills what is left of the process group `pgid` when it is the
 /// workload's (a live member carries `uid` as [`WORKLOAD_MARK_ENV`]), and
 /// waits briefly for it to go; true when no marked member is left.
@@ -549,15 +534,7 @@ fn process_group(pid: u32) -> Option<u32> {
     fields.nth(1)?.parse().ok()
 }
 
-/// Whether `pid` still names the process that started at `start_ticks`
-/// and has not terminated (a zombie counts as terminated).
-pub(super) fn process_alive(pid: u32, start_ticks: Option<u64>) -> bool {
-    match (process_start_ticks(pid), start_ticks) {
-        (Some(now), Some(then)) => now == then,
-        (Some(_), None) => true,
-        (None, _) => false,
-    }
-}
+pub(super) use narsor_shared::process_liveness::{process_alive, process_start_ticks};
 
 #[cfg(test)]
 mod tests {

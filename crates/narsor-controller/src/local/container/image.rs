@@ -775,15 +775,33 @@ pub fn controller_id(paths: &ControllerStatePaths) -> String {
     if let Err(error) = create_private_dir(dir) {
         tracing::warn!(dir = %dir.display(), %error, "images: cannot create the controller directory");
     }
-    let canonical = fs::canonicalize(dir)
-        .or_else(|_| std::path::absolute(dir))
-        .unwrap_or_else(|_| dir.to_path_buf());
-    let digest = hex(&Sha256::digest(canonical.as_os_str().as_encoded_bytes()));
-    let id = digest[..16].to_string();
+    let id = id_of_directory(dir);
     if let Err(error) = write_private_file(&file, format!("{id}\n").as_bytes()) {
         tracing::warn!(file = %file.display(), %error, "images: cannot record the controller id");
     }
     id
+}
+
+/// Records, before a migration moves anything, the id of the controller
+/// whose old directory was `old_dir` as the `controller-id` of `paths`
+/// (KTD8): the images it built keep matching. An id already recorded
+/// stays.
+pub fn seed_controller_id(paths: &ControllerStatePaths, old_dir: &Path) -> io::Result<()> {
+    let file = paths.controller_id_file();
+    if fs::read_to_string(&file).is_ok_and(|text| !text.trim().is_empty()) {
+        return Ok(());
+    }
+    create_private_dir(paths.dir())?;
+    write_private_file(&file, format!("{}\n", id_of_directory(old_dir)).as_bytes())
+}
+
+/// The first 16 hex digits of the sha256 of the canonical path of `dir`.
+fn id_of_directory(dir: &Path) -> String {
+    let canonical = fs::canonicalize(dir)
+        .or_else(|_| std::path::absolute(dir))
+        .unwrap_or_else(|_| dir.to_path_buf());
+    let digest = hex(&Sha256::digest(canonical.as_os_str().as_encoded_bytes()));
+    digest[..16].to_string()
 }
 
 /// Writes `bytes` to `path` with mode 0600, through a temporary file.

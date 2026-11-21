@@ -28,6 +28,7 @@ use tokio::signal::unix::{signal, SignalKind};
 
 use crate::api::{ApiHandle, ApiServices, ServerSecurity};
 use crate::auth_gate::NetworkAuth;
+use crate::layout_migration::DockerProbe;
 use crate::local_controller::{controller_program, LocalController, LocalControllerSettings};
 use crate::observer_worker::{
     worker_program, ObserverPlan, ObserverWorker, ObserverWorkerSettings,
@@ -45,6 +46,8 @@ use narsor_engine::persistence::{DaemonInfo, DefaultHarnessSelector};
 use narsor_engine::workflows::WorkflowResolver;
 
 use narsor_shared::cli_error::{CliError, Result};
+use narsor_shared::config::old_layout::OldRoots;
+use narsor_shared::layout_move::Mover;
 
 /// How many times a starting daemon tries the instance lock, and the pause
 /// between tries: about 20 s, longer than a predecessor's shutdown drain.
@@ -103,6 +106,11 @@ pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<(
     )
     .await
     .map_err(|error| CliError::failure(error.to_string()))?;
+    // An installation of the old layout moves first, under the lock and
+    // before anything reads the server's files (KTD10).
+    let old_roots = OldRoots::of(config);
+    crate::layout_migration::migrate(&old_roots, &paths, &DockerProbe, Mover::new())
+        .map_err(|error| CliError::failure(error.to_string()))?;
     // Refused before anything starts, not after the controller enrolled.
     run.prepare()
         .map_err(|error| CliError::failure(error.to_string()))?;
@@ -210,7 +218,7 @@ pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<(
     // holds a lease of its own: otherwise a freshly connected local client
     // can create work in the gap before any controller can take it (R7).
     let local_controller = if runs_local_controller {
-        let settings = local_controller_settings(config, &api_handle)?;
+        let settings = local_controller_settings(config, &old_roots, &api_handle)?;
         Some(
             LocalController::start(settings, Arc::clone(&control))
                 .await
@@ -336,6 +344,7 @@ fn refuse_declared_local_backend(catalog_dir: &Path) -> Result<()> {
 /// own directories below the roots (KTD7).
 fn local_controller_settings(
     config: &Resolved,
+    old_roots: &OldRoots,
     api: &ApiHandle,
 ) -> Result<LocalControllerSettings> {
     let program = controller_program().map_err(CliError::failure)?;
@@ -344,6 +353,7 @@ fn local_controller_settings(
         control_plane: format!("http://{}", api.addr()),
         state_root: config.state_dir().to_path_buf(),
         work_root: config.work_dir().to_path_buf(),
+        legacy_dirs: crate::layout_migration::legacy_controller_dirs(old_roots),
         // The controller reads its own section (R21) from the file this
         // daemon read, on every start: a restart reads the file again.
         config_args: local_controller::config_args(config.file().path()),
