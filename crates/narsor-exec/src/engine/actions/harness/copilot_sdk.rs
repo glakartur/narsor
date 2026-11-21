@@ -1,16 +1,16 @@
-use std::fmt::Display;
-use std::future::Future;
+//! `harness: github-copilot` steps, run through the GitHub Copilot SDK.
+//!
+//! The SDK itself is behind the `copilot-sdk` cargo feature ([`runtime`]):
+//! only `narsor-runner` runs agent steps, so only it enables the feature.
+//! Built without it, [`GitHubCopilotSdkRuntime`] fails every run with an
+//! error that says so, instead of starting anything else.
+
 use std::path::Path;
 use std::time::Duration;
 
 use base64::Engine;
-use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
-use github_copilot_sdk::{
-    CliProgram, Client, ClientOptions, MessageOptions, ResumeSessionConfig, SessionConfig,
-    SessionId,
-};
-use narsor_protocol::controller::{UsageLimit, UsageStatus};
+use narsor_protocol::controller::UsageLimit;
 use serde_json::Value;
 
 use crate::domain::ActionError;
@@ -19,7 +19,11 @@ use crate::engine::actions::session::conversation::{
     record_stdout_line, ConversationSink, UsageRelay,
 };
 use crate::engine::actions::session::process::{FinishedRun, SpawnEnding};
-use crate::engine::actions::ACTION_ID_ENV_VAR;
+
+#[cfg(feature = "copilot-sdk")]
+mod runtime;
+#[cfg(feature = "copilot-sdk")]
+pub(crate) use runtime::GitHubCopilotSdkRuntime;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_copilot_sdk(
@@ -161,56 +165,8 @@ pub(crate) struct CopilotSdkResponse {
     usage_limits: Vec<UsageLimit>,
 }
 
-/// Reads the subscription quota snapshot maintained by the Copilot SDK.
-fn copilot_usage_limits(
-    projection: &github_copilot_sdk::rpc::SessionQuotaProjection,
-) -> Vec<UsageLimit> {
-    let Some(quota) = projection.snapshots.get("premium_interactions") else {
-        return Vec::new();
-    };
-    if quota.is_unlimited_entitlement || !quota.remaining_percentage.is_finite() {
-        return Vec::new();
-    }
-    let Some(reset_millis) = quota.reset_date_epoch_ms else {
-        return Vec::new();
-    };
-    if !reset_millis.is_finite() || reset_millis < i64::MIN as f64 || reset_millis > i64::MAX as f64
-    {
-        return Vec::new();
-    }
-    let Some(resets_at) = DateTime::<Utc>::from_timestamp_millis(reset_millis as i64) else {
-        return Vec::new();
-    };
-    if resets_at <= Utc::now() {
-        return Vec::new();
-    }
-
-    let status = match quota.has_quota {
-        Some(true) => Some(UsageStatus::Allowed),
-        Some(false) if quota.usage_allowed_with_exhausted_quota => Some(UsageStatus::Allowed),
-        Some(false) => Some(UsageStatus::Rejected),
-        None => None,
-    };
-    vec![UsageLimit {
-        // Copilot reports a monthly premium-interaction allowance; the shared
-        // usage contract represents its cycle with the closest supported label.
-        window: "30d".to_string(),
-        utilization: (100.0 - quota.remaining_percentage.clamp(0.0, 100.0)) / 100.0,
-        resets_at,
-        status,
-    }]
-}
-
-async fn run_with_sdk_deadline<F: Future>(
-    deadline: Option<tokio::time::Instant>,
-    future: F,
-) -> Result<F::Output, tokio::time::error::Elapsed> {
-    match deadline {
-        Some(deadline) => tokio::time::timeout_at(deadline, future).await,
-        None => Ok(future.await),
-    }
-}
-
+// Without the `copilot-sdk` feature only the tests' fake backend has an outcome.
+#[cfg_attr(not(feature = "copilot-sdk"), allow(dead_code))]
 pub(crate) enum CopilotSdkOutcome {
     Finished(CopilotSdkResponse),
     TimedOut,
@@ -224,270 +180,36 @@ pub(crate) trait CopilotSdkBackend: Send + Sync {
     ) -> BoxFuture<'a, Result<CopilotSdkOutcome, ActionError>>;
 }
 
-pub(crate) struct GitHubCopilotSdkRuntime {
-    program: CliProgram,
-}
+/// Stands in for the SDK runtime in a build without the `copilot-sdk`
+/// feature (every binary but `narsor-runner`).
+#[cfg(not(feature = "copilot-sdk"))]
+#[derive(Default)]
+pub(crate) struct GitHubCopilotSdkRuntime;
 
-impl Default for GitHubCopilotSdkRuntime {
-    fn default() -> Self {
-        Self {
-            program: CliProgram::Resolve,
-        }
-    }
-}
-
+#[cfg(not(feature = "copilot-sdk"))]
 impl CopilotSdkBackend for GitHubCopilotSdkRuntime {
     fn run<'a>(
         &'a self,
-        request: CopilotSdkRequest,
-        on_event: &'a mut (dyn FnMut(serde_json::Value) + Send),
+        _request: CopilotSdkRequest,
+        _on_event: &'a mut (dyn FnMut(serde_json::Value) + Send),
     ) -> BoxFuture<'a, Result<CopilotSdkOutcome, ActionError>> {
-        Box::pin(async move {
-            let mut options = ClientOptions::default();
-            options.program = self.program.clone();
-            options.working_directory = request.working_dir.clone();
-            if let Some(action_execution_id) = &request.action_execution_id {
-                options
-                    .env
-                    .push((ACTION_ID_ENV_VAR.into(), action_execution_id.into()));
-            }
-
-            let deadline = request
-                .limit
-                .and_then(|limit| tokio::time::Instant::now().checked_add(limit));
-            let client = match run_with_sdk_deadline(deadline, Client::start(options)).await {
-                Ok(Ok(client)) => client,
-                Ok(Err(error)) => {
-                    return Err(copilot_sdk_error("failed to start Copilot SDK", error));
-                }
-                Err(_) => return Ok(CopilotSdkOutcome::TimedOut),
-            };
-            let run_client = client.clone();
-            let run = async move {
-                let session = if let Some(session_id) = request.session_id {
-                    let mut config = ResumeSessionConfig::new(SessionId::new(session_id))
-                        .with_working_directory(request.working_dir.clone())
-                        .approve_all_permissions();
-                    if let Some(model) = request.model {
-                        config = config.with_model(model);
-                    }
-                    run_client.resume_session(config).await
-                } else {
-                    let mut config = SessionConfig::default()
-                        .with_working_directory(request.working_dir.clone())
-                        .approve_all_permissions();
-                    if let Some(model) = request.model {
-                        config = config.with_model(model);
-                    }
-                    run_client.create_session(config).await
-                }
-                .map_err(|error| {
-                    copilot_sdk_error("failed to create Copilot SDK session", error)
-                })?;
-
-                let session_id = session.id().to_string();
-                let mut events = session.subscribe();
-                on_event(serde_json::json!({
-                    "type": "session",
-                    "session_id": session_id.clone()
-                }));
-                let message_id = session
-                    .send(MessageOptions::new(request.prompt))
-                    .await
-                    .map_err(|error| copilot_sdk_error("Copilot SDK request failed", error))?;
-                let mut request_started = false;
-                let mut final_message = None;
-                let response = loop {
-                    let event = events.recv().await.map_err(|error| {
-                        copilot_sdk_error("failed to receive Copilot SDK event", error)
-                    })?;
-                    let event_type = event.event_type.as_str();
-                    let is_root = event.agent_id.as_deref().is_none_or(str::is_empty);
-                    let data = &event.data;
-
-                    let record = serde_json::to_value(&event).map_err(|error| {
-                        copilot_sdk_error("failed to serialize Copilot SDK event", error)
-                    })?;
-                    on_event(record);
-
-                    if is_root && event_type == "user.message" {
-                        request_started |= data.get("messageId").and_then(Value::as_str)
-                            == Some(message_id.as_str());
-                    }
-                    if is_root
-                        && event_type == "session.warning"
-                        && data.get("warningType").and_then(Value::as_str) == Some("policy_blocked")
-                        && data.get("originatingMessageId").and_then(Value::as_str)
-                            == Some(message_id.as_str())
-                    {
-                        request_started = true;
-                    }
-                    if is_root && event_type == "assistant.message" {
-                        let origin = data.get("originatingMessageId").and_then(Value::as_str);
-                        if origin == Some(message_id.as_str())
-                            || (origin.is_none() && request_started)
-                        {
-                            request_started = true;
-                            final_message = if data
-                                .get("toolRequests")
-                                .and_then(Value::as_array)
-                                .is_some_and(|tools| !tools.is_empty())
-                            {
-                                None
-                            } else {
-                                Some(data.clone())
-                            };
-                        }
-                    }
-
-                    if event_type == "session.quota_observation" {
-                        match session.rpc().quota().get().await {
-                            Ok(projection) => {
-                                let limits = copilot_usage_limits(&projection);
-                                if !limits.is_empty() {
-                                    on_event(serde_json::json!({
-                                        "type": "usage",
-                                        "limits": limits
-                                    }));
-                                }
-                            }
-                            Err(error) => {
-                                tracing::debug!(%error, "could not read Copilot subscription usage");
-                            }
-                        }
-                    }
-
-                    if !is_root {
-                        continue;
-                    }
-                    match event_type {
-                        "session.idle" if request_started => {
-                            if data.get("aborted").and_then(Value::as_bool) == Some(true) {
-                                break Err(copilot_sdk_error(
-                                    "Copilot SDK request failed",
-                                    "session aborted before the response completed",
-                                ));
-                            }
-                            if data.get("mode").and_then(Value::as_str) != Some("autopilot") {
-                                break Ok(final_message);
-                            }
-                        }
-                        "session.autopilot_stopped"
-                            if data.get("requestId").and_then(Value::as_str)
-                                == Some(message_id.as_str()) =>
-                        {
-                            match data.get("reason").and_then(Value::as_str) {
-                                Some("error") => {
-                                    break Err(copilot_sdk_error(
-                                        "Copilot SDK request failed",
-                                        "autopilot request failed",
-                                    ));
-                                }
-                                Some("aborted") => {
-                                    break Err(copilot_sdk_error(
-                                        "Copilot SDK request failed",
-                                        "session aborted before the response completed",
-                                    ));
-                                }
-                                _ => break Ok(final_message),
-                            }
-                        }
-                        "session.error"
-                            if data
-                                .get("originatingMessageId")
-                                .and_then(Value::as_str)
-                                .filter(|id| !id.is_empty())
-                                .is_none_or(|origin| origin == message_id) =>
-                        {
-                            let message = data
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("session error");
-                            break Err(copilot_sdk_error("Copilot SDK request failed", message));
-                        }
-                        _ => {}
-                    }
-                };
-                let usage_limits = match session.rpc().quota().get().await {
-                    Ok(projection) => copilot_usage_limits(&projection),
-                    Err(error) => {
-                        tracing::debug!(%error, "could not read Copilot subscription usage");
-                        Vec::new()
-                    }
-                };
-                let disconnect = session.disconnect().await.map_err(|error| {
-                    copilot_sdk_error("failed to disconnect Copilot SDK session", error)
-                });
-                let response = match (response, disconnect) {
-                    (Ok(response), Ok(())) => response,
-                    (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
-                    (Err(error), Err(cleanup_error)) => {
-                        return Err(combine_sdk_errors(error, cleanup_error));
-                    }
-                };
-                Ok(CopilotSdkResponse {
-                    session_id,
-                    text: response.and_then(|event| {
-                        event
-                            .get("content")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    }),
-                    usage_limits,
-                })
-            };
-
-            let run_and_stop = async {
-                let response = run.await;
-                let stop = client
-                    .stop()
-                    .await
-                    .map_err(|error| copilot_sdk_error("failed to stop Copilot SDK", error));
-
-                match (response, stop) {
-                    (Ok(response), Ok(())) => Ok(response),
-                    (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-                    (Err(error), Err(stop_error)) => Err(combine_sdk_errors(error, stop_error)),
-                }
-            };
-
-            match run_with_sdk_deadline(deadline, run_and_stop).await {
-                Ok(Ok(response)) => Ok(CopilotSdkOutcome::Finished(response)),
-                Ok(Err(error)) => Err(error),
-                Err(_) => {
-                    client.force_stop();
-                    Ok(CopilotSdkOutcome::TimedOut)
-                }
-            }
+        Box::pin(async {
+            Err(ActionError {
+                message: "the GitHub Copilot harness runs only in narsor-runner: this binary \
+                          was built without the `copilot-sdk` feature of narsor-exec"
+                    .to_string(),
+                error_type: Some("harness_unavailable".to_string()),
+                details: Some(serde_json::json!({
+                    "harness": super::github_copilot::GITHUB_COPILOT,
+                })),
+            })
         })
-    }
-}
-
-fn copilot_sdk_error(context: &str, error: impl Display) -> ActionError {
-    ActionError {
-        message: format!("{context}: {error}"),
-        error_type: Some("sdk_runtime_error".to_string()),
-        details: None,
-    }
-}
-
-fn combine_sdk_errors(primary: ActionError, cleanup: ActionError) -> ActionError {
-    ActionError {
-        message: format!(
-            "{}; cleanup also failed: {}",
-            primary.message, cleanup.message
-        ),
-        error_type: primary.error_type,
-        details: primary.details,
     }
 }
 
 #[cfg(test)]
 mod copilot_sdk_dispatch_tests {
-    use super::{
-        copilot_usage_limits, run_with_sdk_deadline, CopilotSdkBackend, CopilotSdkOutcome,
-        CopilotSdkRequest, CopilotSdkResponse,
-    };
+    use super::{CopilotSdkBackend, CopilotSdkOutcome, CopilotSdkRequest, CopilotSdkResponse};
     use crate::engine::actions::answer::AnswerShape;
     use crate::engine::actions::harness::{GitHubCopilotAdapter, HarnessAdapter};
     use crate::engine::actions::session::conversation::ConversationSink;
@@ -495,83 +217,9 @@ mod copilot_sdk_dispatch_tests {
         run_harness_invocation, run_harness_invocation_with_sdk, SpawnEnding, FINAL_ANSWER_GRACE,
     };
     use base64::Engine;
-    use chrono::Utc;
     use futures::future::BoxFuture;
-    use narsor_protocol::controller::UsageStatus;
     use std::path::Path;
     use std::sync::Mutex;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn copilot_sdk_deadline_covers_all_lifecycle_phases() {
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
-        let result = run_with_sdk_deadline(Some(deadline), async {
-            for _ in 0..3 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await;
-
-        assert!(result.is_err(), "the shared deadline should expire");
-    }
-
-    #[test]
-    fn copilot_subscription_quota_maps_remaining_percentage_and_reset() {
-        use github_copilot_sdk::rpc::{SessionQuotaProjection, SessionQuotaSnapshot};
-
-        let reset = Utc::now() + chrono::Duration::days(5);
-        let projection = SessionQuotaProjection {
-            snapshots: [(
-                "premium_interactions".to_string(),
-                SessionQuotaSnapshot {
-                    remaining_percentage: 37.5,
-                    reset_date_epoch_ms: Some(reset.timestamp_millis() as f64),
-                    has_quota: Some(true),
-                    ..Default::default()
-                },
-            )]
-            .into_iter()
-            .collect(),
-            ..Default::default()
-        };
-
-        let limits = copilot_usage_limits(&projection);
-        assert_eq!(limits.len(), 1);
-        assert_eq!(limits[0].window, "30d");
-        assert_eq!(limits[0].utilization, 0.625);
-        assert_eq!(
-            limits[0].resets_at.timestamp_millis(),
-            reset.timestamp_millis()
-        );
-        assert_eq!(limits[0].status, Some(UsageStatus::Allowed));
-    }
-
-    #[test]
-    fn copilot_subscription_quota_omits_unlimited_and_unknown_snapshots() {
-        use github_copilot_sdk::rpc::{SessionQuotaProjection, SessionQuotaSnapshot};
-
-        let unlimited = SessionQuotaProjection {
-            snapshots: [(
-                "premium_interactions".to_string(),
-                SessionQuotaSnapshot {
-                    is_unlimited_entitlement: true,
-                    ..Default::default()
-                },
-            )]
-            .into_iter()
-            .collect(),
-            ..Default::default()
-        };
-        assert!(copilot_usage_limits(&unlimited).is_empty());
-
-        let other_bucket = SessionQuotaProjection {
-            snapshots: [("chat".to_string(), SessionQuotaSnapshot::default())]
-                .into_iter()
-                .collect(),
-            ..Default::default()
-        };
-        assert!(copilot_usage_limits(&other_bucket).is_empty());
-    }
 
     struct MockCopilotSdk {
         request: Mutex<Option<CopilotSdkRequest>>,
@@ -634,6 +282,37 @@ mod copilot_sdk_dispatch_tests {
         assert_eq!(error.error_type.as_deref(), Some("sdk_config_error"));
     }
 
+    /// Runs only where the `copilot-sdk` feature is off, e.g.
+    /// `cargo test -p narsor-exec` (a workspace build turns it on).
+    #[cfg(not(feature = "copilot-sdk"))]
+    #[tokio::test]
+    async fn copilot_step_without_the_sdk_feature_fails_and_names_narsor_runner() {
+        let adapter = GitHubCopilotAdapter::new();
+        let config = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::json!({ "prompt": "hello" }).to_string());
+
+        let error = match run_harness_invocation(
+            "copilot-sdk",
+            &["agent".to_string(), config],
+            None,
+            Path::new("."),
+            None,
+            None,
+            FINAL_ANSWER_GRACE,
+            adapter.stream_parser(AnswerShape::Choice),
+            &ConversationSink::none(),
+            None,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a build without the SDK must refuse a Copilot step"),
+        };
+
+        assert_eq!(error.error_type.as_deref(), Some("harness_unavailable"));
+        assert!(error.message.contains("narsor-runner"), "{}", error.message);
+    }
+
     #[tokio::test]
     async fn copilot_sdk_dispatch_uses_sdk_backend_with_prompt_model_and_resume_session() {
         let adapter = GitHubCopilotAdapter::new();
@@ -687,56 +366,5 @@ mod copilot_sdk_dispatch_tests {
                 limit: None,
             })
         );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn sdk_runtime_starts_the_cli_server_protocol_not_the_agent_command() {
-        use super::GitHubCopilotSdkRuntime;
-        use github_copilot_sdk::CliProgram;
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory =
-            std::env::temp_dir().join(format!("narsor-copilot-sdk-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&directory).unwrap();
-        let args_file = directory.join("args");
-        let program = directory.join("copilot-stub");
-        std::fs::write(
-            &program,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 1\n",
-                args_file.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-        let runtime = GitHubCopilotSdkRuntime {
-            program: CliProgram::Path(program),
-        };
-        let mut on_event = |_| {};
-        let result = runtime
-            .run(
-                CopilotSdkRequest {
-                    prompt: "test".to_string(),
-                    model: None,
-                    session_id: None,
-                    working_dir: directory.clone(),
-                    action_execution_id: None,
-                    limit: None,
-                },
-                &mut on_event,
-            )
-            .await;
-
-        let args = std::fs::read_to_string(&args_file).unwrap();
-        let _ = std::fs::remove_dir_all(&directory);
-        assert!(
-            result.is_err(),
-            "the test runtime should exit before connecting"
-        );
-        assert!(args.lines().any(|arg| arg == "--server"), "{args}");
-        assert!(args.lines().any(|arg| arg == "--stdio"), "{args}");
-        assert!(!args.lines().any(|arg| arg == "agent"), "{args}");
     }
 }

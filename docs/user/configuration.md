@@ -242,6 +242,10 @@ spaces.
 An **empty** variable counts as unset, because that is how Kubernetes renders
 an unset key of a ConfigMap.
 
+`COPILOT_CLI_PATH` is not a setting either. It names the GitHub Copilot CLI
+that the `github-copilot` harness starts; without it the runner uses
+`copilot` on `PATH`. See [Agents](agents.md).
+
 `RUST_LOG` beats `NARSOR_GLOBAL__LOG_LEVEL`: it takes full `tracing`
 directives such as `narsor::engine=debug`, where the setting takes a bare
 level, and the sharper instrument should not lose. `config show` names

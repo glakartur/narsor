@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-narsor-exec = { path = "../narsor-exec" }
+narsor-exec = { path = "../narsor-exec", features = ["copilot-sdk"] }
 narsor-controller-client = { path = "../narsor-controller-client" }
 narsor-protocol = { path = "../narsor-protocol" }
 bytes = "1"

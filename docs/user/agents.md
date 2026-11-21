@@ -134,6 +134,23 @@ bundled and never installed; a missing one is reported as an action error
 naming the binary and saying it must be on `PATH`, not as
 `No such file or directory`.
 
+**GitHub Copilot needs the GitHub Copilot CLI.** The `github-copilot` harness
+runs through the GitHub Copilot SDK, which starts the Copilot CLI in server
+mode (`copilot --server --stdio`). Narsor does not ship the CLI. Install it on
+the machine or in the task image that runs `narsor-runner`. Narsor uses
+`COPILOT_CLI_PATH` when it is set, and otherwise `copilot` on `PATH`. If it
+finds neither, the step fails with `harness_not_found` and a message that
+names `copilot` and `COPILOT_CLI_PATH`. Only `narsor-runner` runs Copilot
+steps. Other binaries are built without the SDK (the `copilot-sdk` feature of
+`narsor-exec`) and refuse such a step with "the GitHub Copilot harness runs
+only in narsor-runner".
+
+The SDK of this release (`github-copilot-sdk` 1.0.27, see `Cargo.lock`)
+targets Copilot CLI 1.0.104 (its `cli-version.txt`). This is not verified
+against other CLI versions. A much older or much newer CLI can speak a
+different protocol, and the step then fails when the SDK starts or talks to
+the CLI. If that happens, install a CLI version close to 1.0.104.
+
 ### Sessions
 
 Every run is an agent session: `AgentSessionStarted` is written to the event

@@ -164,6 +164,13 @@ silent.
 startup file. The line carries a `# narsor-installer` marker so uninstall can
 find it. To build from source, see the README.
 
+The installer does not install agent harness CLIs. Install the ones your
+workflows use (Claude Code `claude`, `codex`, `opencode`, the GitHub Copilot
+CLI `copilot`) on the host or in the task image that runs `narsor-runner`,
+and put them on `PATH`. For Copilot, `COPILOT_CLI_PATH` can name the CLI
+instead. The GitHub Copilot SDK in `narsor-runner` targets Copilot CLI
+1.0.104; see [Agents](../user/agents.md).
+
 ## Uninstall
 
 The same script removes what it installed:

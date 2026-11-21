@@ -148,6 +148,15 @@ codex exec [--model <model>] --sandbox <read-only|workspace-write> \
           --config approval_policy=never --json [resume <thread-id>] <prompt>
 ```
 
+`github-copilot` is not spawned this way. It runs through the GitHub Copilot
+SDK (`github-copilot-sdk`), which starts the operator's Copilot CLI as
+`copilot --server --stdio` and talks JSON-RPC to it. The runner finds the CLI
+itself: `COPILOT_CLI_PATH` when it is set, else `copilot` on `PATH`. The SDK
+is behind the `copilot-sdk` feature of `narsor-exec`, and only
+`narsor-runner` enables it. The SDK's default feature `bundled-cli` is off,
+because it embeds the whole Copilot CLI runtime (about 200 MB) in every
+binary that links the SDK.
+
 **Which login a harness uses.** A harness keeps its subscription login next
 to its sessions — `codex` in `~/.codex/auth.json`, Claude Code in
 `~/.claude/.credentials.json` — so which `HOME` the runner gives a task decides

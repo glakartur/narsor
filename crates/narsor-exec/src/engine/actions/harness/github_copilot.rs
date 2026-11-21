@@ -1,9 +1,11 @@
 //! The `github-copilot` harness — GitHub Copilot SDK.
 //!
-//! The GitHub Copilot SDK provides a production-grade runtime for embedding AI
-//! agents. This adapter uses the Copilot SDK via JSON-RPC instead of spawning
-//! a separate CLI process. The SDK handles all communication with the GitHub
-//! Copilot service.
+//! This adapter runs a step through the GitHub Copilot SDK, which starts the
+//! operator's GitHub Copilot CLI (`copilot` on `PATH`, or `COPILOT_CLI_PATH`)
+//! in server mode and talks JSON-RPC to it. The CLI is a runtime prerequisite,
+//! like `claude`; it is not bundled. The SDK runtime is in
+//! [`super::copilot_sdk`], behind the `copilot-sdk` cargo feature that only
+//! `narsor-runner` enables.
 //!
 //! # Integration
 //!
