@@ -18,7 +18,7 @@ use std::io::{self, Write as _};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use narsor_engine::environment::backend::is_reference_name;
+use narsor_model::domain::is_reference_name;
 
 /// The name of the store directory beside the controller credential.
 pub const STORE_DIR: &str = "secrets";

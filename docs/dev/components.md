@@ -40,9 +40,9 @@ graph TD
   server --> cr[narsor-controller-runtime]
   runner[narsor-runner] --> exec[narsor-exec]
   runner --> cc[narsor-controller-client]
-  ctrl[narsor-controller] --> engine
-  ctrl --> cc
+  ctrl[narsor-controller] --> cc
   ctrl --> cr
+  ctrl --> model
   engine --> exec
   engine --> cc
   engine --> cr
@@ -52,6 +52,7 @@ graph TD
   cc --> model
   cc --> cr
   model --> shared[narsor-shared]
+  ctrl --> shared
   api --> shared
   cr --> shared
   web --> shared
@@ -67,7 +68,7 @@ graph TD
 | `narsor-observer-worker` | api-client, protocol |
 | `narsor-server` | api-client, engine, controller-runtime, protocol, shared |
 | `narsor-runner` | exec, controller-client, protocol |
-| `narsor-controller` | engine, controller-client, controller-runtime, protocol |
+| `narsor-controller` | model, controller-client, controller-runtime, protocol, shared |
 | `narsor-engine` | exec, model, store, controller-client, controller-runtime, protocol, shared |
 | `narsor-exec` | model, store, protocol, shared |
 | `narsor-controller-client` | model, controller-runtime, protocol, shared |
@@ -82,9 +83,11 @@ Rules this graph keeps:
 
 - Clients (`narsor`, `narsor-web`, `narsor-observer-worker`) do not depend on
   `narsor-engine`. They reach the engine only through `narsor-api-client`.
-- Only `narsor-server` and `narsor-controller` link `narsor-engine` (the
-  control plane). `narsor-runner` links only the execution layer
-  (`narsor-exec`) and the protocol client (`narsor-controller-client`).
+- Only `narsor-server` links `narsor-engine` (the control plane).
+  `narsor-runner` links only the execution layer (`narsor-exec`) and the
+  protocol client (`narsor-controller-client`). `narsor-controller` links
+  neither: it needs only the domain types (`narsor-model`), configuration
+  and Git rules (`narsor-shared`) and the controller crates.
 - `narsor-protocol` has no workspace dependencies.
 
 The root package lists every crate under `[dev-dependencies]`. Only the
@@ -134,7 +137,7 @@ graph TD
 | `narsor-cli` | `narsor-server`, `narsor-web`, `narsor`, `narsor-runner`, `narsor-controller` | `config show`: run each sibling binary with `--check-config` and merge the JSON reports | process (`src/cli/commands/config.rs`) |
 | `narsor-server` | `narsor-observer-worker` | Start and supervise when `server.observer.enabled` is `true` | process (`server/src/observer_worker.rs`) |
 | `narsor-controller` (local, kubernetes) | `narsor-server` | Enroll, lease, heartbeat, commands, acks, reports | HTTP, `/controller/v1` |
-| `narsor-controller local` | `narsor-runner` | One runner process per task | process (`narsor-controller/src/local/backend.rs`) |
+| `narsor-controller local` | `narsor-runner` | One runner per task: a host process, or a container in the Docker work mode | process (`narsor-controller/src/local/process.rs`), `docker` CLI (`narsor-controller/src/local/container/`) |
 | `narsor-controller kubernetes` | Kubernetes | One Pod (command `narsor-runner`) and one PVC per task | Kubernetes API (`controller/src/kubernetes/manifest.rs`) |
 | `narsor-runner` | `narsor-server` | Poll, renew, snapshots, usage, materials | HTTP, `/runner/v1` |
 | `narsor-runner` | agent harness, scripts, git | Execute workflow actions | process (`engine/src/engine/actions/`) |

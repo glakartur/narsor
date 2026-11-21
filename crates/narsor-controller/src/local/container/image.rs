@@ -50,7 +50,7 @@ use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use narsor_engine::domain::{TaskImage, TaskImageComponent};
+use narsor_model::domain::{TaskImage, TaskImageComponent};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -975,7 +975,7 @@ mod tests {
     use std::sync::mpsc::Receiver;
     use std::time::Instant;
 
-    use narsor_engine::domain::ImageSpec;
+    use narsor_model::domain::ImageSpec;
 
     use super::super::docker_fake::{DockerCall, FakeDocker};
     use super::*;

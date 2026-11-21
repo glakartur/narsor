@@ -30,8 +30,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use narsor_engine::domain::{GitIdentity, SecretDelivery, TaskLaunchSpec, TaskRepositorySource};
-use narsor_engine::registry::{check_https_remote, RemoteWording};
+use narsor_model::domain::{GitIdentity, SecretDelivery, TaskLaunchSpec, TaskRepositorySource};
+use narsor_shared::git::{check_https_remote, RemoteWording};
 
 /// The variables a secret may be delivered as without `--allow-env`: the
 /// credentials of the harnesses and tools the runner supports.
@@ -120,7 +120,7 @@ fn check_remote(identity: &GitIdentity) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use narsor_engine::domain::{
+    use narsor_model::domain::{
         BackendId, ResolvedEnvironment, ResourceProfile, SecretReference, TaskRepository,
         TaskWorkspace,
     };

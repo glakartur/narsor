@@ -39,8 +39,8 @@ change to the local backend.
 The Docker work mode of the local backend has its contract target in
 `tests/integration/backend_contract_support/local_docker.rs`. It needs **no
 Docker daemon**: the adapter talks to `FakeDocker`
-(`crates/narsor-controller/src/local/docker_fake.rs`), which builds images
-in memory and, for a started container, runs the container's program — the
+(`crates/narsor-controller/src/local/container/docker_fake.rs`), which builds
+images in memory and, for a started container, runs the container's program — the
 stub runner mounted at the runner's path — as a host process with the
 container's arguments and only its environment. Killing that process is
 `docker kill`; `remove_container` is `docker rm -f`. So the whole suite, and

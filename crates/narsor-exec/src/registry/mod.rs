@@ -37,7 +37,7 @@
 //! hole.
 
 pub mod branches;
-pub mod remote_policy;
+pub use narsor_shared::git::remote_policy;
 pub mod store;
 
 pub use branches::{

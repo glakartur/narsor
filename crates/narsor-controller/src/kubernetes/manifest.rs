@@ -56,8 +56,8 @@ use super::names;
 use narsor_controller_runtime::backend::{
     BackendError, BackendResult, TaskResources, WorkloadLaunch,
 };
-use narsor_engine::config::{HarnessHome, AGENT_ARGS_ENV};
-use narsor_engine::domain::{ImageReference, ResolvedImage, SecretReference, TaskLaunchSpec};
+use narsor_model::domain::{ImageReference, ResolvedImage, SecretReference, TaskLaunchSpec};
+use narsor_shared::config::{HarnessHome, AGENT_ARGS_ENV};
 
 /// Component label of a read-only runner's Pod.
 pub const READER_COMPONENT: &str = "reader";
@@ -287,7 +287,7 @@ impl KubernetesBackendConfig {
                     ));
                 }
             }
-            if self.harness_home.mode != narsor_engine::config::HomeMode::Private
+            if self.harness_home.mode != narsor_shared::config::HomeMode::Private
                 || self.harness_home.claude_config_dir.is_some()
             {
                 problems.push(

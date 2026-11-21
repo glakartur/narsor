@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use narsor::cli::commands::secret_set_args;
-use narsor_controller::local::secrets::SecretStore;
+use narsor_controller::local::container::secrets::SecretStore;
 use narsor_engine::config::cascade::ConfigCascade;
 use narsor_engine::config::local_controller;
 use narsor_engine::config::resolve::{resolve_with, Environment, Flags};

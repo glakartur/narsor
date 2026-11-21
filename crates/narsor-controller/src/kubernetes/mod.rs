@@ -97,12 +97,11 @@ pub use self::manifest::KubernetesBackendConfig;
 use self::manifest::{EPOCH_KEY, GENERATION_KEY, INCARNATION_ANNOTATION, RESOURCE_KEY_ANNOTATION};
 use self::objects::{PersistentVolumeClaim, Pod, StorageClass};
 use narsor_controller_runtime::backend::{
-    ArchiveProgress, BackendError, BackendResult, ExecutionBackend, Provisioned, ReaderStart,
-    Removal, StorageState, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase,
-    WorkloadState,
+    ArchiveProgress, BackendCapabilities, BackendError, BackendKind, BackendResult,
+    ExecutionBackend, Provisioned, ReaderStart, Removal, StorageState, TaskObservation,
+    TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
 };
-use narsor_engine::domain::TaskId;
-use narsor_engine::environment::{BackendCapabilities, BackendKind};
+use narsor_model::domain::TaskId;
 
 /// The Kubernetes adapter. Cloning shares the HTTP client.
 #[derive(Debug, Clone)]

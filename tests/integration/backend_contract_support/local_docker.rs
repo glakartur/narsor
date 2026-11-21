@@ -21,13 +21,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{stub_runner, ContractTarget};
-use narsor_controller::local::backend::{
-    ContainerMode, LocalBackend, LocalBackendConfig, DEFAULT_START_WINDOW, TASK_LABEL,
-};
-use narsor_controller::local::docker::{DockerTransport, UserIds};
-use narsor_controller::local::docker_fake::FakeDocker;
-use narsor_controller::local::image::{BuildSettings, TaskImageBuilds};
-use narsor_controller::local::secrets::SecretStore;
+use narsor_controller::local::backend::{LocalBackend, LocalBackendConfig};
+use narsor_controller::local::container::docker::{DockerTransport, UserIds};
+use narsor_controller::local::container::docker_fake::FakeDocker;
+use narsor_controller::local::container::image::{BuildSettings, TaskImageBuilds};
+use narsor_controller::local::container::secrets::SecretStore;
+use narsor_controller::local::container::{ContainerMode, DEFAULT_START_WINDOW, TASK_LABEL};
 use narsor_controller_runtime::backend::{ExecutionBackend, TaskResources};
 use narsor_engine::domain::{
     ImageSpec, ResolvedEnvironment, ResourceProfile, TaskId, TaskImage, TaskLaunchSpec,
