@@ -830,9 +830,9 @@ pub(super) fn print_created(task: &TaskSummary) {
     print_status(task);
 }
 
-/// The capabilities of the control plane, once it is known to be a trusted
-/// local daemon: the only one that reads files and old executions of its own
-/// disk for its owner. Any other server is refused with the reason it gives.
+/// Refuses unless the control plane is a trusted local daemon: the only one
+/// that reads workflow files of its own disk for its owner. Any other
+/// server is refused with the reason it gives.
 pub(super) async fn require_local_daemon(client: &ApiClient, what: &str) -> Result<()> {
     let capabilities = client
         .control_capabilities()

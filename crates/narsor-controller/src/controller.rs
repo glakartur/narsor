@@ -146,8 +146,9 @@ impl std::fmt::Debug for Connection {
 impl ConnectionArgs {
     /// The connection keeping its credential in `credential_file`, the
     /// enrollment code read from `--enrollment-code-file` or
-    /// [`ENROLLMENT_CODE_ENV`], or a usage error naming what is missing
-    /// (`None`: `--credential-file`, which `kubernetes` takes).
+    /// [`ENROLLMENT_CODE_ENV`] (removed from the environment once read), or
+    /// a usage error naming what is missing (`None`: `--credential-file`,
+    /// which `kubernetes` takes).
     pub fn resolve(&self, credential_file: Option<PathBuf>) -> Result<Connection, ControllerError> {
         if self.enrollment_code.is_some() {
             // The value is not repeated: it is the secret being protected.
@@ -169,9 +170,15 @@ impl ConnectionArgs {
         })?;
         let enrollment_code = match &self.enrollment_code_file {
             Some(path) => Some(read_enrollment_code(path)?),
-            None => std::env::var(ENROLLMENT_CODE_ENV)
-                .ok()
-                .filter(|code| !code.is_empty()),
+            None => {
+                let code = std::env::var(ENROLLMENT_CODE_ENV)
+                    .ok()
+                    .filter(|code| !code.is_empty());
+                // Read once, at start, before any child (a runner, the
+                // Docker CLI) is spawned: none of them inherits the code.
+                std::env::remove_var(ENROLLMENT_CODE_ENV);
+                code
+            }
         };
         Ok(Connection {
             runner_control_plane: self

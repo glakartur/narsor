@@ -41,13 +41,23 @@ impl ProtocolService {
         &self,
         ttl: std::time::Duration,
     ) -> ProtocolResult<EnrollmentResponse> {
-        self.issue_enrollment(
-            crate::environment::BackendRecord::LOCAL_ID,
-            CreateEnrollmentRequest {
-                ttl_secs: Some(ttl.as_secs()),
-                ..CreateEnrollmentRequest::default()
-            },
-        )
+        let backend_id = BackendId::parse(crate::environment::BackendRecord::LOCAL_ID)
+            .expect("a valid backend id");
+        let ttl = bounded_ttl(
+            Some(ttl.as_secs()),
+            self.config.default_enrollment_ttl,
+            self.config.max_enrollment_ttl,
+        );
+        // Every start of the daemon makes one: the earlier ones that
+        // expired unused go with it.
+        let (record, code) = self
+            .credentials
+            .create_enrollment_replacing_expired(&backend_id, ttl)?;
+        Ok(EnrollmentResponse {
+            enrollment_code: code.expose().to_string(),
+            backend_id: record.backend_id.to_string(),
+            expires_at: record.expires_at,
+        })
     }
 
     fn issue_enrollment(

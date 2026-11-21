@@ -545,8 +545,8 @@ fn read_protected(path: &Path) -> Result<Option<DaemonDiscoveryRecord>, Discover
 /// record names — the only way to tell "a live process happens to hold
 /// this PID" from "the narsor daemon is actually listening and accepting
 /// this token" (see the module doc). There is no unauthenticated `/health`
-/// endpoint (every route in this plan sits behind `require_token`), so this
-/// reuses an ordinary read endpoint, `GET /executions`, exactly as an
+/// endpoint (every route sits behind the token check), so this reuses an
+/// ordinary read endpoint, `GET /control/v1/capabilities`, exactly as an
 /// ordinary [`ApiClient`] caller would.
 async fn health_check(info: &DaemonDiscoveryRecord) -> bool {
     let client = ApiClient::with_timeout(info.addr, info.token.clone(), HEALTH_CHECK_TIMEOUT);
