@@ -8,7 +8,8 @@
 //! by itself.
 //!
 //! * A watch the server ends (its `timeoutSeconds` passed, the connection
-//!   closed) is opened again from the last version seen; bookmarks keep that
+//!   closed) is opened again from the last version seen, at once when it
+//!   delivered events or lasted [`HEALTHY_ROUND`]; bookmarks keep that
 //!   version current on a quiet namespace.
 //! * A version too old for the server (410 Gone, as an HTTP status or as an
 //!   `ERROR` event) means changes may have gone unseen: the follower lists
@@ -41,6 +42,12 @@ const RETRY_MIN: Duration = Duration::from_millis(100);
 
 /// The longest pause between two rounds.
 const RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// A watch the server closes after at least this long ended as it should
+/// (its `timeoutSeconds` on a quiet namespace, with no bookmark): it is
+/// opened again at once, like one that delivered events. A quicker close
+/// is paused after, like a failure.
+const HEALTHY_ROUND: Duration = Duration::from_secs(5);
 
 /// Follows the managed Pods and wakes `wake` at each change, until nobody
 /// listens to it any more.
@@ -93,7 +100,12 @@ impl Follower {
             };
             let round = match from {
                 Ok(mut from) => {
-                    let round = self.watch(&mut from).await;
+                    let started = tokio::time::Instant::now();
+                    let round = self.watch(&mut from).await.map(|(ended, heard)| {
+                        let lasted =
+                            matches!(ended, Ended::Closed) && started.elapsed() >= HEALTHY_ROUND;
+                        (ended, heard || lasted)
+                    });
                     if !matches!(round, Ok((Ended::Expired, _))) {
                         version = Some(from);
                     }

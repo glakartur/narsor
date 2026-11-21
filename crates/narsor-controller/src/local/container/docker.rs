@@ -25,6 +25,7 @@ use std::io;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -357,8 +358,6 @@ impl DockerTransport for DockerCli {
         label: &str,
         on_event: &mut dyn FnMut(Option<ContainerEvent>) -> bool,
     ) -> DockerResult<()> {
-        use std::io::BufRead as _;
-
         let args = container_events_args(label);
         let mut child = Command::new(&self.program)
             .args(&args)
@@ -368,18 +367,20 @@ impl DockerTransport for DockerCli {
             .spawn()
             .map_err(|error| spawn_failure(&error, &args))?;
         let stderr = read_all(child.stderr.take().expect("stderr is piped"));
-        let stdout = io::BufReader::new(child.stdout.take().expect("stdout is piped"));
-        for line in stdout.lines() {
-            let Ok(line) = line else { break };
-            let Some(event) = parse_container_event(&line) else {
-                tracing::debug!(%line, "docker events: an event that cannot be read");
-                continue;
-            };
-            if !on_event(Some(event)) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Ok(());
-            }
+        let lines = read_lines(child.stdout.take().expect("stdout is piped"));
+        let early = match pump_events(&lines, EVENTS_IDLE_TICK, on_event) {
+            PumpEnd::Ended => None,
+            PumpEnd::Unwanted => Some(Ok(())),
+            PumpEnd::Failed(message) => Some(Err(DockerError::Failed {
+                command: command_line(&args),
+                message: format!("cannot read the docker events: {message}"),
+            })),
+        };
+        if let Some(outcome) = early {
+            // Still running: nobody reads it any more.
+            let _ = child.kill();
+            let _ = child.wait();
+            return outcome;
         }
         let status = child.wait().map_err(|error| DockerError::Failed {
             command: command_line(&args),
@@ -408,6 +409,66 @@ impl DockerTransport for DockerCli {
             return Ok(tail_text(&format!("{stdout}{stderr}")));
         }
         Err(classify_failure(&command_line(&args), &tail_text(&stderr)))
+    }
+}
+
+/// How long the event follower waits for a line before it asks its
+/// callback (with `None`) whether events are still wanted: a quiet stream
+/// still stops soon after its follower is no longer heard.
+const EVENTS_IDLE_TICK: Duration = Duration::from_secs(1);
+
+/// How [`pump_events`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum PumpEnd {
+    /// The callback wanted no more events.
+    Unwanted,
+    /// The stream ended.
+    Ended,
+    /// Reading the stream failed.
+    Failed(String),
+}
+
+/// The lines of `pipe`, read on a thread of their own until it ends, fails
+/// or nobody receives them any more.
+fn read_lines(pipe: impl io::Read + Send + 'static) -> mpsc::Receiver<io::Result<String>> {
+    use std::io::BufRead as _;
+
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in io::BufReader::new(pipe).lines() {
+            let failed = line.is_err();
+            if sender.send(line).is_err() || failed {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
+/// Hands every container event of `lines` to `on_event`, and `None` after
+/// each `idle` without one, until the callback returns false, the stream
+/// ends or a read fails.
+fn pump_events(
+    lines: &mpsc::Receiver<io::Result<String>>,
+    idle: Duration,
+    on_event: &mut dyn FnMut(Option<ContainerEvent>) -> bool,
+) -> PumpEnd {
+    loop {
+        let wanted = match lines.recv_timeout(idle) {
+            Ok(Ok(line)) => match parse_container_event(&line) {
+                Some(event) => on_event(Some(event)),
+                None => {
+                    tracing::debug!(%line, "docker events: an event that cannot be read");
+                    continue;
+                }
+            },
+            Ok(Err(error)) => return PumpEnd::Failed(error.to_string()),
+            Err(mpsc::RecvTimeoutError::Timeout) => on_event(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return PumpEnd::Ended,
+        };
+        if !wanted {
+            return PumpEnd::Unwanted;
+        }
     }
 }
 
@@ -924,6 +985,29 @@ mod tests {
         let network = r#"{"Type":"network","Action":"connect","Actor":{"ID":"n","Attributes":{}}}"#;
         assert_eq!(parse_container_event(network), None);
         assert_eq!(parse_container_event("not json"), None);
+    }
+
+    /// A quiet stream that stays open still asks whether events are wanted,
+    /// so its follower stops; a stream that cannot be read stops too.
+    #[test]
+    fn the_event_pump_stops_on_a_quiet_open_stream_and_on_a_read_error() {
+        let event =
+            r#"{"Type":"container","Action":"die","Actor":{"ID":"a","Attributes":{"name":"n"}}}"#;
+        let (sender, lines) = mpsc::channel();
+        sender.send(Ok(event.to_string())).unwrap();
+        let mut seen = Vec::new();
+        let end = pump_events(&lines, Duration::from_millis(10), &mut |event| {
+            seen.push(event.map(|event| event.action));
+            seen.len() < 2
+        });
+        assert_eq!(end, PumpEnd::Unwanted);
+        assert_eq!(seen, [Some("die".to_string()), None]);
+        drop(sender);
+
+        let (sender, lines) = mpsc::channel();
+        sender.send(Err(io::Error::other("broken pipe"))).unwrap();
+        let end = pump_events(&lines, Duration::from_millis(10), &mut |_| true);
+        assert_eq!(end, PumpEnd::Failed("broken pipe".into()));
     }
 
     #[test]
