@@ -178,6 +178,22 @@ pub enum LocalCommand {
         #[command(subcommand)]
         command: ImageCommand,
     },
+    /// Checks the Docker daemon the docker work mode would use.
+    #[command(hide = true)]
+    Docker {
+        /// What to check.
+        #[command(subcommand)]
+        command: DockerCommand,
+    },
+}
+
+/// What `narsor-controller local docker` can do.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum DockerCommand {
+    /// Exits 0 and prints the daemon's version when the docker work mode
+    /// can use the Docker daemon; otherwise prints why on stderr and exits 1
+    /// (`narsor-cli init`).
+    Check,
 }
 
 /// What `narsor-controller local image` can do.
@@ -229,7 +245,20 @@ pub fn local_helper_command(command: LocalCommand) -> i32 {
         LocalCommand::Image {
             command: ImageCommand::Refresh(args),
         } => exit_code(image_refresh(&args)),
+        LocalCommand::Docker {
+            command: DockerCommand::Check,
+        } => exit_code(docker_check(&DockerCli::default())),
     }
+}
+
+/// `local docker check`: the availability check the backend makes before
+/// a Docker-mode task, run once.
+fn docker_check(docker: &dyn DockerTransport) -> Result<(), ControllerError> {
+    let version = docker
+        .check_available()
+        .map_err(|error| ControllerError::failure(error.to_string()))?;
+    println!("{version}");
+    Ok(())
 }
 
 /// The credential file a helper command names, else the default one.

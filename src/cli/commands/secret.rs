@@ -36,7 +36,7 @@ pub fn secret_set_args(state_dir: &Path, name: &str) -> Vec<OsString> {
 
 /// The `narsor-controller` installed next to this executable; `role` says
 /// why it is needed when it is missing.
-pub(super) fn controller_program(role: &str) -> Result<PathBuf> {
+pub fn controller_program(role: &str) -> Result<PathBuf> {
     sibling_executable(CONTROLLER_BINARY)
         .map_err(|error| {
             CliError::failure(format!("cannot look for {CONTROLLER_BINARY}: {error}"))

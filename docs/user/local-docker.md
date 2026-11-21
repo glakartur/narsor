@@ -33,6 +33,24 @@ for workflows, the TUI, the CLI or the web interface.
 
 ## Setup
 
+The installer can do steps 1 and 3 for you: for the `local` role,
+`narsor-cli init` asks for the **work mode for local tasks** (`process` or
+`docker`), or takes `--local-mode docker`
+(`install.sh --role local --local-mode docker`, or
+`narsor-cli init --role local --local-mode docker`). It checks Docker, writes
+`controller.local.mode: docker` and, when `{catalog}/runtime.yaml` does not
+exist, creates it with the example task image (`base-tools` and
+`claude-code`) and copies the component scripts into
+`{catalog}/components/`. An existing `runtime.yaml` is left unchanged. Then
+store the Claude Code token (step 2):
+
+```console
+$ claude setup-token                              # prints a long-lived token
+$ narsor-cli secret set claude-token < token-file
+```
+
+By hand:
+
 1. Define the task image in the catalogue, `{catalog}/runtime.yaml` (see
    [The task image](#the-task-image)). The example catalogue has one:
    `examples/catalog/runtime.yaml` with scripts in

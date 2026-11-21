@@ -43,7 +43,8 @@ enum Backend {
 }
 
 /// `narsor-controller local`: the controller, or one of its hidden helper
-/// commands (`local secret set`, `local image refresh`), which take none of the controller's
+/// commands (`local secret set`, `local image refresh`,
+/// `local docker check`), which take none of the controller's
 /// arguments.
 ///
 /// Written by hand because the derive cannot make the controller's
