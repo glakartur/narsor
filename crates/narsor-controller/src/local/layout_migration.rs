@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 
 use narsor_model::domain::WorkflowExecution;
 use narsor_shared::layout_move::{self, Mover};
+use narsor_store::paths::EXECUTIONS_DIR;
 use narsor_store::ExecutionStore;
 
 use super::container::image;
@@ -285,15 +286,24 @@ fn rename_claude_sessions(old_storage: &[PathBuf; 2], new_storage: &Path) -> usi
 /// every directory on the way is a real one: a link (to anywhere outside
 /// the storage) is not followed, with a warning.
 fn claude_projects_dir(task: &Path) -> Option<PathBuf> {
-    let mut path = task.to_path_buf();
-    let components = Path::new(CLAUDE_PROJECTS).components();
+    real_dir_below(task, Path::new(CLAUDE_PROJECTS), "Claude sessions path")
+}
+
+/// `base` joined with `relative` when `base` and every directory on the way
+/// are real directories, `None` when one is missing or is not a directory.
+/// A task writes its own storage: a symbolic link it planted must not send
+/// the migration's reads or writes outside it, so one is refused with a
+/// warning naming `what`.
+fn real_dir_below(base: &Path, relative: &Path, what: &str) -> Option<PathBuf> {
+    let mut path = base.to_path_buf();
+    let components = relative.components();
     for component in std::iter::once(None).chain(components.map(Some)) {
         if let Some(component) = component {
             path.push(component);
         }
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                tracing::warn!(path = %path.display(), "migration: a symbolic link in a task's Claude sessions path; leaving its sessions as they are");
+                tracing::warn!(path = %path.display(), "migration: a symbolic link in a task's {what}; leaving it as it is");
                 return None;
             }
             Ok(metadata) if metadata.is_dir() => {}
@@ -325,6 +335,12 @@ fn rebase_workspace_paths(old_storage: &[PathBuf; 2], new_storage: &Path) -> usi
             .zip(&new_storage)
             .map(|(old, new)| (old.join(task.file_name()), new.join(task.file_name())))
             .collect();
+        // Every directory the store reads or writes below the task must be
+        // real: the files themselves are replaced by a rename, never followed.
+        let executions = Path::new(TASK_STATE_DIR).join(EXECUTIONS_DIR);
+        if real_dir_below(&task.path(), &executions, "stored executions").is_none() {
+            continue;
+        }
         let store = ExecutionStore::new(task.path().join(TASK_STATE_DIR));
         let ids = match store.list_execution_ids() {
             Ok(ids) => ids,
@@ -334,6 +350,15 @@ fn rebase_workspace_paths(old_storage: &[PathBuf; 2], new_storage: &Path) -> usi
             }
         };
         for id in ids {
+            if real_dir_below(
+                &task.path(),
+                &executions.join(id.as_str()),
+                "stored executions",
+            )
+            .is_none()
+            {
+                continue;
+            }
             let mut execution = match store.load_execution(&id) {
                 Ok(execution) => execution,
                 Err(error) => {
@@ -671,6 +696,31 @@ mod tests {
             0,
             "a repeat after a crash changes nothing"
         );
+    }
+
+    /// A task writes its own storage: a `state` it turned into a link to
+    /// another directory must not get that directory's executions rewritten.
+    #[test]
+    fn a_linked_task_state_directory_is_left_alone() {
+        let temp = Temp::new();
+        let old_storage = temp.0.join("old/storage");
+        let new_storage = temp.0.join("new/storage");
+        let outside = temp.0.join("outside");
+        let planted = paused_execution(&old_storage.join("task-1/workspace"), "/srv/x");
+        ExecutionStore::new(&outside)
+            .save_execution(&planted)
+            .unwrap();
+        fs::create_dir_all(new_storage.join("task-1")).unwrap();
+        std::os::unix::fs::symlink(&outside, new_storage.join("task-1").join(TASK_STATE_DIR))
+            .unwrap();
+
+        let rebased = rebase_workspace_paths(&[old_storage.clone(), old_storage], &new_storage);
+
+        assert_eq!(rebased, 0);
+        let kept = ExecutionStore::new(&outside)
+            .load_execution("exec-1")
+            .unwrap();
+        assert_eq!(kept.workspace.path, planted.workspace.path);
     }
 
     /// `narsor-cli secret set` run after the update and before the first
