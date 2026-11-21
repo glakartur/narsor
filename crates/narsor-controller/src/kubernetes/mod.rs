@@ -42,6 +42,13 @@
 //! second one while it exists. The ReadWriteOnce claim is the second guard
 //! against two runners on one storage.
 //!
+//! The controller is woken at once by any change of a managed Pod: the
+//! first time it waits ([`ExecutionBackend::changed`]) the adapter starts
+//! following them with a list and a watch (`watch`, R4). The watch only
+//! wakes; the next observation tells what changed. Without it — an RBAC
+//! that does not grant `list` and `watch` on pods, an API server that
+//! drops it — the controller observes at its periodic pace.
+//!
 //! `resourceVersion` is opaque and must not be compared, so the monotonic
 //! `resource_generation` is derived deliberately: the phase only ever moves
 //! forward for one Pod (Starting 1 → Running 2 → Exited 3 → Deleting 4), and
@@ -82,9 +89,10 @@ pub mod client;
 pub mod manifest;
 pub mod names;
 pub mod objects;
+mod watch;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -99,15 +107,33 @@ use self::objects::{PersistentVolumeClaim, Pod, StorageClass};
 use narsor_controller_runtime::backend::{
     ArchiveProgress, BackendCapabilities, BackendError, BackendKind, BackendResult,
     ExecutionBackend, Provisioned, ReaderStart, Removal, StorageState, TaskObservation,
-    TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
+    TaskResources, WakeListener, WakeSignal, WorkloadLaunch, WorkloadPhase, WorkloadState,
 };
 use narsor_model::domain::TaskId;
 
-/// The Kubernetes adapter. Cloning shares the HTTP client.
-#[derive(Debug, Clone)]
+/// The Kubernetes adapter. Cloning shares the HTTP client and the Pod
+/// watch; each clone is woken by it on its own.
+#[derive(Debug)]
 pub struct KubernetesBackend {
     client: KubeClient,
     config: Arc<KubernetesBackendConfig>,
+    /// What a managed Pod's change wakes (R4).
+    wake: WakeSignal,
+    listener: Arc<WakeListener>,
+    /// Starts the Pod watch, once, at the first wait.
+    following: Arc<Once>,
+}
+
+impl Clone for KubernetesBackend {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            config: Arc::clone(&self.config),
+            listener: Arc::new(self.wake.listen()),
+            wake: self.wake.clone(),
+            following: Arc::clone(&self.following),
+        }
+    }
 }
 
 impl KubernetesBackend {
@@ -143,9 +169,13 @@ impl KubernetesBackend {
         if !names::is_dns_label(&namespace) {
             return Err(format!("namespace '{namespace}' is not a DNS-1123 label"));
         }
+        let wake = WakeSignal::new();
         Ok(Self {
             client: client()?,
             config: Arc::new(config),
+            listener: Arc::new(wake.listen()),
+            wake,
+            following: Arc::new(Once::new()),
         })
     }
 
@@ -577,6 +607,16 @@ impl ExecutionBackend for KubernetesBackend {
             persistent_storage: true,
             archive: true,
         }
+    }
+
+    async fn changed(&self) {
+        self.following.call_once(|| {
+            tokio::spawn(watch::follow_managed_pods(
+                self.client.clone(),
+                self.wake.clone(),
+            ));
+        });
+        self.listener.woken().await;
     }
 
     fn resources(&self, task_id: &TaskId, resource_key: &str) -> BackendResult<TaskResources> {

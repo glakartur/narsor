@@ -457,6 +457,12 @@ impl WakeSignal {
     pub fn unheard(&self) -> bool {
         self.0.receiver_count() == 0
     }
+
+    /// Resolves once no listener is left: an event follower waiting on a
+    /// quiet stream can stop without waiting for its next event.
+    pub async fn deserted(&self) {
+        self.0.closed().await;
+    }
 }
 
 /// The consumer side of a [`WakeSignal`]: what a backend's

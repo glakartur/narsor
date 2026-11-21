@@ -14,7 +14,10 @@
 #   The controller is its one writer in Narsor: `narsor-controller
 #   edit-claude-profile`, run in the controller Pod, writes it back after
 #   a Claude Code edit session (R15). Task Pods mount it read-only;
-# * no other update/patch: a Pod is never modified, only replaced.
+# * no other update/patch: a Pod is never modified, only replaced;
+# * pods list and watch: the controller follows its Pods (selected by the
+#   label app.kubernetes.io/managed-by=narsor) only to wake at once when
+#   one changes (R4). Without them it still works, at its periodic pace.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -29,7 +32,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "create", "delete"]
+    verbs: ["get", "list", "watch", "create", "delete"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "create", "delete"]

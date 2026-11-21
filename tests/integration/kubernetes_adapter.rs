@@ -1672,6 +1672,95 @@ async fn observation_is_normalized_and_foreign_objects_are_refused() {
 }
 
 // ---------------------------------------------------------------------------
+// The Pod watch that wakes the controller (R4)
+// ---------------------------------------------------------------------------
+
+/// A provisioned task, with the adapter already following its Pods
+/// (nothing changed since it listed them).
+async fn watched(quiet: &Quiet) -> TaskResources {
+    let task = task_resources(&quiet.backend, "task-1");
+    quiet
+        .backend
+        .provision(&task, &launch_of("task-1", 1, spec()))
+        .await
+        .unwrap();
+    let woken = tokio::time::timeout(Duration::from_millis(50), quiet.backend.changed()).await;
+    assert!(woken.is_err(), "nothing changed since the list");
+    wait_until("the Pod watch", async || quiet.cluster.pod_watches() == 1).await;
+    task
+}
+
+/// A Pod whose runner fails wakes the controller at once, and its
+/// observation then sees the exit.
+#[tokio::test]
+async fn a_pod_that_fails_wakes_the_controller_whose_observation_sees_it() {
+    let quiet = Quiet::new();
+    let task = watched(&quiet).await;
+
+    assert!(quiet.cluster.fail_pod(&task.workload, 137));
+
+    tokio::time::timeout(Duration::from_secs(5), quiet.backend.changed())
+        .await
+        .expect("woken by the failure");
+    let observed = quiet.backend.observe(&task).await.unwrap().workload;
+    assert_eq!(
+        observed.unwrap().phase,
+        WorkloadPhase::Exited { code: Some(137) }
+    );
+}
+
+/// A change made while the watch ended and its version expired (410 Gone)
+/// reaches no watch: the adapter lists again and wakes the controller
+/// anyway, then follows the Pods from the new list.
+#[tokio::test]
+async fn an_expired_pod_watch_lists_again_without_missing_a_wake() {
+    let quiet = Quiet::new();
+    let task = watched(&quiet).await;
+
+    assert!(quiet.cluster.evict_unwatched(&task.workload));
+
+    tokio::time::timeout(Duration::from_secs(5), quiet.backend.changed())
+        .await
+        .expect("woken after listing again");
+    assert_eq!(quiet.cluster.pod_lists(), 2, "listed again");
+    let other = task_resources(&quiet.backend, "task-2");
+    quiet
+        .backend
+        .provision(&other, &launch_of("task-2", 1, spec()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), quiet.backend.changed())
+        .await
+        .expect("woken by a new Pod through the renewed watch");
+}
+
+/// With a Role from before the watch (no list or watch on pods) nothing
+/// wakes the controller and the adapter keeps working: the follower retries
+/// with a growing pause instead of hammering the API server.
+#[tokio::test]
+async fn a_role_without_the_pod_watch_leaves_the_controller_at_its_periodic_pace() {
+    let quiet = Quiet::new();
+    quiet.cluster.forbid_pod_watch(true);
+    let task = task_resources(&quiet.backend, "task-1");
+    quiet
+        .backend
+        .provision(&task, &launch_of("task-1", 1, spec()))
+        .await
+        .unwrap();
+
+    let woken = tokio::time::timeout(Duration::from_secs(2), quiet.backend.changed()).await;
+
+    assert!(woken.is_err(), "nothing wakes it");
+    let attempts = quiet.cluster.pod_lists();
+    assert!(
+        (2..=12).contains(&attempts),
+        "retried with a growing pause, not in a loop: {attempts} lists"
+    );
+    let observed = quiet.backend.observe(&task).await.unwrap().workload;
+    assert_eq!(observed.unwrap().phase, WorkloadPhase::Starting);
+}
+
+// ---------------------------------------------------------------------------
 // End to end through the controller
 // ---------------------------------------------------------------------------
 
@@ -2079,6 +2168,9 @@ fn controller_rbac_is_namespaced_and_minimal() {
     assert_eq!(profile_verbs, BTreeSet::from(["get", "update"]));
     for (resource, verb) in [
         ("pods", "get"),
+        // The Pod watch that wakes the controller (R4).
+        ("pods", "list"),
+        ("pods", "watch"),
         ("pods", "create"),
         ("pods", "delete"),
         ("persistentvolumeclaims", "get"),

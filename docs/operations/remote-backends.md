@@ -400,8 +400,15 @@ kubectl apply -f deploy/kubernetes/controller.yaml             # backend config,
 ```
 
 The admission parameter ConfigMap must exist before the bindings reference
-it, and the controller must start only once the policies are enforced. An
-operator who is only a Rancher Project Owner needs the cluster administrator
+it, and the controller must start only once the policies are enforced.
+
+The controller's Role grants `list` and `watch` on pods: the controller
+watches its own Pods so that a Pod change wakes it at once. When you
+upgrade a controller, apply `controller-rbac.yaml` again. With an older
+Role the controller logs a warning ("cannot watch the managed Pods") and
+notices Pod changes only at its periodic observation.
+
+An operator who is only a Rancher Project Owner needs the cluster administrator
 to create the shared policies, the per-user admission bindings and the
 StorageClass read binding.
 

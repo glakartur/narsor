@@ -10,11 +10,21 @@
 //!
 //! Exactly the endpoints and verbs the controller's RBAC grants
 //! (`deploy/kubernetes/controller-rbac.yaml`): Pods and PVCs get, create
-//! and delete; Secrets create only (a read or delete of a Secret answers
-//! 403, as RBAC would); StorageClasses get. Creates answer 409
+//! and delete, Pods also list and watch; Secrets create only (a read or
+//! delete of a Secret answers 403, as RBAC would); StorageClasses get. Creates answer 409
 //! `AlreadyExists` for a taken name, deletes honour a UID precondition
 //! (409 on mismatch), and a missing object is a 404 `Status`. Every request
 //! and every created object is recorded for the tests to inspect.
+//!
+//! # The Pod watch
+//!
+//! Every change of a Pod — created, marked for deletion, started, ended,
+//! gone — gets a new `resourceVersion` and an event in the mock's history,
+//! which every open watch delivers from the version it started at (filtered
+//! by its label selector). A test can end the open watches, make the
+//! history too old for them (410 Gone, sent as an `ERROR` event as API
+//! servers do), or refuse list and watch as an RBAC without them would; it
+//! sees how often the Pods were listed and watched.
 //!
 //! # The kubelet
 //!
@@ -47,10 +57,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 
-use narsor_controller::kubernetes::client::{KubeTransport, Method, StatusCode, TransportFuture};
+use narsor_controller::kubernetes::client::{
+    KubeTransport, Method, StatusCode, TransportFuture, WatchAnswer, WatchStream,
+};
 use narsor_controller::kubernetes::manifest::RUNNER_CONTAINER;
 use narsor_controller::kubernetes::{KubernetesBackend, KubernetesBackendConfig};
 use narsor_controller_runtime::backend::BackendResult;
@@ -91,6 +105,15 @@ struct ClusterState {
     hold_pod_deletion: bool,
     kubelet: bool,
     fail_requests: u32,
+    /// Every Pod change as a watch event, by its resourceVersion.
+    pod_events: Vec<(u64, Value)>,
+    /// A watch from a version below this one is answered 410 Gone.
+    watch_floor: u64,
+    /// Bumped to end every open watch.
+    watch_ends: u64,
+    forbid_pod_watch: bool,
+    pod_lists: usize,
+    pod_watches: usize,
 }
 
 struct Runner {
@@ -101,6 +124,8 @@ struct Runner {
 /// The mock cluster: API server plus kubelet.
 pub struct MockCluster {
     state: Mutex<ClusterState>,
+    /// Tells the open watches that the history grew or they must end.
+    watch_notify: Notify,
     scratch: PathBuf,
     program: PathBuf,
 }
@@ -120,6 +145,63 @@ impl KubeTransport for MockCluster {
     ) -> TransportFuture<'a, BackendResult<(StatusCode, Value)>> {
         let answer = self.handle(method, path, body.cloned());
         Box::pin(async move { Ok(answer) })
+    }
+
+    fn watch<'a>(
+        &'a self,
+        path: &'a str,
+        _timeout: Duration,
+    ) -> TransportFuture<'a, BackendResult<WatchAnswer<'a>>> {
+        let answer = self.open_watch(path);
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
+/// One open watch of the mock's Pods.
+struct MockWatch<'a> {
+    cluster: &'a MockCluster,
+    /// The last version delivered.
+    cursor: u64,
+    /// The `watch_ends` it started under.
+    ends: u64,
+    selector: Option<(String, String)>,
+    /// Answers 410 Gone first, then ends.
+    expired: bool,
+    done: bool,
+}
+
+impl MockWatch<'_> {
+    async fn next(&mut self) -> BackendResult<Option<Value>> {
+        loop {
+            let notified = self.cluster.watch_notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.cluster.lock();
+                if self.done || state.watch_ends != self.ends {
+                    return Ok(None);
+                }
+                if self.expired {
+                    self.done = true;
+                    let (_, gone) = status(StatusCode::GONE, "Expired", "too old resource version");
+                    return Ok(Some(json!({ "type": "ERROR", "object": gone })));
+                }
+                let next = state.pod_events.iter().find(|(version, event)| {
+                    *version > self.cursor && selects(&self.selector, &event["object"])
+                });
+                if let Some((version, event)) = next {
+                    self.cursor = *version;
+                    return Ok(Some(event.clone()));
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+impl WatchStream for MockWatch<'_> {
+    fn next_event(&mut self) -> TransportFuture<'_, BackendResult<Option<Value>>> {
+        Box::pin(self.next())
     }
 }
 
@@ -146,6 +228,7 @@ impl MockCluster {
         }
         Arc::new(Self {
             state: Mutex::new(state),
+            watch_notify: Notify::new(),
             scratch: scratch.to_path_buf(),
             program: program.into(),
         })
@@ -164,6 +247,7 @@ impl MockCluster {
     /// Lets the kubelet act once, as it does before every request.
     pub fn tick(&self) {
         self.tick_locked(&mut self.lock());
+        self.watch_notify.notify_waiters();
     }
 
     fn lock(&self) -> MutexGuard<'_, ClusterState> {
@@ -303,7 +387,68 @@ impl MockCluster {
             return false;
         };
         pod["metadata"]["deletionTimestamp"] = Value::String(now());
+        pod_changed(&mut state, "MODIFIED", name);
+        drop(state);
+        self.watch_notify.notify_waiters();
         true
+    }
+
+    /// The node reports the Pod's runner ended with `code` (128 + 9 for a
+    /// kill), without the kubelet running anything.
+    pub fn fail_pod(&self, name: &str, code: i32) -> bool {
+        let mut state = self.lock();
+        let Some(pod) = state.pods.get_mut(name) else {
+            return false;
+        };
+        pod["status"] = json!({
+            "phase": "Failed",
+            "containerStatuses": [{
+                "name": RUNNER_CONTAINER,
+                "state": { "terminated": { "exitCode": code } },
+            }],
+        });
+        pod_changed(&mut state, "MODIFIED", name);
+        drop(state);
+        self.watch_notify.notify_waiters();
+        true
+    }
+
+    /// Ends every open Pod watch, as an API server restart would.
+    pub fn end_pod_watches(&self) {
+        self.lock().watch_ends += 1;
+        self.watch_notify.notify_waiters();
+    }
+
+    /// Deletes a Pod while the open watches end and every version seen so
+    /// far becomes too old (410 Gone): no watch delivers the change.
+    pub fn evict_unwatched(&self, name: &str) -> bool {
+        let mut state = self.lock();
+        let Some(pod) = state.pods.get_mut(name) else {
+            return false;
+        };
+        pod["metadata"]["deletionTimestamp"] = Value::String(now());
+        pod_changed(&mut state, "MODIFIED", name);
+        state.watch_ends += 1;
+        state.watch_floor = state.next_version;
+        drop(state);
+        self.watch_notify.notify_waiters();
+        true
+    }
+
+    /// While set, listing and watching Pods answer 403, as a Role without
+    /// those verbs would.
+    pub fn forbid_pod_watch(&self, forbid: bool) {
+        self.lock().forbid_pod_watch = forbid;
+    }
+
+    /// How often the Pods were listed.
+    pub fn pod_lists(&self) -> usize {
+        self.lock().pod_lists
+    }
+
+    /// How often a Pod watch was opened.
+    pub fn pod_watches(&self) -> usize {
+        self.lock().pod_watches
     }
 
     /// The Pod's node stops reporting (a partition): the Pod's phase turns
@@ -315,6 +460,9 @@ impl MockCluster {
             return false;
         };
         pod["status"]["phase"] = Value::String("Unknown".into());
+        pod_changed(&mut state, "MODIFIED", name);
+        drop(state);
+        self.watch_notify.notify_waiters();
         true
     }
 
@@ -365,7 +513,34 @@ impl MockCluster {
         self.tick_locked(&mut state);
         let (status, answer) = self.answer(&mut state, &method, path, body);
         self.record(&mut state, &method, path, status);
+        drop(state);
+        self.watch_notify.notify_waiters();
         (status, answer)
+    }
+
+    fn open_watch(&self, path: &str) -> WatchAnswer<'_> {
+        let mut state = self.lock();
+        state.pod_watches += 1;
+        let forbidden = state.forbid_pod_watch
+            || parse(path).map(|(_, plural, name)| (plural, name)) != Some(("pods", None))
+            || query(path, "watch").as_deref() != Some("true");
+        if forbidden {
+            let (code, body) = status(StatusCode::FORBIDDEN, "Forbidden", "RBAC: not granted");
+            self.record(&mut state, &Method::GET, path, code);
+            return WatchAnswer::Refused(code, body);
+        }
+        self.record(&mut state, &Method::GET, path, StatusCode::OK);
+        let from = query(path, "resourceVersion")
+            .and_then(|version| version.parse::<u64>().ok())
+            .unwrap_or(0);
+        WatchAnswer::Events(Box::new(MockWatch {
+            cluster: self,
+            cursor: from,
+            ends: state.watch_ends,
+            selector: selector(path),
+            expired: from < state.watch_floor,
+            done: false,
+        }))
     }
 
     fn answer(
@@ -391,6 +566,28 @@ impl MockCluster {
         }
         let forbidden = || status(StatusCode::FORBIDDEN, "Forbidden", "RBAC: not granted");
         match (plural, method.clone(), name) {
+            ("pods", Method::GET, None) => {
+                state.pod_lists += 1;
+                if state.forbid_pod_watch {
+                    return forbidden();
+                }
+                let selector = selector(path);
+                let items: Vec<Value> = state
+                    .pods
+                    .values()
+                    .filter(|pod| selects(&selector, pod))
+                    .cloned()
+                    .collect();
+                (
+                    StatusCode::OK,
+                    json!({
+                        "kind": "PodList",
+                        "apiVersion": "v1",
+                        "metadata": { "resourceVersion": state.next_version.to_string() },
+                        "items": items,
+                    }),
+                )
+            }
             ("storageclasses", Method::GET, Some(name)) => match state.storage_classes.get(name) {
                 Some(object) => (StatusCode::OK, object.clone()),
                 None => not_found(name),
@@ -443,8 +640,7 @@ impl MockCluster {
                     .and_then(|body| body.pointer("/preconditions/uid"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                let objects = objects(state, plural);
-                let Some(object) = objects.get_mut(name) else {
+                let Some(object) = objects(state, plural).get_mut(name) else {
                     return not_found(name);
                 };
                 if precondition.is_some_and(|uid| object["metadata"]["uid"] != uid.as_str()) {
@@ -452,8 +648,12 @@ impl MockCluster {
                 }
                 if object["metadata"]["deletionTimestamp"].is_null() {
                     object["metadata"]["deletionTimestamp"] = Value::String(now());
+                    if plural == "pods" {
+                        pod_changed(state, "MODIFIED", name);
+                    }
                 }
-                (StatusCode::OK, object.clone())
+                let object = objects(state, plural)[name].clone();
+                (StatusCode::OK, object)
             }
             _ => forbidden(),
         }
@@ -488,7 +688,10 @@ impl MockCluster {
             }
             _ => {}
         }
-        objects(state, plural).insert(name, object.clone());
+        objects(state, plural).insert(name.clone(), object.clone());
+        if plural == "pods" {
+            pod_changed(state, "ADDED", &name);
+        }
         (StatusCode::CREATED, object)
     }
 
@@ -517,6 +720,7 @@ impl MockCluster {
                             "state": { "terminated": { "exitCode": code } },
                         }],
                     });
+                    pod_changed(state, "MODIFIED", &name);
                 }
             }
         }
@@ -548,7 +752,13 @@ impl MockCluster {
                 let _ = runner.child.wait();
                 state.runners.remove(&name);
             }
-            state.pods.remove(&name);
+            if let Some(pod) = state.pods.remove(&name) {
+                state.next_version += 1;
+                let version = state.next_version;
+                state
+                    .pod_events
+                    .push((version, json!({ "type": "DELETED", "object": pod })));
+            }
             state.secrets.retain(|_, secret| {
                 !secret["metadata"]["ownerReferences"]
                     .as_array()
@@ -601,6 +811,7 @@ impl MockCluster {
                         "phase": "Running",
                         "containerStatuses": [{ "name": RUNNER_CONTAINER, "state": { "running": {} } }],
                     });
+                    pod_changed(state, "MODIFIED", &name);
                 }
                 // A volume is not there yet: try again next tick.
                 Ok(None) => {}
@@ -613,6 +824,7 @@ impl MockCluster {
                             "state": { "terminated": { "exitCode": 128 } },
                         }],
                     });
+                    pod_changed(state, "MODIFIED", &name);
                 }
             }
         }
@@ -736,6 +948,58 @@ fn objects<'a>(state: &'a mut ClusterState, plural: &str) -> &'a mut BTreeMap<St
     }
 }
 
+/// Gives the Pod a new `resourceVersion` and records the change for the
+/// watches.
+fn pod_changed(state: &mut ClusterState, kind: &str, name: &str) {
+    state.next_version += 1;
+    let version = state.next_version;
+    if let Some(pod) = state.pods.get_mut(name) {
+        pod["metadata"]["resourceVersion"] = Value::String(version.to_string());
+        let event = json!({ "type": kind, "object": pod.clone() });
+        state.pod_events.push((version, event));
+    }
+}
+
+/// A query parameter of `path`, percent-decoded.
+fn query(path: &str, key: &str) -> Option<String> {
+    let (_, query) = path.split_once('?')?;
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == key).then(|| decode(value))
+    })
+}
+
+fn decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The one `key=value` term of the path's label selector.
+fn selector(path: &str) -> Option<(String, String)> {
+    let selector = query(path, "labelSelector")?;
+    let (key, value) = selector.split_once('=')?;
+    Some((key.to_string(), value.to_string()))
+}
+
+fn selects(selector: &Option<(String, String)>, object: &Value) -> bool {
+    selector.as_ref().is_none_or(|(key, value)| {
+        object["metadata"]["labels"][key.as_str()].as_str() == Some(value.as_str())
+    })
+}
+
 fn claims(pod: &Value) -> Vec<String> {
     pod["spec"]["volumes"]
         .as_array()
@@ -774,6 +1038,7 @@ fn not_found(name: &str) -> (StatusCode, Value) {
 
 /// `(namespace, plural, name)` of an API path.
 fn parse(path: &str) -> Option<(Option<&str>, &str, Option<&str>)> {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
     let mut parts = path.trim_start_matches('/').split('/');
     match (parts.next()?, parts.next()?, parts.next()?) {
         ("api", "v1", "namespaces") => {
