@@ -630,6 +630,17 @@ pub struct SecretReference {
     pub delivery: SecretDelivery,
 }
 
+/// Whether `name` is usable as a secret, tool or skill reference: the same
+/// conservative character set identifiers use.
+pub fn is_reference_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= super::MAX_IDENTIFIER_LEN
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 /// A credential value, held only transiently by whoever materializes it.
 ///
 /// No `Serialize`, no `Display`, and a `Debug` that prints a mask: the type

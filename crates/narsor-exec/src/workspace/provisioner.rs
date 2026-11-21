@@ -685,17 +685,7 @@ pub enum GitAccess {
 
 /// The variables through which git would reach the user's own credentials
 /// or configuration, none of which a [`GitAccess::PinnedOnly`] clone sees.
-pub const USER_GIT_ACCESS_ENVS: [&str; 9] = [
-    "SSH_AUTH_SOCK",
-    "SSH_ASKPASS",
-    "GIT_ASKPASS",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
-    "GIT_CONFIG",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT",
-    "XDG_CONFIG_HOME",
-];
+pub use narsor_shared::git::USER_GIT_ACCESS_ENVS;
 
 /// Clones `remote` into `target` and leaves it on `commit`, detached (R39).
 ///

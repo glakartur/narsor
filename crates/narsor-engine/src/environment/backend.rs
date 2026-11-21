@@ -47,6 +47,7 @@ pub const DEFAULT_SLOT_READER_IDLE_SECS: u64 = 120;
 pub const MAX_SLOT_PERIOD_SECS: u64 = 86_400;
 
 pub use narsor_controller_runtime::backend::{BackendCapabilities, BackendKind};
+pub use narsor_model::domain::is_reference_name;
 
 /// How far the operator trusts the place a backend runs (R3, KTD6).
 ///
@@ -386,17 +387,6 @@ impl BackendRecord {
             )
         })
     }
-}
-
-/// Whether `name` is usable as a secret, tool or skill reference: the same
-/// conservative character set identifiers use.
-pub fn is_reference_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= crate::domain::MAX_IDENTIFIER_LEN
-        && !name.starts_with('.')
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 #[cfg(test)]
