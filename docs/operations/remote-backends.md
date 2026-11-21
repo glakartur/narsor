@@ -198,8 +198,9 @@ into the task's immutable launch spec and never re-read for that task.
 | Backends | `{catalog}/backends/{id}.yaml` |
 | Profiles | `{catalog}/profiles/{id}.yaml` |
 | Runtime bundle and tool images | `{catalog}/runtime.yaml` |
-| Repository base image | `{catalog}/repositories/{id}.yaml`, key `base_image` |
+| Repository base image (deprecated) | `{catalog}/repositories/{id}.yaml`, key `base_image` |
 | Workflow image | workflow `globals.image` |
+| Global task image (fallback) | `{catalog}/runtime.yaml`, key `task_image` |
 | Default backend / profile | settings `server.defaults.backend` (default `local`), `server.defaults.profile` (default `default`); the owner can override the backend at runtime |
 | Automations and queues | `{catalog}/automations/{name}/` (`automation.yaml`, `check.sh`, optional `in.sh`, `out.sh`), `{catalog}/queues/{name}.yaml`; read at every run, not sealed into a task (see [Automations and queues](../user/observers.md#2-the-catalogue-files)) |
 
@@ -251,21 +252,41 @@ tools:
   gh: ghcr.io/narsor/tools/gh@sha256:<64 hex>
 ```
 
-### Repository base image and digest policy
+### Task image precedence and digest policy
 
-Every repository used by a remote task needs a base image; a task without one
-is refused before anything is queued.
+Every remote task needs a base image; a task without one is refused before
+anything is queued. The image of a task is the first of:
+
+1. a step's own `image` (not supported on Kubernetes in v1, see
+   [Repository base image](#repository-base-image));
+2. the workflow's `globals.image`;
+3. the repository's `base_image` — **deprecated**: it still works and logs a
+   warning at task creation; move the image to `globals.image` or to the
+   global task image;
+4. the global `task_image` of `runtime.yaml`, by its `base` — **only when it
+   has no `components`**. A backend that runs images does not build images:
+   a global task image with components is refused with
+   `task_image_needs_build`. Components are built only by the local backend
+   in Docker mode (see [Local tasks in Docker](../user/local-docker.md)).
 
 ```yaml
 # {catalog}/repositories/api.yaml (narsor-cli repo add …, then edit)
 remote: https://github.com/acme/api.git
-base_image: ghcr.io/acme/api-dev@sha256:<64 hex>      # pinned (default policy)
-# or, to let the control plane resolve a tag once at task creation:
-# base_image:
-#   reference: ghcr.io/acme/api-dev:2026.09
-#   digest_policy: resolve
+base_image: ghcr.io/acme/api-dev@sha256:<64 hex>      # deprecated, still read
 git_credential: github-token     # optional: backend secret used for the clone
+
+# {catalog}/runtime.yaml — the last fallback, without components here
+task_image:
+  base: ghcr.io/acme/dev@sha256:<64 hex>
 ```
+
+**A tag needs a digest on Kubernetes.** Every image of an image-running
+backend goes through the digest policy: the default `pinned` policy refuses
+a reference without `@sha256:…`, and `digest_policy: resolve` needs a tag
+resolver, which the shipped control plane does not have (it refuses every
+tag with "pin the image as 'name@sha256:…'"). Write images by digest. The
+local Docker mode is different: it lets `docker` pull a tag of
+`task_image.base` itself.
 
 A workflow's `globals.image` overrides the repository image. Digests are
 recorded in the task's `ResolvedEnvironment`; a later change of any
@@ -592,7 +613,7 @@ Tool images are copied the same way under `/opt/narsor-tools`.
 
 ### Repository base image
 
-The main container runs the repository's own image with its command replaced
+The main container runs the task's image (see the precedence in §3) with its command replaced
 by `/opt/narsor/bin/narsor-runner`. The runner checks the contract before any
 work and reports a readable `base_image_contract` problem otherwise:
 

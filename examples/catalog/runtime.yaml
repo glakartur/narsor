@@ -1,0 +1,33 @@
+# The runtime catalogue: copy it to {catalog}/runtime.yaml.
+#
+# `task_image` is the image the local controller builds for tasks in the
+# Docker work mode (controller.local.mode: docker). See
+# docs/user/local-docker.md. A backend that runs images (Kubernetes) also
+# needs `bundle`; the local backend does not.
+task_image:
+  # Pin a digest (debian:trixie-slim@sha256:…) for repeatable builds; a tag
+  # is pulled again at every version check.
+  base: debian:trixie-slim
+  components:
+    # Installed in order, one image layer each. A bare string is a path
+    # relative to this catalogue; `{ inline: "…" }` is the script itself.
+    # Every secret a component names must be in the token store before a
+    # task starts: remove the components you do not use.
+    - name: base-tools
+      install: components/base-tools.sh
+    - name: claude-code
+      install: components/claude-code/install.sh
+      version: components/claude-code/version.sh
+      secrets:
+        # narsor-cli secret set claude-token   (the output of `claude setup-token`)
+        - { name: claude-token, env: CLAUDE_CODE_OAUTH_TOKEN }
+      # Host files copied into the task's private HOME at every start. A
+      # source that does not exist refuses the task, so this is off here:
+      # home:
+      #   - { from: ~/.claude/skills, to: .claude/skills }
+    - name: glab
+      install: components/glab/install.sh
+      version: components/glab/version.sh
+      secrets:
+        # narsor-cli secret set gitlab-token   (a personal access token)
+        - { name: gitlab-token, env: GITLAB_TOKEN }

@@ -147,8 +147,13 @@ An optional section defining default behavior for the whole workflow.
         containing secrets or credentials (e.g. `.env`), because that very file would end up in
         plain form in the checkpoint (R33).
 *   `image`: The base image in which a remote backend runs the task; it overrides the registry
-    repository's `base_image`. A step can override it with its own `image` field (precedence:
-    step > workflow > repository). Written as a reference with a digest
+    repository's `base_image` (deprecated). A step can override it with its own `image` field.
+    Precedence on a backend that runs images: step > workflow > repository `base_image` > the
+    `base` of the global `task_image` in `runtime.yaml`, which counts only when it has no
+    `components` (with components the task is refused: such an image must be built, and only the
+    local backend's Docker mode builds images). The local backend ignores `image` in process mode
+    and refuses a step `image` in Docker mode, where every task runs in the image built from
+    `task_image` (see `docs/user/local-docker.md`). Written as a reference with a digest
     (`ghcr.io/acme/dev@sha256:…`) or as a map
     `{ reference: ghcr.io/acme/dev:2026.10, digest_policy: resolve }` — in which case the tag is
     converted into a digest once, when the task is created. The default `pinned` policy requires a

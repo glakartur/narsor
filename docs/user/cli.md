@@ -429,6 +429,21 @@ usage errors (exit code `2`). In a script:
 Text that came from a script or a source (answer reasons, stderr) is
 printed without control characters.
 
+### `secret set <NAME>`
+
+Stores a token in the token store of the local controller, which tasks in the
+Docker work mode take their component secrets from. The value is read from
+standard input (a trailing newline is dropped), never from the command line.
+Works only next to the local daemon. See
+[Local tasks in Docker](local-docker.md#tokens).
+
+### `image refresh`
+
+Asks the local controller to check the versions of its Docker-mode task
+images at the next task start, without waiting for
+`controller.local.docker.update_interval`. See
+[Local tasks in Docker](local-docker.md#updates).
+
 ## Exit codes
 
 The exit codes are a contract for CI:
