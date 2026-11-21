@@ -5,7 +5,9 @@
 //! container needs, write a container record and ask the image build job
 //! for the task image, and return at once; `observe` reports `Starting`
 //! while the image builds, then copies the task's secrets into the workload
-//! directory and starts the container (KTD5–KTD7, KTD10, KTD12). There is no
+//! directory and starts the container (KTD5–KTD7, KTD10, KTD12). The launch
+//! spec it starts the container from is kept in memory ([`LaunchSpecs`]);
+//! after a controller restart the controller fetches it again. There is no
 //! fallback to a host process (R4). The read-only runner (D63) stays a host
 //! process in both modes.
 //!
@@ -38,6 +40,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use narsor_controller_runtime::backend::{
     BackendError, BackendResult, TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
 };
+use narsor_controller_runtime::LaunchSpecs;
 use narsor_model::domain::{SecretDelivery, TaskImage, TaskLaunchSpec, TaskRepositorySource};
 
 use super::backend::LocalBackendConfig;
@@ -124,12 +127,24 @@ struct ContainerInputs {
 pub(super) struct ContainerRunners {
     config: Arc<LocalBackendConfig>,
     store: WorkloadStore,
+    /// The launch specs of the workloads created, until their container
+    /// starts (shared with the controller).
+    specs: LaunchSpecs,
 }
 
 impl ContainerRunners {
-    /// Containers run as `config` says, recorded in `store`.
-    pub(super) fn new(config: Arc<LocalBackendConfig>, store: WorkloadStore) -> Self {
-        Self { config, store }
+    /// Containers run as `config` says, recorded in `store`, started from
+    /// the launch specs in `specs`.
+    pub(super) fn new(
+        config: Arc<LocalBackendConfig>,
+        store: WorkloadStore,
+        specs: LaunchSpecs,
+    ) -> Self {
+        Self {
+            config,
+            store,
+            specs,
+        }
     }
 
     fn docker(&self) -> BackendResult<&Arc<dyn DockerTransport>> {
@@ -285,6 +300,8 @@ impl ContainerRunners {
             let _ = fs::remove_dir_all(&dir);
             return Err(error);
         }
+        self.specs
+            .insert(&task.task_id, launch.generation, launch.launch_spec.clone());
         Ok(WorkloadState {
             uid: record.uid,
             resource_generation: record.resource_generation,
@@ -319,11 +336,24 @@ impl ContainerRunners {
                     .to_string(),
             ));
         };
-        let dir = self.store.workload_dir(task, role);
-        let spec = match read_spec(&dir) {
-            Ok(spec) => spec,
-            Err(problem) => return Ok(ended(task, record, None, problem)),
+        // The spec the workload was created with, kept in memory; after a
+        // controller restart it is asked for, and the controller fetches it
+        // at its next observation of the task (KTD4). Until then the
+        // container waits as for its image.
+        let Some(spec) = self
+            .specs
+            .get_or_request(&task.task_id, record.launch_generation)
+        else {
+            return Ok(Look::phase(WorkloadPhase::Starting));
         };
+        let spec = match serde_json::from_value::<TaskLaunchSpec>(spec) {
+            Ok(spec) => spec,
+            Err(error) => {
+                let problem = format!("the launch spec is malformed: {error}");
+                return Ok(ended(task, record, None, problem));
+            }
+        };
+        let dir = self.store.workload_dir(task, role);
         let image_id = match &container.image {
             Some(id) => id.clone(),
             None => {
@@ -772,15 +802,6 @@ fn ended(
         phase: Some(WorkloadPhase::Exited { code }),
         updated: Some(updated),
     }
-}
-
-/// The launch spec in a workload directory; a problem when it cannot be
-/// read.
-fn read_spec(dir: &Path) -> Result<TaskLaunchSpec, String> {
-    let path = dir.join("launch-spec.json");
-    let bytes =
-        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    serde_json::from_slice(&bytes).map_err(|error| format!("the launch spec is malformed: {error}"))
 }
 
 fn mount(path: &Path, read_only: bool) -> Mount {

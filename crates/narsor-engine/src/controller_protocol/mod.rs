@@ -23,6 +23,11 @@
 //!    with `wait_secs`). After a (re)start ask once with `all=true` to
 //!    reconcile every live task; afterwards only commands newer than this
 //!    identity's acknowledged generation are returned.
+//!    A command names the task's launch spec by digest only; the controller
+//!    fetches the spec to create a workload or start a reader
+//!    (`GET /controller/v1/tasks/:id/launch-spec?generation=N`, refused for
+//!    a stale generation) and uses it only when its recomputed content
+//!    digest equals the command's.
 //! 4. **Acknowledge** (`POST /controller/v1/acks`) the generation it has
 //!    taken over. Acknowledgements only ever raise; repeats are harmless.
 //! 5. **Reconcile and report** (`POST /controller/v1/reports`) resource UID,

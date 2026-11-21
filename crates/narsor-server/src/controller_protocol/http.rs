@@ -230,6 +230,10 @@ where
             "/controller/v1/tasks/{task_id}/reader-credentials",
             post(post_reader_credential),
         )
+        .route(
+            "/controller/v1/tasks/{task_id}/launch-spec",
+            get(get_launch_spec),
+        )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&service),
             require_controller,
@@ -858,6 +862,22 @@ async fn post_reader_credential(
     })
     .await?;
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// The task's sealed launch spec, to the lease holder, for the task's
+/// current generation (R2). Its body is never logged.
+async fn get_launch_spec(
+    State(service): State<Service>,
+    Extension(identity): Extension<ControllerIdentity>,
+    Path(task_id): Path<String>,
+    Query(query): Query<LaunchSpecQuery>,
+) -> ProtocolResult<Json<narsor_engine::domain::TaskLaunchSpec>> {
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.launch_spec(&identity, &task_id, query.generation)
+        })
+        .await?,
+    ))
 }
 
 // ---------------------------------------------------------------------------

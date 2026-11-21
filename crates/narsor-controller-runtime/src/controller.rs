@@ -79,9 +79,10 @@ use chrono::Utc;
 use tokio::time::Instant;
 
 use crate::backend::{
-    validate_launch_input, BackendError, BackendErrorKind, ExecutionBackend, Removal,
-    RunnerCredential, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
+    BackendError, BackendErrorKind, ExecutionBackend, Removal, RunnerCredential, TaskObservation,
+    TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
 };
+use crate::launch_specs::{verify_launch_spec, LaunchSpecs};
 use narsor_protocol::controller::{
     AckResponse, CommandAck, CommandsResponse, DesiredAction, DesiredCommand, HeartbeatResponse,
     LeaseView, Observation, ObservedSummary, ReportRequest, ReportResponse, ResourceIdentity,
@@ -89,6 +90,7 @@ use narsor_protocol::controller::{
 };
 use narsor_protocol::identifier::TaskId;
 use narsor_shared::api_error::ClientError;
+use serde_json::Value;
 
 /// Refusal codes that mean "this controller no longer holds the lease".
 const LEASE_CODES: [&str; 4] = [
@@ -154,6 +156,14 @@ pub trait ControllerLink: Send + Sync + 'static {
         task_id: &str,
         request: &RunnerCredentialRequest,
     ) -> impl Future<Output = Result<RunnerCredentialResponse, ClientError>> + Send;
+    /// `GET /controller/v1/tasks/:task_id/launch-spec?generation=N`: the
+    /// task's sealed launch spec, as JSON. Refused with `stale_generation`
+    /// once the task moved past `generation`.
+    fn fetch_launch_spec(
+        &self,
+        task_id: &str,
+        generation: u64,
+    ) -> impl Future<Output = Result<Value, ClientError>> + Send;
 }
 
 /// Timing and policy of a controller.
@@ -276,6 +286,16 @@ impl From<ClientError> for CallError {
     }
 }
 
+/// Why no launch spec is at hand.
+enum SpecMissing {
+    /// The fetch was refused (a stale generation, for one): the desired
+    /// state moved on, re-read it.
+    Refused,
+    /// The spec is malformed or its content does not match the command's
+    /// digest: nothing may be created from it.
+    Invalid,
+}
+
 /// How one task's reconciliation ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Progress {
@@ -317,11 +337,16 @@ pub struct Controller<B, L> {
     /// When a task's reader may be started again (see
     /// [`ControllerConfig::reader_restart_interval`]).
     reader_retry_at: HashMap<TaskId, Instant>,
+    /// The launch specs fetched and verified, shared with a backend that
+    /// needs them after creation (KTD4). A verified spec of a generation
+    /// never changes, so a lease change keeps them.
+    launch_specs: LaunchSpecs,
 }
 
 impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
     /// A controller for `backend` talking to the control plane over `link`.
     pub fn new(backend: B, link: L, config: ControllerConfig) -> Self {
+        let launch_specs = backend.launch_specs().unwrap_or_default();
         Self {
             backend,
             link,
@@ -334,6 +359,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             loss_confirmation_refused: OncePerTask::default(),
             readers_clear: HashSet::new(),
             reader_retry_at: HashMap::new(),
+            launch_specs,
         }
     }
 
@@ -439,6 +465,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         self.exited_before_ack.retain(|task| live.contains(task));
         self.readers_clear.retain(|task| live.contains(task));
         self.reader_retry_at.retain(|task, _| live.contains(task));
+        self.launch_specs.retain(|task| live.contains(task));
         self.acknowledge(&response.commands).await?;
 
         let mut progress = Progress::Settled;
@@ -678,8 +705,6 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         observed: &TaskObservation,
     ) -> Result<Progress, Interrupt> {
         let command = context.command;
-        validate_launch_input(&command.launch_spec).map_err(Interrupt::Fenced)?;
-        let launch_spec = command.launch_spec.clone();
         match observed.storage {
             crate::backend::StorageState::Deleting => return Ok(Progress::Settling),
             crate::backend::StorageState::Absent
@@ -692,6 +717,13 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             }
             _ => {}
         }
+        // Fetched only now that a workload is to be created; a refusal or a
+        // spec that is not the command's creates nothing.
+        let launch_spec = match self.launch_spec(context).await? {
+            Ok(spec) => spec,
+            Err(SpecMissing::Refused) => return Ok(Progress::Settling),
+            Err(SpecMissing::Invalid) => return Ok(Progress::Settled),
+        };
 
         let incarnation = new_incarnation(&context.task.workload, command.generation);
         let issued = self
@@ -1006,6 +1038,14 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
                 }
             }
         }
+        let launch_spec = match self.launch_spec(context).await? {
+            Ok(spec) => spec,
+            Err(SpecMissing::Refused) => return Ok(Progress::Settling),
+            Err(SpecMissing::Invalid) => {
+                self.hold_reader_back(task_id);
+                return Ok(Progress::Settling);
+            }
+        };
         let incarnation = new_incarnation(&context.task.reader, command.generation);
         let issued = self
             .call(self.link.issue_reader_credential(
@@ -1031,7 +1071,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             generation: command.generation,
             incarnation,
             lease_epoch: context.epoch,
-            launch_spec: command.launch_spec.clone(),
+            launch_spec,
             control_plane_url: self.config.runner_control_plane_url.clone(),
             credential: RunnerCredential::new(issued.credential),
         };
@@ -1129,6 +1169,14 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         match self.backend.observe(&context.task).await {
             Ok(observed) => {
                 self.observe_failures.remove(task_id);
+                // A backend that lost its spec (this controller restarted)
+                // asked for it while observing.
+                if self
+                    .launch_specs
+                    .is_requested(task_id, context.command.generation)
+                {
+                    let _ = self.launch_spec(context).await?;
+                }
                 Ok(Some(observed))
             }
             Err(error) => {
@@ -1156,6 +1204,45 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
                 Ok(None)
             }
         }
+    }
+
+    /// The task's launch spec for the command's generation: the one fetched
+    /// earlier, else fetched now and kept once its recomputed content digest
+    /// equals the command's (KTD3). The spec itself is never logged.
+    async fn launch_spec(
+        &self,
+        context: &TaskContext<'_>,
+    ) -> Result<Result<Value, SpecMissing>, Interrupt> {
+        let command = context.command;
+        let task_id = &command.task_id;
+        if let Some(spec) = self.launch_specs.get(task_id, command.generation) {
+            return Ok(Ok(spec));
+        }
+        let fetched = self
+            .call(
+                self.link
+                    .fetch_launch_spec(task_id.as_str(), command.generation),
+            )
+            .await?;
+        let spec = match fetched {
+            Ok(spec) => spec,
+            Err(reason) => {
+                tracing::debug!(task = %task_id, %reason, "controller: launch spec refused");
+                return Ok(Err(SpecMissing::Refused));
+            }
+        };
+        if let Err(problem) = verify_launch_spec(&spec, &command.launch_digest) {
+            tracing::error!(
+                task = %task_id,
+                generation = command.generation,
+                %problem,
+                "controller: refusing the task's launch spec; nothing is created"
+            );
+            return Ok(Err(SpecMissing::Invalid));
+        }
+        self.launch_specs
+            .insert(task_id, command.generation, spec.clone());
+        Ok(Ok(spec))
     }
 
     /// Removes the task's compute; `None` when the backend failed.
@@ -1344,6 +1431,7 @@ mod tests {
         StorageState,
     };
     use narsor_protocol::controller::ReportResponse;
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     /// What a scripted platform and control plane did, in order.
@@ -1376,6 +1464,7 @@ mod tests {
     struct StubBackend {
         log: Log,
         state: Arc<Mutex<StubState>>,
+        specs: LaunchSpecs,
     }
 
     struct StubState {
@@ -1385,6 +1474,8 @@ mod tests {
         slow_removals: u32,
         /// Reader starts that fail before one works.
         failing_starts: u32,
+        /// The launch spec of the last workload or reader created.
+        launched_spec: Option<Value>,
     }
 
     impl StubBackend {
@@ -1396,7 +1487,9 @@ mod tests {
                     reader: None,
                     slow_removals: 0,
                     failing_starts: 0,
+                    launched_spec: None,
                 })),
+                specs: LaunchSpecs::default(),
             }
         }
 
@@ -1415,6 +1508,9 @@ mod tests {
         }
         fn capabilities(&self) -> BackendCapabilities {
             BackendCapabilities::default()
+        }
+        fn launch_specs(&self) -> Option<LaunchSpecs> {
+            Some(self.specs.clone())
         }
         fn resources(&self, task_id: &TaskId, key: &str) -> BackendResult<TaskResources> {
             Ok(TaskResources {
@@ -1439,6 +1535,7 @@ mod tests {
             self.say("provision");
             let created = workload(launch.generation, WorkloadPhase::Running);
             self.state().work = Some(created.clone());
+            self.state().launched_spec = Some(launch.launch_spec.clone());
             Ok(Provisioned {
                 workload: created,
                 created_workload: true,
@@ -1514,6 +1611,10 @@ mod tests {
         command: Arc<Mutex<DesiredCommand>>,
         /// Whether the control plane refuses a reader credential.
         refuse_reader: Arc<Mutex<bool>>,
+        /// What launch-spec fetches answer before they serve `spec`.
+        fetch_failures: Arc<Mutex<VecDeque<ClientError>>>,
+        /// The launch spec the control plane serves.
+        spec: Arc<Mutex<Value>>,
     }
 
     impl StubLink {
@@ -1591,6 +1692,17 @@ mod tests {
             }
             Ok(credential(task_id, request))
         }
+        async fn fetch_launch_spec(
+            &self,
+            _task_id: &str,
+            _generation: u64,
+        ) -> Result<Value, ClientError> {
+            self.say("fetch_launch_spec");
+            if let Some(error) = self.fetch_failures.lock().unwrap().pop_front() {
+                return Err(error);
+            }
+            Ok(self.spec.lock().unwrap().clone())
+        }
     }
 
     fn credential(task_id: &str, request: &RunnerCredentialRequest) -> RunnerCredentialResponse {
@@ -1603,11 +1715,18 @@ mod tests {
         }
     }
 
-    fn launch_spec() -> serde_json::Value {
-        serde_json::json!({
-            "version": narsor_protocol::launch::TASK_LAUNCH_SPEC_VERSION, "workflow_id": "wf", "workflow_version": 1, "inputs": {},
-            "workspace": {}, "environment": {}, "resources": {}, "digest": "d",
-        })
+    fn launch_spec() -> narsor_model::domain::TaskLaunchSpec {
+        use narsor_model::domain::{
+            ResolvedEnvironment, ResourceProfile, TaskLaunchSpec, TaskWorkspace,
+        };
+        TaskLaunchSpec::new(
+            "wf",
+            1,
+            serde_json::json!({}),
+            TaskWorkspace::none(),
+            ResolvedEnvironment::harness_only("claude-code"),
+            ResourceProfile::new(1000, 2048),
+        )
     }
 
     fn desired(
@@ -1621,7 +1740,7 @@ mod tests {
             runner_state,
             action,
             resource_key: "task-1".into(),
-            launch_spec: launch_spec(),
+            launch_digest: launch_spec().digest,
             runner: None,
             reader_needed,
         }
@@ -1646,6 +1765,8 @@ mod tests {
                 log: Arc::clone(&log),
                 command: Arc::new(Mutex::new(command)),
                 refuse_reader: Arc::new(Mutex::new(false)),
+                fetch_failures: Arc::default(),
+                spec: Arc::new(Mutex::new(serde_json::to_value(launch_spec()).unwrap())),
             };
             let mut config = ControllerConfig::new("http://cp.test");
             config.reader_restart_interval = interval;
@@ -1670,7 +1791,11 @@ mod tests {
 
         assert_eq!(
             said(&rig.log),
-            ["issue_reader_credential", "start_reader"],
+            [
+                "fetch_launch_spec",
+                "issue_reader_credential",
+                "start_reader"
+            ],
             "no report: a reader says nothing about the task"
         );
         let reader = rig.backend.state().reader.clone().expect("a reader");
@@ -1842,6 +1967,113 @@ mod tests {
 
         let replacement = rig.backend.state().reader.clone().expect("a new reader");
         assert_eq!(replacement.launch_generation, 2);
+    }
+
+    fn spec_json() -> Value {
+        serde_json::to_value(launch_spec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_start_fetches_the_launch_spec_once_and_creates_the_workload_from_it() {
+        let mut rig = Rig::new(desired(RunnerState::Queued, DesiredAction::Start, false));
+
+        rig.controller.step().await;
+        *rig.link.command.lock().unwrap() =
+            desired(RunnerState::Provisioning, DesiredAction::Provision, false);
+        rig.controller.step().await;
+
+        assert_eq!(
+            count(&rig.log, "fetch_launch_spec"),
+            1,
+            "{:?}",
+            said(&rig.log)
+        );
+        assert_eq!(count(&rig.log, "provision"), 1);
+        assert_eq!(rig.backend.state().launched_spec, Some(spec_json()));
+        let accepted = position(&rig.log, "report StartAccepted").expect("accepted");
+        assert!(accepted < position(&rig.log, "fetch_launch_spec").unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_running_task_is_not_fetched() {
+        let mut rig = Rig::new(desired(RunnerState::Running, DesiredAction::Run, false));
+        rig.backend.state().work = Some(workload(2, WorkloadPhase::Running));
+
+        rig.controller.step().await;
+        rig.controller.step().await;
+
+        assert_eq!(
+            count(&rig.log, "fetch_launch_spec"),
+            0,
+            "{:?}",
+            said(&rig.log)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_creates_nothing_and_the_next_step_tries_again() {
+        let failures = [
+            ClientError::Refused {
+                code: "stale_generation".into(),
+                message: "task 'task-1' is at generation 3, not 2".into(),
+            },
+            ClientError::Unavailable("connection reset".into()),
+        ];
+        for failure in failures {
+            let name = failure.to_string();
+            let mut rig = Rig::new(desired(RunnerState::Queued, DesiredAction::Start, false));
+            rig.link.fetch_failures.lock().unwrap().push_back(failure);
+
+            rig.controller.step().await;
+            assert_eq!(count(&rig.log, "provision"), 0, "{name}");
+            assert_eq!(count(&rig.log, "issue_runner_credential"), 0, "{name}");
+
+            *rig.link.command.lock().unwrap() =
+                desired(RunnerState::Provisioning, DesiredAction::Provision, false);
+            rig.controller.step().await;
+            assert_eq!(count(&rig.log, "fetch_launch_spec"), 2, "{name}");
+            assert_eq!(count(&rig.log, "provision"), 1, "{name}");
+            assert_eq!(count(&rig.log, "report StartAccepted"), 1, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spec_whose_content_is_not_the_commands_creates_nothing() {
+        let mut rig = Rig::new(desired(
+            RunnerState::Provisioning,
+            DesiredAction::Provision,
+            false,
+        ));
+        // The spec's own digest field still claims the command's digest.
+        let mut tampered = spec_json();
+        tampered["inputs"] = serde_json::json!({ "feature": "tampered" });
+        *rig.link.spec.lock().unwrap() = tampered;
+
+        rig.controller.step().await;
+
+        assert_eq!(count(&rig.log, "fetch_launch_spec"), 1);
+        assert_eq!(count(&rig.log, "issue_runner_credential"), 0);
+        assert_eq!(count(&rig.log, "provision"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_spec_the_backend_asks_for_is_fetched_once_at_the_next_observation() {
+        let mut rig = Rig::new(desired(
+            RunnerState::Provisioning,
+            DesiredAction::Provision,
+            false,
+        ));
+        let task = TaskId::parse("task-1").unwrap();
+        rig.backend.state().work = Some(workload(2, WorkloadPhase::Starting));
+        // A backend restarted with its image still building lost the spec.
+        assert_eq!(rig.backend.specs.get_or_request(&task, 2), None);
+
+        rig.controller.step().await;
+        rig.controller.step().await;
+
+        assert_eq!(count(&rig.log, "fetch_launch_spec"), 1);
+        assert_eq!(rig.backend.specs.get(&task, 2), Some(spec_json()));
+        assert_eq!(count(&rig.log, "provision"), 0);
     }
 
     #[test]

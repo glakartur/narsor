@@ -855,6 +855,41 @@ mod containers {
         assert!(!fixture.backend_ref().storage_dir(&task).exists());
     }
 
+    /// KTD4: a controller restarted while the image builds no longer holds
+    /// the launch spec; the container waits until the controller fetched it
+    /// again, then starts from it.
+    #[tokio::test]
+    async fn after_a_restart_the_container_starts_once_its_spec_is_fetched_again() {
+        let mut fixture = Fixture::new();
+        fixture.store().set("claude-token", "t").unwrap();
+        let (release, wait) = mpsc::channel::<()>();
+        let wait = Mutex::new(wait);
+        fixture.docker.on_build(move |_| {
+            let _ = wait.lock().unwrap().recv();
+        });
+        let task = fixture.task("task-1");
+        let launch = fixture.default_launch("task-1");
+        fixture
+            .backend_ref()
+            .provision(&task, &launch)
+            .await
+            .unwrap();
+
+        fixture.use_backend(true);
+        drop(release);
+        let specs = fixture.backend_ref().launch_specs().expect("shared");
+        let observed = fixture.backend_ref().observe(&task).await.unwrap();
+        assert_eq!(observed.workload.unwrap().phase, WorkloadPhase::Starting);
+        assert!(specs.is_requested(&task.task_id, launch.generation));
+        assert!(fixture.docker.runs().is_empty(), "no start without a spec");
+
+        specs.insert(&task.task_id, launch.generation, launch.launch_spec.clone());
+        let state = fixture.settled(&task).await.unwrap();
+
+        assert_eq!(state.phase, WorkloadPhase::Running);
+        assert_eq!(fixture.docker.runs().len(), 1);
+    }
+
     /// A build that cannot reach Docker is tried again after a short
     /// delay: its task waits as for a build and a new task is not
     /// refused meanwhile.

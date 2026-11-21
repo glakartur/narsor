@@ -4,6 +4,7 @@ use std::future::Future;
 
 use std::fmt;
 
+use crate::launch_specs::LaunchSpecs;
 use narsor_protocol::identifier::TaskId;
 use narsor_protocol::launch::{unsupported_launch_spec_version, LaunchSpecEnvelope};
 use serde::{Deserialize, Serialize};
@@ -380,6 +381,15 @@ pub trait ExecutionBackend: Send + Sync + 'static {
         &self,
         task: &TaskResources,
     ) -> impl Future<Output = BackendResult<Removal>> + Send;
+
+    /// The launch-spec cache of a backend that needs a task's spec after
+    /// [`Self::provision`] or [`Self::resume`] returned (KTD4). The
+    /// controller fills it with every spec it verified, and fetches the ones
+    /// the backend asks for ([`LaunchSpecs::get_or_request`]) when it next
+    /// observes their task. `None` (the default): the launch is enough.
+    fn launch_specs(&self) -> Option<LaunchSpecs> {
+        None
+    }
 }
 /// What platform a backend runs task workloads on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

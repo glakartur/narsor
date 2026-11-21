@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
+narsor-model = { path = "../narsor-model" }
 narsor-protocol = { path = "../narsor-protocol" }
 narsor-shared = { path = "../narsor-shared" }
 serde = { version = "1", features = ["derive"] }

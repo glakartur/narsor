@@ -461,6 +461,22 @@ impl ControllerClient {
             )
             .await
     }
+
+    /// `GET /controller/v1/tasks/:task_id/launch-spec`: the task's sealed
+    /// launch spec for `generation`, as JSON. The caller checks its digest.
+    pub async fn fetch_launch_spec(
+        &self,
+        task_id: &str,
+        generation: u64,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.transport
+            .get(
+                &format!("/controller/v1/tasks/{task_id}/launch-spec"),
+                &LaunchSpecQuery { generation },
+                Duration::ZERO,
+            )
+            .await
+    }
 }
 
 /// A client for one runner incarnation.

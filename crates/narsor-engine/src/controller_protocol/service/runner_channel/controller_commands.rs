@@ -6,7 +6,7 @@ use crate::controller_protocol::credentials::ControllerIdentity;
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::ProtocolService;
 use crate::controller_protocol::wire::*;
-use crate::domain::{BackendId, TaskId};
+use crate::domain::{BackendId, TaskId, TaskLaunchSpec};
 use crate::orchestration::{RunnerState, TaskRecord};
 
 impl ProtocolService {
@@ -153,6 +153,30 @@ impl ProtocolService {
         })
     }
 
+    /// The sealed launch spec of a task of the controller's backend, for the
+    /// task's current `generation`, to the lease holder only (R2). A
+    /// generation the task moved past is refused with `stale_generation`:
+    /// the controller re-reads its commands. The spec is never logged.
+    pub fn launch_spec(
+        &self,
+        identity: &ControllerIdentity,
+        task_id: &str,
+        generation: u64,
+    ) -> ProtocolResult<TaskLaunchSpec> {
+        let record = self.backend_task(identity, task_id)?;
+        self.require_lease(identity)?;
+        if generation != record.generation {
+            return Err(ProtocolError::conflict(
+                "stale_generation",
+                format!(
+                    "task '{}' is at generation {}, not {generation}",
+                    record.task_id, record.generation
+                ),
+            ));
+        }
+        Ok(record.launch_spec)
+    }
+
     /// A task of the controller's backend, or `NotFound` (R37 scope).
     pub(super) fn backend_task(
         &self,
@@ -185,15 +209,13 @@ fn desired_command(
         RunnerState::Archiving => DesiredAction::Archive,
         RunnerState::Archived => return Ok(None),
     };
-    let launch_spec = serde_json::to_value(&record.launch_spec)
-        .map_err(|error| ProtocolError::Internal(error.to_string()))?;
     Ok(Some(DesiredCommand {
         task_id: record.task_id.clone(),
         generation: record.generation,
         runner_state: record.runner_state,
         action,
         resource_key: record.assignment.resource_key.clone(),
-        launch_spec,
+        launch_digest: record.launch_spec.digest.clone(),
         runner: record.runner.as_ref().map(|runner| RunnerProgress {
             incarnation: runner.incarnation.clone(),
             launch_generation: runner.launch_generation,

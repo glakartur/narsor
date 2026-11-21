@@ -39,6 +39,7 @@ use narsor_controller_runtime::backend::{
     ExecutionBackend, Provisioned, ReaderStart, Removal, StorageState, TaskObservation,
     TaskResources, WorkloadLaunch, WorkloadState,
 };
+use narsor_controller_runtime::LaunchSpecs;
 use narsor_model::domain::{TaskId, TaskLaunchSpec};
 
 use super::container::docker::DockerTransport;
@@ -153,6 +154,9 @@ pub struct LocalBackend {
     pub(super) process: ProcessRunners,
     /// Container runners: the working runners of the Docker mode.
     containers: ContainerRunners,
+    /// The launch specs a container waiting for its image starts from,
+    /// shared with the controller (KTD4).
+    launch_specs: LaunchSpecs,
 }
 
 impl LocalBackend {
@@ -160,9 +164,11 @@ impl LocalBackend {
     pub fn new(config: LocalBackendConfig) -> Self {
         let config = Arc::new(config);
         let store = WorkloadStore::new(config.root.clone());
+        let launch_specs = LaunchSpecs::default();
         Self {
             process: ProcessRunners::new(config.clone(), store.clone()),
-            containers: ContainerRunners::new(config.clone(), store.clone()),
+            containers: ContainerRunners::new(config.clone(), store.clone(), launch_specs.clone()),
+            launch_specs,
             store,
             config,
         }
@@ -428,6 +434,10 @@ impl ExecutionBackend for LocalBackend {
             persistent_storage: true,
             archive: true,
         }
+    }
+
+    fn launch_specs(&self) -> Option<LaunchSpecs> {
+        Some(self.launch_specs.clone())
     }
 
     fn resources(&self, task_id: &TaskId, resource_key: &str) -> BackendResult<TaskResources> {

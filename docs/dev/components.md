@@ -55,6 +55,7 @@ graph TD
   ctrl --> shared
   api --> shared
   cr --> shared
+  cr --> model
   web --> shared
   narsor --> shared
   server --> shared
@@ -75,7 +76,7 @@ graph TD
 | `narsor-store` | model, protocol |
 | `narsor-model` | protocol, shared |
 | `narsor-api-client` | protocol, shared |
-| `narsor-controller-runtime` | protocol, shared |
+| `narsor-controller-runtime` | model, protocol, shared |
 | `narsor-shared` | protocol |
 | `narsor-protocol` | — |
 

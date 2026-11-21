@@ -2223,6 +2223,7 @@ name = "narsor-controller-runtime"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "narsor-model",
  "narsor-protocol",
  "narsor-shared",
  "serde",

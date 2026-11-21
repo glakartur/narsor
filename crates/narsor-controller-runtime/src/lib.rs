@@ -3,9 +3,11 @@
 
 pub mod backend;
 pub mod controller;
+pub mod launch_specs;
 pub mod testkit;
 
 pub use controller::{Controller, ControllerConfig, ControllerLink, ControllerStatus, StepOutcome};
+pub use launch_specs::LaunchSpecs;
 
 use std::future::Future;
 use std::io;

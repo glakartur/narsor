@@ -2,7 +2,6 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::api::ExecutionStatusDto;
 use crate::chat::is_false;
@@ -82,8 +81,10 @@ pub struct RunnerProgress {
     pub received_at: DateTime<Utc>,
 }
 
-/// Desired state sent to a backend controller. The sealed launch spec is
-/// carried as JSON so the wire contract does not import the engine model.
+/// Desired state sent to a backend controller. It carries no launch spec:
+/// the controller fetches one only to create a workload or start a reader
+/// ([`LaunchSpecQuery`]), and accepts it only when its recomputed content
+/// digest equals [`Self::launch_digest`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DesiredCommand {
     pub task_id: TaskId,
@@ -92,7 +93,9 @@ pub struct DesiredCommand {
     pub runner_state: RunnerState,
     pub action: DesiredAction,
     pub resource_key: String,
-    pub launch_spec: Value,
+    /// Digest of the task's sealed launch spec: what a fetched spec must
+    /// hash to.
+    pub launch_digest: String,
     pub runner: Option<RunnerProgress>,
     /// Whether the control plane wants a read-only runner for the task
     /// alongside (D63): an owner is reading a stopped or interrupted task and
@@ -101,6 +104,14 @@ pub struct DesiredCommand {
     /// plane, which never asks for one.
     #[serde(default, skip_serializing_if = "is_false")]
     pub reader_needed: bool,
+}
+
+/// `GET /controller/v1/tasks/:task_id/launch-spec`: the task's sealed
+/// launch spec for this desired generation. Refused with `stale_generation`
+/// when the task moved on, and to a controller not holding the lease.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchSpecQuery {
+    pub generation: u64,
 }
 
 /// Controller command response.

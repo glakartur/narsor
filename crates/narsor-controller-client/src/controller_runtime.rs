@@ -50,6 +50,13 @@ impl ControllerLink for ControllerClient {
     ) -> Result<RunnerCredentialResponse, ClientError> {
         ControllerClient::issue_reader_credential(self, task, request).await
     }
+    async fn fetch_launch_spec(
+        &self,
+        task: &str,
+        generation: u64,
+    ) -> Result<serde_json::Value, ClientError> {
+        ControllerClient::fetch_launch_spec(self, task, generation).await
+    }
 }
 
 struct ProtocolEnrollment<'o> {

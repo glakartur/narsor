@@ -953,3 +953,28 @@ fn queue_views_round_trip_and_old_fields_are_optional() {
         queue
     );
 }
+
+/// R1: a command names the spec by its digest; the spec itself is fetched
+/// on demand and never rides along.
+#[test]
+fn a_command_carries_the_launch_digest_and_no_launch_spec() {
+    let response = super::CommandsResponse {
+        lease_epoch: 1,
+        commands: vec![super::DesiredCommand {
+            task_id: crate::identifier::TaskId::parse("task-1").unwrap(),
+            generation: 2,
+            runner_state: RunnerState::Queued,
+            action: super::DesiredAction::Start,
+            resource_key: "task-1".into(),
+            launch_digest: "sha256:abc".into(),
+            runner: None,
+            reader_needed: false,
+        }],
+    };
+
+    let value = serde_json::to_value(&response).unwrap();
+
+    let command = &value["commands"][0];
+    assert!(command.get("launch_spec").is_none(), "{command}");
+    assert_eq!(command["launch_digest"], "sha256:abc");
+}

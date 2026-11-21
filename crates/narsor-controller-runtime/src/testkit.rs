@@ -320,6 +320,10 @@ impl<B: ExecutionBackend> ExecutionBackend for Probed<B> {
         self.inner.capabilities()
     }
 
+    fn launch_specs(&self) -> Option<crate::launch_specs::LaunchSpecs> {
+        self.inner.launch_specs()
+    }
+
     fn resources(&self, task_id: &TaskId, resource_key: &str) -> BackendResult<TaskResources> {
         self.inner.resources(task_id, resource_key)
     }
@@ -554,5 +558,14 @@ impl<L: ControllerLink> ControllerLink for SeverableLink<L> {
     ) -> Result<RunnerCredentialResponse, ClientError> {
         self.check()?;
         self.inner.issue_reader_credential(task_id, request).await
+    }
+
+    async fn fetch_launch_spec(
+        &self,
+        task_id: &str,
+        generation: u64,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.check()?;
+        self.inner.fetch_launch_spec(task_id, generation).await
     }
 }

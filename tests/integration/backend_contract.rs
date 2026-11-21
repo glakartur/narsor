@@ -64,6 +64,38 @@ impl ContractTarget for FakeTarget {
 
 contract_suite!(fake, crate::backend_contract::FakeTarget);
 
+/// R2: the launch spec is served to the lease holder only, and only for the
+/// task's current generation; a command itself carries none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_launch_spec_is_served_to_the_lease_holder_for_the_current_generation_only() {
+    use backend_contract_support::Harness;
+    use narsor_engine::controller_protocol::ControllerClient;
+    use narsor_shared::api_error::ClientError;
+
+    let h = Harness::<FakeTarget>::new()
+        .await
+        .expect("the fake runs anywhere");
+    let client = ControllerClient::new(&h.url, h.enroll());
+    h.create("task-1");
+    let generation = h.record("task-1").generation;
+    let code = |error: ClientError| match error {
+        ClientError::Refused { code, .. } => code,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+
+    let without_lease = client.fetch_launch_spec("task-1", generation).await;
+    assert_eq!(code(without_lease.unwrap_err()), "lease_not_held");
+    client.acquire_lease(Some(30)).await.expect("lease");
+    let stale = client.fetch_launch_spec("task-1", generation + 1).await;
+    assert_eq!(code(stale.unwrap_err()), "stale_generation");
+    let spec = client
+        .fetch_launch_spec("task-1", generation)
+        .await
+        .expect("the spec");
+
+    assert_eq!(spec, serde_json::to_value(contract_launch_spec()).unwrap());
+}
+
 // ---------------------------------------------------------------------------
 // The local adapter
 // ---------------------------------------------------------------------------
