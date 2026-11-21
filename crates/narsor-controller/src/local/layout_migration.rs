@@ -366,6 +366,12 @@ fn rebase_workspace_paths(old_storage: &[PathBuf; 2], new_storage: &Path) -> usi
                     continue;
                 }
             };
+            // The store writes to the directory the record's own id names;
+            // the task wrote that id, so it must be the directory just checked.
+            if execution.id != id {
+                tracing::warn!(task = %task.path().display(), execution = %id, "migration: a stored execution names another id; its workspace paths stay as they were");
+                continue;
+            }
             if !rebase_execution(&mut execution, &moves) {
                 continue;
             }
@@ -721,6 +727,32 @@ mod tests {
             .load_execution("exec-1")
             .unwrap();
         assert_eq!(kept.workspace.path, planted.workspace.path);
+    }
+
+    /// The store writes where the record's own id points; an id the task
+    /// changed to climb out of its storage must not be followed.
+    #[test]
+    fn a_stored_execution_naming_another_id_is_left_alone() {
+        let temp = Temp::new();
+        let old_storage = temp.0.join("old/storage");
+        let new_storage = temp.0.join("new/storage");
+        let state = new_storage.join("task-1").join(TASK_STATE_DIR);
+        let mut planted = paused_execution(&old_storage.join("task-1/workspace"), "/srv/x");
+        ExecutionStore::new(&state)
+            .save_execution(&planted)
+            .unwrap();
+        planted.id = "../../../escaped".to_string();
+        let state_file = state
+            .join(EXECUTIONS_DIR)
+            .join("exec-1")
+            .join(narsor_store::STATE_FILE);
+        fs::write(&state_file, serde_json::to_vec(&planted).unwrap()).unwrap();
+
+        let rebased = rebase_workspace_paths(&[old_storage.clone(), old_storage], &new_storage);
+
+        assert_eq!(rebased, 0);
+        assert!(!new_storage.join("escaped").exists());
+        assert!(!temp.0.join("new/escaped").exists());
     }
 
     /// `narsor-cli secret set` run after the update and before the first
