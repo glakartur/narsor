@@ -1,13 +1,19 @@
 //! What `narsor-cli list|show|events|steps|conversation` print for a task's
 //! execution, read from a served control plane (U8).
 //!
-//! The task's runner reports a snapshot to the control plane; its execution
-//! lives on the task's storage. The lines are compared with timestamps
-//! replaced by `<T>`, so they pin the output format and the content.
+//! The execution lives on the task's storage, which only its runner reads:
+//! a fake runner here serves the relayed reads from it the way
+//! `narsor-runner` does, and a fake controller starts a read-only runner
+//! when a stopped task is read (D63). The server is given no path to that
+//! storage. The lines are compared with timestamps replaced by `<T>`; they
+//! are those the CLI printed when the server still read local storage
+//! itself.
 
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::Utc;
 use narsor::cli::commands::{
@@ -15,8 +21,12 @@ use narsor::cli::commands::{
     execution_show_lines, execution_steps_lines,
 };
 use narsor_api_client::api::token::TokenSource;
-use narsor_api_client::api::ApiClient;
-use narsor_engine::controller_protocol::{ProtocolService, LOCAL_OWNER};
+use narsor_api_client::api::{ApiClient, ClientError};
+use narsor_engine::api::conversation_response_from_snapshot;
+use narsor_engine::controller_protocol::{
+    ControllerIdentity, ExecutionEventsPage, ProtocolConfig, ProtocolService,
+    RunnerCredentialRequest, RunnerDirective, RunnerIdentity, RunnerPollQuery, LOCAL_OWNER,
+};
 use narsor_engine::domain::{
     BackendId, Context, Event, EventData, ExecutionStatus, GitIdentity, RepositoryInfo,
     ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec, TaskRepository,
@@ -24,42 +34,59 @@ use narsor_engine::domain::{
 };
 use narsor_engine::engine::current_timeline;
 use narsor_engine::orchestration::{
-    BackendAvailability, ControlPlane, ControllerReport, ConversationAttemptSummary,
-    ConversationAvailability, ExecutionCursor, NewTask, Observation, ObservedSummary, OwnerRef,
-    RunnerSnapshot, SchedulingPolicy,
+    BackendAvailability, BackendLease, CommandRequest, ControlPlane, ControllerReport,
+    ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, NewTask, Observation,
+    ObservedSummary, OwnerCommand, OwnerRef, RunnerSnapshot, SchedulingPolicy,
 };
 use narsor_engine::persistence::conversation::ConversationSource;
 use narsor_engine::persistence::{ExecutionStore, ServerStatePaths};
 use narsor_server::api::{start_with_services, ApiHandle, ApiServices};
 use serde_json::json;
+use tokio::task::JoinHandle;
 
 const EXECUTION: &str = "exec-1";
 const ATTEMPT: &str = "attempt-1";
 
-/// A served control plane, a client of its owner and the roots under it.
+/// The execution the runner of task `id` runs: [`EXECUTION`] for `task-1`.
+fn execution_of(id: &str) -> String {
+    match id {
+        "task-1" => EXECUTION.to_string(),
+        other => format!("exec-{other}"),
+    }
+}
+const CONTROLLER: &str = "controller-a";
+const RUNNER: &str = "pod-1";
+
+/// How long the CLI waits for a stopped task's read-only runner here.
+const READER_WAIT: Duration = Duration::from_secs(5);
+
+/// A served control plane, a client of its owner, and the runners and
+/// controller standing in for a backend's.
 struct Fixture {
     root: PathBuf,
-    work: PathBuf,
     service: Arc<ProtocolService>,
     /// Serves while the fixture lives.
     _server: ApiHandle,
     client: ApiClient,
+    leases: Mutex<HashMap<String, BackendLease>>,
+    runners: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
 impl Fixture {
     async fn new() -> Self {
         let root = std::env::temp_dir().join(format!("narsor-cli-reads-{}", uuid::Uuid::new_v4()));
         let state = root.join("state");
-        let work = root.join("work");
         fs::create_dir_all(&state).unwrap();
-        fs::create_dir_all(&work).unwrap();
-        let service = Arc::new(ProtocolService::new(
+        let service = Arc::new(ProtocolService::with_config(
             ControlPlane::new(ServerStatePaths::new(&state)),
             crate::environment_support::seeded_resolver(&state),
+            ProtocolConfig {
+                reader_connect_wait: Duration::from_millis(100),
+                ..ProtocolConfig::default()
+            },
         ));
         let server = start_with_services(
             root.join("catalog"),
-            work.clone(),
             ApiServices {
                 control: Some(Arc::clone(&service)),
                 ..ApiServices::default()
@@ -74,16 +101,92 @@ impl Fixture {
         .expect("a loopback client");
         Self {
             root,
-            work,
             service,
             _server: server,
             client,
+            leases: Mutex::new(HashMap::new()),
+            runners: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The task `id` of `owner` on `backend`, running, whose runner reported
-    /// the execution [`EXECUTION`] kept in `store`.
-    fn running_task(&self, id: &str, owner: &str, backend: &str, store: &ExecutionStore) {
+    /// The backend's storage of task `id`, holding the execution
+    /// [`execution_of`] it; nothing of the server's points at it.
+    fn storage(&self, id: &str) -> ExecutionStore {
+        let store = ExecutionStore::new(self.root.join("backend").join(id));
+        if !store.exists(&execution_of(id)) {
+            write_execution(&store, &execution_of(id));
+        }
+        store
+    }
+
+    /// The controller's lease of `backend`.
+    fn lease(&self, backend: &BackendId) -> BackendLease {
+        let mut leases = self.leases.lock().unwrap();
+        leases
+            .entry(backend.to_string())
+            .or_insert_with(|| {
+                self.service
+                    .control_plane()
+                    .acquire_lease(backend, CONTROLLER, chrono::Duration::days(1))
+                    .unwrap()
+            })
+            .clone()
+    }
+
+    fn report(&self, task_id: &TaskId, lease: &BackendLease, observation: Observation) {
+        let control = self.service.control_plane();
+        control
+            .report(ControllerReport {
+                task_id: task_id.clone(),
+                lease: lease.token(),
+                desired_generation: control.task(task_id).unwrap().generation,
+                observation,
+                resource: None,
+                summary: ObservedSummary {
+                    workload_present: true,
+                    storage_present: true,
+                    runner_status: None,
+                    detail: None,
+                },
+                observed_at: Utc::now(),
+            })
+            .expect("controller report");
+    }
+
+    /// A runner credential of `role` for task `id`, as its controller gets
+    /// it.
+    fn credential(&self, id: &str, backend: &BackendId, reader: bool) -> RunnerIdentity {
+        let lease = self.lease(backend);
+        let controller = ControllerIdentity {
+            controller_id: CONTROLLER.to_string(),
+            backend_id: backend.clone(),
+        };
+        let request = RunnerCredentialRequest {
+            lease_epoch: lease.epoch,
+            generation: self
+                .service
+                .control_plane()
+                .task(&TaskId::parse(id).unwrap())
+                .unwrap()
+                .generation,
+            incarnation: if reader { "reader-1" } else { RUNNER }.to_string(),
+        };
+        let issued = if reader {
+            self.service
+                .issue_reader_credential(&controller, id, request)
+        } else {
+            self.service
+                .issue_runner_credential(&controller, id, request)
+        }
+        .expect("a runner credential");
+        self.service
+            .authenticate_runner(&issued.credential)
+            .expect("the credential authenticates")
+    }
+
+    /// The task `id` of `owner` on `backend`, running: its runner reported
+    /// the execution in its storage and answers the reads of it.
+    fn running_task(&self, id: &str, owner: &str, backend: &str) {
         let task_id = TaskId::parse(id).unwrap();
         let backend_id = BackendId::parse(backend).unwrap();
         let control = self.service.control_plane();
@@ -95,9 +198,7 @@ impl Fixture {
                 launch_spec(),
             ))
             .unwrap();
-        let lease = control
-            .acquire_lease(&backend_id, "controller-a", chrono::Duration::days(1))
-            .unwrap();
+        let lease = self.lease(&backend_id);
         control
             .schedule(
                 &backend_id,
@@ -107,51 +208,153 @@ impl Fixture {
                 },
             )
             .unwrap();
-        for observation in [Observation::StartAccepted, Observation::RunnerReady] {
-            control
-                .report(ControllerReport {
-                    task_id: task_id.clone(),
-                    lease: lease.token(),
-                    desired_generation: control.task(&task_id).unwrap().generation,
-                    observation,
-                    resource: None,
-                    summary: ObservedSummary {
-                        workload_present: true,
-                        storage_present: true,
-                        runner_status: None,
-                        detail: None,
-                    },
-                    observed_at: Utc::now(),
-                })
-                .expect("controller report");
-        }
+        self.report(&task_id, &lease, Observation::StartAccepted);
+        self.report(&task_id, &lease, Observation::RunnerReady);
+        let runner = self.credential(id, &backend_id, false);
+        let store = self.storage(id);
         self.service
             .record_runner_snapshot(
                 &task_id,
-                "pod-1",
-                1,
-                runner_snapshot(store),
+                RUNNER,
+                runner.launch_generation,
+                runner_snapshot(&store, &execution_of(id), 1, false),
                 chrono::Duration::hours(1),
             )
             .expect("runner snapshot");
+        let handle = tokio::spawn(serve_reads(
+            Arc::clone(&self.service),
+            runner,
+            store,
+            execution_of(id),
+        ));
+        self.runners.lock().unwrap().insert(id.to_string(), handle);
     }
 
-    /// The storage of the local backend's task `id`, where its runner keeps
-    /// the execution.
-    fn local_storage(&self, id: &str) -> ExecutionStore {
-        ExecutionStore::new(
-            self.work
-                .join("narsor-controller-local")
-                .join("storage")
-                .join(id)
-                .join("state"),
-        )
+    /// Pauses the running task `id`: its runner acknowledges a safe point
+    /// and goes away, and the task is `Stopped`.
+    fn stop(&self, id: &str, backend: &str) {
+        let task_id = TaskId::parse(id).unwrap();
+        let backend_id = BackendId::parse(backend).unwrap();
+        let control = self.service.control_plane();
+        let launch_generation = control.task(&task_id).unwrap().generation;
+        control
+            .command(
+                &task_id,
+                CommandRequest::new(OwnerCommand::Pause, "pause-1"),
+            )
+            .expect("pause");
+        self.service
+            .record_runner_snapshot(
+                &task_id,
+                RUNNER,
+                launch_generation,
+                runner_snapshot(&self.storage(id), &execution_of(id), 2, true),
+                chrono::Duration::hours(1),
+            )
+            .expect("safe-point snapshot");
+        self.report(
+            &task_id,
+            &self.lease(&backend_id),
+            Observation::PausedAtSafePoint,
+        );
+        if let Some(runner) = self.runners.lock().unwrap().remove(id) {
+            runner.abort();
+        }
+    }
+
+    /// Stands in for the controller of `backend`: once a read of the stopped
+    /// task `id` leases a reader, starts a read-only runner on its storage.
+    fn start_readers(&self, id: &str, backend: &str) -> JoinHandle<()> {
+        let service = Arc::clone(&self.service);
+        let task_id = TaskId::parse(id).unwrap();
+        let backend_id = BackendId::parse(backend).unwrap();
+        // Credentials are issued here, not in the task: the lease is the
+        // fixture's.
+        let lease = self.lease(&backend_id);
+        let store = self.storage(id);
+        let execution = execution_of(id);
+        tokio::spawn(async move {
+            loop {
+                let record = service.control_plane().task(&task_id).unwrap();
+                if record.reader_lease_active(Utc::now()) {
+                    let issued = service
+                        .issue_reader_credential(
+                            &ControllerIdentity {
+                                controller_id: CONTROLLER.to_string(),
+                                backend_id: backend_id.clone(),
+                            },
+                            task_id.as_str(),
+                            RunnerCredentialRequest {
+                                lease_epoch: lease.epoch,
+                                generation: record.generation,
+                                incarnation: "reader-1".to_string(),
+                            },
+                        )
+                        .expect("a reader credential");
+                    let reader = service.authenticate_runner(&issued.credential).unwrap();
+                    serve_reads(service, reader, store, execution).await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
     }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        for (_, runner) in self.runners.lock().unwrap().drain() {
+            runner.abort();
+        }
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// A runner's side of the relayed reads: answers every events and
+/// conversation read of its task from `store`, as `narsor-runner` does,
+/// until it is told to go.
+async fn serve_reads(
+    service: Arc<ProtocolService>,
+    identity: RunnerIdentity,
+    store: ExecutionStore,
+    execution: String,
+) {
+    let query = RunnerPollQuery {
+        wait_secs: Some(1),
+        defer_materials: true,
+        ..RunnerPollQuery::default()
+    };
+    while let Ok(response) = service.runner_poll(&identity, query.clone()).await {
+        // A runner told to go goes, as `narsor-runner` does.
+        if response.directive != RunnerDirective::Continue {
+            return;
+        }
+        for request in response.execution_events {
+            let (events, has_more) = store
+                .event_log(&execution)
+                .read_after(request.after, request.limit as usize)
+                .unwrap();
+            let _ = service.runner_execution_events(
+                &identity,
+                &request.request_id,
+                ExecutionEventsPage { events, has_more },
+            );
+        }
+        for request in response.conversation_pages {
+            let snapshot = store
+                .conversation_store(&execution)
+                .read(
+                    &request.attempt_id,
+                    request.from_entry,
+                    request.byte_budget as usize,
+                )
+                .unwrap();
+            let _ = service.runner_conversation_page(
+                &identity,
+                &request.request_id,
+                conversation_response_from_snapshot(snapshot),
+            );
+        }
     }
 }
 
@@ -179,10 +382,10 @@ fn launch_spec() -> TaskLaunchSpec {
 
 /// An execution of `steps` that ran one agent attempt in `plan` and waits
 /// in `review`: its record, its events and the attempt's conversation.
-fn write_execution(store: &ExecutionStore) {
+fn write_execution(store: &ExecutionStore, execution: &str) {
     store
         .save_execution(&WorkflowExecution {
-            id: EXECUTION.to_string(),
+            id: execution.to_string(),
             workflow_id: "steps".to_string(),
             workflow_version: 1,
             status: ExecutionStatus::Running,
@@ -205,7 +408,7 @@ fn write_execution(store: &ExecutionStore) {
             metadata: json!({}),
         })
         .unwrap();
-    let log = store.event_log(EXECUTION);
+    let log = store.event_log(execution);
     let events = [
         EventData::WorkflowStarted {
             workflow_id: "steps".to_string(),
@@ -233,10 +436,10 @@ fn write_execution(store: &ExecutionStore) {
         },
     ];
     for (index, data) in events.into_iter().enumerate() {
-        log.append(&Event::new(EXECUTION.to_string(), data, index as u64 + 1))
+        log.append(&Event::new(execution.to_string(), data, index as u64 + 1))
             .unwrap();
     }
-    let conversations = store.conversation_store(EXECUTION);
+    let conversations = store.conversation_store(execution);
     let mut writer = conversations.writer(ATTEMPT).unwrap();
     writer.append_narsor("prompt: plan the work", &[]).unwrap();
     writer
@@ -248,20 +451,25 @@ fn write_execution(store: &ExecutionStore) {
 
 /// What the runner of the execution in `store` reports: its status, its
 /// cursor and the timeline it works out of the store.
-fn runner_snapshot(store: &ExecutionStore) -> RunnerSnapshot {
-    let execution = store.load_execution(EXECUTION).unwrap();
-    let events = store.event_log(EXECUTION).read_all().unwrap();
+fn runner_snapshot(
+    store: &ExecutionStore,
+    execution: &str,
+    sequence: u64,
+    safe_point: bool,
+) -> RunnerSnapshot {
+    let record = store.load_execution(execution).unwrap();
+    let events = store.event_log(execution).read_all().unwrap();
     let recorded = store
-        .conversation_store(EXECUTION)
+        .conversation_store(execution)
         .recorded_attempt_ids()
         .unwrap();
-    let timeline = current_timeline(store, EXECUTION, &events, execution.status, &recorded);
+    let timeline = current_timeline(store, execution, &events, record.status, &recorded);
     RunnerSnapshot {
-        snapshot_sequence: 1,
-        execution_status: execution.status,
+        snapshot_sequence: sequence,
+        execution_status: record.status,
         execution_cursor: ExecutionCursor {
-            execution_id: Some(EXECUTION.to_string()),
-            current_state: execution.current_state.clone(),
+            execution_id: Some(execution.to_string()),
+            current_state: record.current_state.clone(),
             ..Default::default()
         },
         event_cursor: events.last().map_or(0, |event| event.sequence),
@@ -277,7 +485,7 @@ fn runner_snapshot(store: &ExecutionStore) -> RunnerSnapshot {
             }],
         },
         timeline: Some(timeline),
-        safe_point: false,
+        safe_point,
         problem: None,
         attention: Vec::new(),
         conductor_available: false,
@@ -308,15 +516,6 @@ fn without_times(lines: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// A local task's execution as the CLI prints it.
-async fn local_task_fixture() -> Fixture {
-    let fx = Fixture::new().await;
-    let store = fx.local_storage("task-1");
-    write_execution(&store);
-    fx.running_task("task-1", LOCAL_OWNER, "local", &store);
-    fx
-}
-
 fn expected_steps() -> Vec<String> {
     vec![
         "plan #1        succeeded          agent      <T>  ->  <T>".to_string(),
@@ -324,9 +523,47 @@ fn expected_steps() -> Vec<String> {
     ]
 }
 
-#[tokio::test]
+/// What the CLI prints of the execution: steps, events, conversation —
+/// asserted against what it printed when the server read local storage.
+async fn assert_prints_the_execution(fx: &Fixture) {
+    let steps = without_times(execution_steps_lines(&fx.client, EXECUTION).await.unwrap());
+    assert_eq!(steps, expected_steps());
+
+    let events = without_times(
+        execution_event_lines(&fx.client, EXECUTION, READER_WAIT)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(events.len(), 5, "{events:#?}");
+    assert!(
+        events[0].starts_with("    1  <T>  workflow_started"),
+        "{events:#?}"
+    );
+    assert!(
+        events[4].starts_with("    5  <T>  state_entered"),
+        "{events:#?}"
+    );
+
+    let conversation = without_times(
+        execution_conversation_lines(&fx.client, EXECUTION, ATTEMPT, READER_WAIT)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(conversation.len(), 2, "{conversation:#?}");
+    assert!(
+        conversation[0].starts_with("    1  <T>") && conversation[0].ends_with("plan the work"),
+        "{conversation:#?}"
+    );
+    assert!(
+        conversation[1].starts_with("    2  <T>"),
+        "{conversation:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_lists_and_shows_the_execution_of_a_local_task() {
-    let fx = local_task_fixture().await;
+    let fx = Fixture::new().await;
+    fx.running_task("task-1", LOCAL_OWNER, "local");
 
     let list = execution_list_lines(&fx.client).await.unwrap();
     assert_eq!(
@@ -350,46 +587,89 @@ async fn cli_lists_and_shows_the_execution_of_a_local_task() {
     );
 }
 
-#[tokio::test]
-async fn cli_shows_the_steps_events_and_conversation_of_a_running_local_task() {
-    let fx = local_task_fixture().await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_shows_the_steps_events_and_conversation_of_a_running_task_of_any_backend() {
+    for backend in ["local", "k8s"] {
+        let fx = Fixture::new().await;
+        fx.running_task("task-1", LOCAL_OWNER, backend);
 
-    let steps = without_times(execution_steps_lines(&fx.client, EXECUTION).await.unwrap());
-    assert_eq!(steps, expected_steps());
+        assert_prints_the_execution(&fx).await;
+    }
+}
 
-    let events = without_times(execution_event_lines(&fx.client, EXECUTION).await.unwrap());
-    assert_eq!(events.len(), 5, "{events:#?}");
-    assert!(
-        events[0].starts_with("    1  <T>  workflow_started"),
-        "{events:#?}"
-    );
-    assert!(
-        events[4].starts_with("    5  <T>  state_entered"),
-        "{events:#?}"
-    );
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_reads_a_stopped_local_task_through_a_reader_started_on_demand() {
+    let fx = Fixture::new().await;
+    fx.running_task("task-1", LOCAL_OWNER, "local");
+    fx.stop("task-1", "local");
+    let reader = fx.start_readers("task-1", "local");
 
-    let conversation = without_times(
-        execution_conversation_lines(&fx.client, EXECUTION, ATTEMPT)
-            .await
-            .unwrap(),
-    );
-    assert_eq!(conversation.len(), 2, "{conversation:#?}");
+    assert_prints_the_execution(&fx).await;
+    reader.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_task_whose_reader_does_not_start_is_a_readable_error() {
+    let fx = Fixture::new().await;
+    fx.running_task("task-1", LOCAL_OWNER, "local");
+    fx.stop("task-1", "local");
+
+    let wait = Duration::from_millis(300);
+    let events = execution_event_lines(&fx.client, EXECUTION, wait)
+        .await
+        .unwrap_err();
     assert!(
-        conversation[0].starts_with("    1  <T>") && conversation[0].ends_with("plan the work"),
-        "{conversation:#?}"
+        events
+            .message
+            .starts_with("The execution's events cannot be read: ")
+            && events.message.contains("read-only runner is starting"),
+        "{}",
+        events.message
     );
+    let conversation = execution_conversation_lines(&fx.client, EXECUTION, ATTEMPT, wait)
+        .await
+        .unwrap_err();
     assert!(
-        conversation[1].starts_with("    2  <T>"),
-        "{conversation:#?}"
+        conversation
+            .message
+            .starts_with("The execution's conversation cannot be read: ")
+            && conversation
+                .message
+                .contains("read-only runner is starting"),
+        "{}",
+        conversation.message
+    );
+    // The steps are the task record's: they need no reader.
+    assert_eq!(
+        without_times(execution_steps_lines(&fx.client, EXECUTION).await.unwrap()),
+        expected_steps()
     );
 }
 
-#[tokio::test]
-async fn an_execution_of_a_task_the_caller_does_not_own_is_not_found() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listing_stopped_tasks_starts_no_reader() {
     let fx = Fixture::new().await;
-    let store = fx.local_storage("task-1");
-    write_execution(&store);
-    fx.running_task("task-1", "someone-else", "local", &store);
+    for id in ["task-1", "task-2", "task-3"] {
+        fx.running_task(id, LOCAL_OWNER, "local");
+        fx.stop(id, "local");
+    }
+
+    let list = execution_list_lines(&fx.client).await.unwrap();
+    assert_eq!(list.len(), 4, "a header and three executions: {list:#?}");
+    for id in ["task-1", "task-2", "task-3"] {
+        let record = fx
+            .service
+            .control_plane()
+            .task(&TaskId::parse(id).unwrap())
+            .unwrap();
+        assert!(record.reader_lease.is_none(), "{id} leased a reader");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_execution_of_a_task_the_caller_does_not_own_is_refused_like_its_task() {
+    let fx = Fixture::new().await;
+    fx.running_task("task-1", "someone-else", "local");
 
     let refusals = [
         execution_show_lines(&fx.client, EXECUTION)
@@ -398,7 +678,7 @@ async fn an_execution_of_a_task_the_caller_does_not_own_is_not_found() {
         execution_steps_lines(&fx.client, EXECUTION)
             .await
             .unwrap_err(),
-        execution_event_lines(&fx.client, EXECUTION)
+        execution_event_lines(&fx.client, EXECUTION, READER_WAIT)
             .await
             .unwrap_err(),
     ];
@@ -412,4 +692,45 @@ async fn an_execution_of_a_task_the_caller_does_not_own_is_not_found() {
         execution_list_lines(&fx.client).await.unwrap(),
         vec!["No executions."]
     );
+    // The same refusal as a read of the task itself.
+    assert!(matches!(
+        fx.client.control_execution(EXECUTION).await,
+        Err(ClientError::NotFound)
+    ));
+    assert!(matches!(
+        fx.client.control_timeline("task-1").await,
+        Err(ClientError::NotFound)
+    ));
+}
+
+/// The server reads no task's storage (R8): its sources do not name the
+/// controller's work directory or the execution store.
+#[test]
+fn the_server_sources_never_name_task_storage() {
+    fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    sources(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/narsor-server/src"),
+        &mut files,
+    );
+    assert!(!files.is_empty());
+    for file in files {
+        let text = fs::read_to_string(&file).unwrap();
+        for name in [
+            "narsor-controller-local",
+            "ControllerWorkPaths",
+            "ExecutionStore",
+        ] {
+            assert!(!text.contains(name), "{} names {name}", file.display());
+        }
+    }
 }

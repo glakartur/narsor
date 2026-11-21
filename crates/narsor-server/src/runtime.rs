@@ -181,7 +181,6 @@ pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<(
 
     let api_handle = crate::api::serve(
         config.catalog_dir().to_path_buf(),
-        config.work_dir().to_path_buf(),
         ApiServices {
             harness_selector: Some(selector),
             control: Some(Arc::clone(&control)),

@@ -173,6 +173,8 @@ Properties of the runtime:
   scripts ended, and then removes the entry. A runner gets an automation's
   answer as a queued input, as a person's answer; a held exit reaches it at
   its next poll. The runner protocol has no event delivery (D77, D78).
-- Only `narsor-runner` executes workflows. The daemon drives no execution:
-  its `/executions` routes read what runners keep and hand answers to the
-  task of the execution.
+- Only `narsor-runner` executes workflows. The daemon drives no execution
+  and reads no task storage: `/control/v1/executions` lists the executions
+  from the task records, and an execution's events and conversation come
+  from its task's runner or a read-only runner (D63), for every backend
+  alike (U8).

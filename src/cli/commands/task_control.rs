@@ -2,12 +2,13 @@
 
 use serde_json::{Map, Value};
 
-use crate::api::{ClientError, ExecutionStatusDto, ExecutionSummary, HumanInputDeliveryDto};
-use crate::config::{Flags, Resolved};
-
-use super::daemon_access::{
-    client_error, daemon_client, load_execution_summary, wait_until_stopped,
+use crate::api::{
+    ApiClient, ClientError, ExecutionStatusDto, ExecutionSummary, HumanInputDeliveryDto,
 };
+use crate::config::{Flags, Resolved};
+use crate::controller_protocol::SubmitInputRequest;
+
+use super::daemon_access::{client_error, daemon_client, load_execution, wait_until_stopped};
 use super::open_matters::print_open_matters;
 use super::{CliError, Result};
 
@@ -76,8 +77,9 @@ pub(in crate::cli) fn permission_decision(
 /// `narsor input <id> [--field k=v]… [--label l] [--data k=v]… [--variable k=v]…
 /// [--comment text]` — answer a question, or resolve a problem.
 ///
-/// Goes through `ApiClient` (R4/D52): `POST /executions/:id/input`, which
-/// hands the answer to the execution's task, then [`wait_until_stopped`].
+/// Goes through the control API: the answer goes to the execution's task
+/// (`POST /control/v1/tasks/:task_id/input`), bound to the request it waits
+/// on, then [`wait_until_stopped`].
 ///
 /// `--file` has no REST equivalent: the task carries its sealed workflow,
 /// and a REST call cannot point the server at a local override path.
@@ -128,7 +130,9 @@ pub async fn input(
     // not single this case out from every other "engine can't proceed"
     // reason, so relying on the REST error alone would only report a bare
     // `500`.
-    let current = load_execution_summary(&client, execution_id).await?;
+    let found = load_execution(&client, execution_id).await?;
+    let task_id = found.task_id;
+    let current = found.execution;
     let Some(pending) = &current.pending_input else {
         return Err(CliError::failure(format!(
             "Execution '{execution_id}' is not waiting for human input (status: {}).",
@@ -151,14 +155,12 @@ pub async fn input(
                 "This execution needs a permission decision. Use --permission deny, allow-exact, allow-group, or allow-pattern.",
             )
         })?;
-        client
-            .resolve_permission(
-                execution_id,
-                narsor_protocol::api::PermissionDecisionRequestDto {
-                    episode: pending.episode_key().to_string(),
-                    permission_decision,
-                },
-            )
+        let delivery = HumanInputDeliveryDto {
+            episode: Some(pending.episode_key().to_string()),
+            permission_decision: Some(permission_decision),
+            ..HumanInputDeliveryDto::default()
+        };
+        submit_answer(&client, &task_id, pending.episode_key(), delivery)
             .await
             .map_err(|error| client_error(execution_id, error))?;
         wait_until_stopped(&client, execution_id, current.status).await?;
@@ -170,11 +172,10 @@ pub async fn input(
         ));
     }
 
-    client
-        .deliver_input(execution_id, delivery)
+    submit_answer(&client, &task_id, pending.episode_key(), delivery)
         .await
         .map_err(|error| match error {
-            ClientError::Conflict => CliError::failure(format!(
+            ClientError::Conflict | ClientError::Refused { .. } => CliError::failure(format!(
                 "Execution '{execution_id}' is no longer waiting for the input this answer was \
                  for: it was answered or closed meanwhile, or another process is driving it \
                  right now. Check it with 'narsor show {execution_id}'."
@@ -194,6 +195,27 @@ pub async fn input(
         )));
     }
     Ok(())
+}
+
+/// Hands `delivery` to `task_id` as the answer to its pending input
+/// `pending_input_id` (the request's episode key).
+async fn submit_answer(
+    client: &ApiClient,
+    task_id: &str,
+    pending_input_id: &str,
+    delivery: HumanInputDeliveryDto,
+) -> std::result::Result<(), ClientError> {
+    client
+        .control_input(
+            task_id,
+            &SubmitInputRequest {
+                pending_input_id: pending_input_id.to_string(),
+                idempotency_key: uuid::Uuid::new_v4().to_string(),
+                delivery,
+            },
+        )
+        .await
+        .map(drop)
 }
 
 /// Parses `name=value` pairs of `--variable` into a map. A value that reads

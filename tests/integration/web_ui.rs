@@ -45,7 +45,6 @@ async fn server(root: &TempRoot) -> ApiHandle {
     );
     start_with_services(
         catalog,
-        root.0.join("work"),
         ApiServices {
             control: Some(Arc::new(control)),
             ..ApiServices::default()

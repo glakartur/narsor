@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::api::{ApiClient, ClientError, ExecutionStatusDto, ExecutionSummary};
 use crate::config::Flags;
+use narsor_protocol::api::ExecutionLookupResponse;
 
 use super::{CliError, Result};
 
@@ -51,34 +52,38 @@ pub(super) fn client_error(execution_id: &str, error: ClientError) -> CliError {
     }
 }
 
-/// `execution_id`'s summary, or `None` if the daemon does not know it —
-/// `GET /executions`, filtered client-side (there is no single-execution GET
-/// endpoint; every existing caller of that list is small enough that this is
-/// not worth adding one for).
+/// `execution_id` and the task that runs it, or `None` if no task of the
+/// caller reported it — one control-plane read of the task records
+/// (`GET /control/v1/executions/:id`).
 pub(super) async fn find_execution(
     client: &ApiClient,
     execution_id: &str,
-) -> Result<Option<ExecutionSummary>> {
-    let listing = client
-        .list_executions()
-        .await
-        .map_err(|error| client_error(execution_id, error))?;
-    Ok(listing
-        .executions
-        .into_iter()
-        .find(|execution| execution.id == execution_id))
+) -> Result<Option<ExecutionLookupResponse>> {
+    match client.control_execution(execution_id).await {
+        Ok(found) => Ok(Some(found)),
+        Err(ClientError::NotFound) => Ok(None),
+        Err(error) => Err(client_error(execution_id, error)),
+    }
 }
 
 /// [`find_execution`], turning "not found" into a readable message.
-pub(super) async fn load_execution_summary(
+pub(super) async fn load_execution(
     client: &ApiClient,
     execution_id: &str,
-) -> Result<ExecutionSummary> {
+) -> Result<ExecutionLookupResponse> {
     find_execution(client, execution_id).await?.ok_or_else(|| {
         CliError::failure(format!(
             "Could not load execution '{execution_id}': not found"
         ))
     })
+}
+
+/// The summary of [`load_execution`].
+pub(super) async fn load_execution_summary(
+    client: &ApiClient,
+    execution_id: &str,
+) -> Result<ExecutionSummary> {
+    Ok(load_execution(client, execution_id).await?.execution)
 }
 
 /// How often [`wait_until_stopped`] asks the daemon whether `execution_id`
@@ -88,15 +93,17 @@ pub(super) const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Blocks until `execution_id` is no longer `Running` and has left the
 /// status `before`, returning its final summary.
 ///
-/// A plain poll of `GET /executions`: the execution is driven by its runner,
-/// and the daemon publishes no stream of that one execution's events.
+/// A plain poll of the execution's task record: the execution is driven by
+/// its runner, and the daemon publishes no stream of that one execution's
+/// events.
 pub(super) async fn wait_until_stopped(
     client: &ApiClient,
     execution_id: &str,
     before: ExecutionStatusDto,
 ) -> Result<ExecutionSummary> {
     loop {
-        if let Some(summary) = find_execution(client, execution_id).await? {
+        if let Some(found) = find_execution(client, execution_id).await? {
+            let summary = found.execution;
             if summary.status != ExecutionStatusDto::Running && summary.status != before {
                 return Ok(summary);
             }

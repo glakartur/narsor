@@ -158,6 +158,8 @@ where
             get(get_concurrency_limit).put(put_concurrency_limit),
         )
         .route("/control/v1/usage", get(get_usage))
+        .route("/control/v1/executions", get(list_executions))
+        .route("/control/v1/executions/{execution_id}", get(get_execution))
         .route("/control/v1/tasks/{task_id}/timeline", get(get_timeline))
         .route(
             "/control/v1/tasks/{task_id}/execution-events",
@@ -489,6 +491,27 @@ async fn get_usage(
     Extension(_owner): Extension<OwnerRef>,
 ) -> Json<HarnessUsageResponse> {
     Json(service.harness_usage())
+}
+
+/// The execution of every task of the owner, from the task records.
+async fn list_executions(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+) -> ProtocolResult<Json<narsor_protocol::api::ExecutionListResponse>> {
+    Ok(Json(
+        blocking(&service, move |s| s.executions(&owner)).await?,
+    ))
+}
+
+/// One execution of the owner and the task that runs it.
+async fn get_execution(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(execution_id): Path<String>,
+) -> ProtocolResult<Json<narsor_protocol::api::ExecutionLookupResponse>> {
+    Ok(Json(
+        blocking(&service, move |s| s.execution(&owner, &execution_id)).await?,
+    ))
 }
 
 async fn get_timeline(

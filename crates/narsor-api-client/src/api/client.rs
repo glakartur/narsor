@@ -61,20 +61,19 @@ use serde_json::Map;
 use serde_json::Value;
 
 use narsor_protocol::api::{
-    ClaimRequest, ConversationResponse as ConversationPage, HumanInputDeliveryDto, MaterialFile,
+    ClaimRequest, ConversationResponse as ConversationPage, ExecutionLookupResponse, MaterialFile,
     MaterialListResponse, MaterialSummary, MaterialUploadResponse, MaterialView, OwnerView,
-    PermissionDecisionRequestDto, Timeline, WhoAmIResponse, BUNDLE_CONTENT_TYPE,
+    WhoAmIResponse, BUNDLE_CONTENT_TYPE,
 };
 use narsor_protocol::controller::{
     ControlEventEnvelope, ConversationResponse as RemoteConversationResponse, MoveTaskRequest,
     OwnerCommandResponse, SubmitCommentRequest, SubmitCommentResponse, SubmitInputResponse,
     SubmitOperatorCommandResponse, TaskEvent, TaskListResponse, TaskSummary, TimelineResponse,
 };
-use narsor_protocol::event::Event;
 
 use super::dto::{
-    AcceptedResponse, ConversationResponse, ExecutionListResponse, HarnessSelectionSnapshot,
-    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
+    ExecutionListResponse, HarnessSelectionSnapshot, RequestErrorResponse,
+    SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
 };
 use crate::controller_protocol::ConductorReadResponse;
 use narsor_protocol::controller::{
@@ -270,37 +269,6 @@ impl ApiClient {
         &self.base_url
     }
 
-    /// Events of `execution_id` with `sequence > after`.
-    pub async fn events(&self, execution_id: &str, after: u64) -> Result<Vec<Event>, ClientError> {
-        let url = format!(
-            "{}/executions/{execution_id}/events?after={after}",
-            self.base_url
-        );
-        self.get_json(&url).await
-    }
-
-    /// The step timeline of `execution_id`.
-    pub async fn timeline(&self, execution_id: &str) -> Result<Timeline, ClientError> {
-        let url = format!("{}/executions/{execution_id}/timeline", self.base_url);
-        self.get_json(&url).await
-    }
-
-    /// Conversation entries of one attempt, from entry `from` onward, up to
-    /// `byte_budget` bytes.
-    pub async fn conversation(
-        &self,
-        execution_id: &str,
-        attempt_id: &str,
-        from: u64,
-        byte_budget: usize,
-    ) -> Result<ConversationResponse, ClientError> {
-        let url = format!(
-            "{}/executions/{execution_id}/attempts/{attempt_id}/conversation?from={from}&byte_budget={byte_budget}",
-            self.base_url
-        );
-        self.get_json(&url).await
-    }
-
     // -----------------------------------------------------------------
     // Mutating calls (U5)
     // -----------------------------------------------------------------
@@ -339,30 +307,20 @@ impl ApiClient {
         self.post_json(&url, body).await
     }
 
-    /// Delivers a person's answer to a paused execution — `POST
-    /// /executions/:id/input`.
-    pub async fn deliver_input(
-        &self,
-        execution_id: &str,
-        delivery: HumanInputDeliveryDto,
-    ) -> Result<AcceptedResponse, ClientError> {
-        let url = format!("{}/executions/{execution_id}/input", self.base_url);
-        self.post_json(&url, &delivery).await
+    /// The execution of every task of the owner, as the task records hold
+    /// them — `GET /control/v1/executions`.
+    pub async fn control_executions(&self) -> Result<ExecutionListResponse, ClientError> {
+        let url = format!("{}/control/v1/executions", self.base_url);
+        self.get_json(&url).await
     }
 
-    /// Resolves one pending Claude Code permission decision.
-    pub async fn resolve_permission(
+    /// One execution of the owner and the task that runs it — `GET
+    /// /control/v1/executions/:execution_id`.
+    pub async fn control_execution(
         &self,
         execution_id: &str,
-        request: PermissionDecisionRequestDto,
-    ) -> Result<AcceptedResponse, ClientError> {
-        let url = format!("{}/executions/{execution_id}/permission", self.base_url);
-        self.post_json(&url, &request).await
-    }
-
-    /// Every stored execution, summarised — `GET /executions`.
-    pub async fn list_executions(&self) -> Result<ExecutionListResponse, ClientError> {
-        let url = format!("{}/executions", self.base_url);
+    ) -> Result<ExecutionLookupResponse, ClientError> {
+        let url = format!("{}/control/v1/executions/{execution_id}", self.base_url);
         self.get_json(&url).await
     }
 

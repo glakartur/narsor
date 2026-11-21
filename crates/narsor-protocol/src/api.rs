@@ -62,10 +62,19 @@ pub struct ExecutionSummary {
     pub conductor: Option<ConductorActivity>,
 }
 
-/// `GET /executions` response body.
+/// `GET /control/v1/executions` response body: the execution of every task
+/// of the owner whose runner reported one, as the task records hold them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionListResponse {
     pub executions: Vec<ExecutionSummary>,
+}
+
+/// `GET /control/v1/executions/{execution_id}` response body: the execution
+/// and the task that runs it, whose reads serve its content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionLookupResponse {
+    pub task_id: String,
+    pub execution: ExecutionSummary,
 }
 
 /// The conductor's chat history after a sequence number.

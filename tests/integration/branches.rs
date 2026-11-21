@@ -270,7 +270,6 @@ async fn serve(root: &TempRoot, lister: Arc<Double>) -> ApiHandle {
         .unwrap();
     start_with_services(
         catalog,
-        root.path().join("work"),
         ApiServices {
             control: Some(Arc::new(control)),
             branch_lister: Some(lister),

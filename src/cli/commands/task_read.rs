@@ -1,19 +1,31 @@
 //! `list`, `show`, `events`, `steps` and `conversation`: reading what an execution
 //! did and where it stands.
 
+//!
+//! An execution is named by its id; the CLI finds the task that runs it in
+//! the task records and reads it through that task's control-plane reads,
+//! the same for every backend (U8). Its events and conversation come from
+//! the task's runner — for a stopped task, a read-only runner started on
+//! demand (D63) — and its steps from the timeline the runner reported.
+
 use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
+use tokio::time::Instant;
 
-use crate::api::{ApiClient, ConversationResponse};
+use crate::api::{ApiClient, ClientError, ConversationResponse};
 use crate::config::Flags;
+use crate::controller_protocol::{
+    ConversationPageQuery, ConversationUnavailableReason, ExecutionEventsQuery,
+    ExecutionEventsResponse, CONVERSATION_READER_STARTING,
+};
 use crate::domain::{without_unsafe_chars, Event};
 use crate::tui::conversation::{classify, unclassified_preview};
 use narsor_protocol::api::{ConversationState, Position};
 use narsor_protocol::chat::ChatElement;
 
-use super::daemon_access::{client_error, daemon_client, load_execution_summary};
+use super::daemon_access::{client_error, daemon_client, load_execution, load_execution_summary};
 use super::open_matters::{conductor_matter_lines, pending_input_lines};
 use super::{CliError, Result};
 use crate::cli::task_text::position_status_name;
@@ -21,13 +33,15 @@ use crate::cli::task_text::position_status_name;
 /// How often `events --follow` looks for new entries in the log.
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(250);
 
-/// `narsor list` — every execution, newest first.
-///
-/// Goes through `ApiClient` (R4/D52): `GET /executions`, the same request
-/// `ApiClient::list_executions` already makes for `find_execution`/the TUI's
-/// own listing. Used to read `ExecutionStore` directly — the very
-/// construction the daemon migration exists to keep out of this file (R1) —
-/// left over from before this unit's own migration ever reached it.
+/// How long a read of a stopped task waits for its read-only runner to
+/// connect (D63) before it gives up with the reason.
+pub const READER_WAIT: Duration = Duration::from_secs(30);
+
+/// How often a read asks again while the read-only runner is starting.
+const READER_RETRY: Duration = Duration::from_millis(250);
+
+/// `narsor list` — every execution, newest first, from the task records
+/// (`GET /control/v1/executions`): nothing is read from a task's storage.
 pub async fn list(state: &Path, flags: &Flags) -> Result<()> {
     let client = daemon_client(state, flags).await?;
     print_lines(execution_list_lines(&client).await?);
@@ -38,7 +52,7 @@ pub async fn list(state: &Path, flags: &Flags) -> Result<()> {
 /// newest first, or `No executions.`.
 pub async fn execution_list_lines(client: &ApiClient) -> Result<Vec<String>> {
     let listing = client
-        .list_executions()
+        .control_executions()
         .await
         .map_err(|error| CliError::failure(format!("Could not read the executions: {error}")))?;
 
@@ -73,7 +87,8 @@ fn print_lines(lines: Vec<String>) {
     }
 }
 
-/// `narsor show <id>` — the current state, the status and the context.
+/// `narsor show <id>` — the current state, the status and what waits on
+/// the owner, as the execution's task record holds them.
 pub async fn show(state: &Path, flags: &Flags, execution_id: &str) -> Result<()> {
     let client = daemon_client(state, flags).await?;
     print_lines(execution_show_lines(&client, execution_id).await?);
@@ -101,18 +116,6 @@ pub async fn execution_show_lines(client: &ApiClient, execution_id: &str) -> Res
         lines.push(format!("Finished:      {}", completed_at.to_rfc3339()));
     }
 
-    lines.push("Context variables:".to_string());
-    if execution.variables.is_empty() {
-        lines.push("  (none)".to_string());
-    } else {
-        let mut names: Vec<&String> = execution.variables.keys().collect();
-        names.sort();
-        for name in names {
-            let value = &execution.variables[name];
-            lines.push(format!("  {name} = {value}"));
-        }
-    }
-
     if let Some(pending) = &execution.pending_input {
         lines.extend(pending_input_lines(pending));
     }
@@ -124,11 +127,12 @@ pub async fn execution_show_lines(client: &ApiClient, execution_id: &str) -> Res
 pub async fn events(state: &Path, flags: &Flags, execution_id: &str, follow: bool) -> Result<()> {
     let client = daemon_client(state, flags).await?;
     // Fails early and readably when the id is unknown.
-    let mut summary = load_execution_summary(&client, execution_id).await?;
+    let found = load_execution(&client, execution_id).await?;
+    let mut summary = found.execution;
 
     let mut after = 0u64;
     loop {
-        let events = execution_events_after(&client, execution_id, after).await?;
+        let events = execution_events_after(&client, &found.task_id, after, READER_WAIT).await?;
         for event in &events {
             print_event(event);
         }
@@ -145,26 +149,77 @@ pub async fn events(state: &Path, flags: &Flags, execution_id: &str, follow: boo
     Ok(())
 }
 
-/// The lines `narsor events` (without `--follow`) prints.
-pub async fn execution_event_lines(client: &ApiClient, execution_id: &str) -> Result<Vec<String>> {
-    load_execution_summary(client, execution_id).await?;
-    Ok(execution_events_after(client, execution_id, 0)
-        .await?
-        .iter()
-        .map(event_line)
-        .collect())
-}
-
-/// Every event of `execution_id` with a sequence above `after`.
-async fn execution_events_after(
+/// The lines `narsor events` (without `--follow`) prints; a stopped task's
+/// read-only runner is waited for up to `reader_wait`.
+pub async fn execution_event_lines(
     client: &ApiClient,
     execution_id: &str,
+    reader_wait: Duration,
+) -> Result<Vec<String>> {
+    let found = load_execution(client, execution_id).await?;
+    Ok(
+        execution_events_after(client, &found.task_id, 0, reader_wait)
+            .await?
+            .iter()
+            .map(event_line)
+            .collect(),
+    )
+}
+
+/// Every event of the execution of `task_id` with a sequence above `after`,
+/// page by page, from the task's runner.
+async fn execution_events_after(
+    client: &ApiClient,
+    task_id: &str,
     after: u64,
+    reader_wait: Duration,
 ) -> Result<Vec<Event>> {
-    client
-        .events(execution_id, after)
-        .await
-        .map_err(|error| client_error(execution_id, error))
+    let deadline = Instant::now() + reader_wait;
+    let mut query = ExecutionEventsQuery { after, limit: None };
+    let mut events = Vec::new();
+    loop {
+        let response = client
+            .control_execution_events(task_id, &query)
+            .await
+            .map_err(|error| read_error("events", error))?;
+        match response {
+            ExecutionEventsResponse::Available {
+                events: page,
+                has_more,
+                ..
+            } => {
+                let last = page.last().map(|event| event.sequence);
+                events.extend(page);
+                match last {
+                    Some(last) if has_more => query.after = last,
+                    _ => return Ok(events),
+                }
+            }
+            ExecutionEventsResponse::Unavailable {
+                reason: ConversationUnavailableReason::ReaderStarting,
+                ..
+            } if Instant::now() < deadline => tokio::time::sleep(READER_RETRY).await,
+            ExecutionEventsResponse::Unavailable { message, .. } => {
+                return Err(CliError::failure(format!(
+                    "The execution's events cannot be read: {}",
+                    without_unsafe_chars(&message)
+                )));
+            }
+        }
+    }
+}
+
+/// What the operator sees when a relayed read of `what` fails.
+fn read_error(what: &str, error: ClientError) -> CliError {
+    match error {
+        ClientError::Refused { message, .. }
+        | ClientError::Degraded { message, .. }
+        | ClientError::Request { message, .. } => CliError::failure(format!(
+            "The execution's {what} cannot be read: {}",
+            without_unsafe_chars(&message)
+        )),
+        other => CliError::failure(format!("The execution's {what} cannot be read: {other}")),
+    }
 }
 
 /// One event line: sequence, timestamp, type, description.
@@ -206,17 +261,22 @@ pub async fn steps(state: &Path, flags: &Flags, execution_id: &str) -> Result<()
     Ok(())
 }
 
-/// The lines `narsor steps` prints.
+/// The lines `narsor steps` prints: the timeline the execution's runner
+/// reported last, kept in its task record.
 pub async fn execution_steps_lines(client: &ApiClient, execution_id: &str) -> Result<Vec<String>> {
-    let timeline = client
-        .timeline(execution_id)
+    let found = load_execution(client, execution_id).await?;
+    let response = client
+        .control_timeline(&found.task_id)
         .await
         .map_err(|error| client_error(execution_id, error))?;
 
-    if timeline.positions.is_empty() {
-        return Ok(vec!["No steps.".to_string()]);
+    match response
+        .timeline
+        .filter(|timeline| !timeline.positions.is_empty())
+    {
+        Some(timeline) => Ok(timeline.positions.iter().flat_map(position_lines).collect()),
+        None => Ok(vec!["No steps.".to_string()]),
     }
-    Ok(timeline.positions.iter().flat_map(position_lines).collect())
 }
 
 /// Prints [`position_lines`].
@@ -291,42 +351,70 @@ pub async fn conversation(
     attempt_id: &str,
 ) -> Result<()> {
     let client = daemon_client(state, flags).await?;
-    print_lines(execution_conversation_lines(&client, execution_id, attempt_id).await?);
+    print_lines(
+        execution_conversation_lines(&client, execution_id, attempt_id, READER_WAIT).await?,
+    );
     Ok(())
 }
 
-/// The lines `narsor conversation` prints.
+/// The lines `narsor conversation` prints: every page of the attempt, from
+/// the task's runner; a stopped task's read-only runner is waited for up to
+/// `reader_wait`.
 pub async fn execution_conversation_lines(
     client: &ApiClient,
     execution_id: &str,
     attempt_id: &str,
+    reader_wait: Duration,
 ) -> Result<Vec<String>> {
-    load_execution_summary(client, execution_id).await?;
-
-    let response = client
-        .conversation(execution_id, attempt_id, 1, usize::MAX)
-        .await
-        .map_err(|error| client_error(execution_id, error))?;
-
-    match response {
-        ConversationResponse::Recorded {
-            entries,
-            truncated_tail,
-            ..
-        } => {
-            let mut lines: Vec<String> =
-                entries.iter().flat_map(conversation_entry_lines).collect();
-            if truncated_tail {
-                lines.push(
-                    "(the last line on disk was incomplete — the attempt was interrupted mid-write)"
-                        .to_string(),
-                );
+    let found = load_execution(client, execution_id).await?;
+    let deadline = Instant::now() + reader_wait;
+    let mut lines = Vec::new();
+    let mut from = 0;
+    loop {
+        let page = client
+            .control_conversation_page(
+                &found.task_id,
+                attempt_id,
+                &ConversationPageQuery {
+                    from,
+                    byte_budget: None,
+                },
+            )
+            .await;
+        match page {
+            Ok(ConversationResponse::Recorded {
+                entries,
+                next_entry,
+                truncated_tail,
+                ..
+            }) => {
+                let done = entries.is_empty() || next_entry <= from;
+                lines.extend(entries.iter().flat_map(conversation_entry_lines));
+                if done {
+                    if truncated_tail {
+                        lines.push(
+                            "(the last line on disk was incomplete — the attempt was interrupted \
+                             mid-write)"
+                                .to_string(),
+                        );
+                    }
+                    return Ok(lines);
+                }
+                from = next_entry;
             }
-            Ok(lines)
+            Ok(ConversationResponse::NoRecord) => {
+                return Err(CliError::failure(format!(
+                    "No conversation record for attempt '{attempt_id}' in execution \
+                     '{execution_id}'."
+                )))
+            }
+            Err(ClientError::Refused { code, .. })
+                if code == CONVERSATION_READER_STARTING && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(READER_RETRY).await
+            }
+            Err(error) => return Err(read_error("conversation", error)),
         }
-        ConversationResponse::NoRecord => Err(CliError::failure(format!(
-            "No conversation record for attempt '{attempt_id}' in execution '{execution_id}'."
-        ))),
     }
 }
 
