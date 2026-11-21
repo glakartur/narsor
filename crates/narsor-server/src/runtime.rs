@@ -337,10 +337,7 @@ fn local_controller_settings(
     Ok(LocalControllerSettings {
         program,
         control_plane: format!("http://{}", api.addr()),
-        credential_file: config
-            .state_dir()
-            .join("local-controller")
-            .join("credential"),
+        credential_file: local_controller::credential_file(config.state_dir()),
         storage: config.work_dir().join("local-controller"),
         // The controller reads its own section (R21) from the file this
         // daemon read, on every start: a restart reads the file again.

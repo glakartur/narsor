@@ -385,6 +385,39 @@ fn local_tasks_keep_the_hosts_home_unless_the_controller_section_says_otherwise(
 }
 
 #[test]
+fn local_tasks_run_as_host_processes_unless_the_controller_section_says_docker() {
+    use narsor_engine::config::local_controller::LocalMode;
+    let root = TempRoot::new();
+    let resolved = root.resolve(&Flags::default(), &[], Scope::CONTROLLER);
+    assert_eq!(resolved.local_mode(), LocalMode::Process);
+    assert_eq!(resolved.local_docker_update_interval(), Some(24 * 60 * 60));
+
+    root.user_config(
+        "controller:\n  local:\n    mode: docker\n    docker:\n      update_interval: 6h\n",
+    );
+    let resolved = root.resolve(
+        &Flags::default(),
+        &[("NARSOR_CONTROLLER__LOCAL__DOCKER__UPDATE_INTERVAL", "none")],
+        Scope::CONTROLLER,
+    );
+    assert!(resolved.is_ok(), "{:?}", resolved.errors());
+    assert_eq!(resolved.local_mode(), LocalMode::Docker);
+    assert!(matches!(
+        resolved.source(SettingKey::LocalMode),
+        Source::File(_)
+    ));
+    assert_eq!(resolved.local_docker_update_interval(), None);
+
+    root.user_config("controller:\n  local:\n    mode: dokcer\n");
+    let resolved = root.resolve(&Flags::default(), &[], Scope::CONTROLLER);
+    let error = resolved.errors()[0].to_string();
+    assert!(
+        error.contains("controller.local.mode") && error.contains("process, docker"),
+        "{error}"
+    );
+}
+
+#[test]
 fn the_observer_worker_is_off_unless_the_observer_group_enables_it() {
     use narsor_engine::config::ObserverWorkerConfig;
     let root = TempRoot::new();

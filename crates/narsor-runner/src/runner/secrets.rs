@@ -87,11 +87,16 @@ impl MountedSecrets {
 
     /// The mounted file of `reference`, checked to exist.
     pub fn file(&self, reference: &SecretReference) -> Result<PathBuf, RunnerError> {
+        self.named_file(&reference.name)
+    }
+
+    /// The mounted file of the secret `name`, checked to exist.
+    fn named_file(&self, name: &str) -> Result<PathBuf, RunnerError> {
         let missing = |detail: String| RunnerError::Secret {
-            name: reference.name.clone(),
+            name: name.to_string(),
             detail,
         };
-        if !is_plain_name(&reference.name) {
+        if !is_plain_name(name) {
             return Err(missing(
                 "a secret reference name must be one plain path component".to_string(),
             ));
@@ -101,7 +106,7 @@ impl MountedSecrets {
                 "no secrets directory was mounted (--secrets-dir)".to_string(),
             ));
         };
-        let path = dir.join(&reference.name);
+        let path = dir.join(name);
         if !path.is_file() {
             return Err(missing(format!("'{}' is not mounted", path.display())));
         }
@@ -120,20 +125,53 @@ impl MountedSecrets {
         environment: &ResolvedEnvironment,
         home: Option<&Path>,
     ) -> Result<ProcessEnvironment, RunnerError> {
+        let references = environment
+            .secrets
+            .iter()
+            .map(|reference| (reference.name.as_str(), &reference.delivery));
+        self.materialize_named(references, home)
+    }
+
+    /// [`Self::materialize`], plus the secrets the components of the sealed
+    /// task image name (`--task-image-secrets`): what the local controller
+    /// copies from its token store for a container in Docker mode (KTD10).
+    pub fn materialize_with_task_image(
+        &self,
+        environment: &ResolvedEnvironment,
+        home: Option<&Path>,
+    ) -> Result<ProcessEnvironment, RunnerError> {
+        let references = environment
+            .secrets
+            .iter()
+            .map(|reference| (reference.name.as_str(), &reference.delivery));
+        let components = environment
+            .task_image
+            .iter()
+            .flat_map(|image| &image.components)
+            .flat_map(|component| &component.secrets)
+            .map(|secret| (secret.name.as_str(), &secret.delivery));
+        self.materialize_named(references.chain(components), home)
+    }
+
+    fn materialize_named<'a>(
+        &self,
+        references: impl IntoIterator<Item = (&'a str, &'a SecretDelivery)>,
+        home: Option<&Path>,
+    ) -> Result<ProcessEnvironment, RunnerError> {
         let mut process = ProcessEnvironment {
             home: home.map(Path::to_path_buf),
             secrets: Vec::new(),
             task: Vec::new(),
         };
-        for reference in &environment.secrets {
-            if let Some(problem) = reference.delivery.problem() {
+        for (name, delivery) in references {
+            if let Some(problem) = delivery.problem() {
                 return Err(RunnerError::Secret {
-                    name: reference.name.clone(),
+                    name: name.to_string(),
                     detail: problem,
                 });
             }
-            let file = self.file(reference)?;
-            match &reference.delivery {
+            let file = self.named_file(name)?;
+            match delivery {
                 SecretDelivery::Env(name) => {
                     let value = fs::read_to_string(&file)
                         .map_err(|source| RunnerError::io(&file, source))?;
@@ -146,7 +184,7 @@ impl MountedSecrets {
                     Some(home) => link_into_home(home, relative, &file)?,
                     None => {
                         return Err(RunnerError::Secret {
-                            name: reference.name.clone(),
+                            name: name.to_string(),
                             detail: "file delivery needs the private HOME (--home private)"
                                 .to_string(),
                         })
@@ -277,6 +315,45 @@ mod tests {
         assert!(process
             .variables()
             .any(|(name, value)| name == "CODEX_API_KEY" && value == "sk-1"));
+    }
+
+    /// KTD10: in Docker mode the components of the sealed task image name
+    /// secrets of the controller's token store; only
+    /// `--task-image-secrets` makes the runner look for them.
+    #[test]
+    fn task_image_secrets_are_materialized_only_when_asked_for() {
+        use crate::domain::{ComponentSecret, ImageSpec, TaskImage, TaskImageComponent};
+        let (_dir, secrets) = mounted(&[("gitlab-token", "glpat-1\n")]);
+        let mut environment = ResolvedEnvironment::harness_only("claude-code");
+        environment.task_image = Some(TaskImage {
+            base: ImageSpec::pinned("debian:trixie-slim"),
+            components: vec![TaskImageComponent {
+                name: "glab".into(),
+                install: "true\n".into(),
+                version: None,
+                secrets: vec![ComponentSecret {
+                    name: "gitlab-token".into(),
+                    delivery: SecretDelivery::Env("GITLAB_TOKEN".into()),
+                }],
+                home: Vec::new(),
+            }],
+        });
+
+        let plain = secrets.materialize(&environment, None).unwrap();
+        assert!(plain.secrets.is_empty(), "process mode is unchanged");
+
+        let with_image = secrets
+            .materialize_with_task_image(&environment, None)
+            .unwrap();
+        assert!(with_image
+            .variables()
+            .any(|(name, value)| name == "GITLAB_TOKEN" && value == "glpat-1"));
+
+        let (_empty, none_mounted) = mounted(&[]);
+        let error = none_mounted
+            .materialize_with_task_image(&environment, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("gitlab-token"), "{error}");
     }
 
     /// R19: an `env` secret becomes the tool's variable and a `file` secret

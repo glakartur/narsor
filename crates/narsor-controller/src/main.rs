@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory as _, Parser, Subcommand};
 use narsor_controller::controller::{kubernetes_command, KubernetesArgs};
-use narsor_controller::local::{check_command, local_command, LocalArgs};
+use narsor_controller::local::{
+    check_command, local_command, local_helper_command, LocalArgs, LocalCommand,
+};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 /// The filter in force when `RUST_LOG` is not set.
@@ -37,7 +39,48 @@ enum Backend {
     /// One Pod and one PVC per task, in a Kubernetes namespace.
     Kubernetes(KubernetesArgs),
     /// One `narsor-runner` process per task, on this machine.
-    Local(LocalArgs),
+    Local(LocalCli),
+}
+
+/// `narsor-controller local`: the controller, or one of its hidden helper
+/// commands (`local secret set`, `local image refresh`), which take none of the controller's
+/// arguments.
+///
+/// Written by hand because the derive cannot make the controller's
+/// arguments optional beside a subcommand: they hold a nested flatten, so
+/// an `Option` of them is always `None`.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // parsed once, at start
+enum LocalCli {
+    Controller(LocalArgs),
+    Helper(LocalCommand),
+}
+
+impl clap::FromArgMatches for LocalCli {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        if matches.subcommand_name().is_some() {
+            LocalCommand::from_arg_matches(matches).map(Self::Helper)
+        } else {
+            LocalArgs::from_arg_matches(matches).map(Self::Controller)
+        }
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches(matches)?;
+        Ok(())
+    }
+}
+
+impl clap::Args for LocalCli {
+    fn augment_args(command: clap::Command) -> clap::Command {
+        LocalCommand::augment_subcommands(LocalArgs::augment_args(command))
+            .args_conflicts_with_subcommands(true)
+            .subcommand_negates_reqs(true)
+    }
+
+    fn augment_args_for_update(command: clap::Command) -> clap::Command {
+        Self::augment_args(command)
+    }
 }
 
 #[tokio::main]
@@ -57,7 +100,8 @@ async fn main() {
     init_logging();
     let code = match backend {
         Backend::Kubernetes(args) => kubernetes_command(args).await,
-        Backend::Local(args) => local_command(args).await,
+        Backend::Local(LocalCli::Controller(args)) => local_command(args).await,
+        Backend::Local(LocalCli::Helper(command)) => local_helper_command(command),
     };
     std::process::exit(code);
 }

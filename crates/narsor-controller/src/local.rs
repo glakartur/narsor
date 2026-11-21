@@ -63,6 +63,7 @@ use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Args;
@@ -73,14 +74,18 @@ use crate::controller::{
 use untrusted::UntrustedServer;
 
 pub mod backend;
+pub mod docker;
+pub mod docker_fake;
+pub mod image;
+pub mod secrets;
 mod untrusted;
-use backend::{LaunchCheck, LocalBackend, LocalBackendConfig};
+use backend::{ContainerMode, LaunchCheck, LocalBackend, LocalBackendConfig};
+use docker::{DockerCli, DockerTransport};
 use narsor_controller_client::controller_runtime::load_or_enroll_with_options;
 use narsor_controller_client::{ClientOptions, ControllerClient};
 use narsor_controller_runtime::{Controller, ControllerConfig};
-use narsor_engine::config::{
-    local_controller, Flags, HarnessHome, HomeMode, Resolved, SettingKey, Source,
-};
+use narsor_engine::config::local_controller::{self, LocalMode};
+use narsor_engine::config::{Flags, HarnessHome, HomeMode, Resolved, SettingKey, Source};
 
 /// What the lock file's name adds to the credential file's.
 const LOCK_SUFFIX: &str = ".lock";
@@ -153,6 +158,189 @@ pub struct LocalArgs {
     /// delivered as environment variable NAME (repeatable).
     #[arg(long = "allow-env", value_name = "NAME")]
     pub allow_env: Vec<String>,
+}
+
+/// The hidden helper commands of `narsor-controller local`, which
+/// `narsor-cli` runs for the operator.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum LocalCommand {
+    /// Manages the controller's token store.
+    #[command(hide = true)]
+    Secret {
+        /// What to do with the store.
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+    /// Manages the task images of the docker work mode.
+    #[command(hide = true)]
+    Image {
+        /// What to do with the images.
+        #[command(subcommand)]
+        command: ImageCommand,
+    },
+}
+
+/// What `narsor-controller local image` can do.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum ImageCommand {
+    /// Asks for a version check of every task image at its next use, even
+    /// inside the update interval: writes the refresh marker.
+    Refresh(ImageRefreshArgs),
+}
+
+/// Arguments of `narsor-controller local image refresh`.
+#[derive(Debug, Clone, Args)]
+pub struct ImageRefreshArgs {
+    /// The credential file of the controller whose images these are; the
+    /// marker is in the `images` directory beside it. Defaults to the
+    /// credential of a controller started by hand.
+    #[arg(long, env = "NARSOR_CONTROLLER_CREDENTIAL_FILE", value_name = "FILE")]
+    pub credential_file: Option<PathBuf>,
+}
+
+/// What `narsor-controller local secret` can do.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum SecretCommand {
+    /// Stores the value read from stdin under NAME (one trailing newline is
+    /// dropped). The value is never taken from the command line.
+    Set(SecretSetArgs),
+}
+
+/// Arguments of `narsor-controller local secret set`.
+#[derive(Debug, Clone, Args)]
+pub struct SecretSetArgs {
+    /// The secret's name, as a component of the task image names it.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+
+    /// The credential file of the controller whose store this is; the store
+    /// is the `secrets` directory beside it. Defaults to the credential of
+    /// a controller started by hand.
+    #[arg(long, env = "NARSOR_CONTROLLER_CREDENTIAL_FILE", value_name = "FILE")]
+    pub credential_file: Option<PathBuf>,
+}
+
+/// Runs a hidden helper command of `narsor-controller local`.
+pub fn local_helper_command(command: LocalCommand) -> i32 {
+    match command {
+        LocalCommand::Secret {
+            command: SecretCommand::Set(args),
+        } => exit_code(secret_set(&args, &mut std::io::stdin().lock())),
+        LocalCommand::Image {
+            command: ImageCommand::Refresh(args),
+        } => exit_code(image_refresh(&args)),
+    }
+}
+
+/// The credential file a helper command names, else the default one.
+fn helper_credential_file(given: Option<&Path>) -> Result<PathBuf, ControllerError> {
+    given
+        .map(Path::to_path_buf)
+        .or_else(default_credential_file)
+        .ok_or_else(|| {
+            crate::controller::missing_argument(
+                "--credential-file <FILE>",
+                "NARSOR_CONTROLLER_CREDENTIAL_FILE",
+            )
+        })
+}
+
+/// `local image refresh`: writes the refresh marker beside the credential.
+fn image_refresh(args: &ImageRefreshArgs) -> Result<(), ControllerError> {
+    let credential_file = helper_credential_file(args.credential_file.as_deref())?;
+    let controller_dir = credential_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let marker = image::request_refresh(controller_dir).map_err(|error| {
+        ControllerError::failure(format!("cannot write the image refresh marker: {error}"))
+    })?;
+    eprintln!(
+        "narsor-controller: task images are checked again at their next use ({})",
+        marker.display()
+    );
+    Ok(())
+}
+
+/// `local secret set`: the value from `input`, stored beside the credential.
+fn secret_set(args: &SecretSetArgs, input: &mut impl std::io::Read) -> Result<(), ControllerError> {
+    let credential_file = helper_credential_file(args.credential_file.as_deref())?;
+    let mut text = String::new();
+    input.read_to_string(&mut text).map_err(|error| {
+        ControllerError::failure(format!("cannot read the value from stdin: {error}"))
+    })?;
+    let store = secrets::SecretStore::beside_credential(&credential_file);
+    store
+        .set(&args.name, secrets::value_from_input(&text))
+        .map_err(|error| match error {
+            secrets::SecretError::Io { .. } => ControllerError::failure(error.to_string()),
+            _ => ControllerError::usage(error.to_string()),
+        })?;
+    eprintln!(
+        "narsor-controller: stored secret '{}' in {}",
+        args.name,
+        store.dir().display()
+    );
+    Ok(())
+}
+
+/// What the controller's configuration step settles before anything starts:
+/// how runners run and which HOME they get.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSetup {
+    /// How runners run (`controller.local.mode`).
+    pub mode: LocalMode,
+    /// The HOME settings runners are started with.
+    pub home: HarnessHome,
+    /// How long a built task image is used before its component versions
+    /// are checked again (Docker mode); `None` never checks again.
+    pub docker_update_interval: Option<Duration>,
+}
+
+/// The controller's configuration step: the work mode and the HOME
+/// settings, with the rules between them and the control plane.
+///
+/// Docker mode needs the trusted local control plane (KTD13): a sealed
+/// task image from a server beyond this machine could otherwise run
+/// scripts on this host. A container always gets a private HOME (KTD5):
+/// a `host` HOME somebody set is refused, the built-in one is replaced.
+fn configure(
+    args: &LocalArgs,
+    place: ControlPlanePlace,
+    config: &Resolved,
+) -> Result<LocalSetup, ControllerError> {
+    let mode = config.local_mode();
+    if mode == LocalMode::Docker {
+        if place == ControlPlanePlace::Remote {
+            return Err(ControllerError::usage(format!(
+                "{} is 'docker', which needs the local daemon as the control plane: a control \
+                 plane beyond this machine could have this computer build and run any image. \
+                 Use mode 'process' with it",
+                SettingKey::LocalMode
+            )));
+        }
+        if args.home == Some(HomeMode::Host) {
+            return Err(ControllerError::usage(format!(
+                "--home host with {} 'docker': a container always runs with a private HOME on \
+                 task storage. Leave --home out or use --home private",
+                SettingKey::LocalMode
+            )));
+        }
+    }
+    if let Some(problem) = local_controller::problems(config).into_iter().next() {
+        return Err(ControllerError::usage(problem.to_string()));
+    }
+    let mut home = resolve_home(args, place, config)?;
+    if mode == LocalMode::Docker {
+        home.mode = HomeMode::Private;
+    }
+    Ok(LocalSetup {
+        mode,
+        home,
+        docker_update_interval: config
+            .local_docker_update_interval()
+            .map(Duration::from_secs),
+    })
 }
 
 /// The HOME settings runners are started with (R17, R18; KTD15): each from
@@ -258,7 +446,10 @@ fn resolve_config(file: Option<&Path>, no_config: bool) -> Resolved {
 /// problem) or 1, without starting anything (`narsor-cli config show`).
 pub fn check_command(file: Option<&Path>) -> ! {
     let resolved = resolve_config(file, false);
-    let problems = narsor_engine::config::Problem::of_resolution(&resolved);
+    let mut problems = narsor_engine::config::Problem::of_resolution(&resolved);
+    if resolved.is_ok() {
+        problems.extend(local_controller::problems(&resolved));
+    }
     narsor_engine::config::CheckReport::build("narsor-controller", &resolved, &problems)
         .print_and_exit()
 }
@@ -312,7 +503,8 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
     if let Some(warning) = narsor_engine::config::legacy::warning(&config, &environment) {
         eprintln!("narsor-controller: warning: {warning}");
     }
-    let home = resolve_home(&args, place, &config)?;
+    let setup = configure(&args, place, &config)?;
+    let home = setup.home;
     if place == ControlPlanePlace::Remote {
         warn_untrusted(&connection.control_plane, &home);
     }
@@ -339,7 +531,25 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
             backend_config.withhold_user_credentials = true;
         }
     }
+    // Containers are observed and removed in either mode: a process-mode
+    // controller still removes what a Docker-mode one left (KTD1).
+    let docker: Arc<dyn DockerTransport> = Arc::new(DockerCli::default());
+    backend_config.docker = Some(Arc::clone(&docker));
+    if setup.mode == LocalMode::Docker {
+        backend_config.container_mode = Some(container_mode(
+            docker,
+            &connection.credential_file,
+            setup.docker_update_interval,
+            config.file().path().map(Path::to_path_buf),
+        ));
+    }
     let backend = LocalBackend::new(backend_config);
+    if setup.mode == LocalMode::Docker {
+        let collector = backend.clone();
+        // Images no task names any more go at start (KTD12); a failure is
+        // only logged.
+        let _ = tokio::task::spawn_blocking(move || collector.collect_image_garbage()).await;
+    }
 
     let options = ClientOptions {
         release_lease_timeout: Some(RELEASE_LEASE_TIMEOUT),
@@ -365,6 +575,7 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
     tracing::info!(
         storage = %args.storage.display(),
         remote = place == ControlPlanePlace::Remote,
+        mode = setup.mode.as_str(),
         "controller: driving the local backend"
     );
     let parent = args.parent_pid;
@@ -379,6 +590,33 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
         })
         .await;
     Ok(())
+}
+
+/// What the Docker work mode needs: the image build jobs and the token
+/// store of the controller keeping `credential_file`, and the host user.
+fn container_mode(
+    docker: Arc<dyn DockerTransport>,
+    credential_file: &Path,
+    update_interval: Option<Duration>,
+    config_file: Option<PathBuf>,
+) -> ContainerMode {
+    let controller_dir = credential_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let settings = image::BuildSettings::new(update_interval);
+    let user = settings.user;
+    ContainerMode {
+        builds: image::TaskImageBuilds::new(docker, controller_dir, settings),
+        secrets: secrets::SecretStore::beside_credential(credential_file),
+        user,
+        host_home: std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from),
+        config_file,
+        runner_args: Vec::new(),
+        start_window: backend::DEFAULT_START_WINDOW,
+    }
 }
 
 /// The checks of every launch spec from a control plane beyond this
@@ -660,5 +898,57 @@ mod tests {
             resolve_home(&accepted, remote, &set_host).unwrap().mode,
             HomeMode::Host
         );
+    }
+
+    #[test]
+    fn docker_mode_runs_with_a_private_home_on_the_local_daemon_only() {
+        let loopback = ControlPlanePlace::Loopback;
+        let docker = configuration(Some("    mode: docker\n"), &[]);
+        let setup = configure(&args(), loopback, &docker).unwrap();
+        assert_eq!(setup.mode, LocalMode::Docker);
+        // KTD5: the built-in `host` gives way to a private HOME.
+        assert_eq!(setup.home.mode, HomeMode::Private);
+        assert_eq!(
+            setup.docker_update_interval,
+            Some(Duration::from_secs(24 * 60 * 60))
+        );
+
+        let explicit_host = configuration(Some("    mode: docker\n    home: host\n"), &[]);
+        let host_flag = LocalArgs {
+            home: Some(HomeMode::Host),
+            ..args()
+        };
+        for (case, args, place, config, expected) in [
+            (
+                "home: host set in the file",
+                args(),
+                loopback,
+                &explicit_host,
+                vec!["controller.local.mode", "controller.local.home"],
+            ),
+            (
+                "--home host",
+                host_flag,
+                loopback,
+                &docker,
+                vec!["--home host", "controller.local.mode"],
+            ),
+            (
+                "a remote control plane",
+                args(),
+                ControlPlanePlace::Remote,
+                &docker,
+                vec!["controller.local.mode", "local daemon"],
+            ),
+        ] {
+            let refused = configure(&args, place, config).unwrap_err();
+            for needle in expected {
+                assert!(
+                    refused.message.contains(needle),
+                    "{case}: '{needle}' missing from: {}",
+                    refused.message
+                );
+            }
+        }
     }
 }

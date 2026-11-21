@@ -339,6 +339,50 @@ pub enum Command {
 
     /// Manages controller identities through the control plane.
     Controller(ControllerCli),
+
+    /// Manages the token store of the local controller, which Docker-mode
+    /// tasks take their secrets from.
+    Secret {
+        /// What to do with the store.
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+
+    /// Manages the task images the local controller builds for Docker-mode
+    /// tasks.
+    Image {
+        /// What to do with the images.
+        #[command(subcommand)]
+        command: ImageCommand,
+    },
+}
+
+/// What `image` can do.
+#[derive(Debug, Subcommand)]
+pub enum ImageCommand {
+    /// Checks the component versions of every task image again at its next
+    /// use, even inside `controller.local.docker.update_interval`. A
+    /// changed version rebuilds its layer and the ones after it.
+    Refresh,
+}
+
+/// What `secret` can do.
+#[derive(Debug, Subcommand)]
+pub enum SecretCommand {
+    /// Stores a secret for Docker-mode tasks of the local daemon, replacing
+    /// an earlier value.
+    ///
+    /// The value is read from stdin, never from the command line; one
+    /// trailing newline is dropped. Give it from a file or a pipe:
+    ///
+    ///   narsor-cli secret set gitlab-token < token.txt
+    ///
+    ///   pass show gitlab | narsor-cli secret set gitlab-token
+    Set {
+        /// The secret's name, as a component of the task image names it.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
 }
 
 /// Controller identity management in `narsor-cli`.
@@ -476,6 +520,8 @@ impl Command {
             | Command::Usage { .. }
             | Command::Auth { .. }
             | Command::Daemon { .. }
+            | Command::Secret { .. }
+            | Command::Image { .. }
             | Command::Queue { .. } => false,
             // Configured by its own flags and environment only, like the
             // runner: it reads no Narsor configuration file. Its operator
@@ -615,6 +661,12 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
                 "narsor-cli controller needs an operator subcommand (enroll-code, list, revoke)",
             )),
         },
+        Command::Secret {
+            command: SecretCommand::Set { name },
+        } => commands::secret_set(&state, &name),
+        Command::Image {
+            command: ImageCommand::Refresh,
+        } => commands::image_refresh(&state),
         Command::Daemon {
             command: DaemonCommand::Stop,
         } => daemon::stop_daemon(&flags),

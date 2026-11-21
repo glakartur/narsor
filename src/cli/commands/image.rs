@@ -1,0 +1,47 @@
+//! `image refresh`: asks the local controller to check the versions of its
+//! Docker-mode task images at their next use, even inside the update
+//! interval.
+//!
+//! Like `secret set`, `narsor-cli` resolves the daemon's state directory and
+//! runs the `narsor-controller` installed next to it, with
+//! `--credential-file` naming the controller's credential; the controller
+//! writes its refresh marker beside it.
+
+use std::ffi::OsString;
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+use crate::config::local_controller;
+
+use super::secret::{controller_program, CONTROLLER_BINARY};
+use super::{CliError, Result};
+
+/// The `narsor-controller` arguments that ask for a refresh of the task
+/// images of the daemon whose state directory is `state_dir`.
+pub fn image_refresh_args(state_dir: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["local", "image", "refresh", "--credential-file"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    args.push(local_controller::credential_file(state_dir).into_os_string());
+    args
+}
+
+/// `narsor-cli image refresh`.
+pub fn image_refresh(state_dir: &Path) -> Result<()> {
+    let program = controller_program("it builds the task images")?;
+    let status = Command::new(&program)
+        .args(image_refresh_args(state_dir))
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|error| CliError::failure(format!("cannot run {}: {error}", program.display())))?;
+    // The controller has said why on stderr.
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliError::failure(format!(
+            "narsor-cli: the task images were not marked for a refresh ({CONTROLLER_BINARY} \
+             ended with {status})"
+        )))
+    }
+}

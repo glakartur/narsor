@@ -438,6 +438,16 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
         "Claude Code profile copied into local tasks before each start.",
     ),
     (
+        SettingKey::LocalMode,
+        "process",
+        "How local tasks run: process (on the host) or docker (in a container; HOME is private).",
+    ),
+    (
+        SettingKey::LocalDockerUpdateInterval,
+        "24h",
+        "How long a built task image is used before its component versions are checked again, or none.",
+    ),
+    (
         SettingKey::CorsAllowedOrigins,
         "[]",
         "Browser origins allowed to call the API.",

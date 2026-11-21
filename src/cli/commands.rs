@@ -20,13 +20,17 @@
 
 mod config;
 mod daemon_access;
+mod image;
 mod open_matters;
+mod secret;
 mod task_control;
 mod task_read;
 mod tui;
 mod workflow;
 
 pub use config::*;
+pub use image::*;
+pub use secret::*;
 pub use task_control::*;
 pub use task_read::*;
 pub use tui::*;

@@ -33,6 +33,7 @@ use crate::config::{AgentArgs, HarnessHome, HomeMode};
 
 use super::cascade::{CascadeError, ConfigCascade, Resolution};
 use super::file::{self, FileError, FileValues};
+use super::local_controller::LocalMode;
 use super::scope::Scope;
 use super::settings::{SettingKey, SettingValue, Source, ENV_PREFIX, LOG_OFF, RUST_LOG};
 
@@ -266,6 +267,23 @@ impl Resolved {
                 .text(SettingKey::LocalClaudeProfileSource)
                 .map(PathBuf::from),
         }
+    }
+
+    /// How the local backend runs a task's runner (`controller.local.mode`).
+    pub fn local_mode(&self) -> LocalMode {
+        match self.text(SettingKey::LocalMode) {
+            Some("docker") => LocalMode::Docker,
+            _ => LocalMode::Process,
+        }
+    }
+
+    /// How long a built task image is used before its component versions
+    /// are checked again (`controller.local.docker.update_interval`), in
+    /// seconds; `None` never checks again.
+    pub fn local_docker_update_interval(&self) -> Option<u64> {
+        self.value(SettingKey::LocalDockerUpdateInterval)
+            .as_duration()
+            .expect("the update interval is a duration")
     }
 
     /// The observer worker the server starts (`server.observer.*`), `None`

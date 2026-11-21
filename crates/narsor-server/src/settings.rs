@@ -63,6 +63,13 @@ pub fn configure(
                 problems.push(problem.prefixed("local controller: "));
             }
         }
+        if controller.is_ok() {
+            problems.extend(
+                local_controller::problems(&controller)
+                    .into_iter()
+                    .map(|problem| problem.prefixed("local controller: ")),
+            );
+        }
     }
 
     match (security, observer) {
