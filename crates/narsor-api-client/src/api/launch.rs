@@ -31,7 +31,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 /// Spawns a fully detached copy of the current binary.
 ///
@@ -52,13 +52,13 @@ use std::process::{Command, Stdio};
 /// there; its stdin is `/dev/null` — a detached process has no terminal to
 /// read from.
 ///
-/// Returns the spawned child's PID as soon as it exists. The `Child` handle
-/// itself is deliberately dropped without `wait()`: this process is not
-/// responsible for the daemon's lifetime, and blocking here would defeat
-/// the entire point of detaching. A process whose parent exits without
-/// `wait`ing on it is simply reparented (to `init` or the nearest
-/// subreaper) by the kernel — it does not become a zombie or get killed.
-pub fn spawn_detached<I, S>(args: I, log_file: &Path) -> io::Result<u32>
+/// Returns the spawned child as soon as it exists. The caller may poll it
+/// with `try_wait()` to notice a daemon that exits at once, but never
+/// blocks on it: this process is not responsible for the daemon's lifetime.
+/// Dropping the handle without `wait()` is safe: a process whose parent
+/// exits without `wait`ing on it is simply reparented (to `init` or the
+/// nearest subreaper) by the kernel — it does not get killed.
+pub fn spawn_detached<I, S>(args: I, log_file: &Path) -> io::Result<Child>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -90,10 +90,7 @@ where
         });
     }
 
-    let child = command.spawn()?;
-    let pid = child.id();
-    drop(child);
-    Ok(pid)
+    command.spawn()
 }
 
 /// Environment variable [`set_exe_override_for_tests`] writes to, and
@@ -200,13 +197,11 @@ pub fn set_exe_override_for_tests(path: &Path) {
 }
 
 /// Opens `path` for appending, ensuring `0600` permissions whether the file
-/// is created fresh or already existed from a previous run.
+/// is created fresh or already existed from a previous run. Its directory
+/// is the prepared rendezvous directory.
 fn open_log_file(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

@@ -926,7 +926,7 @@ fn a_controller_whose_credential_was_deleted_enrolls_again_at_the_next_start() {
     fs::create_dir_all(&root).unwrap();
     let config = root.join("config.yaml");
     fs::write(&config, format!("global:\n  root: {}\n", root.display())).unwrap();
-    let daemon_file = root.join("state/daemon.json");
+    let daemon_file = root.join("state/run/daemon.json");
     let credential = root.join("state/narsor-controller-local/credential");
 
     let mut credentials = Vec::new();
@@ -959,4 +959,73 @@ fn a_controller_whose_credential_was_deleted_enrolls_again_at_the_next_start() {
     let _ = fs::remove_dir_all(&root);
 
     assert_ne!(credentials[0], credentials[1], "a new identity each time");
+}
+
+/// R7: a client finds and starts the daemon only through `state/run/`
+/// (0700). A daemon that refuses its configuration is reported with the end
+/// of its log there, at once.
+#[test]
+#[ignore = "starts the built narsor-cli, narsor-server and narsor-controller binaries"]
+fn a_client_starts_the_daemon_through_the_rendezvous_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Output};
+    use std::time::{Duration, Instant};
+
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_narsor-cli"));
+    let server = cli.with_file_name("narsor-server");
+    assert!(
+        server.is_file() && cli.with_file_name("narsor-controller").is_file(),
+        "build the workspace binaries first"
+    );
+    let root = std::env::temp_dir().join(format!("narsor-rendezvous-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let config = root.join("config.yaml");
+    let run_dir = root.join("state/run");
+    let run = |binary: &Path, args: &[&str]| -> Output {
+        Command::new(binary)
+            .arg("--config")
+            .arg(&config)
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &root)
+            .output()
+            .expect("run a narsor binary")
+    };
+
+    fs::write(&config, format!("global:\n  root: {}\n", root.display())).unwrap();
+    let listed = run(&cli, &["list"]);
+    let mode = fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
+    let discovered = run_dir.join("daemon.json").is_file();
+    let stopped = run(&server, &["stop"]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while run_dir.join("daemon.json").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    fs::write(
+        &config,
+        format!(
+            "global:\n  root: {}\nserver:\n  mode: netwrk\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let refused = run(&cli, &["list"]);
+    let _ = fs::remove_dir_all(&root);
+
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert_eq!(mode, 0o700);
+    assert!(discovered, "daemon.json is written in state/run/");
+    assert!(stopped.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success());
+    assert!(
+        message.contains("server.mode") && message.contains("narsor-server.log"),
+        "{message}"
+    );
 }

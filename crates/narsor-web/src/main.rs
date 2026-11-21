@@ -84,8 +84,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             problems.join("\n  ")
         )
     })?;
-    // The state root: the daemon is found below it, and this binary's own
-    // files are in its own directory there.
+    // The state root: the daemon is found in its rendezvous directory
+    // (`run/`), and this binary's own files are in its own directory there.
     let state = resolved.state_dir().to_path_buf();
     let paths = WebStatePaths::new(&state);
 

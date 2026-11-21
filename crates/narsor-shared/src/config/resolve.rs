@@ -211,11 +211,6 @@ impl Resolved {
         self.root_of(SettingKey::WorkDir)
     }
 
-    /// The client's narrow filesystem paths for logging and daemon discovery.
-    pub fn client_paths(&self) -> crate::config::client_paths::ClientPaths {
-        crate::config::client_paths::ClientPaths::new(self.state_dir())
-    }
-
     /// One of the directory settings, which are all paths.
     fn root_of(&self, setting: SettingKey) -> &Path {
         self.value(setting)

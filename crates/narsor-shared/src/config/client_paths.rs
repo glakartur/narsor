@@ -1,35 +1,7 @@
-//! Filesystem paths the client needs for its own log and daemon discovery.
-//! No execution, orchestration, credential, or material storage paths are
-//! exposed here.
+//! Client-side paths outside the state root. The rendezvous directory is
+//! [`crate::run_paths::RunPaths`].
 
-use std::path::{Path, PathBuf};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientPaths {
-    root: PathBuf,
-}
-
-impl ClientPaths {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub fn log_file(&self) -> PathBuf {
-        self.root.join("narsor.log")
-    }
-
-    pub fn daemon_file(&self) -> PathBuf {
-        self.root.join("daemon.json")
-    }
-
-    pub fn daemon_lock_file(&self) -> PathBuf {
-        self.root.join("daemon.lock")
-    }
-}
+use std::path::PathBuf;
 
 /// `$XDG_CONFIG_HOME/narsor/workflows`, falling back to `$HOME/.config`.
 /// Empty `XDG_CONFIG_HOME` is treated as unset, matching server resolution.

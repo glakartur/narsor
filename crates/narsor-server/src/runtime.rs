@@ -89,9 +89,9 @@ const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// every rule between the settings already held.
 pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<()> {
     let paths = narsor_engine::persistence::ServerStatePaths::new(config.state_dir());
-    // The discovery file stays at the state root, where clients look for
-    // it, until it moves to the rendezvous directory.
-    let daemon_file = config.client_paths().daemon_file();
+    // Clients find this daemon only through the rendezvous directory (R7).
+    let run = narsor_shared::run_paths::RunPaths::new(config.state_dir());
+    let daemon_file = run.daemon_file();
     // One daemon per state directory, held until this function returns. A
     // predecessor that is still shutting down is waited for: two daemons
     // must never drive the same tasks.
@@ -103,6 +103,9 @@ pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<(
     )
     .await
     .map_err(|error| CliError::failure(error.to_string()))?;
+    // Refused before anything starts, not after the controller enrolled.
+    run.prepare()
+        .map_err(|error| CliError::failure(error.to_string()))?;
     let runs_local_controller = settings.runs_local_controller();
     let ServerSettings {
         security,

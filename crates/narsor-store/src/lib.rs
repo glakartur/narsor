@@ -4,8 +4,6 @@
 //! filesystem under a configurable root (default `./.narsor`):
 //!
 //! ```text
-//! {root}/daemon.json                  -- discovery file of a running daemon
-//! {root}/daemon.lock                  -- exclusive lock guarding daemon spawn
 //! {root}/agent-harness.json            -- durable default-harness override
 //! {root}/executions/{execution_id}/
 //!     state.json                  -- the serialized WorkflowExecution

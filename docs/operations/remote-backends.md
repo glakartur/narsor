@@ -103,7 +103,7 @@ every problem.
 | --- | --- | --- |
 | For | one person on one machine | a shared, reachable control plane |
 | Listens on | loopback only; a wildcard, IPv4-mapped or non-loopback bind is refused | any address, behind a TLS-terminating proxy |
-| Users prove | the random per-process token in the `0600` discovery file `{state}/daemon.json` | an OIDC access token of the configured issuer and audience |
+| Users prove | the random per-process token in the `0600` discovery file `{state}/run/daemon.json` | an OIDC access token of the configured issuer and audience |
 | Owner | the local token holder | one OIDC identity `(issuer, subject)` |
 
 ### Trusted mode

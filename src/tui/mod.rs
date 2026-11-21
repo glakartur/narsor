@@ -44,6 +44,7 @@ pub mod failure_form;
 pub mod form;
 pub mod input_form;
 pub mod keymap;
+pub mod paths;
 pub mod queues;
 pub mod refresh;
 pub mod scroll;

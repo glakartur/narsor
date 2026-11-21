@@ -459,7 +459,9 @@ With the built-in directories, everything is under the root (`global.root`,
 │   ├── state/                      # execution history once the runner initializes it
 │   └── workspace/                  # provisioned only after scheduler admission
 ├── local-controller/tasks/{task_id}.json # under `server.work`: last runner kind and image of a task
-└── narsor.log                # only written by `tui`, and only with RUST_LOG set
+├── state/run/                      # 0700: daemon.json (discovery), daemon.lock, and
+│                                   # narsor-server.log (output of a daemon a client started)
+└── state/narsor/narsor.log         # only written by `tui`, and only with RUST_LOG set
 ```
 
 Every write of `state.json`, `context.json` and `repositories.json` is atomic
