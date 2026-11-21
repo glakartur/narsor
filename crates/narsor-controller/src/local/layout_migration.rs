@@ -15,8 +15,12 @@
 //!    anything moves, so the images built earlier stay this controller's;
 //! 4. moves its entries ([`STATE_ENTRIES`], [`WORK_ENTRIES`]), splitting
 //!    them between its state and work directories;
+//!    `secrets/` and `images/` merge into a target a newer `narsor-cli`
+//!    already created ([`MERGED_ENTRIES`]);
 //! 5. renames the Claude Code session directories of every task, keyed by
-//!    the old workspace path, to the key of the new one ([`claude_project_key`]);
+//!    the old workspace path, to the key of the new one ([`claude_project_key`]),
+//!    and rewrites the workspace paths each stored execution recorded below
+//!    the old storage directory ([`rebase_workspace_paths`]);
 //! 6. writes its marker, then removes the old directories when empty.
 //!
 //! A repeat finishes what a crash left: every move and rename is done per
@@ -28,7 +32,9 @@ use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use narsor_model::domain::WorkflowExecution;
 use narsor_shared::layout_move::{self, Mover};
+use narsor_store::ExecutionStore;
 
 use super::container::image;
 use super::paths::{ControllerStatePaths, ControllerWorkPaths};
@@ -45,12 +51,21 @@ pub const WORK_ENTRIES: [(&str, bool); 4] = [
     ("tasks", true),
 ];
 
+/// The state entries a newer `narsor-cli` may create before the first start
+/// of the new server (`secret set`, `image refresh`): an existing target
+/// is merged into, entry by entry, instead of refused.
+pub const MERGED_ENTRIES: [&str; 2] = ["secrets", "images"];
+
 /// The old credential lock: moved last.
 const CREDENTIAL_LOCK: &str = "credential.lock";
 
 /// Where Claude Code keeps its sessions, inside a task's private HOME on
 /// its storage.
 const CLAUDE_PROJECTS: &str = "home/.claude/projects";
+
+/// The Engine state root inside a task storage (the runner's
+/// `TaskStorage::state_dir`).
+const TASK_STATE_DIR: &str = "state";
 
 /// The longest key Claude Code uses as it is; a longer one is cut and gets
 /// a hash this migration cannot reproduce.
@@ -74,9 +89,14 @@ pub struct LegacyDirs {
 pub enum Outcome {
     /// The marker was there: an earlier start migrated.
     AlreadyMigrated,
-    /// Migrated now: the entries that moved and the Claude session
-    /// directories renamed.
-    Migrated { moved: Vec<String>, sessions: usize },
+    /// Migrated now: the entries that moved, the Claude session
+    /// directories renamed and the stored executions whose workspace paths
+    /// were rewritten.
+    Migrated {
+        moved: Vec<String>,
+        sessions: usize,
+        executions: usize,
+    },
 }
 
 /// Moves the controller's old files (see the module documentation).
@@ -108,7 +128,15 @@ pub fn migrate(
 
     let mut moved = Vec::new();
     let mut move_one = |from: &Path, name: &str, to: &Path| -> Result<(), String> {
-        match mover.move_entry(&from.join(name), &to.join(name)) {
+        let merge = MERGED_ENTRIES.contains(&name)
+            && is_real_dir(&from.join(name))
+            && is_real_dir(&to.join(name));
+        let outcome = if merge {
+            merge_dir(mover, &from.join(name), &to.join(name))
+        } else {
+            mover.move_entry(&from.join(name), &to.join(name))
+        };
+        match outcome {
             Ok(layout_move::Moved::Moved) => {
                 moved.push(name.to_string());
                 Ok(())
@@ -127,6 +155,7 @@ pub fn migrate(
     move_one(&legacy.state, CREDENTIAL_LOCK, state.dir())?;
 
     let sessions = rename_claude_sessions(&old_storage, &work.storage_dir());
+    let executions = rebase_workspace_paths(&old_storage, &work.storage_dir());
     layout_move::write_marker(state.dir()).map_err(|error| {
         format!(
             "cannot write the migration marker in {}: {error}",
@@ -143,10 +172,68 @@ pub fn migrate(
             work = %work.dir().display(),
             entries = %moved.join(", "),
             sessions,
+            executions,
             "migration: moved the controller's files to the new layout"
         );
     }
-    Ok(Outcome::Migrated { moved, sessions })
+    Ok(Outcome::Migrated {
+        moved,
+        sessions,
+        executions,
+    })
+}
+
+/// Moves every entry of the old directory `from` into the existing `to`,
+/// one by one, so a repeat finishes what a crash left. An entry whose name
+/// `to` already holds was written after the update and is newer: it stays,
+/// and the old one is left beside the old directory with a warning.
+fn merge_dir(
+    mover: Mover,
+    from: &Path,
+    to: &Path,
+) -> Result<layout_move::Moved, layout_move::MoveError> {
+    let fail = |reason: String| layout_move::MoveError {
+        source: from.to_path_buf(),
+        target: to.to_path_buf(),
+        reason,
+    };
+    let mut names = fs::read_dir(from)
+        .map_err(|error| fail(error.to_string()))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(|error| fail(error.to_string()))?;
+    // A copy across filesystems a crash left complete is renamed aside
+    // (`<name>.narsor-moved`); `move_entry` of `<name>` finishes it.
+    for name in &mut names {
+        if let Some(original) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(layout_move::MOVED_SUFFIX))
+        {
+            *name = original.into();
+        }
+    }
+    names.sort();
+    names.dedup();
+    let mut outcome = layout_move::Moved::AlreadyThere;
+    for name in names {
+        let (source, target) = (from.join(&name), to.join(&name));
+        let kept = fs::symlink_metadata(&source).is_ok() && fs::symlink_metadata(&target).is_ok();
+        if kept {
+            tracing::warn!(old = %source.display(), kept = %target.display(), "migration: a newer entry of the same name is already in the new layout; keeping it and leaving the old one");
+            continue;
+        }
+        if mover.move_entry(&source, &target)? == layout_move::Moved::Moved {
+            outcome = layout_move::Moved::Moved;
+        }
+    }
+    // Only an empty one goes; a kept conflict stays for the operator.
+    let _ = fs::remove_dir(from);
+    Ok(outcome)
+}
+
+/// Whether `path` is a directory itself, not a link to one.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
 /// The key Claude Code files the sessions of the working directory `path`
@@ -180,7 +267,9 @@ fn rename_claude_sessions(old_storage: &[PathBuf; 2], new_storage: &Path) -> usi
     let new_storage = [physical(new_storage), absolute(new_storage)];
     let mut renamed = 0;
     for task in tasks.flatten() {
-        let projects = task.path().join(CLAUDE_PROJECTS);
+        let Some(projects) = claude_projects_dir(&task.path()) else {
+            continue;
+        };
         for (old, new) in old_storage.iter().zip(&new_storage) {
             let old_prefix = claude_project_key(&old.join(task.file_name()));
             let new_prefix = claude_project_key(&new.join(task.file_name()));
@@ -190,6 +279,122 @@ fn rename_claude_sessions(old_storage: &[PathBuf; 2], new_storage: &Path) -> usi
         }
     }
     renamed
+}
+
+/// The Claude Code projects directory of the task storage `task`, when
+/// every directory on the way is a real one: a link (to anywhere outside
+/// the storage) is not followed, with a warning.
+fn claude_projects_dir(task: &Path) -> Option<PathBuf> {
+    let mut path = task.to_path_buf();
+    let components = Path::new(CLAUDE_PROJECTS).components();
+    for component in std::iter::once(None).chain(components.map(Some)) {
+        if let Some(component) = component {
+            path.push(component);
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                tracing::warn!(path = %path.display(), "migration: a symbolic link in a task's Claude sessions path; leaving its sessions as they are");
+                return None;
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            _ => return None,
+        }
+    }
+    Some(path)
+}
+
+/// Rewrites, in the executions stored in every task storage below
+/// `new_storage`, the workspace paths recorded below the task's old
+/// storage path to the same place below its new one: a paused task resumes
+/// where its work tree is now. `old_storage` and `new_storage` pair the
+/// physical and the given form, as for the Claude keys; a path below
+/// neither old form is left. A task whose execution cannot be read or
+/// written is skipped with a warning. Returns how many executions changed.
+fn rebase_workspace_paths(old_storage: &[PathBuf; 2], new_storage: &Path) -> usize {
+    let Ok(tasks) = fs::read_dir(new_storage) else {
+        return 0;
+    };
+    let new_storage = [physical(new_storage), absolute(new_storage)];
+    let mut rebased = 0;
+    for task in tasks.flatten() {
+        if !task.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let moves: Vec<(PathBuf, PathBuf)> = old_storage
+            .iter()
+            .zip(&new_storage)
+            .map(|(old, new)| (old.join(task.file_name()), new.join(task.file_name())))
+            .collect();
+        let store = ExecutionStore::new(task.path().join(TASK_STATE_DIR));
+        let ids = match store.list_execution_ids() {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!(task = %task.path().display(), %error, "migration: cannot list a task's executions; its workspace paths stay as they were");
+                continue;
+            }
+        };
+        for id in ids {
+            let mut execution = match store.load_execution(&id) {
+                Ok(execution) => execution,
+                Err(error) => {
+                    tracing::warn!(task = %task.path().display(), execution = %id, %error, "migration: cannot read a stored execution; its workspace paths stay as they were");
+                    continue;
+                }
+            };
+            if !rebase_execution(&mut execution, &moves) {
+                continue;
+            }
+            match store.save_execution(&execution) {
+                Ok(()) => rebased += 1,
+                Err(error) => {
+                    tracing::warn!(task = %task.path().display(), execution = %id, %error, "migration: cannot write a stored execution; its workspace paths stay as they were");
+                }
+            }
+        }
+    }
+    rebased
+}
+
+/// Rewrites every workspace path of `execution` below an old path of
+/// `moves` to the paired new one. Whether anything changed.
+fn rebase_execution(execution: &mut WorkflowExecution, moves: &[(PathBuf, PathBuf)]) -> bool {
+    let workspace = &mut execution.workspace;
+    let mut paths: Vec<&mut String> = vec![&mut workspace.path];
+    paths.extend(workspace.root.as_mut());
+    paths.extend(
+        workspace
+            .repositories
+            .iter_mut()
+            .map(|repository| &mut repository.path),
+    );
+    paths.extend(
+        execution
+            .context
+            .workspace
+            .as_mut()
+            .map(|info| &mut info.path),
+    );
+    let mut changed = false;
+    for path in paths {
+        if let Some(rebased) = rebase_path(path, moves) {
+            *path = rebased;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// `path` moved from below the first old path of `moves` it lies below.
+fn rebase_path(path: &str, moves: &[(PathBuf, PathBuf)]) -> Option<String> {
+    moves.iter().find_map(|(old, new)| {
+        let rest = Path::new(path).strip_prefix(old).ok()?;
+        let rebased = if rest.as_os_str().is_empty() {
+            new.clone()
+        } else {
+            new.join(rest)
+        };
+        Some(rebased.display().to_string())
+    })
 }
 
 /// Renames the session directories in `projects` whose key is `old_prefix`
@@ -369,6 +574,133 @@ mod tests {
         assert!(error.contains("credential.lock"), "{error}");
         assert!(legacy.state.join("credential").is_file());
         assert!(!state.controller_id_file().exists());
+    }
+
+    fn paused_execution(workspace_dir: &Path, elsewhere: &str) -> WorkflowExecution {
+        use narsor_model::domain::{
+            Context, ExecutionStatus, Workspace, WorkspaceInfo, WorkspaceRepository,
+        };
+        let repository = |name: &str, path: String, primary| WorkspaceRepository {
+            name: name.into(),
+            path,
+            primary,
+            branch: None,
+            repository: None,
+            base_commit: None,
+        };
+        let primary = workspace_dir.join("app").display().to_string();
+        let mut workspace = Workspace::local_folder(primary.clone());
+        workspace.root = Some(workspace_dir.display().to_string());
+        workspace.repositories = vec![
+            repository("app", primary.clone(), true),
+            repository("docs", elsewhere.into(), false),
+        ];
+        WorkflowExecution {
+            id: "exec-1".into(),
+            workflow_id: "flow".into(),
+            workflow_version: 1,
+            status: ExecutionStatus::Paused,
+            current_state: Some("work".into()),
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            inputs: serde_json::json!({}),
+            context: Context {
+                workspace: Some(WorkspaceInfo {
+                    id: workspace.id.clone(),
+                    path: primary,
+                    workspace_type: "local_folder".into(),
+                }),
+                ..Context::default()
+            },
+            workspace,
+            current_action_execution: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    /// A paused task resumes from its stored execution, whose workspace
+    /// paths must follow its storage; a path outside it stays.
+    #[test]
+    fn stored_workspace_paths_follow_the_moved_task_storage() {
+        let temp = Temp::new();
+        let legacy = old_controller(&temp.0.join("local-controller"));
+        let task = legacy.work.join("storage/task-1");
+        let elsewhere = "/srv/elsewhere/docs";
+        ExecutionStore::new(task.join(TASK_STATE_DIR))
+            .save_execution(&paused_execution(&task.join("workspace"), elsewhere))
+            .unwrap();
+        let state = ControllerStatePaths::new(temp.0.join("state"));
+        let work = ControllerWorkPaths::new(temp.0.join("work"));
+
+        let outcome = migrate(&legacy, &state, &work, Mover::new(), Duration::ZERO).unwrap();
+
+        assert!(
+            matches!(outcome, Outcome::Migrated { executions: 1, .. }),
+            "{outcome:?}"
+        );
+        let workspace = work.storage_dir().join("task-1/workspace");
+        let primary = workspace.join("app").display().to_string();
+        let store = ExecutionStore::new(work.storage_dir().join("task-1").join(TASK_STATE_DIR));
+        let execution = store.load_execution("exec-1").unwrap();
+        assert_eq!(execution.workspace.path, primary);
+        assert_eq!(
+            execution.workspace.root.as_deref(),
+            Some(workspace.display().to_string().as_str())
+        );
+        let paths: Vec<_> = execution
+            .workspace
+            .repositories
+            .iter()
+            .map(|repository| repository.path.as_str())
+            .collect();
+        assert_eq!(paths, [primary.as_str(), elsewhere]);
+        assert_eq!(execution.context.workspace.unwrap().path, primary);
+        assert_eq!(
+            store
+                .load_context("exec-1")
+                .unwrap()
+                .workspace
+                .unwrap()
+                .path,
+            primary,
+            "the context projection follows too"
+        );
+        let old_storage = [legacy.work.join("storage"), legacy.work.join("storage")];
+        assert_eq!(
+            rebase_workspace_paths(&old_storage, &work.storage_dir()),
+            0,
+            "a repeat after a crash changes nothing"
+        );
+    }
+
+    /// `narsor-cli secret set` run after the update and before the first
+    /// start of the new server creates the new `secrets/` already.
+    #[test]
+    fn old_secrets_merge_into_a_newer_secrets_directory_keeping_the_newer_value() {
+        let temp = Temp::new();
+        let legacy = old_controller(&temp.0.join("local-controller"));
+        fs::write(legacy.state.join("secrets/token"), "old").unwrap();
+        fs::write(legacy.state.join("secrets/key"), "old key").unwrap();
+        let state = ControllerStatePaths::new(temp.0.join("state"));
+        fs::create_dir_all(state.secrets_dir()).unwrap();
+        fs::write(state.secrets_dir().join("token"), "new").unwrap();
+        let work = ControllerWorkPaths::new(temp.0.join("work"));
+
+        migrate(&legacy, &state, &work, Mover::copying(), Duration::ZERO).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(state.secrets_dir().join("token")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            fs::read_to_string(state.secrets_dir().join("key")).unwrap(),
+            "old key"
+        );
+        assert!(layout_move::marker_present(state.dir()));
+        assert!(
+            legacy.state.join("secrets/token").is_file(),
+            "the older value stays for the operator"
+        );
     }
 
     /// Behind a linked root a process keys its sessions by the physical

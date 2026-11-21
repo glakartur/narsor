@@ -48,7 +48,9 @@ At start, before it reads any of its files, the new server:
    and `--legacy-work-dir <old work>/local-controller`. The controller takes
    the old `credential.lock`, records its `controller-id` from the old
    directory (so the Docker images it built earlier stay its own), moves its
-   entries, renames the Claude Code sessions of the tasks (see below) and
+   entries, renames the Claude Code sessions of the tasks (see below),
+   changes the workspace paths in the stored execution of each task to the
+   new storage path (so a stopped task resumes in its moved workspace) and
    writes the marker `{state}/narsor-controller-local/layout-migrated`.
    It removes the old `local-controller/` directories when they are empty.
 
@@ -59,6 +61,11 @@ source that is a symbolic link is refused. A failed move stops the program
 and names the file; correct the cause and start again. A start after a
 crash finishes the move. A program that finds its marker does not migrate
 again.
+
+A copy across filesystems can take long. The server waits up to 30 minutes
+for its controller while it can migrate, and logs that it waits. A client
+started in that time can stop waiting before; start it again when the server
+log says that the local controller holds its lease.
 
 **Claude Code sessions.** The workspace of every task moves with its
 storage, and Claude Code finds a session by its working directory. In
@@ -93,6 +100,11 @@ its container, so its sessions are renamed the same way.
    new controller image (see
    [Remote execution backends](remote-backends.md)).
 3. Start the server. The migration runs and the server logs what it moved.
+   Start the server before you use `narsor-cli secret set` or
+   `narsor-cli image refresh`: when you use them first, the migration keeps
+   the new `secrets/` and `images/` entries, adds the old entries with other
+   names, and leaves each old entry of the same name in the old
+   `local-controller/` directory with a warning in the log.
 4. Then start the controllers on other machines.
 
 ### Runners that still run

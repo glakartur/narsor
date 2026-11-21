@@ -37,7 +37,7 @@ pub const MARKER_FILE: &str = "layout-migrated";
 const STAGING_SUFFIX: &str = ".narsor-moving";
 
 /// Suffix of a source whose copy is complete, until it is deleted.
-const MOVED_SUFFIX: &str = ".narsor-moved";
+pub const MOVED_SUFFIX: &str = ".narsor-moved";
 
 /// Why an entry could not be moved: names the entry and what failed.
 #[derive(Debug)]

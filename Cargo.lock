@@ -2185,6 +2185,7 @@ dependencies = [
  "narsor-model",
  "narsor-protocol",
  "narsor-shared",
+ "narsor-store",
  "reqwest",
  "serde",
  "serde_json",
