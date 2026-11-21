@@ -651,12 +651,6 @@ impl ServerStatePaths {
             .join(sha256)
     }
 
-    /// `{state}/narsor-server/observers`: only for the startup warning about stored
-    /// observers.
-    pub fn observers_dir(&self) -> PathBuf {
-        self.dir.join(OBSERVERS_DIR)
-    }
-
     /// `{state}/narsor-server/observer-queues/automations`
     pub fn automation_states_dir(&self) -> PathBuf {
         self.observer_queues_dir().join(AUTOMATION_STATES_DIR)

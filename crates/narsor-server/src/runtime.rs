@@ -111,6 +111,11 @@ pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<(
     let old_roots = OldRoots::of(config);
     crate::layout_migration::migrate(&old_roots, &paths, &DockerProbe, Mover::new())
         .map_err(|error| CliError::failure(error.to_string()))?;
+    // Stored observers of older versions are never read or moved:
+    // automations and queues are catalogue files now (R22). Say so once.
+    if let Some(warning) = stored_observers_warning(&old_roots.state) {
+        tracing::warn!("daemon: {warning}");
+    }
     // Refused before anything starts, not after the controller enrolled.
     run.prepare()
         .map_err(|error| CliError::failure(error.to_string()))?;
@@ -516,11 +521,6 @@ pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
         Err(error) => {
             tracing::warn!(error = %error, "daemon: control-plane recovery failed");
         }
-    }
-    // Stored observers of older versions are never read: automations and
-    // queues are catalogue files now (R22). Say so once.
-    if let Some(warning) = stored_observers_warning(control.store().paths()) {
-        tracing::warn!("daemon: {warning}");
     }
     let observers = ObserverStore::new(control.store().paths().clone());
     match observers.cleanup_orphaned_temp_files() {
