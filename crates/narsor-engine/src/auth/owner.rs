@@ -30,7 +30,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::controller_protocol::credentials::constant_time_eq;
-use crate::persistence::{read_json, write_json_atomic_with_mode, PersistenceError, StatePaths};
+use crate::persistence::{
+    read_json, write_json_atomic_with_mode, PersistenceError, ServerStatePaths,
+};
 
 use super::oidc::OidcIdentity;
 
@@ -165,7 +167,7 @@ struct OwnerState {
 /// before it takes effect there, so a crash never leaves the process
 /// believing in an owner the disk does not know.
 pub struct OwnerStore {
-    paths: StatePaths,
+    paths: ServerStatePaths,
     issuer: String,
     state: Mutex<OwnerState>,
 }
@@ -186,7 +188,7 @@ impl OwnerStore {
     /// Without it, a recorded owner stays; with neither, a new claim code is
     /// generated — a restart invalidates the previous one.
     pub fn open(
-        paths: &StatePaths,
+        paths: &ServerStatePaths,
         issuer: &str,
         configured_subject: Option<&str>,
     ) -> Result<(Self, StartupOwnership), OwnerStoreError> {

@@ -21,7 +21,7 @@ use narsor_engine::orchestration::{
     Clock, CommandRequest, ControlPlane, Observation, OwnerCommand, OwnerRef, RunnerState,
     TaskEventKind,
 };
-use narsor_engine::persistence::StatePaths;
+use narsor_engine::persistence::ServerStatePaths;
 use narsor_protocol::api::HumanInputDeliveryDto;
 use narsor_protocol::controller::{
     ObserverDecideRequest, ObserverEffectOutcome, TaskEvent, TaskProvenance,
@@ -71,7 +71,7 @@ impl Fixture {
             Utc.with_ymd_and_hms(2026, 11, 17, 12, 0, 0).unwrap(),
         )));
         let service = ProtocolService::new(
-            ControlPlane::with_clock(StatePaths::new(&root), clock.clone()),
+            ControlPlane::with_clock(ServerStatePaths::new(&root), clock.clone()),
             crate::environment_support::seeded_resolver(&root),
         );
         Self {

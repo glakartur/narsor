@@ -6,7 +6,7 @@
 //! write, and snapshot publication, so callers can never observe a value that
 //! was acknowledged but did not reach disk.
 
-use super::{read_json, write_json_atomic, PersistenceError, StatePaths};
+use super::{read_json, write_json_atomic, PersistenceError, ServerStatePaths};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::ErrorKind;
@@ -104,7 +104,7 @@ impl DefaultHarnessSelector {
     /// supplied harness registry. A missing file is the backward-compatible
     /// initial state and deliberately does not create a file.
     pub async fn load(
-        paths: StatePaths,
+        paths: ServerStatePaths,
         supported: Vec<String>,
         configured: impl Into<String>,
     ) -> Result<Self, HarnessSelectionError> {

@@ -1085,13 +1085,18 @@ operation](installation.md) for role selection and the generated setup.
    ```bash
    NARSOR_ENROLLMENT_CODE=<code> narsor-controller local \
      --control-plane https://narsor.example \
-     --storage ~/narsor-laptop
+     --work-root ~/narsor-laptop
    ```
 
-   The credential is kept `0600` in
-   `$XDG_STATE_HOME/narsor/workstation-controller/credential` (or
-   `--credential-file`). At start the controller prints the server's address,
-   the backend it serves and a warning.
+   The controller keeps its files in a directory of its own below two
+   roots: task storages and runner directories in
+   `<work root>/narsor-controller-local/` (`--work-root`, required), its
+   credential (`0600`) and records in
+   `<state root>/narsor-controller-local/` (`--state-root`, by default
+   `$XDG_STATE_HOME/narsor`). The former `--storage` and `--credential-file`
+   are refused with the flag that replaces them; a controller whose
+   credential is gone needs a new enrollment code. At start the controller
+   prints the server's address, the backend it serves and a warning.
 
 **Transport.** Beyond loopback (a loopback IP address or exactly
 `localhost`; no DNS) the controller accepts only `https://`, checks the
@@ -1121,7 +1126,8 @@ task is created:
   `GLAB_TOKEN`, `GLAB_CONFIG_DIR`, `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `GIT_ASKPASS`,
   `GIT_SSH`, `GIT_SSH_COMMAND`, `XDG_CONFIG_HOME` and no `GIT_CONFIG*`
   variable;
-* a local workspace directory must lie inside `--storage`;
+* a local workspace directory must lie inside the controller's work
+  directory, `<work root>/narsor-controller-local/`;
 * a Git workspace is cloned over `https://` only — never a path, a
   `file://`, `ssh://` or `git@host:` remote, nor a host on this computer or
   a private network (`localhost`, a loopback, private, link-local or

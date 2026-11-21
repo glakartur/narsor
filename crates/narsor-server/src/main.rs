@@ -134,7 +134,7 @@ fn refuse(problems: impl Iterator<Item = String>, code: i32) -> ! {
 /// This lifecycle operation belongs to the server executable so the client
 /// does not open server persistence records or signal process IDs itself.
 fn stop_daemon(config: &narsor_engine::config::Resolved) -> Result<(), String> {
-    let daemon_file = narsor_engine::persistence::StatePaths::new(config.state_dir()).daemon_file();
+    let daemon_file = config.client_paths().daemon_file();
     let info = match DaemonInfo::read(&daemon_file) {
         Ok(info) => info,
         Err(_) => {

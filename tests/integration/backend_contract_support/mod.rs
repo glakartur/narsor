@@ -66,7 +66,7 @@ use narsor_engine::orchestration::{
     CommandActor, CommandRequest, NewTask, Observation, OperatorCommand, OperatorCommandStatus,
     OwnerCommand, OwnerRef, ResumePolicy, RunnerState, TaskEventKind, TaskRecord,
 };
-use narsor_engine::persistence::paths::StatePaths;
+use narsor_engine::persistence::paths::ServerStatePaths;
 use narsor_server::controller_protocol::http::{controller_routes, runner_routes};
 use tokio::sync::oneshot;
 
@@ -247,7 +247,7 @@ impl<T: ContractTarget> Harness<T> {
         let service = Arc::new(
             ProtocolService::with_config(
                 narsor_engine::orchestration::ControlPlane::with_clock(
-                    StatePaths::new(&state),
+                    ServerStatePaths::new(&state),
                     Arc::clone(&clock) as Arc<dyn narsor_engine::orchestration::Clock>,
                 ),
                 launch,

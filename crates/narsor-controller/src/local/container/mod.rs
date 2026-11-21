@@ -113,6 +113,9 @@ pub struct ContainerMode {
     pub builds: TaskImageBuilds,
     /// The controller's token store (KTD10).
     pub secrets: SecretStore,
+    /// The state root the controller was given: no host path mounted into
+    /// a container may overlap it.
+    pub state_root: PathBuf,
     /// The host user and group the container runs as (KTD5).
     pub user: UserIds,
     /// The controller user's HOME, which a leading `~` of a home source
@@ -266,7 +269,7 @@ impl ContainerRunners {
             }
         })?;
         let inputs =
-            container_inputs(mode, spec, self.store.root()).map_err(BackendError::rejected)?;
+            container_inputs(mode, spec, self.store.work_dir()).map_err(BackendError::rejected)?;
         let mut missing = Vec::new();
         for name in &inputs.secret_names {
             match mode.secrets.read(name) {
@@ -553,7 +556,7 @@ impl ContainerRunners {
         dir: &Path,
         image_id: &str,
     ) -> Result<RunRequest, String> {
-        let inputs = container_inputs(mode, spec, self.store.root())?;
+        let inputs = container_inputs(mode, spec, self.store.work_dir())?;
         let storage = self.store.storage_dir(task);
         let mut mounts = vec![
             mount(&storage, false),
@@ -687,9 +690,9 @@ fn is_managed(event: &ContainerEvent) -> bool {
 fn container_inputs(
     mode: &ContainerMode,
     spec: &TaskLaunchSpec,
-    root: &Path,
+    work_dir: &Path,
 ) -> Result<ContainerInputs, String> {
-    let protected = protected_dirs(mode, root);
+    let protected = protected_dirs(mode, work_dir);
     let mut local_sources = Vec::new();
     for repository in &spec.workspace.repositories {
         if let TaskRepositorySource::Local { path } = &repository.source {
@@ -703,7 +706,7 @@ fn container_inputs(
             }
             if let Some(dir) = overlapping(&protected, &path) {
                 return Err(format!(
-                    "the local workspace source '{}' overlaps the controller's own directory {}, \
+                    "the local workspace source '{}' overlaps Narsor's protected directory {}, \
                      so it cannot be mounted into a task's container",
                     path.display(),
                     dir.display()
@@ -739,7 +742,7 @@ fn container_inputs(
             }
             if let Some(protected) = overlapping(&protected, &host) {
                 return Err(format!(
-                    "the home source '{}' of component '{}' overlaps the controller's own \
+                    "the home source '{}' of component '{}' overlaps Narsor's protected \
                      directory {}, so it cannot be mounted into a task's container",
                     source.from,
                     component.name,
@@ -783,31 +786,13 @@ fn container_inputs(
 }
 
 /// The directories no host path mounted into a container may overlap: the
-/// controller's directory (the token store and the controller credential),
-/// the directory above it (the daemon state directory, with `daemon.json`
-/// and the owner token of the local API) and the backend `root` (the
-/// storage and credentials of other tasks). All canonical. The directory
-/// above the controller's is left out when it is `/` or holds the HOME
-/// (a controller directory placed by hand), as it then is no state
-/// directory and would refuse every source.
-fn protected_dirs(mode: &ContainerMode, root: &Path) -> Vec<PathBuf> {
+/// whole state root the controller was given (its own credential and token
+/// store, the daemon's records and discovery file with the owner token of
+/// the local API, every other binary's state) and the controller's work
+/// directory (the storage and credentials of other tasks). Both canonical.
+fn protected_dirs(mode: &ContainerMode, work_dir: &Path) -> Vec<PathBuf> {
     let canonical = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let controller = mode.secrets.dir().parent().map(canonical);
-    let state = controller
-        .as_deref()
-        .and_then(Path::parent)
-        .filter(|state| state.parent().is_some())
-        .filter(|state| {
-            !mode
-                .host_home
-                .as_deref()
-                .is_some_and(|home| canonical(home).starts_with(state))
-        })
-        .map(Path::to_path_buf);
-    [controller, state, Some(canonical(root))]
-        .into_iter()
-        .flatten()
-        .collect()
+    vec![canonical(&mode.state_root), canonical(work_dir)]
 }
 
 /// The protected directory `path` (canonicalized) is in or holds, if any.

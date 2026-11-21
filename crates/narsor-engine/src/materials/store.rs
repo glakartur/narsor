@@ -36,12 +36,12 @@ use crate::domain::TaskId;
 use crate::persistence::atomic::sync_parent_dir;
 use crate::persistence::lock::FileLock;
 use crate::persistence::paths::{MATERIAL_BLOBS_DIR, MATERIAL_RECORD_FILE};
-use crate::persistence::{read_json, write_json_atomic, StatePaths};
+use crate::persistence::{read_json, write_json_atomic, ServerStatePaths};
 
 /// Material files on the state root.
 #[derive(Debug, Clone)]
 pub struct MaterialStore {
-    paths: StatePaths,
+    paths: ServerStatePaths,
     limits: MaterialLimits,
 }
 
@@ -73,7 +73,7 @@ impl Drop for Staging {
 
 impl MaterialStore {
     /// The store below the state root of `paths`, bounded by `limits`.
-    pub fn new(paths: &StatePaths, limits: MaterialLimits) -> Self {
+    pub fn new(paths: &ServerStatePaths, limits: MaterialLimits) -> Self {
         Self {
             paths: paths.clone(),
             limits,

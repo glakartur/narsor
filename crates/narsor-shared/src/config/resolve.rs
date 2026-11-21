@@ -199,12 +199,14 @@ impl Resolved {
         self.root_of(SettingKey::CatalogDir)
     }
 
-    /// Where executions are kept.
+    /// The state root (`server.state`): every binary keeps its state in a
+    /// directory of its own below it.
     pub fn state_dir(&self) -> &Path {
         self.root_of(SettingKey::StateDir)
     }
 
-    /// Where task workspaces are created.
+    /// The work root (`server.work`): every binary keeps its work in a
+    /// directory of its own below it.
     pub fn work_dir(&self) -> &Path {
         self.root_of(SettingKey::WorkDir)
     }
@@ -439,8 +441,8 @@ pub fn resolve_with(
 /// Joins every relative server directory of the scope to `global.root`.
 ///
 /// An absolute directory is used as it is. `.` components of the relative
-/// value are dropped, so the built-in `.` is the root itself (`./.narsor`,
-/// not `./.narsor/.`).
+/// value are dropped, so the built-in `.` of the catalogue is the root
+/// itself (`./.narsor`, not `./.narsor/.`).
 fn join_directories_to_root(values: &mut BTreeMap<SettingKey, (SettingValue, Source)>) {
     let Some(root) = values
         .get(&SettingKey::GlobalRoot)

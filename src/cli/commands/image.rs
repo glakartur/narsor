@@ -2,10 +2,9 @@
 //! Docker-mode task images at their next use, even inside the update
 //! interval.
 //!
-//! Like `secret set`, `narsor-cli` resolves the daemon's state directory and
-//! runs the `narsor-controller` installed next to it, with
-//! `--credential-file` naming the controller's credential; the controller
-//! writes its refresh marker beside it.
+//! Like `secret set`, `narsor-cli` resolves the daemon's state root and runs
+//! the `narsor-controller` installed next to it with `--state-root`; the
+//! controller writes its refresh marker in its own directory below it.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -17,13 +16,13 @@ use super::secret::{controller_program, CONTROLLER_BINARY};
 use super::{CliError, Result};
 
 /// The `narsor-controller` arguments that ask for a refresh of the task
-/// images of the daemon whose state directory is `state_dir`.
+/// images of the daemon whose state root is `state_dir`.
 pub fn image_refresh_args(state_dir: &Path) -> Vec<OsString> {
-    let mut args: Vec<OsString> = ["local", "image", "refresh", "--credential-file"]
+    let mut args: Vec<OsString> = ["local", "image", "refresh"]
         .into_iter()
         .map(OsString::from)
         .collect();
-    args.push(local_controller::credential_file(state_dir).into_os_string());
+    args.extend(local_controller::root_args(state_dir, None));
     args
 }
 

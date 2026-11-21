@@ -2,7 +2,7 @@
 //! stored once with `narsor-cli secret set <name>`, kept for the containers
 //! that need them.
 //!
-//! The store is the `secrets` directory beside the controller credential
+//! The store is the `secrets` directory of the controller's state
 //! (mode 0700), with one file per name (mode 0600). A value is written to a
 //! temporary file and renamed over the old one, so a reader never sees half
 //! a value. For each container start, [`SecretStore::copy_into`] copies the
@@ -20,8 +20,7 @@ use std::path::{Path, PathBuf};
 
 use narsor_model::domain::is_reference_name;
 
-/// The name of the store directory beside the controller credential.
-pub const STORE_DIR: &str = "secrets";
+use crate::local::paths::ControllerStatePaths;
 
 /// Mode of the store directory and of a per-workload directory.
 const DIR_MODE: u32 = 0o700;
@@ -96,15 +95,10 @@ pub struct SecretStore {
 }
 
 impl SecretStore {
-    /// The store of the controller keeping `credential_file`: the
-    /// [`STORE_DIR`] directory beside it.
-    pub fn beside_credential(credential_file: &Path) -> Self {
-        let parent = credential_file
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
+    /// The store of the controller whose state is `paths`.
+    pub fn of(paths: &ControllerStatePaths) -> Self {
         Self {
-            dir: parent.join(STORE_DIR),
+            dir: paths.secrets_dir(),
         }
     }
 
@@ -250,18 +244,17 @@ mod tests {
     }
 
     fn store(temp: &TempDir) -> SecretStore {
-        SecretStore::beside_credential(&temp.0.join("controller").join("credential"))
+        SecretStore::of(&ControllerStatePaths::new(&temp.0))
     }
 
     #[test]
-    fn a_stored_value_reads_back_from_private_files_beside_the_credential() {
+    fn a_stored_value_reads_back_from_private_files() {
         let temp = TempDir::new("set");
         let store = store(&temp);
 
         store.set("gitlab-token", "first").unwrap();
         store.set("gitlab-token", "glpat-secret").unwrap();
 
-        assert_eq!(store.dir(), temp.0.join("controller").join(STORE_DIR));
         assert_eq!(
             store.read("gitlab-token").unwrap().as_deref(),
             Some("glpat-secret")

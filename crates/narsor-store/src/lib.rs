@@ -49,8 +49,8 @@ pub use daemon_info::{pid_is_alive, DaemonInfo};
 pub use event_log::EventLog;
 pub use execution_store::{ExecutionStore, PENDING_EVENT_FILE, PENDING_INPUT_FILE};
 pub use paths::{
-    CatalogPaths, StatePaths, WorkPaths, AGENT_HARNESS_SELECTION_FILE, CONTEXT_FILE, DEFAULT_ROOT,
-    STATE_FILE, STEP_PROFILE_FILE, TEMP_SUFFIX,
+    CatalogPaths, ServerStatePaths, StatePaths, WorkPaths, AGENT_HARNESS_SELECTION_FILE,
+    CONTEXT_FILE, DEFAULT_ROOT, STATE_FILE, STEP_PROFILE_FILE, TEMP_SUFFIX,
 };
 pub use step_profile::{
     StepProfileEntry, StepProfileResult, MAX_STEP_PROFILE_BYTES, STEP_PROFILE_VERSION,

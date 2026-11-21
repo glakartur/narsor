@@ -33,13 +33,20 @@ impl ProtocolService {
         self.issue_enrollment(backend_id, request)
     }
 
-    /// A one-time code for the controller a trusted daemon starts for its
-    /// built-in `local` backend. Not reachable over HTTP: the daemon calls
-    /// it in process, for a controller it starts itself (KTD11).
-    pub fn create_builtin_local_enrollment(&self) -> ProtocolResult<EnrollmentResponse> {
+    /// A one-time code, valid for `ttl`, for the controller a trusted
+    /// daemon starts for its built-in `local` backend. Not reachable over
+    /// HTTP: the daemon calls it in process, for a controller it starts
+    /// itself (KTD11), on every start (KTD7).
+    pub fn create_builtin_local_enrollment(
+        &self,
+        ttl: std::time::Duration,
+    ) -> ProtocolResult<EnrollmentResponse> {
         self.issue_enrollment(
             crate::environment::BackendRecord::LOCAL_ID,
-            CreateEnrollmentRequest::default(),
+            CreateEnrollmentRequest {
+                ttl_secs: Some(ttl.as_secs()),
+                ..CreateEnrollmentRequest::default()
+            },
         )
     }
 

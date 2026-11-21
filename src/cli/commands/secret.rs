@@ -1,12 +1,13 @@
 //! `secret set`: stores a secret in the token store of the local
 //! controller, which Docker-mode tasks take their secrets from (KTD10).
 //!
-//! The store belongs to the controller the daemon starts, beside its
-//! credential under the daemon's state directory. `narsor-cli` resolves that
-//! directory from the same configuration as the daemon and runs the
-//! `narsor-controller` installed next to it, which writes the store, with
-//! `--credential-file` naming that credential. The value goes through stdin
-//! only: it never appears on a command line or in the output.
+//! The store belongs to the controller the daemon starts, in its own
+//! directory below the daemon's state root. `narsor-cli` resolves that root
+//! from the same configuration as the daemon and runs the
+//! `narsor-controller` installed next to it with `--state-root`; the
+//! controller finds its store below it, so `narsor-cli` never constructs
+//! the controller's paths. The value goes through stdin only: it never
+//! appears on a command line or in the output.
 
 use std::ffi::OsString;
 use std::io::IsTerminal as _;
@@ -22,13 +23,13 @@ use super::{CliError, Result};
 pub const CONTROLLER_BINARY: &str = "narsor-controller";
 
 /// The `narsor-controller` arguments that store secret `name` for the
-/// daemon whose state directory is `state_dir`; the value comes on stdin.
+/// daemon whose state root is `state_dir`; the value comes on stdin.
 pub fn secret_set_args(state_dir: &Path, name: &str) -> Vec<OsString> {
-    let mut args: Vec<OsString> = ["local", "secret", "set", "--credential-file"]
+    let mut args: Vec<OsString> = ["local", "secret", "set"]
         .into_iter()
         .map(OsString::from)
         .collect();
-    args.push(local_controller::credential_file(state_dir).into_os_string());
+    args.extend(local_controller::root_args(state_dir, None));
     args.push("--".into());
     args.push(name.into());
     args

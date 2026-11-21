@@ -486,10 +486,16 @@ fn protocol_error_as_api(error: ProtocolError) -> ApiError {
     }
 }
 
-/// Where the daemon-owned local backend keeps its task storages — under the
-/// configured work root, which is where task workspaces have always lived.
+/// Where the daemon-owned local backend keeps its task storages — in the
+/// local controller's directory below the configured work root.
+///
+/// The one place the server still spells the controller's directory: these
+/// reads move to the runner/reader channel, and this goes with them.
 fn local_storage_root(state: &AppState) -> PathBuf {
-    state.work_dir.join("local-controller").join("storage")
+    state
+        .work_dir
+        .join("narsor-controller-local")
+        .join("storage")
 }
 
 /// Resolves an execution visible to one owner.  Runner storage is never

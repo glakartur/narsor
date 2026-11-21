@@ -9,12 +9,17 @@
 //! environment, so nothing here can race a test running beside it in the same
 //! binary — which is what `std::env::set_var` would guarantee it does.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use clap::Parser as _;
+use narsor_controller::local::LocalArgs;
 use narsor_engine::config::cascade::ConfigCascade;
+use narsor_engine::config::local_controller;
 use narsor_engine::config::resolve::{resolve_with, Environment, Flags, Resolved};
 use narsor_engine::config::{Scope, SettingKey, SettingValue, Source};
+use narsor_engine::persistence::ServerStatePaths;
 
 /// A temporary directory that deletes itself when it goes out of scope.
 struct TempRoot {
@@ -136,8 +141,8 @@ fn server_directories_are_relative_to_the_root_unless_absolute() {
     let root = TempRoot::new();
     for (state, expected) in [
         (Some("/var/lib/narsor-state"), "/var/lib/narsor-state"),
-        (None, "/srv/narsor"),
-        (Some("state"), "/srv/narsor/state"),
+        (None, "/srv/narsor/state"),
+        (Some("."), "/srv/narsor"),
     ] {
         let state_line = state.map_or(String::new(), |state| format!("  state: {state}\n"));
         root.user_config(&format!(
@@ -155,6 +160,83 @@ fn server_directories_are_relative_to_the_root_unless_absolute() {
     }
 }
 
+/// `narsor-controller local` as the server starts it, for parsing the
+/// arguments the server hands it.
+#[derive(Debug, clap::Parser)]
+struct ControllerArgs {
+    #[command(flatten)]
+    local: LocalArgs,
+}
+
+#[test]
+fn every_binary_keeps_its_own_directory_below_the_state_and_work_roots() {
+    // KTD6, KTD7: the roots are configured; each binary appends its name.
+    let root = TempRoot::new();
+    for (state, expected_state, expected_work) in [
+        (None, "/srv/narsor/state", "/srv/narsor/work"),
+        (
+            Some("/var/lib/narsor"),
+            "/var/lib/narsor",
+            "/srv/narsor/work",
+        ),
+    ] {
+        let state_line = state.map_or(String::new(), |state| format!("  state: {state}\n"));
+        root.user_config(&format!(
+            "global:\n  root: /srv/narsor\nserver:\n{state_line}"
+        ));
+        let resolved = root.resolve(&Flags::default(), &[], Scope::SERVER);
+        assert!(resolved.is_ok(), "{:?}", resolved.errors());
+
+        let server = ServerStatePaths::new(resolved.state_dir());
+        assert_eq!(
+            server.dir(),
+            Path::new(expected_state).join("narsor-server"),
+            "{state:?}"
+        );
+
+        // What the server hands its local controller, as the controller
+        // reads it.
+        let args = std::iter::once(OsString::from("narsor-controller")).chain(
+            local_controller::root_args(resolved.state_dir(), Some(resolved.work_dir())),
+        );
+        let controller = ControllerArgs::try_parse_from(args)
+            .expect("the controller accepts the roots")
+            .local
+            .directories()
+            .expect("the roots are enough");
+        assert_eq!(controller.state_root, Path::new(expected_state));
+        assert_eq!(
+            controller.state.dir(),
+            Path::new(expected_state).join("narsor-controller-local"),
+            "{state:?}"
+        );
+        assert_eq!(
+            controller.work.dir(),
+            Path::new(expected_work).join("narsor-controller-local"),
+            "{state:?}"
+        );
+    }
+}
+
+#[test]
+fn a_hand_started_controller_refuses_the_flags_the_roots_replaced() {
+    for (args, replacement) in [
+        (&["--storage", "/x", "--work-root", "/w"][..], "--work-root"),
+        (
+            &["--credential-file", "/c", "--work-root", "/w"][..],
+            "--state-root",
+        ),
+    ] {
+        let parsed = ControllerArgs::try_parse_from(
+            std::iter::once("narsor-controller").chain(args.iter().copied()),
+        )
+        .expect("still parsed, to explain the refusal");
+        let refused = parsed.local.directories().expect_err("refused");
+        assert!(refused.message.contains(replacement), "{}", refused.message);
+        assert_eq!(refused.code, 2, "a usage error");
+    }
+}
+
 #[test]
 fn the_root_flag_alone_moves_every_server_directory() {
     let resolved = resolve_with(
@@ -165,8 +247,8 @@ fn the_root_flag_alone_moves_every_server_directory() {
     );
 
     assert_eq!(resolved.catalog_dir(), Path::new("/x"));
-    assert_eq!(resolved.state_dir(), Path::new("/x"));
-    assert_eq!(resolved.work_dir(), Path::new("/x"));
+    assert_eq!(resolved.state_dir(), Path::new("/x/state"));
+    assert_eq!(resolved.work_dir(), Path::new("/x/work"));
     assert_eq!(
         resolved.source(SettingKey::StateDir),
         &Source::BuiltIn,
@@ -184,10 +266,11 @@ fn with_nothing_anywhere_every_scoped_setting_is_built_in_and_nothing_fails() {
         assert_eq!(resolved.source(setting), &Source::BuiltIn, "{setting}");
     }
     assert_eq!(
-        resolved.state_dir().to_string_lossy(),
+        resolved.catalog_dir().to_string_lossy(),
         "./.narsor",
-        "the built-in directory is the root itself, not ./.narsor/."
+        "the built-in catalogue is the root itself, not ./.narsor/."
     );
+    assert_eq!(resolved.state_dir().to_string_lossy(), "./.narsor/state");
     assert_eq!(resolved.agent_harness(), "claude-code");
     assert_eq!(
         resolved.log_directive(),
@@ -270,7 +353,7 @@ fn a_broken_file_yields_errors_and_still_yields_every_value() {
     for error in resolved.errors() {
         assert!(error.to_string().contains(&path.display().to_string()));
     }
-    assert_eq!(resolved.state_dir().to_string_lossy(), "./.narsor");
+    assert_eq!(resolved.state_dir().to_string_lossy(), "./.narsor/state");
     assert_eq!(resolved.source(SettingKey::StateDir), &Source::BuiltIn);
 }
 

@@ -17,6 +17,7 @@ use std::time::Duration;
 use backend_contract_support::fake::FakeBackend;
 use backend_contract_support::{stub_runner, ContractTarget};
 use narsor_controller::local::backend::{LocalBackend, LocalBackendConfig};
+use narsor_controller::local::paths::{ControllerStatePaths, ControllerWorkPaths};
 use narsor_controller_runtime::backend::{ExecutionBackend, TaskResources};
 use narsor_engine::domain::{
     ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec, TaskWorkspace,
@@ -511,7 +512,11 @@ impl ContractTarget for LocalTarget {
     fn setup(scratch: &Path) -> Option<Self> {
         let program = stub_runner::install(&scratch.join("bin"));
         Some(Self {
-            config: LocalBackendConfig::with_program(scratch.join("local"), program),
+            config: LocalBackendConfig::with_program(
+                ControllerStatePaths::new(scratch.join("state")),
+                ControllerWorkPaths::new(scratch.join("work")),
+                program,
+            ),
         })
     }
 
@@ -554,8 +559,9 @@ impl ContractTarget for LocalTarget {
     fn cleanup(&self, backend: &LocalBackend) {
         // Runners outlive their controller by design; a finished scenario
         // must not leave any behind — workers and readers alike.
-        for (directory, suffix) in [("workloads", ""), ("readers", "-reader")] {
-            let Ok(entries) = fs::read_dir(self.config.root.join(directory)) else {
+        let work = &self.config.work;
+        for (directory, suffix) in [(work.workloads_dir(), ""), (work.readers_dir(), "-reader")] {
+            let Ok(entries) = fs::read_dir(directory) else {
                 continue;
             };
             for entry in entries.flatten() {
@@ -674,7 +680,11 @@ async fn removing_a_dead_runners_workload_kills_what_it_left_running() {
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
     )
     .unwrap();
-    let mut config = LocalBackendConfig::with_program(scratch.join("local"), &program);
+    let mut config = LocalBackendConfig::with_program(
+        ControllerStatePaths::new(scratch.join("state")),
+        ControllerWorkPaths::new(scratch.join("work")),
+        &program,
+    );
     config.env = vec![("CHILD_PID_FILE".into(), child_pid_file.clone().into())];
     let backend = LocalBackend::new(config);
     let task_id = TaskId::parse("task-1").unwrap();

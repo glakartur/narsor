@@ -8,12 +8,12 @@
 //! ([`stored_observers_warning`]), so an operator who updated without
 //! writing the catalogue files knows why nothing runs.
 
-use crate::persistence::paths::{StatePaths, OBSERVER_RECORD_FILE};
+use crate::persistence::paths::{ServerStatePaths, OBSERVER_RECORD_FILE};
 
 /// The warning the server logs at start when `{state}/observers/` still
 /// holds observer records, `None` when it holds none. Only the directory
 /// listing is read: a record's content is never opened.
-pub fn stored_observers_warning(paths: &StatePaths) -> Option<String> {
+pub fn stored_observers_warning(paths: &ServerStatePaths) -> Option<String> {
     let dir = paths.observers_dir();
     let entries = std::fs::read_dir(&dir).ok()?;
     let stored = entries
@@ -38,7 +38,7 @@ mod tests {
     #[test]
     fn only_a_directory_with_observer_records_gets_a_warning() {
         let root = std::env::temp_dir().join(format!("narsor-migrate-{}", uuid::Uuid::new_v4()));
-        let paths = StatePaths::new(&root);
+        let paths = ServerStatePaths::new(&root);
         assert_eq!(stored_observers_warning(&paths), None);
         let observer = paths.observers_dir().join("obs-1");
         std::fs::create_dir_all(&observer).unwrap();

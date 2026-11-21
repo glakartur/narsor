@@ -1,18 +1,19 @@
 //! What the local adapter keeps on disk about a task, whatever runs it: the
-//! workload directories with their `workload.json` records and the per-task
-//! records, under the adapter's root.
+//! workload directories with their `workload.json` records in the
+//! controller's work directory, and the per-task records in its state
+//! directory ([`super::paths`]).
 //!
-//! # Layout under the adapter's root
+//! # Layout
 //!
 //! ```text
-//! {root}/storage/{storage}/           task storage (R9): state, workspace, HOME
-//! {root}/workloads/{workload}/        one live "workload" at most per task
+//! {work}/storage/{storage}/           task storage (R9): state, workspace, HOME
+//! {work}/workloads/{workload}/        one live "workload" at most per task
 //!     workload.json                   incarnation, generation, pid or container
 //!     credential                      the runner credential, 0600, outside storage
 //!     runner.log                      the runner's stdout and stderr (process)
 //!     secrets/                        the task's secrets (container), 0700
-//! {root}/readers/{reader}/            the task's read-only runner (D63), same files
-//! {root}/tasks/{storage}.json         the per-task record (KTD14)
+//! {work}/readers/{reader}/            the task's read-only runner (D63), same files
+//! {state}/tasks/{storage}.json        the per-task record (KTD14)
 //! ```
 //!
 //! A workload directory exists exactly while the workload does, so the
@@ -32,7 +33,7 @@
 //!
 //! # The per-task record
 //!
-//! `{root}/tasks/{storage}.json` keeps the kind of the task's last working
+//! `{state}/tasks/{storage}.json` keeps the kind of the task's last working
 //! runner and the image it last ran on (KTD14). It is a controller file
 //! beside the workloads, not a file on task storage: the agent in the
 //! container writes task storage and must not choose the image of its next
@@ -49,6 +50,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::paths::{ControllerStatePaths, ControllerWorkPaths};
 use narsor_controller_runtime::backend::{
     BackendError, BackendResult, RunnerCredential, TaskResources, WorkloadLaunch, WorkloadPhase,
 };
@@ -56,9 +58,6 @@ use narsor_controller_runtime::backend::{
 /// The environment variable every runner gets, set to its workload's uid:
 /// what proves a process group still ours after the runner is gone.
 pub(super) const WORKLOAD_MARK_ENV: &str = "NARSOR_LOCAL_WORKLOAD_UID";
-
-/// The directory of the per-task records under the adapter's root.
-const TASKS_DIR: &str = "tasks";
 
 /// Which of a task's two kinds of workload a call is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,10 +69,10 @@ pub(super) enum Role {
 }
 
 impl Role {
-    fn directory(self) -> &'static str {
+    fn directory(self, work: &ControllerWorkPaths) -> PathBuf {
         match self {
-            Self::Work => "workloads",
-            Self::Read => "readers",
+            Self::Work => work.workloads_dir(),
+            Self::Read => work.readers_dir(),
         }
     }
 
@@ -174,31 +173,32 @@ impl Look {
     }
 }
 
-/// The files of the adapter's root: task storages, workload directories
-/// with their records, per-task records.
+/// The files of the adapter: task storages, workload directories with
+/// their records (work), per-task records (state).
 #[derive(Debug, Clone)]
 pub(super) struct WorkloadStore {
-    root: PathBuf,
+    state: ControllerStatePaths,
+    work: ControllerWorkPaths,
 }
 
 impl WorkloadStore {
-    /// The files under `root`.
-    pub(super) fn new(root: PathBuf) -> Self {
-        Self { root }
+    /// The files under the controller's `state` and `work` directories.
+    pub(super) fn new(state: ControllerStatePaths, work: ControllerWorkPaths) -> Self {
+        Self { state, work }
     }
 
-    /// The adapter's root.
-    pub(super) fn root(&self) -> &Path {
-        &self.root
+    /// The controller's work directory: storages, workloads, readers.
+    pub(super) fn work_dir(&self) -> &Path {
+        self.work.dir()
     }
 
     /// Where the task's storage lives.
     pub(super) fn storage_dir(&self, task: &TaskResources) -> PathBuf {
-        self.root.join("storage").join(&task.storage)
+        self.work.storage_dir().join(&task.storage)
     }
 
     pub(super) fn workload_dir(&self, task: &TaskResources, role: Role) -> PathBuf {
-        self.root.join(role.directory()).join(role.name(task))
+        role.directory(&self.work).join(role.name(task))
     }
 
     fn record_path(&self, task: &TaskResources, role: Role) -> PathBuf {
@@ -206,8 +206,8 @@ impl WorkloadStore {
     }
 
     fn task_record_path(&self, task: &TaskResources) -> PathBuf {
-        self.root
-            .join(TASKS_DIR)
+        self.state
+            .tasks_dir()
             .join(format!("{}.json", task.storage))
     }
 
@@ -275,13 +275,13 @@ impl WorkloadStore {
 
     /// Every readable per-task record.
     pub(super) fn task_records(&self) -> impl Iterator<Item = TaskRecord> {
-        json_files(&self.root.join(TASKS_DIR))
+        json_files(&self.state.tasks_dir())
             .filter_map(|bytes| serde_json::from_slice::<TaskRecord>(&bytes).ok())
     }
 
     /// Every readable record of a working runner (no reader's).
     pub(super) fn work_records(&self) -> impl Iterator<Item = WorkloadRecord> {
-        fs::read_dir(self.root.join(Role::Work.directory()))
+        fs::read_dir(Role::Work.directory(&self.work))
             .into_iter()
             .flatten()
             .filter_map(Result::ok)

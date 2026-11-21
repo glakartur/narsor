@@ -1,6 +1,6 @@
 //! Durable default-harness selection, exercised against the real filesystem.
 
-use narsor_engine::persistence::{DefaultHarnessSelector, StatePaths};
+use narsor_engine::persistence::{DefaultHarnessSelector, ServerStatePaths};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -41,10 +41,13 @@ fn supported() -> Vec<String> {
 #[tokio::test]
 async fn missing_file_uses_configured_harness_without_an_override() {
     let root = TempRoot::new();
-    let selector =
-        DefaultHarnessSelector::load(StatePaths::new(root.path()), supported(), "claude-code")
-            .await
-            .expect("missing selection file is initial state");
+    let selector = DefaultHarnessSelector::load(
+        ServerStatePaths::new(root.path()),
+        supported(),
+        "claude-code",
+    )
+    .await
+    .expect("missing selection file is initial state");
 
     assert_eq!(
         selector.snapshot().await,
@@ -61,7 +64,7 @@ async fn missing_file_uses_configured_harness_without_an_override() {
 #[tokio::test]
 async fn override_survives_reload_and_reset_persists_null() {
     let root = TempRoot::new();
-    let paths = StatePaths::new(root.path());
+    let paths = ServerStatePaths::new(root.path());
     let selector = DefaultHarnessSelector::load(paths.clone(), supported(), "claude-code")
         .await
         .unwrap();
@@ -88,7 +91,8 @@ async fn override_survives_reload_and_reset_persists_null() {
 #[tokio::test]
 async fn invalid_or_corrupt_persisted_state_is_rejected_at_startup() {
     let root = TempRoot::new();
-    let paths = StatePaths::new(root.path());
+    let paths = ServerStatePaths::new(root.path());
+    fs::create_dir_all(paths.dir()).unwrap();
     fs::write(
         paths.agent_harness_selection_file(),
         r#"{"version":1,"revision":4,"override":"unknown"}"#,
@@ -111,10 +115,13 @@ async fn failed_persistence_never_publishes_a_new_snapshot() {
     let root = TempRoot::new();
     let state_root = root.path().join("state");
     fs::create_dir(&state_root).unwrap();
-    let selector =
-        DefaultHarnessSelector::load(StatePaths::new(&state_root), supported(), "claude-code")
-            .await
-            .unwrap();
+    let selector = DefaultHarnessSelector::load(
+        ServerStatePaths::new(&state_root),
+        supported(),
+        "claude-code",
+    )
+    .await
+    .unwrap();
     fs::remove_dir(&state_root).unwrap();
     fs::write(&state_root, b"file").unwrap();
 
@@ -129,9 +136,13 @@ async fn failed_persistence_never_publishes_a_new_snapshot() {
 async fn mutations_are_serialized_and_idempotent() {
     let root = TempRoot::new();
     let selector = std::sync::Arc::new(
-        DefaultHarnessSelector::load(StatePaths::new(root.path()), supported(), "claude-code")
-            .await
-            .unwrap(),
+        DefaultHarnessSelector::load(
+            ServerStatePaths::new(root.path()),
+            supported(),
+            "claude-code",
+        )
+        .await
+        .unwrap(),
     );
     let first = {
         let selector = selector.clone();

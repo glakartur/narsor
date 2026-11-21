@@ -17,11 +17,9 @@ use narsor_api_client::api::{ensure_daemon_running, ApiClient, DiscoveryError};
 use narsor_shared::config::{self, CheckReport, Flags};
 use narsor_web::gateway::{Gateway, Reconnect, Upstream};
 use narsor_web::launch;
+use narsor_web::paths::WebStatePaths;
 use narsor_web::settings::{configure, TokenMode, Upstream as UpstreamSetting, WebSettings};
 use tokio::net::TcpListener;
-
-/// The file in the state directory that holds the session token.
-const SESSION_FILE: &str = "web-session";
 
 /// The browser interface of Narsor.
 #[derive(Debug, Parser)]
@@ -86,7 +84,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             problems.join("\n  ")
         )
     })?;
+    // The state root: the daemon is found below it, and this binary's own
+    // files are in its own directory there.
     let state = resolved.state_dir().to_path_buf();
+    let paths = WebStatePaths::new(&state);
 
     let upstream = upstream(&settings, &cli, &state, &flags).await?;
     let listener = TcpListener::bind(settings.bind)
@@ -95,7 +96,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     let address = listener.local_addr().map_err(|error| error.to_string())?;
 
     let session = match settings.token {
-        TokenMode::Server => Some(new_session(&state)?),
+        TokenMode::Server => Some(new_session(&paths)?),
         TokenMode::Passthrough => None,
     };
     let page = format!("http://{address}/ui/");
@@ -107,7 +108,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     if session.is_some() {
         println!(
             "narsor-web: the session token is in {} (or start with --open)",
-            state.join(SESSION_FILE).display()
+            paths.session_file().display()
         );
     }
     if cli.open {
@@ -115,7 +116,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             Some(session) => format!("{page}#token={session}"),
             None => page.clone(),
         };
-        match launch::write_launch_page(&state, &url).and_then(|file| launch::start_browser(&file))
+        match launch::write_launch_page(&paths, &url).and_then(|file| launch::start_browser(&file))
         {
             Ok(()) => println!("narsor-web: opened {page} in the browser"),
             Err(error) => eprintln!(
@@ -208,10 +209,12 @@ fn token_source(cli: &Cli) -> Option<TokenSource> {
 }
 
 /// A new session token, also written for the operator only.
-fn new_session(state: &Path) -> Result<String, String> {
+fn new_session(paths: &WebStatePaths) -> Result<String, String> {
     let session = uuid::Uuid::new_v4().simple().to_string();
-    std::fs::create_dir_all(state).map_err(|error| error.to_string())?;
-    let path = state.join(SESSION_FILE);
+    paths
+        .create()
+        .map_err(|error| format!("could not create {}: {error}", paths.dir().display()))?;
+    let path = paths.session_file();
     match std::fs::remove_file(&path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.to_string()),
         _ => {}

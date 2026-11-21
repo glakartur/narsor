@@ -52,6 +52,7 @@ use narsor_model::domain::{TaskId, TaskLaunchSpec};
 
 use super::container::docker::DockerTransport;
 use super::container::{ContainerMode, ContainerRunners};
+use super::paths::{ControllerStatePaths, ControllerWorkPaths};
 use super::process::ProcessRunners;
 use super::workload::{io_error, Look, Role, WorkloadKind, WorkloadRecord, WorkloadStore};
 
@@ -82,8 +83,10 @@ impl std::fmt::Debug for LaunchCheck {
 /// Configuration of a [`LocalBackend`].
 #[derive(Debug, Clone)]
 pub struct LocalBackendConfig {
-    /// Directory holding task storages and workload records.
-    pub root: PathBuf,
+    /// The controller's state directory: per-task records.
+    pub state: ControllerStatePaths,
+    /// The controller's work directory: task storages and workloads.
+    pub work: ControllerWorkPaths,
     /// The standalone `narsor-runner` executable.
     pub program: PathBuf,
     /// Extra arguments appended to every `narsor-runner` process invocation
@@ -114,7 +117,7 @@ pub struct LocalBackendConfig {
 impl LocalBackendConfig {
     /// Runners started from the `narsor-runner` sibling of the current
     /// executable. The server and runner binaries are installed together.
-    pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
+    pub fn new(state: ControllerStatePaths, work: ControllerWorkPaths) -> io::Result<Self> {
         let current_exe = std::env::current_exe()?;
         let runner_name = if cfg!(windows) {
             "narsor-runner.exe"
@@ -124,13 +127,18 @@ impl LocalBackendConfig {
         let parent = current_exe.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "current executable has no parent")
         })?;
-        Ok(Self::with_program(root, parent.join(runner_name)))
+        Ok(Self::with_program(state, work, parent.join(runner_name)))
     }
 
     /// Runners started from the explicit executable `program`.
-    pub fn with_program(root: impl Into<PathBuf>, program: impl Into<PathBuf>) -> Self {
+    pub fn with_program(
+        state: ControllerStatePaths,
+        work: ControllerWorkPaths,
+        program: impl Into<PathBuf>,
+    ) -> Self {
         Self {
-            root: absolute_root(root.into()),
+            state,
+            work,
             program: program.into(),
             runner_args: Vec::new(),
             env: Vec::new(),
@@ -140,16 +148,6 @@ impl LocalBackendConfig {
             container_mode: None,
         }
     }
-}
-
-/// `root` made absolute against the current directory, once: container
-/// mounts and workdirs need absolute host paths. An absolute root, or one
-/// the current directory cannot resolve, stays as it is.
-fn absolute_root(root: PathBuf) -> PathBuf {
-    if root.is_absolute() {
-        return root;
-    }
-    std::path::absolute(&root).unwrap_or(root)
 }
 
 /// The local adapter. Cloning shares the process table.
@@ -173,10 +171,10 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
-    /// An adapter over `config.root`.
+    /// An adapter over the controller's state and work directories.
     pub fn new(config: LocalBackendConfig) -> Self {
         let config = Arc::new(config);
-        let store = WorkloadStore::new(config.root.clone());
+        let store = WorkloadStore::new(config.state.clone(), config.work.clone());
         let launch_specs = LaunchSpecs::default();
         let wake = WakeSignal::new();
         Self {
@@ -611,8 +609,10 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(!scratch
-            .root
-            .join("local/readers")
+            .backend
+            .config
+            .work
+            .readers_dir()
             .join(&task.reader)
             .exists());
     }
@@ -623,7 +623,7 @@ mod tests {
         let task = scratch.task();
         assert_ne!(task.reader, task.workload);
         let reader_dir = scratch.backend.store.workload_dir(&task, Role::Read);
-        assert!(reader_dir.starts_with(scratch.root.join("local/readers")));
+        assert!(reader_dir.starts_with(scratch.backend.config.work.readers_dir()));
         assert_ne!(
             reader_dir,
             scratch.backend.store.workload_dir(&task, Role::Work)

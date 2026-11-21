@@ -11,7 +11,7 @@ use std::time::Duration;
 use narsor_api_client::api::ClientError;
 use narsor_engine::controller_protocol::ProtocolService;
 use narsor_engine::orchestration::ControlPlane;
-use narsor_engine::persistence::StatePaths;
+use narsor_engine::persistence::ServerStatePaths;
 use narsor_engine::registry::{
     ls_remote_command, BranchListError, BranchLister, GitBranchLister, RepositoryEntry,
     RepositoryRegistry,
@@ -258,7 +258,7 @@ async fn serve(root: &TempRoot, lister: Arc<Double>) -> ApiHandle {
     let state = root.path().join("state");
     fs::create_dir_all(&state).unwrap();
     let control = ProtocolService::new(
-        ControlPlane::new(StatePaths::new(&state)),
+        ControlPlane::new(ServerStatePaths::new(&state)),
         crate::environment_support::seeded_resolver(&state),
     );
     let registry = RepositoryRegistry::new(&catalog);

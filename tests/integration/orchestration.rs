@@ -14,7 +14,7 @@ use narsor_engine::orchestration::{
     ResumeExhaustion, ResumePolicy, ResumeState, RunnerSnapshot, RunnerState, SchedulingPolicy,
     TaskEventKind, TaskRecord, WorkloadLoss,
 };
-use narsor_engine::persistence::paths::{temp_path_for, StatePaths};
+use narsor_engine::persistence::paths::{temp_path_for, ServerStatePaths};
 use narsor_engine::persistence::ExecutionStore;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,8 +37,8 @@ impl TempRoot {
         &self.path
     }
 
-    fn paths(&self) -> StatePaths {
-        StatePaths::new(&self.path)
+    fn paths(&self) -> ServerStatePaths {
+        ServerStatePaths::new(&self.path)
     }
 }
 

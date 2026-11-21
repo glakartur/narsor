@@ -22,7 +22,7 @@ use narsor_engine::orchestration::{
     Clock, CommandRequest, ControlPlane, Observation, OwnerCommand, OwnerRef, RunnerState,
     TaskEventKind,
 };
-use narsor_engine::persistence::StatePaths;
+use narsor_engine::persistence::ServerStatePaths;
 use narsor_protocol::controller::{GateWatch, RunnerProblem, TaskQueueEntryView};
 use serde_json::{json, Value};
 
@@ -71,7 +71,7 @@ impl Fixture {
             Utc.with_ymd_and_hms(2026, 11, 17, 12, 0, 0).unwrap(),
         )));
         let service = ProtocolService::new(
-            ControlPlane::with_clock(StatePaths::new(&root), clock.clone()),
+            ControlPlane::with_clock(ServerStatePaths::new(&root), clock.clone()),
             crate::environment_support::seeded_resolver(&root),
         );
         Self {
@@ -443,7 +443,7 @@ fn an_entry_added_back_keeps_the_start_of_its_episode() {
 /// Overwrites the file of the entry of `task`'s `episode` with bytes no
 /// build can read.
 fn corrupt_entry(fx: &Fixture, task: &TaskId, episode: &str) {
-    let path = StatePaths::new(&fx.root).queue_entry_file(&queue_entry_id(task, episode));
+    let path = ServerStatePaths::new(&fx.root).queue_entry_file(&queue_entry_id(task, episode));
     fs::write(path, b"{\"entry_id\": ").unwrap();
 }
 
@@ -536,7 +536,7 @@ fn an_entry_of_a_newer_version_is_left_as_it_is() {
     fx.active("gitlab-mr", QUEUE, ObserverMode::OnEpisodes);
     let task = fx.task("task-1");
     wait_at(&fx.service, &task, "input-1", &review_gate(QUEUE));
-    let path = StatePaths::new(&fx.root).queue_entry_file(&queue_entry_id(&task, "input-1"));
+    let path = ServerStatePaths::new(&fx.root).queue_entry_file(&queue_entry_id(&task, "input-1"));
     let mut newer: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     newer["record_version"] = json!(99);
     let bytes = serde_json::to_vec(&newer).unwrap();
@@ -560,7 +560,7 @@ fn an_unreadable_entry_of_an_episode_no_task_waits_in_is_removed() {
     let task = fx.task("task-1");
     wait_at(&fx.service, &task, "input-1", &review_gate(QUEUE));
     corrupt_entry(&fx, &task, "input-1");
-    let path = StatePaths::new(&fx.root).queue_entry_file(&queue_entry_id(&task, "input-1"));
+    let path = ServerStatePaths::new(&fx.root).queue_entry_file(&queue_entry_id(&task, "input-1"));
     // The snapshot that ends the episode removes the file; one left behind
     // (a failed removal, a restored backup) is put back here.
     let bad = fs::read(&path).unwrap();

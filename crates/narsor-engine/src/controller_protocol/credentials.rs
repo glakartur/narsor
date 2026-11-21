@@ -357,7 +357,7 @@ impl CredentialStore {
         self.control.now()
     }
 
-    fn paths(&self) -> &crate::persistence::StatePaths {
+    fn paths(&self) -> &crate::persistence::ServerStatePaths {
         self.control.store().paths()
     }
 

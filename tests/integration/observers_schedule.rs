@@ -15,7 +15,7 @@ use narsor_engine::observers::{
     RunStatus,
 };
 use narsor_engine::orchestration::{Clock, CommandRequest, ControlPlane, OwnerCommand, OwnerRef};
-use narsor_engine::persistence::StatePaths;
+use narsor_engine::persistence::ServerStatePaths;
 use narsor_server::runtime::run_periodic_pass;
 use serde_json::json;
 
@@ -63,7 +63,7 @@ impl Fixture {
     /// A fresh service on the same state root: what a restart sees.
     fn service_on(root: &PathBuf, clock: &Arc<ManualClock>) -> ProtocolService {
         ProtocolService::new(
-            ControlPlane::with_clock(StatePaths::new(root), clock.clone()),
+            ControlPlane::with_clock(ServerStatePaths::new(root), clock.clone()),
             crate::environment_support::seeded_resolver(root),
         )
     }
@@ -223,7 +223,9 @@ fn a_restart_after_hours_of_downtime_owes_one_run_and_keeps_the_error() {
 fn stored_observers_of_an_older_version_are_reported_and_never_scheduled() {
     // R22: a hard cutover; the old record is not read, nothing runs.
     let fx = Fixture::new();
-    let old = fx.root.join("observers").join("obs-1");
+    let old = ServerStatePaths::new(&fx.root)
+        .observers_dir()
+        .join("obs-1");
     fs::create_dir_all(&old).unwrap();
     fs::write(
         old.join("observer.json"),

@@ -8,6 +8,7 @@ use narsor_controller_runtime::backend::{ExecutionBackend, TaskResources, Worklo
 use narsor_model::domain::{TaskId, TaskLaunchSpec};
 
 use super::backend::{LocalBackend, LocalBackendConfig};
+use super::paths::{ControllerStatePaths, ControllerWorkPaths};
 use super::workload::Role;
 
 /// A scratch backend whose "runner" is a script that records its
@@ -32,7 +33,11 @@ impl Scratch {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .unwrap();
-        let mut config = LocalBackendConfig::with_program(root.join("local"), &program);
+        let mut config = LocalBackendConfig::with_program(
+            ControllerStatePaths::new(root.join("state")),
+            ControllerWorkPaths::new(root.join("work")),
+            &program,
+        );
         config.env = vec![("ARGS_FILE".into(), root.join("args").into())];
         Self {
             root,

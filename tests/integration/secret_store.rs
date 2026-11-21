@@ -2,15 +2,18 @@
 //! the client stores a secret where the controller the daemon starts reads
 //! it.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use clap::Parser as _;
 use narsor::cli::commands::secret_set_args;
 use narsor_controller::local::container::secrets::SecretStore;
+use narsor_controller::local::paths::ControllerStatePaths;
+use narsor_controller::local::{run_local_helper, LocalCommand};
 use narsor_engine::config::cascade::ConfigCascade;
-use narsor_engine::config::local_controller;
 use narsor_engine::config::resolve::{resolve_with, Environment, Flags};
 use narsor_engine::config::Scope;
 
@@ -45,13 +48,20 @@ impl Drop for TempDir {
     }
 }
 
-/// The value of `--credential-file` in `args`.
-fn credential_file_arg(args: &[std::ffi::OsString]) -> PathBuf {
-    let flag = args
-        .iter()
-        .position(|arg| arg == "--credential-file")
-        .expect("--credential-file is passed");
-    PathBuf::from(&args[flag + 1])
+/// `narsor-controller`'s `local` helper commands, as the binary parses
+/// them.
+#[derive(Debug, clap::Parser)]
+struct Controller {
+    #[command(subcommand)]
+    backend: Backend,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Backend {
+    Local {
+        #[command(subcommand)]
+        command: LocalCommand,
+    },
 }
 
 fn state_dir_of(config: &Path, scope: Scope) -> PathBuf {
@@ -62,28 +72,34 @@ fn state_dir_of(config: &Path, scope: Scope) -> PathBuf {
 }
 
 #[test]
-fn a_secret_set_through_the_cli_is_read_by_the_controller_the_daemon_starts() {
+fn a_secret_set_through_the_cli_lands_in_the_state_of_the_controller_the_daemon_starts() {
     let temp = TempDir::new();
     let config = temp.config_file();
 
-    // narsor-cli and the daemon resolve the state directory from the same
-    // file; the daemon hands its controller the credential beside it.
+    // narsor-cli and the daemon resolve the state root from the same file;
+    // narsor-cli hands it to the controller, which finds its store below it.
     let cli_args = secret_set_args(&state_dir_of(&config, Scope::CLI), "gitlab-token");
-    let daemon_credential =
-        local_controller::credential_file(&state_dir_of(&config, Scope::SERVER));
-    assert_eq!(credential_file_arg(&cli_args), daemon_credential);
-    assert_eq!(
-        cli_args.last().map(|arg| arg.as_os_str()),
-        Some("gitlab-token".as_ref())
-    );
+    let daemon_state_root = state_dir_of(&config, Scope::SERVER);
+    let state_root_arg = cli_args
+        .iter()
+        .position(|arg| arg == "--state-root")
+        .map(|flag| PathBuf::from(&cli_args[flag + 1]));
+    assert_eq!(state_root_arg.as_deref(), Some(daemon_state_root.as_path()));
 
-    SecretStore::beside_credential(&credential_file_arg(&cli_args))
-        .set("gitlab-token", "glpat-secret")
-        .unwrap();
-    let read = SecretStore::beside_credential(&daemon_credential)
+    let parsed = Controller::try_parse_from(
+        std::iter::once(OsString::from("narsor-controller")).chain(cli_args),
+    )
+    .expect("the controller accepts the arguments");
+    let Backend::Local { command } = parsed.backend;
+    run_local_helper(command, &mut "glpat-secret\n".as_bytes()).expect("stored");
+
+    let read = SecretStore::of(&ControllerStatePaths::new(&daemon_state_root))
         .read("gitlab-token")
         .unwrap();
     assert_eq!(read.as_deref(), Some("glpat-secret"));
+    assert!(daemon_state_root
+        .join("narsor-controller-local/secrets/gitlab-token")
+        .is_file());
 }
 
 #[test]
@@ -116,8 +132,7 @@ fn the_built_cli_stores_stdin_where_the_controller_reads_it() {
     assert!(output.status.success(), "{stderr}");
     assert!(!stderr.contains("glpat-secret"), "the value was printed");
 
-    let credential = local_controller::credential_file(&temp.0.join("state"));
-    let read = SecretStore::beside_credential(&credential)
+    let read = SecretStore::of(&ControllerStatePaths::new(temp.0.join("state")))
         .read("gitlab-token")
         .unwrap();
     assert_eq!(read.as_deref(), Some("glpat-secret"));

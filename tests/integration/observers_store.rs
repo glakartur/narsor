@@ -16,7 +16,7 @@ use narsor_engine::observers::{
 };
 use narsor_engine::orchestration::OwnerRef;
 use narsor_engine::persistence::paths::temp_path_for;
-use narsor_engine::persistence::StatePaths;
+use narsor_engine::persistence::ServerStatePaths;
 use narsor_protocol::controller::{GateWatch, GateWatchChoice, GateWatchVariable};
 use serde_json::json;
 use std::fs;
@@ -35,11 +35,11 @@ impl TempRoot {
     }
 
     fn store(&self) -> ObserverStore {
-        ObserverStore::new(StatePaths::new(&self.path))
+        ObserverStore::new(ServerStatePaths::new(&self.path))
     }
 
-    fn paths(&self) -> StatePaths {
-        StatePaths::new(&self.path)
+    fn paths(&self) -> ServerStatePaths {
+        ServerStatePaths::new(&self.path)
     }
 }
 

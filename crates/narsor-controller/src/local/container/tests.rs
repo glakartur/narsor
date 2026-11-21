@@ -4,12 +4,42 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use super::*;
-use crate::local::backend::{LocalBackend, LocalBackendConfig};
+use crate::local::backend::LocalBackend;
+use crate::local::paths::{ControllerStatePaths, ControllerWorkPaths};
 use crate::local::process::process_alive;
 use crate::local::test_support::Scratch;
 use crate::local::workload::LastRunner;
 use narsor_controller_runtime::backend::{ExecutionBackend, Removal, StorageState};
 use narsor_model::domain::TaskId;
+
+/// KTD8: the image label of a controller is its `controller-id` file. A
+/// controller without one gets the label computed from its canonical
+/// directory (what the label always was), written down once; a recorded id
+/// is kept even when it differs, so a moved controller keeps its images.
+#[test]
+fn the_controller_id_is_initialised_from_the_controller_directory_and_then_kept() {
+    use sha2::{Digest as _, Sha256};
+    let scratch = Scratch::new();
+    let state = scratch.backend.config.state.clone();
+
+    let id = image::controller_id(&state);
+
+    let canonical = fs::canonicalize(state.dir()).unwrap();
+    let hash: String = Sha256::digest(canonical.as_os_str().as_encoded_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(id, hash[..16]);
+    assert_eq!(
+        fs::read_to_string(state.controller_id_file())
+            .unwrap()
+            .trim(),
+        id
+    );
+
+    fs::write(state.controller_id_file(), "0123456789abcdef\n").unwrap();
+    assert_eq!(image::controller_id(&state), "0123456789abcdef");
+}
 
 /// KTD7: a container gets the pass-through variables, the configured
 /// ones and the mark; nothing else of the controller's environment.
@@ -147,14 +177,13 @@ mod containers {
             &self.scratch.root
         }
 
-        /// The controller's directory, inside a state directory as the
-        /// server lays it out.
-        fn controller_dir(&self) -> PathBuf {
-            self.root().join("state/controller")
+        /// The controller's state, below the state root `<root>/state`.
+        fn state(&self) -> ControllerStatePaths {
+            self.scratch.backend.config.state.clone()
         }
 
         fn store(&self) -> SecretStore {
-            SecretStore::beside_credential(&self.controller_dir().join("credential"))
+            SecretStore::of(&self.state())
         }
 
         /// A backend over the same root: in the Docker mode, or in the
@@ -165,7 +194,7 @@ mod containers {
             config.container_mode = docker_mode.then(|| ContainerMode {
                 builds: TaskImageBuilds::new(
                     self.docker.clone(),
-                    &self.controller_dir(),
+                    &self.state(),
                     BuildSettings {
                         update_interval: Some(self.update_interval),
                         version_timeout: Duration::from_secs(5),
@@ -175,6 +204,7 @@ mod containers {
                     },
                 ),
                 secrets: self.store(),
+                state_root: self.root().join("state"),
                 user: USER,
                 host_home: Some(self.root().join("home")),
                 config_file: Some(self.root().join("config.yaml")),
@@ -613,17 +643,17 @@ mod containers {
                 "a home source over the controller's token store",
                 healthy,
                 home_source(|fixture| fixture.store().dir().to_path_buf()),
-                "overlaps the controller's own directory",
+                "overlaps Narsor's protected directory",
                 Rejected,
             ),
             (
-                "a home source over the daemon state directory",
+                "a home source inside the state root, beside the controller's directory",
                 |fixture| {
                     fixture.store().set("claude-token", "t").unwrap();
-                    fs::write(fixture.root().join("state/daemon.json"), "{}").unwrap();
+                    fs::create_dir_all(fixture.root().join("state/run")).unwrap();
                 },
-                home_source(|fixture| fixture.root().join("state/daemon.json")),
-                "overlaps the controller's own directory",
+                home_source(|fixture| fixture.root().join("state/run")),
+                "overlaps Narsor's protected directory",
                 Rejected,
             ),
             (
@@ -1007,9 +1037,10 @@ mod containers {
             .skip(1)
             .map(|_| "..")
             .collect::<PathBuf>();
-        let relative = up.join(config.root.strip_prefix("/").unwrap());
+        let relative = up.join(fixture.root().strip_prefix("/").unwrap());
         assert!(relative.is_relative());
-        config.root = LocalBackendConfig::with_program(relative, &config.program).root;
+        config.state = ControllerStatePaths::new(relative.join("state"));
+        config.work = ControllerWorkPaths::new(relative.join("work"));
         fixture.scratch.backend = LocalBackend::new(config);
 
         let (_, run) = fixture.running("task-1").await;

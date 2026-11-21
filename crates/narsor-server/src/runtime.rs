@@ -88,7 +88,10 @@ const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// `settings` is what [`crate::settings::configure`] made of `config`:
 /// every rule between the settings already held.
 pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<()> {
-    let paths = narsor_engine::persistence::StatePaths::new(config.state_dir());
+    let paths = narsor_engine::persistence::ServerStatePaths::new(config.state_dir());
+    // The discovery file stays at the state root, where clients look for
+    // it, until it moves to the rendezvous directory.
+    let daemon_file = config.client_paths().daemon_file();
     // One daemon per state directory, held until this function returns. A
     // predecessor that is still shutting down is waited for: two daemons
     // must never drive the same tasks.
@@ -232,7 +235,7 @@ pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<(
         }
         None => None,
     };
-    if let Err(error) = info.write(&paths.daemon_file()) {
+    if let Err(error) = info.write(&daemon_file) {
         if let Some(observer_worker) = observer_worker {
             observer_worker.stop().await;
         }
@@ -252,7 +255,7 @@ pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<(
     let mut terminate = signal(SignalKind::terminate()).map_err(|error| {
         CliError::failure(format!("could not install the SIGTERM handler: {error}"))
     })?;
-    wait_for_sigterm_keeping_discovery(&mut terminate, &paths.daemon_file(), &info).await;
+    wait_for_sigterm_keeping_discovery(&mut terminate, &daemon_file, &info).await;
 
     // A worker's claim held open (a remote worker's too) answers "nothing"
     // now, so the drain below does not wait for its limit (U6).
@@ -285,7 +288,7 @@ pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<(
              cleanly); exiting anyway"
         );
     }
-    cleanup_discovery_file(&paths.daemon_file());
+    cleanup_discovery_file(&daemon_file);
 
     Ok(())
 }
@@ -326,9 +329,9 @@ fn refuse_declared_local_backend(catalog_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// What the daemon hands its local controller (KTD3): the paths and
-/// launch settings it resolved, the controller's storage and credential
-/// where the in-process controller kept them (R10).
+/// What the daemon hands its local controller (KTD3): the state and work
+/// roots and the launch settings it resolved. The controller derives its
+/// own directories below the roots (KTD7).
 fn local_controller_settings(
     config: &Resolved,
     api: &ApiHandle,
@@ -337,8 +340,8 @@ fn local_controller_settings(
     Ok(LocalControllerSettings {
         program,
         control_plane: format!("http://{}", api.addr()),
-        credential_file: local_controller::credential_file(config.state_dir()),
-        storage: config.work_dir().join("local-controller"),
+        state_root: config.state_dir().to_path_buf(),
+        work_root: config.work_dir().to_path_buf(),
         // The controller reads its own section (R21) from the file this
         // daemon read, on every start: a restart reads the file again.
         config_args: local_controller::config_args(config.file().path()),
@@ -428,7 +431,7 @@ pub fn run_periodic_pass(control: &ProtocolService) -> AutoResumePass {
 /// beside them for the operator.
 fn server_security(
     plan: SecurityPlan,
-    paths: &narsor_engine::persistence::StatePaths,
+    paths: &narsor_engine::persistence::ServerStatePaths,
 ) -> Result<ServerSecurity> {
     let network = match plan {
         SecurityPlan::Trusted { bind, cors } => return Ok(ServerSecurity::Trusted { bind, cors }),

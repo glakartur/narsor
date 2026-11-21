@@ -31,7 +31,7 @@ use super::resume::{
 };
 use super::store::OrchestrationStore;
 use crate::domain::{BackendId, TaskId};
-use crate::persistence::{ExecutionStore, StatePaths};
+use crate::persistence::{ExecutionStore, ServerStatePaths};
 use chrono::{DateTime, Duration, Utc};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -88,12 +88,12 @@ pub struct ControlPlane {
 
 impl ControlPlane {
     /// A control plane on `paths`, using the wall clock.
-    pub fn new(paths: StatePaths) -> Self {
+    pub fn new(paths: ServerStatePaths) -> Self {
         Self::with_clock(paths, Arc::new(SystemClock))
     }
 
     /// A control plane with an explicit clock.
-    pub fn with_clock(paths: StatePaths, clock: Arc<dyn Clock>) -> Self {
+    pub fn with_clock(paths: ServerStatePaths, clock: Arc<dyn Clock>) -> Self {
         Self {
             store: OrchestrationStore::new(paths),
             clock,

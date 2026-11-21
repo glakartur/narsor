@@ -57,7 +57,7 @@ use crate::persistence::atomic::{
     write_json_atomic_exclusive,
 };
 use crate::persistence::lock::FileLock;
-use crate::persistence::paths::{parse_event_file_name, StatePaths};
+use crate::persistence::paths::{parse_event_file_name, ServerStatePaths};
 use crate::persistence::PersistenceError;
 use std::collections::HashSet;
 use std::fs;
@@ -69,7 +69,7 @@ use std::sync::{Arc, Mutex};
 /// read-modify-write runs under an advisory lock.
 #[derive(Debug, Clone)]
 pub struct OrchestrationStore {
-    paths: StatePaths,
+    paths: ServerStatePaths,
     /// Backends this process has seen with every record at the current
     /// version, so that [`Self::lock_schedule`] does not scan them again. Only
     /// a build that predates version 2 writes version 1 records, so a backend
@@ -82,7 +82,7 @@ pub struct OrchestrationStore {
 
 impl OrchestrationStore {
     /// A store below the state root of `paths`.
-    pub fn new(paths: StatePaths) -> Self {
+    pub fn new(paths: ServerStatePaths) -> Self {
         Self {
             paths,
             migrated: Arc::default(),
@@ -91,7 +91,7 @@ impl OrchestrationStore {
     }
 
     /// The path layout.
-    pub fn paths(&self) -> &StatePaths {
+    pub fn paths(&self) -> &ServerStatePaths {
         &self.paths
     }
 
@@ -673,7 +673,7 @@ mod tests {
         };
         use crate::orchestration::{CommandRequest, ControlPlane, NewTask, OwnerCommand, OwnerRef};
         let root = std::env::temp_dir().join(format!("narsor-store-{}", uuid::Uuid::new_v4()));
-        let paths = StatePaths::new(&root);
+        let paths = ServerStatePaths::new(&root);
         let control = ControlPlane::new(paths.clone());
         let task_id = TaskId::parse("task-1").unwrap();
         let workspace = TaskWorkspace::single(TaskRepository::new(

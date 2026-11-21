@@ -256,11 +256,13 @@ pub enum SettingKey {
     /// from. Shareable between processes, and mountable read-only. Relative
     /// to `global.root` unless absolute.
     CatalogDir,
-    /// Where executions are kept. Separable for mounting, not for sharing.
+    /// The state root: every binary keeps its state in a directory of its
+    /// own below it (`narsor-server/`, `narsor-controller-local/`, …).
     /// Relative to `global.root` unless absolute.
     StateDir,
-    /// Where task workspaces — the git checkouts — are created. Local
-    /// scratch. Relative to `global.root` unless absolute.
+    /// The work root: every binary keeps its work (task storage, workloads)
+    /// in a directory of its own below it. Local scratch. Relative to
+    /// `global.root` unless absolute.
     WorkDir,
     /// The agent harness used by an `agent` action that names none itself.
     AgentHarness,
@@ -588,14 +590,15 @@ impl SettingKey {
     /// on for every command at once and make `tui` create a data directory and
     /// a log file on every run — a change of behaviour no requirement asks for.
     ///
-    /// The server directories are `.`, the root itself (R23), so an
-    /// unconfigured run writes where it always did.
+    /// The catalogue is `.`, the root itself (R23). The state and work
+    /// roots are `state` and `work` below it (KTD6): every binary keeps its
+    /// own directory below them, apart from the catalogue.
     pub fn built_in(self) -> SettingValue {
         match self {
             SettingKey::GlobalRoot => SettingValue::Path(PathBuf::from(DEFAULT_ROOT)),
-            SettingKey::CatalogDir | SettingKey::StateDir | SettingKey::WorkDir => {
-                SettingValue::Path(PathBuf::from("."))
-            }
+            SettingKey::CatalogDir => SettingValue::Path(PathBuf::from(".")),
+            SettingKey::StateDir => SettingValue::Path(PathBuf::from("state")),
+            SettingKey::WorkDir => SettingValue::Path(PathBuf::from("work")),
             SettingKey::AgentHarness => SettingValue::Text(CLAUDE_CODE.to_string()),
             SettingKey::MaxConcurrentTasks => SettingValue::Text("1".to_string()),
             SettingKey::LogLevel => SettingValue::Text(LOG_OFF.to_string()),
@@ -857,16 +860,21 @@ mod tests {
     }
 
     #[test]
-    fn the_built_in_directories_keep_todays_layout() {
-        // R23: the root is ./.narsor and each server directory is the root.
+    fn the_built_in_roots_put_state_and_work_below_the_root() {
+        // R23: the root is ./.narsor and the catalogue is the root itself;
+        // KTD6: state and work are directories of their own below it.
         assert_eq!(
             SettingKey::GlobalRoot.built_in(),
             SettingValue::Path(PathBuf::from("./.narsor"))
         );
-        for directory in SettingKey::ROOTS {
+        for (directory, expected) in [
+            (SettingKey::CatalogDir, "."),
+            (SettingKey::StateDir, "state"),
+            (SettingKey::WorkDir, "work"),
+        ] {
             assert_eq!(
                 directory.built_in(),
-                SettingValue::Path(PathBuf::from(".")),
+                SettingValue::Path(PathBuf::from(expected)),
                 "{directory}"
             );
         }
