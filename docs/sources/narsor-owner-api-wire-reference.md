@@ -1,6 +1,6 @@
 # Narsor owner HTTP API: wire reference for a JS client
 
-Source of truth: the Rust code in `/home/artur/Projekty/narsor` at commit `44262f9`.
+Source of truth: the Rust code in `/home/artur/Projekty/narsor` at commit `44262f9`. Sections 11 and 12 (executions by id, removed routes) are updated to the per-binary state layout change (D82).
 All statements come from the code that I read. Items that I did not verify by a run are marked **UNSURE** with a file:line.
 
 Conventions in this document:
@@ -55,13 +55,12 @@ Body type `RequestErrorResponse` (only where the table says "JSON"):
 |---|---|---|---|
 | 200 / 201 / 202 | JSON | success (the client treats all three the same) | — |
 | 400 | JSON `{code,message}` (usual) | malformed or invalid request | `Request{code,message}` |
-| 400 | **empty** | legacy `ApiError::BadRequest` (only on `/executions/...` and `POST /tasks` task-definition errors) | client fails to parse → `Server` |
+| 400 | **empty** | legacy `ApiError::BadRequest` (only on `POST /tasks` task-definition errors) | client fails to parse → `Server` |
 | 400 / 415 / 422 | **plain text** | axum extractor rejection: bad query string (400), JSON syntax (400), missing `Content-Type: application/json` (415), JSON with wrong shape or unknown field in a deny_unknown_fields type (422). Not `{code,message}`. | `Server` |
 | 401 | empty | not authenticated | `Unauthorized` |
 | 403 | empty | not owner / not operator / not via proxy | `Forbidden` |
-| 404 | empty | does not exist **for this caller** (also: task of another owner, legacy routes on a non-local server) | `NotFound` |
+| 404 | empty | does not exist **for this caller** (also: task or execution of another owner) | `NotFound` |
 | 409 | JSON `{code,message}` | conflict with current state | `Refused{code,message}` |
-| 409 | empty | legacy `ApiError::Conflict` (only `/executions/...`) | `Conflict` |
 | 500 | empty | server failure | `Server` |
 | 503 | JSON `{code,message}` | something did not answer (runner relay, git remote); retry is permitted | `Degraded{code,message}` |
 
@@ -75,7 +74,7 @@ Known `code` values (not a complete list; grep `bad_request(`, `conflict(`, `una
 
 ### 1.5 Identifiers
 
-Task id and backend id: 1–128 characters of `[A-Za-z0-9._-]`, first character not `.` (`crates/narsor-protocol/src/identifier.rs:24`). The TUI makes task ids as `task-<uuid v4 hex without dashes>`. Idempotency keys in the TUI are UUID v4 strings. Legacy execution ids and attempt ids: `[A-Za-z0-9_-]+` (anything else is 404 / `no_record`).
+Task id and backend id: 1–128 characters of `[A-Za-z0-9._-]`, first character not `.` (`crates/narsor-protocol/src/identifier.rs:24`). The TUI makes task ids as `task-<uuid v4 hex without dashes>`. Idempotency keys in the TUI are UUID v4 strings. Execution ids and attempt ids: `[A-Za-z0-9_-]+` (anything else is 404 / `no_record`).
 
 ### 1.6 Idempotency and optimistic concurrency
 
@@ -127,18 +126,12 @@ Task id and backend id: 1–128 characters of `[A-Za-z0-9._-]`, first character 
 | R2 | POST | `/control/v1/repositories` | **201** `RepositoryView` | yes |
 | R3 | DELETE | `/control/v1/repositories/{id}` | 200 `RepositoryView` | yes |
 | R4 | GET | `/control/v1/repositories/{id}/branches` | 200 `RepositoryBranchesResponse` | yes |
-| H1 | GET | `/control/v1/executions` | 200 `LegacyExecutionListResponse` | yes |
-| H2 | GET | `/control/v1/executions/{execution_id}` | 200 `LegacyExecutionView` | CLI |
-| H3 | GET | `/control/v1/executions/{execution_id}/events?after=N` | 200 `Event[]` | yes |
-| H4 | GET | `/control/v1/executions/{execution_id}/timeline` | 200 `Timeline` | yes |
-| H5 | GET | `/control/v1/executions/{execution_id}/attempts/{attempt_id}/conversation?from=N&byte_budget=B` | 200 `ConversationPage` | yes |
-| H6 | GET | `/control/v1/executions/{execution_id}/conductor` | 200 `ConductorStateResponse` | yes |
-| H7 | GET | `/control/v1/executions/{execution_id}/conductor/chat?after=N` | 200 `ConductorChatResponse` | yes |
-| H8 | POST | `/control/v1/executions/{execution_id}/recover` | **202** `AcceptedResponse` | yes |
+| H1 | GET | `/control/v1/executions` | 200 `ExecutionListResponse` | CLI |
+| H2 | GET | `/control/v1/executions/{execution_id}` | 200 `ExecutionLookupResponse` | CLI |
 
 The `/control/v1/...` routes exist only when the server has a control plane (the normal daemon has one). `/control/v1/backends/.../enrollments` and `/control/v1/controllers...` are operator routes for controllers. The TUI does not use them. They are not in this document.
 
-**Conductor chat / confirm / reject / undo for a task** have no endpoint of their own. The TUI sends them as operator commands through T7 (`conductor_chat`, `confirm_proposal`, `reject_proposal`, `undo_decision`). The routes `/executions/{id}/conductor/chat` (POST), `/conductor/proposals/{id}/confirm|reject`, `/conductor/decisions/{id}/undo` are the legacy path for pre-scheduler executions. Only the CLI uses them (see section 12).
+**Conductor chat / confirm / reject / undo for a task** have no endpoint of their own. The TUI sends them as operator commands through T7 (`conductor_chat`, `confirm_proposal`, `reject_proposal`, `undo_decision`). The former `/executions/...` routes are removed (see section 12).
 
 ---
 
@@ -1006,10 +999,10 @@ Errors: `400 invalid_material_manifest | invalid_material_path | material_too_la
 ```json
 { "connection_name": "local", "workflow_paths": true,
   "workflow_paths_reason": "…",        // omitted when workflow_paths is true
-  "legacy_executions": false, "local_repository_paths": true }
+ "local_repository_paths": true }
 ```
 
-`workflow_paths` = W3 and `POST /tasks` with a file path can work (trusted local daemon only). `legacy_executions` = H1 has rows. `local_repository_paths` = R2 accepts a path on the server's disk.
+`workflow_paths` = W3 and `POST /tasks` with a file path can work (trusted local daemon only). `local_repository_paths` = R2 accepts a path on the server's disk.
 
 ### C2 / C3 `/control/v1/default-backend`
 
@@ -1138,77 +1131,47 @@ The server runs `git ls-remote` (up to 20 s; the Rust client waits 25 s). Errors
 
 ---
 
-## 11. History (executions from before the task scheduler)
+## 11. Executions by id
 
-All H routes answer `404` on a server that is not the trusted local daemon, and for an unknown id. H1 answers an empty list instead.
+An execution is known to the control plane through its task: the runner reports the execution id, status and pending input in its snapshot. H1 and H2 read only the task records. They read no task storage and start no read-only runner, for every backend (local included). The content of an execution (timeline, events, conversation, conductor) is read through the task routes of its task (T-routes), with the `task_id` that H2 returns.
 
-### H1 `GET /control/v1/executions` → `{ "executions": [ LegacyExecutionView ] }` (newest first)
+### H1 `GET /control/v1/executions` → `ExecutionListResponse`
 
 ```json
-{ "id": "…", "workflow_id": "feature", "workflow_version": 3, "status": "failed",
+{ "executions": [ ExecutionSummary ] }
+```
+
+One entry for each task of the caller whose runner reported an execution. An execution id that more than one task reports is left out.
+
+```json
+// ExecutionSummary
+{ "id": "…", "workflow_id": "feature", "workflow_version": 3, "status": "failed",   // ExecutionStatusDto
   "current_state": "work", "started_at": "…", "completed_at": null,
-  "problem": { "kind": "failure", "reason": "…", "episode": "…" },     // or null; kind: output | failure
-  "recoverable": true,
-  "not_recoverable_reason": "…" }      // omitted when recoverable
+  "variables": {}, "metadata": null,
+  "pending_input": PendingHumanInputView,                                        // or null (section 5.5)
+  "problem": { "kind": "failure", "reason": "…", "episode": "…" },                // or null; kind: output | failure
+  "annotation": { "key": "…", "summary": "…", "recommendation": null, "created_at": "…" },   // or null
+  "conductor": { "purpose": "…", "trigger": "…", "episode": null, "started_at": "…" } }      // or null
 ```
 
-### H2 `GET /control/v1/executions/{execution_id}` → `LegacyExecutionView`
+`ExecutionStatusDto` is described in section 5.
 
-### H3 `GET …/events?after=N` → `Event[]` (section 7, T13 `Event`), `sequence > after`, no page limit. `after` default 0.
-
-### H4 `GET …/timeline` → `Timeline` (bare; not wrapped in `TimelineResponse`).
-
-### H5 `GET …/attempts/{attempt_id}/conversation?from=N&byte_budget=B` → `ConversationPage` (section 7, T12)
-
-Defaults here: `from` = **1**, `byte_budget` = 1048576 (no clamp). The TUI sends only `from`. Read from the daemon's disk (no relay, no 409). An unsafe attempt id answers `{"status":"no_record"}`.
-
-### H6 `GET …/conductor` → `ConductorStateResponse`
+### H2 `GET /control/v1/executions/{execution_id}` → `ExecutionLookupResponse`
 
 ```json
-{ "pending": { "invocation_id": "…",
-               "request": { "request_id": "…", "trigger": "chat", "purpose": "reply_to_chat",
-                            "episode": null, "payload": null, "queued_at": "…" },
-               "started_at": "…" },               // or null
-  "queue": [ { "request_id": "…", "trigger": "…", "purpose": "…", "episode": null, "payload": {…}, "queued_at": "…" } ],
-  "unanswered_chat": ["<chat entry id>"],
-  "invocation_attempts": { "<episode>": 1 },
-  "used_retries": ["<episode>"],
-  "unapplied_decisions": [ { … } ],                // opaque objects for the client
-  "failure": FailureReport }                       // or null (section 7)
+{ "task_id": "…", "execution": ExecutionSummary }
 ```
 
-This is a different shape from T14 `ConductorView`. An execution without conductor data answers the empty state.
-
-### H7 `GET …/conductor/chat?after=N` → `{ "entries": [ ChatEntryDto ] }` (`sequence > after`, no page limit).
-
-### H8 `POST …/recover`
-
-Body `RecoveryRequest`: `{ "comment": "text or null" }` (optional `episode` string; the TUI does not send it). Response **202** `{ "execution_id": "…" }`.
-Errors: `409 not_recoverable` with the reason in `message`; `404`.
+Errors: `404` when no task of the caller reported the execution (an execution of another owner included), `409 ambiguous_execution` when more than one task reports it.
 
 ---
 
-## 12. Legacy `/executions/...` routes (the TUI does not use them)
+## 12. Removed routes
 
-They work only for executions in the daemon's own store. For a task's (runner-owned) execution they answer a bare `409`. Listed for completeness:
+These routes are gone. A client that calls them gets `404`:
 
-| Method | Path | Body | Success |
-|---|---|---|---|
-| POST | `/executions/{id}/conductor/chat` | `{ "text": "…" }` | 202 `ChatEntryDto`; `400 empty_message` |
-| POST | `/executions/{id}/conductor/proposals/{proposal_id}/confirm` | none | 200 `ProposalOutcome` |
-| POST | `/executions/{id}/conductor/proposals/{proposal_id}/reject` | none | 200 `ProposalOutcome` |
-| POST | `/executions/{id}/conductor/decisions/{decision_id}/undo` | none | 200 `UndoOutcome` |
-
-```json
-// ProposalOutcome
-{ "proposal_id": "…", "status": "executed", "decision_id": "…", "message": "…", "repeated": false }   // status: executed | rejected
-// UndoOutcome
-{ "decision_id": "…", "state_id": "work", "episode": "…", "warning": null, "message": "…" }
-```
-
-Errors: `409 stale_proposal | proposal_settled | execution_busy | already_undone | decision_superseded | execution_cancelled`, `400 invalid_proposal | not_undoable`, `404`.
-
-Other legacy routes (`GET /executions`, `/executions/{id}/events|timeline|stream|resume|recover|interrupt|input|permission|transition|operator-note`, `/events/stream`) are used by the CLI only. They are not described here. See `crates/narsor-server/src/api/routes.rs:335-390`.
+- the history routes `/control/v1/executions/{execution_id}/events|timeline|attempts/{attempt_id}/conversation|conductor|conductor/chat|recover` (former H3–H8). Use the task routes of the task that H2 names.
+- every `/executions/...` route of the local daemon (`GET /executions`, `/executions/{id}/events|timeline|stream|resume|recover|interrupt|input|permission|transition|operator-note`, `/executions/{id}/conductor/...`) and `/events/stream`. The CLI uses H1, H2 and the task routes instead; an answer to an input or a permission request goes to the task's input route (T6).
 
 ---
 
@@ -1221,17 +1184,15 @@ Other legacy routes (`GET /executions`, `/executions/{id}/events|timeline|stream
 | T12 conversation page | `from` (u64, **inclusive**) | `next_entry` | `byte_budget` | not `closed`, not `truncated_tail`, not empty, `next_entry > from` |
 | T13 execution events | `after` (exclusive) | last `event.sequence` | `limit` | `has_more` |
 | T14 conductor chat | `after` (exclusive) | last `chat[].sequence` | `limit` | `conductor.chat_has_more` |
-| H3 / H7 | `after` (exclusive) | last `sequence` | none (all) | — |
-| H5 | `from` (inclusive, default 1) | `next_entry` | `byte_budget` | as T12 |
 | T1 task list | none | — | none | — |
 
 ---
 
 ## 14. Things that are surprising or easy to get wrong
 
-1. **Success codes differ.** T2, R2 → 201. T6, T7, T8, W4, H8 → 202. M2 → 201, or 200 for a replay. Treat 200/201/202 the same.
-2. **401, 403, 404 and 500 have no body.** A 400 can have a JSON body (`{code,message}`), an empty body (legacy), or a **plain-text** body (axum rejection of the query or JSON). 409 can be JSON or empty. Do not call `response.json()` without a guard.
-3. **404 also means "not yours"** and "this server does not do that" (history routes on a non-local server). `claim` in trusted mode is 404.
+1. **Success codes differ.** T2, R2 → 201. T6, T7, T8, W4 → 202. M2 → 201, or 200 for a replay. Treat 200/201/202 the same.
+2. **401, 403, 404 and 500 have no body.** A 400 can have a JSON body (`{code,message}`), an empty body (legacy), or a **plain-text** body (axum rejection of the query or JSON). 409 has a JSON body or none. Do not call `response.json()` without a guard.
+3. **404 also means "not yours"** (an execution of another owner in H2). `claim` in trusted mode is 404.
 4. **`unavailable` is a 200** for T11, T13, T14 (`status:"unavailable"`). But T12 uses **409** for the same conditions (`conversation_reader_starting`, `conversation_unavailable`), and T13/T14 use **503** for a runner that did not answer.
 5. **Relayed reads are slow** (T12, T13, T14): the server waits up to 20 s for the runner. Use a long client timeout or cancel and ask again. A stopped task starts a read-only runner: expect `reader_starting`, then ask again.
 6. **Operator command body is flattened** in T7 (`kind` at the top level beside `idempotency_key`), but nested as `command: {kind…}` in `OperatorCommandView`, in task events and in `TaskActionSend`.
@@ -1239,8 +1200,8 @@ Other legacy routes (`GET /executions`, `/executions/{id}/events|timeline|stream
 8. **Nested tags with the same name**: `TaskSummary.queue.reason.reason` (`QueueView.reason` is an object tagged with `reason`); task event `{"type":"queue_changed","reason":{"reason":"admitted"}}`.
 9. **Three different tag names**: `type` (task event kind, workflow `Event.data`, `TaskActionSend`), `kind` (operator command, `ChatElement`, observation, `FailureOutcome`), `status` (conversation/events/conductor responses), `state` (`Position.conversation`), `link`+`value` (`EventLink`), `to`+`task_id` (move target), `reason` (queue reason).
 10. **`PanelPlan` and `PanelFieldKind` are externally tagged**: `"answer"` (bare string) versus `{"output":{"label":"x"}}`. Check `typeof plan === "string"`.
-11. **Two "events"**: T9 and the stream carry control-plane `TaskEvent` (field `kind`). T13 and H3 carry workflow `Event` (field `data`). Two "conversation responses": T11 (`available`/`unavailable` summary) and T12/H5 (`recorded`/`no_record` page). Two conductor shapes: T14 `ConductorView` and H6 `ConductorStateResponse`.
-12. **Conversation `from` is inclusive**; all `after` parameters are exclusive. T12 default `from` is 0, H5 default is 1.
+11. **Two "events"**: T9 and the stream carry control-plane `TaskEvent` (field `kind`). T13 carries workflow `Event` (field `data`). Two "conversation responses": T11 (`available`/`unavailable` summary) and T12 (`recorded`/`no_record` page).
+12. **Conversation `from` is inclusive**; all `after` parameters are exclusive. T12 default `from` is 0.
 13. **`Timeline.links` keys are strings** (sequence numbers as JSON object keys).
 14. **Always-present nullable keys** in `TaskSummary`: `archive`, `observation`, `runner`, `controller` are written as `null`. Other optional keys (`ticket`, `title`, `state_since`, `steps`, `actions`, `panel`, `manual_transitions`) are **omitted**. Use `?? null` everywhere.
 15. **`state` versus `runner_state`**: show `state`. `runner_state` describes resources. `stopped` was `paused` in old records; `runner_state` was `lifecycle`.

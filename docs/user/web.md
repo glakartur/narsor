@@ -40,11 +40,11 @@ passes the proxy's `X-Forwarded-Proto` on in the `passthrough` mode.
 ## Tokens
 
 - **`server` mode:** `narsor-web` holds the server's token (the local
-  daemon's from its discovery file, or a remote server's from the token
+  daemon's from its discovery file `{state}/run/daemon.json`, or a remote server's from the token
   sources above, read again after a `401`). The browser gets a **session
   token** of `narsor-web`, new at each start: `narsor-web --open` puts it in
-  the address, and it is in the file `web-session` (mode `0600`) of the
-  state directory. The server's token never reaches the browser. If the
+  the address, and it is in the file `{state}/narsor-web/web-session` (mode `0600`;
+  `{state}` is the state root, `server.state`). The server's token never reaches the browser. If the
   local daemon restarts on another port with another token, `narsor-web`
   finds it again by itself.
 - **`passthrough` mode:** the browser presents the server's own token (an
@@ -66,7 +66,8 @@ The sign-in form says which token it needs (*Skąd wziąć token?*).
   `/settings/…`, `/auth/v1/whoami`, `POST /tasks`); anything else is a
   `404`, so `narsor-web` is no open relay.
 - `--open` never puts the session token in a process argument: the browser
-  opener gets a page in the state directory (`web-open.html`, mode `0600`)
+  opener gets a page in its own state directory
+  (`{state}/narsor-web/web-open.html`, mode `0600`)
   that sends the browser on to `/ui/#token=…`. A browser never sends the
   fragment to a server; the interface moves the token to the session storage
   of the tab and removes it from the address bar at once.

@@ -8,21 +8,21 @@ decisions behind this structure, see `architecture.md`.
 
 | Crate | Responsibility |
 |---|---|
-| `narsor` (root, `src/`) | The `narsor` (TUI) and `narsor-cli` binaries and the client library they share. |
+| `narsor` (root, `src/`) | The `narsor` (TUI) and `narsor-cli` binaries and the client library they share. `TuiStatePaths` (`src/tui/paths.rs`): the TUI log in `state/narsor/`. |
 | `narsor-protocol` | Wire types shared by clients and services: REST API, events, controller protocol, panel forms. |
-| `narsor-shared` | Small contracts shared by the processes: API errors, configuration. |
-| `narsor-api-client` | HTTP/SSE client transport; discovers a running `narsor-server` or launches one. |
-| `narsor-controller-runtime` | Lifecycle helpers shared by the local controller and the `narsor-controller` process. |
+| `narsor-shared` | Small contracts shared by the processes: API errors, configuration, `RunPaths` (`run_paths.rs`: the rendezvous directory `state/run/`, created `0700` by `RunPaths::prepare`) and `config/old_layout.rs` (the pre-D82 locations, read only by the one-time migration). |
+| `narsor-api-client` | HTTP/SSE client transport; discovers a running `narsor-server` in `state/run/` or launches one. |
+| `narsor-controller-runtime` | Lifecycle helpers shared by the local controller and the `narsor-controller` process; `WakeSignal`/`WakeListener`, which carry a backend event to the controller loop. |
 | `narsor-controller-client` | The client side of the controller protocol: `ControllerClient`, `RunnerClient`, the wire types, proof-of-possession signing, and the adapter to `narsor-controller-runtime`. |
 | `narsor-model` | The model layer: domain types, workflow definitions (schema, loading, templates, validation) and shared configuration. No I/O beyond reading workflow files. |
-| `narsor-store` | File-backed storage primitives: state paths, atomic writes, file locks, the execution store, event logs and conversation records. |
+| `narsor-store` | File-backed storage primitives: `ServerStatePaths` (`state/narsor-server/`; engine stores take it as a parameter, only `narsor-server` constructs it), the task-storage `StatePaths` (execution entries only), atomic writes, file locks, the execution store, event logs and conversation records. |
 | `narsor-exec` | The execution layer: the Engine that runs a workflow, the conductor, task workspaces, the repository registry, task definitions and their sources, and the API projections of an execution. |
 | `narsor-engine` | The control plane: orchestration, controller protocol service, auth, observers, materials, environment configuration and launch resolution. Re-exports `narsor-exec`, `narsor-model`, `narsor-store` (as `persistence`) and `narsor-controller-client` under its old module paths. |
-| `narsor-server` | The daemon (control plane): the API server, its lifecycle and the child processes it supervises. |
+| `narsor-server` | The daemon (control plane): the API server, its lifecycle and the child processes it supervises. It passes the state and work roots to the local controller and migrates its own files once at start (`layout_migration.rs`, D82). |
 | `narsor-runner` | The isolated task runner: the Engine run against one portable task storage. |
-| `narsor-controller` | The environment controller process: `narsor-controller local` and `narsor-controller kubernetes`. |
+| `narsor-controller` | The environment controller process: `narsor-controller local` and `narsor-controller kubernetes`. Local: `ControllerStatePaths`/`ControllerWorkPaths` (`local/paths.rs`, `narsor-controller-local/` below the roots it is given), its part of the one-time migration (`local/layout_migration.rs`), and the wake sources (SIGCHLD of its runners, `docker events`). Kubernetes: the watch of its managed Pods. |
 | `narsor-observer-worker` | The observer worker: claims the due runs of the catalogue's automations (`in`, `check`, `out`) and executes their scripts. |
-| `narsor-web` | The browser interface: serves the single-page application and proxies `/control/v1` to a `narsor-server`. |
+| `narsor-web` | The browser interface: serves the single-page application and proxies `/control/v1` to a `narsor-server`. `WebStatePaths` (`paths.rs`): the session files in `state/narsor-web/`. |
 
 ## Build-time dependencies
 
@@ -134,7 +134,7 @@ graph TD
 | `narsor`, `narsor-cli`, `narsor-web` | `narsor-server` | Discover the daemon; launch it when it is not running | process (`api-client/src/api/launch.rs`) |
 | `narsor`, `narsor-cli`, `narsor-web` | `narsor-server` | Owner operations and the event stream | REST + SSE, `/control/v1` |
 | Browser | `narsor-web` | Application files and the API proxy | HTTP, loopback only |
-| `narsor-server` | `narsor-controller local` | Start as a child with the server's configuration file (or `--no-config`) and only its `NARSOR_GLOBAL__*` / `NARSOR_CONTROLLER__*` variables; enroll, supervise | process (`server/src/local_controller.rs`, `shared/src/config/local_controller.rs`) |
+| `narsor-server` | `narsor-controller local` | Start as a child with the state and work roots (`--state-root`, `--work-root`), a short-lived enrollment code, the server's configuration file (or `--no-config`) and only its `NARSOR_GLOBAL__*` / `NARSOR_CONTROLLER__*` variables; enroll, supervise | process (`server/src/local_controller.rs`, `shared/src/config/local_controller.rs`) |
 | `narsor-cli` | `narsor-server`, `narsor-web`, `narsor`, `narsor-runner`, `narsor-controller` | `config show`: run each sibling binary with `--check-config` and merge the JSON reports | process (`src/cli/commands/config.rs`) |
 | `narsor-server` | `narsor-observer-worker` | Start and supervise when `server.observer.enabled` is `true` | process (`server/src/observer_worker.rs`) |
 | `narsor-controller` (local, kubernetes) | `narsor-server` | Enroll, lease, heartbeat, commands, acks, reports | HTTP, `/controller/v1` |
@@ -160,15 +160,30 @@ Properties of the runtime:
   `narsor-web` the `web` section, and the clients also `server.state` for
   daemon discovery. An error in one section stops only the programs that
   read it. See `docs/user/configuration.md`.
+- Each binary writes state only below `state/<binary>/` and work only below
+  `work/<binary>/`, through its own path type built from the roots (D82).
+  The server and its clients meet in `state/run/` (discovery, autostart
+  lock and log). A program that needs another one to act on its files
+  starts it with the roots (`--state-root`, `--work-root`) instead of
+  spelling its directory; the controller hands a runner the paths of one
+  task. `tests/integration/state_ownership.rs` checks which crate
+  constructs which path type and where the raw roots are read.
+- Controller commands carry no launch spec, only its digest. The controller
+  fetches the spec when it creates a workload or starts a reader
+  (`GET /controller/v1/tasks/{id}/launch-spec`), the working runner on its
+  first start (`GET /runner/v1/launch-spec`); both accept it only when its
+  recomputed digest matches. After a full read the controller reads only the
+  commands that changed; a backend event (runner exit, Docker event, Pod
+  change) wakes it at once, but only to observe again (D82).
 - Automations and queues are catalogue files (`{catalog}/automations/`,
   `{catalog}/queues/`), read by `narsor-engine` (`automations/`) at every
   load, with no cache. Their scheduling lives in the control plane only
   (`observers/` and `controller_protocol/service/observers/`), per (queue,
   automation) pair, with the runtime state in
-  `{state}/observer-queues/automations/{queue}/{automation}/`. A runner
+  `{state}/narsor-server/observer-queues/automations/{queue}/{automation}/`. A runner
   reports the rendered `watch` of a waiting `decision` gate in its snapshot
   (`gate_watch`). The control plane keeps one queue entry per wait episode
-  in `{state}/observer-queues/entries/`, runs the `in` scripts when the
+  in `{state}/narsor-server/observer-queues/entries/`, runs the `in` scripts when the
   episode begins, holds every exit on the task record until the `out`
   scripts ended, and then removes the entry. A runner gets an automation's
   answer as a queued input, as a person's answer; a held exit reaches it at

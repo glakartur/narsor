@@ -69,9 +69,12 @@ Rules that follow from this split:
 The daemon serves the control plane and runs no workflow itself. The `local` backend has a controller like every
 other backend: `narsor-controller local`, a separate process that enrolls and
 talks `/controller/v1` over HTTP. In trusted mode the daemon starts it as its
-child, enrolls it on the first start and supervises it:
+child with the state and work roots (`--state-root`, `--work-root`) and
+supervises it. At every start it passes a short-lived enrollment code, which
+the controller uses only when it has no credential of its own (a first start,
+or a wiped controller state):
 
-* the daemon becomes discoverable (`daemon.json`) only after this controller
+* the daemon becomes discoverable (`{state}/run/daemon.json`) only after this controller
   holds a lease of its own — a newer `epoch` than the one before its start;
   it gives up after 10 s, and the start fails with the last lines the
   controller wrote;
@@ -144,7 +147,7 @@ audience, an asymmetric algorithm allow list (no `none`, no HMAC), signature,
 
 **Owner.** Either set `server.owner_subject` (the owner is bound at startup), or
 leave it empty: the daemon then prints a one-time **claim code** and stores it
-`0600` at `{state}/auth/claim-code`. The first user who presents a valid
+`0600` at `{state}/narsor-server/auth/claim-code`. The first user who presents a valid
 token together with the code owns the installation:
 
 ```bash
@@ -955,7 +958,7 @@ empty components, backslashes, colons, control characters or `.git`
 components, at most 1024 bytes and 32 levels, and no two paths that differ
 only in letter case.
 
-Where the bytes live: at the control plane under `{state}/materials/` (one
+Where the bytes live: at the control plane under `{state}/narsor-server/materials/` (one
 directory per task and material, blobs named by their SHA-256), outside task
 records, event logs and the SSE stream — events say only
 `material <id> uploaded|delivered|published|deleted|expired` with a file

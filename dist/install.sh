@@ -16,6 +16,11 @@
 # directory (~/.narsor by default), writes it as global.root and writes
 # server.catalog, server.state and server.work relative to it. It does not touch an
 # existing configuration: it writes config.yaml.new next to it.
+# server.state and server.work are roots: every program keeps its own directory
+# below them (state/run/, state/narsor-server/, state/narsor-controller-local/,
+# state/narsor-web/, state/narsor/, work/narsor-controller-local/). --purge runs
+# `narsor-cli purge`, which removes the whole data directory with all of them and
+# lists, but keeps, directories the configuration names outside it.
 # For the local role it also asks for the work mode of local tasks (process or
 # docker); `--local-mode process|docker` answers that question and is passed
 # to `narsor-cli init` like the other init options.

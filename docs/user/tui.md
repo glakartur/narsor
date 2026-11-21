@@ -351,7 +351,8 @@ is still told by its icon and its word.
 
 **Logging.** `tui` takes over the alternate screen, so a log line on stderr
 would be written over the panels. With `RUST_LOG` set, the interface's logs are
-appended to `{state}/narsor/narsor.log` instead (`{state}` is `server.state`);
+appended to `{state}/narsor/narsor.log` instead (`{state}` is the state root, `server.state`; the
+interface's own directory is `narsor/`);
 with `RUST_LOG` unset no subscriber is installed at all and the records are
 dropped. Either way nothing
 reaches the terminal while the interface is up. Every other subcommand keeps

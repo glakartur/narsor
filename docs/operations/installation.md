@@ -73,6 +73,14 @@ their sections (remove the `#` to change one; each comment names the flat key
 the setting replaces). The number of tasks processed in parallel is the
 `server.max_concurrent_tasks` setting (default 1). The file is a tree of
 sections, one per program; see [Configuration](../user/configuration.md#the-tree-of-sections).
+`ROOT/state` and `ROOT/work` are roots: each program keeps its files in a
+directory of its own below them (`state/narsor-server/`,
+`state/narsor-controller-local/`, `work/narsor-controller-local/`, …), and
+the server and its clients meet in `state/run/`; see
+[The on-disk layout](../user/configuration.md#the-on-disk-layout). An
+installation of an older version is moved to this layout once, at the first
+start of the new server; see
+[Updates](updates.md#update-to-a-directory-per-program-state-ownership).
 
 For the `local` role, `narsor-cli init` also asks for the **work mode for
 local tasks**: `process` (the default: tasks run on the host as your user) or
@@ -191,7 +199,10 @@ what it will delete and asks for confirmation; with `--non-interactive`, the
 `--purge` flag is the confirmation. Directories that the configuration names
 outside the data directory are listed and kept, and a data directory that
 contains your home directory is refused. `--purge` runs the installed
-`narsor-cli purge`, so it needs the binaries to still be present.
+`narsor-cli purge`, so it needs the binaries to still be present. A
+controller started by hand keeps its state below its own `--state-root`
+(by default `$XDG_STATE_HOME/narsor/narsor-controller-local/`) and its
+task storages below `--work-root`; `--purge` does not remove them.
 
 ## Frontend connection profile
 
