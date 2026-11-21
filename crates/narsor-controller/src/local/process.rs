@@ -38,8 +38,18 @@
 //! is the second guard. It never looks at the process group a dead runner
 //! left behind: should one still hold the lock, the reader cannot read and
 //! says so.
+//!
+//! # Noticing an exit at once
+//!
+//! A runner this instance started is its child, so its exit raises
+//! `SIGCHLD` here. [`ProcessRunners::follow_exits`] listens for it and wakes
+//! the controller when one of those children has ended (R4); it never reaps
+//! one — observing does, with `try_wait`, to read its exit code. `SIGCHLD`
+//! also comes for every other child (a `docker` call), so it wakes only for
+//! a child it has not announced yet. A runner a previous controller started
+//! is no child of this one: it is noticed at the periodic observation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;
@@ -48,7 +58,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use narsor_controller_runtime::backend::{
-    BackendError, BackendResult, TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
+    BackendError, BackendResult, TaskResources, WakeSignal, WorkloadLaunch, WorkloadPhase,
+    WorkloadState,
 };
 use narsor_shared::config::{CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV, ENV_PREFIX};
 use narsor_shared::git::USER_GIT_ACCESS_ENVS;
@@ -101,7 +112,37 @@ impl ProcessRunners {
     }
 
     fn children(&self) -> MutexGuard<'_, HashMap<String, Child>> {
-        self.children.lock().unwrap_or_else(PoisonError::into_inner)
+        lock_children(&self.children)
+    }
+
+    /// Wakes `wake` whenever a runner this instance started has ended, until
+    /// nobody listens to it any more. Must run inside the Tokio runtime.
+    pub(super) fn follow_exits(&self, wake: WakeSignal) {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut exits = match signal(SignalKind::child()) {
+            Ok(exits) => exits,
+            Err(error) => {
+                tracing::warn!(%error, "local backend: cannot listen for runner exits; observing them periodically");
+                return;
+            }
+        };
+        let children = Arc::clone(&self.children);
+        tokio::spawn(async move {
+            let mut announced = HashSet::new();
+            loop {
+                if wake.unheard() {
+                    return;
+                }
+                // Also at the start: a runner may have ended before.
+                if newly_ended(&children, &mut announced) {
+                    wake.wake();
+                }
+                if exits.recv().await.is_none() {
+                    return;
+                }
+            }
+        });
     }
 
     /// The phase of the process `pid` of `record`, with the record to write
@@ -361,6 +402,29 @@ impl ProcessRunners {
     }
 }
 
+fn lock_children(
+    children: &Mutex<HashMap<String, Child>>,
+) -> MutexGuard<'_, HashMap<String, Child>> {
+    children.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether one of `children` has ended since the last call: the pids of the
+/// ended ones are kept in `announced`. None is reaped.
+fn newly_ended(children: &Mutex<HashMap<String, Child>>, announced: &mut HashSet<u32>) -> bool {
+    let children = lock_children(children);
+    let pids: HashSet<u32> = children.values().map(Child::id).collect();
+    // A child observing reaped is no longer one to announce.
+    announced.retain(|pid| pids.contains(pid));
+    let mut ended = false;
+    for pid in pids {
+        // A zombie counts as ended: it is waiting to be reaped.
+        if !process_alive(pid, None) && announced.insert(pid) {
+            ended = true;
+        }
+    }
+    ended
+}
+
 /// Whether `name` is one of the controller's own `NARSOR_*` variables,
 /// which a runner never inherits.
 fn is_controller_setting(name: &OsStr) -> bool {
@@ -498,6 +562,48 @@ pub(super) fn process_alive(pid: u32, start_ticks: Option<u64>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local::test_support::Scratch;
+    use narsor_controller_runtime::backend::ExecutionBackend;
+
+    /// R4: the exit of a runner this controller started wakes it; another
+    /// child ending (a `docker` call) does not, and the exit is left for
+    /// the observation to reap and read.
+    #[tokio::test]
+    async fn a_runner_exit_wakes_the_controller_and_is_left_for_the_observation() {
+        let scratch = Scratch::new();
+        let backend = &scratch.backend;
+        let task = scratch.task();
+        let wait = |limit| tokio::time::timeout(limit, backend.changed());
+        assert!(
+            wait(Duration::from_millis(50)).await.is_err(),
+            "nothing yet"
+        );
+        backend
+            .provision(&task, &scratch.launch("task-1-g1"))
+            .await
+            .unwrap();
+        let pid = backend.runner_pid(&task).expect("running");
+
+        std::process::Command::new("true").status().unwrap();
+        assert!(
+            wait(Duration::from_millis(300)).await.is_err(),
+            "another child is no runner"
+        );
+
+        // SAFETY: signalling the runner's own process group.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+        wait(Duration::from_secs(5))
+            .await
+            .expect("woken by the exit");
+
+        let observed = backend.observe(&task).await.unwrap().workload.unwrap();
+        assert!(
+            matches!(observed.phase, WorkloadPhase::Exited { .. }),
+            "{observed:?}"
+        );
+    }
 
     #[test]
     fn the_controllers_settings_are_not_inherited_by_a_runner() {

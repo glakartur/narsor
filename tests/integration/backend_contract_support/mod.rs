@@ -316,16 +316,35 @@ impl<T: ContractTarget> Harness<T> {
     /// Starts a controller presenting `credential`, on a fresh adapter
     /// instance, with a lease valid for `lease_ttl`.
     pub fn start_controller_as(&mut self, credential: &str, lease_ttl: Duration) -> usize {
+        self.start_controller_configured(credential, |config| config.lease_ttl = lease_ttl)
+    }
+
+    /// Starts a controller with a new identity and the suite's timing,
+    /// changed by `configure`.
+    pub fn start_controller_with(
+        &mut self,
+        configure: impl FnOnce(&mut ControllerConfig),
+    ) -> usize {
+        let credential = self.enroll();
+        self.start_controller_configured(&credential, configure)
+    }
+
+    fn start_controller_configured(
+        &mut self,
+        credential: &str,
+        configure: impl FnOnce(&mut ControllerConfig),
+    ) -> usize {
         let link = SeverableLink::new(ControllerClient::new(&self.url, credential));
         let backend = self.probe.sharing(self.target.backend());
         let mut config = ControllerConfig::new(&self.url);
-        config.lease_ttl = lease_ttl;
+        config.lease_ttl = Duration::from_secs(30);
         config.poll_wait = Duration::from_secs(1);
         config.settle_interval = Duration::from_millis(50);
         config.retry_interval = Duration::from_millis(100);
         config.heartbeat_interval = Duration::from_secs(1);
         config.observe_failures_before_unknown = 2;
         config.reader_restart_interval = Duration::from_millis(200);
+        configure(&mut config);
         let controller = Controller::new(backend, link.clone(), config);
         let (shutdown, stop) = oneshot::channel();
         let task = tokio::spawn(controller.run(async {

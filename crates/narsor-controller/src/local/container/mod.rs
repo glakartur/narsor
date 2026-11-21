@@ -20,6 +20,13 @@
 //! one left. A container needs none of the care a process group needs: its
 //! name is the workload's uid, and removing it takes everything in it.
 //!
+//! In the Docker mode the controller also follows the daemon's events of
+//! the managed containers ([`ContainerRunners::follow_events`]): a container
+//! that dies wakes it at once (R4). The stream is only a wake-up; what a
+//! container's state is, observing tells. When the stream ends it is
+//! followed again after a pause, and meanwhile the periodic observation
+//! notices what it would have.
+//!
 //! - [`docker`]: the `docker` CLI behind the [`DockerTransport`] trait.
 //! - [`docker_fake`]: an in-memory Docker for tests.
 //! - [`image`]: the task image build jobs and their garbage collection.
@@ -41,7 +48,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use narsor_controller_runtime::backend::{
-    BackendError, BackendResult, TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
+    BackendError, BackendResult, TaskResources, WakeSignal, WorkloadLaunch, WorkloadPhase,
+    WorkloadState,
 };
 use narsor_controller_runtime::LaunchSpecs;
 use narsor_model::domain::{SecretDelivery, TaskImage, TaskLaunchSpec, TaskRepositorySource};
@@ -51,7 +59,9 @@ use super::workload::{
     io_error, task_args, write_credential, ContainerRecord, ExitRecord, LastRunner, Look, Role,
     TaskRecord, WorkloadKind, WorkloadRecord, WorkloadStore, WORKLOAD_MARK_ENV,
 };
-use docker::{ContainerState, DockerError, DockerTransport, Mount, RunRequest, UserIds};
+use docker::{
+    ContainerEvent, ContainerState, DockerError, DockerTransport, Mount, RunRequest, UserIds,
+};
 use image::{definition_hash, BuildState, TaskImageBuilds, DEFINITION_LABEL, MANAGED_LABEL};
 use secrets::{SecretError, SecretStore};
 
@@ -83,6 +93,14 @@ const PASS_THROUGH_ENV: [&str; 9] = [
 
 /// How many lines of a container's output tell why it could not start.
 const LOG_TAIL: usize = 50;
+
+/// The first pause before an ended event stream is followed again; it
+/// doubles while the stream keeps ending without an event, up to
+/// [`EVENTS_RETRY_MAX`].
+const EVENTS_RETRY_MIN: Duration = Duration::from_millis(100);
+
+/// The longest pause before an ended event stream is followed again.
+const EVENTS_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// How long after its start a container's failure is checked for a runner
 /// that cannot execute in the image.
@@ -154,6 +172,22 @@ impl ContainerRunners {
         self.config.docker.as_ref().ok_or_else(|| {
             BackendError::transient("this controller has no Docker transport to reach containers")
         })
+    }
+
+    /// In the Docker mode, follows the events of the managed containers on
+    /// a thread of its own and wakes `wake` at each, until nobody listens to
+    /// it any more. Nothing in the process mode.
+    pub(super) fn follow_events(&self, wake: WakeSignal) {
+        let (Some(_), Some(docker)) = (&self.config.container_mode, &self.config.docker) else {
+            return;
+        };
+        let docker = Arc::clone(docker);
+        let spawned = std::thread::Builder::new()
+            .name("docker-events".into())
+            .spawn(move || follow_managed_events(docker.as_ref(), &wake));
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "local backend: cannot follow Docker events; observing containers periodically");
+        }
     }
 
     /// Removes the task images no per-task record names and no cached
@@ -606,6 +640,50 @@ impl ContainerRunners {
 /// workspace sources and the home sources (a leading `~` is the
 /// controller's HOME; each must exist), none of which may overlap a
 /// [`protected_dirs`] entry, and the secrets of the store it needs.
+/// Follows the managed containers' events for as long as `wake` is heard,
+/// following again after a pause whenever the stream ends.
+fn follow_managed_events(docker: &dyn DockerTransport, wake: &WakeSignal) {
+    let label = format!("{MANAGED_LABEL}=true");
+    let mut retry = EVENTS_RETRY_MIN;
+    loop {
+        let mut heard = false;
+        let ended = docker.follow_container_events(&label, &mut |event| {
+            if let Some(event) = event {
+                heard = true;
+                if is_managed(&event) {
+                    wake.wake();
+                }
+            }
+            !wake.unheard()
+        });
+        if wake.unheard() {
+            return;
+        }
+        match ended {
+            Ok(()) => {
+                tracing::debug!("local backend: the Docker event stream ended; following it again")
+            }
+            Err(error) => {
+                tracing::warn!(%error, "local backend: cannot follow Docker events; trying again")
+            }
+        }
+        if heard {
+            retry = EVENTS_RETRY_MIN;
+        }
+        std::thread::sleep(retry);
+        retry = (retry * 2).min(EVENTS_RETRY_MAX);
+    }
+}
+
+/// Whether the event is of a container this mode manages: the stream is
+/// filtered by the label already, and is checked again here.
+fn is_managed(event: &ContainerEvent) -> bool {
+    event
+        .attributes
+        .get(MANAGED_LABEL)
+        .is_some_and(|value| value == "true")
+}
+
 fn container_inputs(
     mode: &ContainerMode,
     spec: &TaskLaunchSpec,

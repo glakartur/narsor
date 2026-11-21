@@ -27,17 +27,25 @@
 //!   never the configured mode: a controller restarted in the other mode
 //!   still observes and removes what the previous one left.
 //! - The read-only runner (D63) is a host process in both modes.
+//!
+//! # Waking the controller
+//!
+//! The controller waits on [`ExecutionBackend::changed`] between steps
+//! (R4). The first wait starts what wakes it: a `SIGCHLD` listener for the
+//! runners this instance starts, and in the Docker mode a follower of the
+//! managed containers' events. Both only wake; the next observation tells
+//! what changed.
 
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use narsor_controller_runtime::backend::{
     ArchiveProgress, BackendCapabilities, BackendError, BackendKind, BackendResult,
     ExecutionBackend, Provisioned, ReaderStart, Removal, StorageState, TaskObservation,
-    TaskResources, WorkloadLaunch, WorkloadState,
+    TaskResources, WakeListener, WakeSignal, WorkloadLaunch, WorkloadState,
 };
 use narsor_controller_runtime::LaunchSpecs;
 use narsor_model::domain::{TaskId, TaskLaunchSpec};
@@ -157,6 +165,11 @@ pub struct LocalBackend {
     /// The launch specs a container waiting for its image starts from,
     /// shared with the controller (KTD4).
     launch_specs: LaunchSpecs,
+    /// What a runner exit or a container event wakes (R4).
+    wake: WakeSignal,
+    listener: Arc<WakeListener>,
+    /// Starts what wakes it, once, at the first wait.
+    following: Arc<Once>,
 }
 
 impl LocalBackend {
@@ -165,7 +178,11 @@ impl LocalBackend {
         let config = Arc::new(config);
         let store = WorkloadStore::new(config.root.clone());
         let launch_specs = LaunchSpecs::default();
+        let wake = WakeSignal::new();
         Self {
+            listener: Arc::new(wake.listen()),
+            wake,
+            following: Arc::new(Once::new()),
             process: ProcessRunners::new(config.clone(), store.clone()),
             containers: ContainerRunners::new(config.clone(), store.clone(), launch_specs.clone()),
             launch_specs,
@@ -438,6 +455,14 @@ impl ExecutionBackend for LocalBackend {
 
     fn launch_specs(&self) -> Option<LaunchSpecs> {
         Some(self.launch_specs.clone())
+    }
+
+    async fn changed(&self) {
+        self.following.call_once(|| {
+            self.process.follow_exits(self.wake.clone());
+            self.containers.follow_events(self.wake.clone());
+        });
+        self.listener.woken().await;
     }
 
     fn resources(&self, task_id: &TaskId, resource_key: &str) -> BackendResult<TaskResources> {

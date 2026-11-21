@@ -34,7 +34,12 @@
 //! Between steps it sleeps briefly while something is in progress (a
 //! runner starting, a deletion finishing, a safe point awaited) and
 //! otherwise long-polls for new commands, which also paces the periodic
-//! observation that notices a dead workload.
+//! observation that notices a dead workload. While it holds the lease, a
+//! backend event ([`ExecutionBackend::changed`]: a runner exited, a
+//! container or a Pod changed) ends the wait at once (R4). An event is only
+//! a reason to observe now: the step that follows checks the lease, observes
+//! and reports exactly as a periodic one, so an event never confirms a loss
+//! and never hurries a reader's replacement.
 //!
 //! # The reader
 //!
@@ -495,11 +500,23 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
 
     /// The wait after a step. While idle it long-polls for a change of the
     /// desired state, and a change it brings is applied to the cache at once.
+    ///
+    /// While it holds the lease, a backend event ([`ExecutionBackend::changed`])
+    /// ends any wait early (R4): the next step then observes, as it would
+    /// have at the periodic pace. A long-poll dropped this way applied
+    /// nothing, so the cache is not fresh and that step reads what changed.
+    /// In standby nothing is observed, so events are not listened to.
     async fn pause(&mut self, outcome: StepOutcome) {
-        match outcome {
-            StepOutcome::Settling => tokio::time::sleep(self.config.settle_interval).await,
+        let listening = self.lease.is_some();
+        let polled = match outcome {
+            StepOutcome::Settling => {
+                self.sleep_or_wake(self.config.settle_interval, listening)
+                    .await;
+                return;
+            }
             StepOutcome::Standby | StepOutcome::Disconnected => {
-                tokio::time::sleep(self.config.retry_interval).await
+                tokio::time::sleep(self.config.retry_interval).await;
+                return;
             }
             StepOutcome::Idle => {
                 // Never wait past the next renewal.
@@ -509,25 +526,47 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
                 });
                 let wait = self.config.poll_wait.min(until_renewal);
                 let wait_secs = wait.as_secs();
-                let epoch = self.lease.map(|lease| lease.epoch);
-                if wait_secs == 0 || epoch.is_none() {
-                    tokio::time::sleep(wait.max(self.config.settle_interval)).await;
+                if wait_secs == 0 || !listening {
+                    self.sleep_or_wake(wait.max(self.config.settle_interval), listening)
+                        .await;
                     return;
                 }
-                match self.link.commands(wait_secs, self.desired.cursor).await {
-                    // Read under another epoch, it is not this lease's to
-                    // apply: the next step finds out properly.
-                    Ok(response) if Some(response.lease_epoch) == epoch => {
-                        self.apply(response);
-                        self.desired.fresh = true;
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        // Whatever it was, the next step finds out properly.
-                        tracing::debug!(%error, "controller: long-poll failed");
-                        tokio::time::sleep(self.config.settle_interval).await;
+                tokio::select! {
+                    polled = self.link.commands(wait_secs, self.desired.cursor) => polled,
+                    () = self.backend.changed() => {
+                        tracing::debug!("controller: backend event; observing now");
+                        return;
                     }
                 }
+            }
+        };
+        let epoch = self.lease.map(|lease| lease.epoch);
+        match polled {
+            // Read under another epoch, it is not this lease's to apply:
+            // the next step finds out properly.
+            Ok(response) if Some(response.lease_epoch) == epoch => {
+                self.apply(response);
+                self.desired.fresh = true;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // Whatever it was, the next step finds out properly.
+                tracing::debug!(%error, "controller: long-poll failed");
+                self.sleep_or_wake(self.config.settle_interval, true).await;
+            }
+        }
+    }
+
+    /// Sleeps for `duration`, or until a backend event when `listening`.
+    async fn sleep_or_wake(&self, duration: Duration, listening: bool) {
+        if !listening {
+            tokio::time::sleep(duration).await;
+            return;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(duration) => {}
+            () = self.backend.changed() => {
+                tracing::debug!("controller: backend event; observing now");
             }
         }
     }
@@ -1583,7 +1622,7 @@ mod tests {
     use super::*;
     use crate::backend::{
         ArchiveProgress, BackendCapabilities, BackendKind, BackendResult, Provisioned, ReaderStart,
-        StorageState,
+        StorageState, WakeListener, WakeSignal,
     };
     use narsor_protocol::controller::{ReportResponse, RunnerProgress};
     use std::collections::VecDeque;
@@ -1620,6 +1659,9 @@ mod tests {
         log: Log,
         state: Arc<Mutex<StubState>>,
         specs: LaunchSpecs,
+        /// What a platform event wakes.
+        wake: WakeSignal,
+        listener: Arc<WakeListener>,
     }
 
     struct StubState {
@@ -1637,7 +1679,10 @@ mod tests {
 
     impl StubBackend {
         fn new(log: &Log) -> Self {
+            let wake = WakeSignal::new();
             Self {
+                listener: Arc::new(wake.listen()),
+                wake,
                 log: Arc::clone(log),
                 state: Arc::new(Mutex::new(StubState {
                     work: None,
@@ -1748,6 +1793,9 @@ mod tests {
                 created: true,
             })
         }
+        async fn changed(&self) {
+            self.listener.woken().await;
+        }
         async fn stop_reader(&self, _task: &TaskResources) -> BackendResult<Removal> {
             self.say("stop_reader");
             let mut state = self.state();
@@ -1782,6 +1830,12 @@ mod tests {
         fetch_failures: Arc<Mutex<VecDeque<ClientError>>>,
         /// The launch spec the control plane serves.
         spec: Arc<Mutex<Value>>,
+        /// Whether a long-poll waits all its time (else it answers at once).
+        long_polls_wait: Arc<Mutex<bool>>,
+        /// Whether another controller holds the lease.
+        held_elsewhere: Arc<Mutex<bool>>,
+        /// How many times the lease was asked for.
+        acquires: Arc<Mutex<usize>>,
     }
 
     impl StubLink {
@@ -1815,6 +1869,13 @@ mod tests {
 
     impl ControllerLink for StubLink {
         async fn acquire_lease(&self, _ttl: Option<u64>) -> Result<LeaseView, ClientError> {
+            *self.acquires.lock().unwrap() += 1;
+            if *self.held_elsewhere.lock().unwrap() {
+                return Err(ClientError::Refused {
+                    code: "lease_held".into(),
+                    message: "another controller holds it".into(),
+                });
+            }
             Ok(self.lease())
         }
         async fn renew_lease(
@@ -1832,9 +1893,13 @@ mod tests {
         }
         async fn commands(
             &self,
-            _wait: u64,
+            wait: u64,
             since: Option<u64>,
         ) -> Result<CommandsResponse, ClientError> {
+            let long_poll_waits = *self.long_polls_wait.lock().unwrap();
+            if wait > 0 && long_poll_waits {
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+            }
             let current = self.commands.lock().unwrap().clone();
             let mut delivered = self.delivered.lock().unwrap();
             let full = since != Some(delivered.0);
@@ -1985,6 +2050,23 @@ mod tests {
             self.backend.state().observed
         }
 
+        /// Runs the controller on its own, as `run` does in production,
+        /// with long-polls that wait their time; dropping the handle stops
+        /// it.
+        fn run(self) -> Running {
+            *self.link.long_polls_wait.lock().unwrap() = true;
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            tokio::spawn(self.controller.run(async {
+                let _ = stopped.await;
+            }));
+            Running {
+                log: self.log,
+                backend: self.backend,
+                link: self.link,
+                _stop: stop,
+            }
+        }
+
         fn with_restart_interval(command: DesiredCommand, interval: Duration) -> Self {
             Self::with_config(command, |config| config.reader_restart_interval = interval)
         }
@@ -2004,6 +2086,9 @@ mod tests {
                 refuse_reader: Arc::new(Mutex::new(false)),
                 fetch_failures: Arc::default(),
                 spec: Arc::new(Mutex::new(serde_json::to_value(launch_spec()).unwrap())),
+                long_polls_wait: Arc::default(),
+                held_elsewhere: Arc::default(),
+                acquires: Arc::default(),
             };
             let mut config = ControllerConfig::new("http://cp.test");
             config.reader_restart_interval = Duration::from_secs(60);
@@ -2015,6 +2100,117 @@ mod tests {
                 link,
             }
         }
+    }
+
+    /// A [`Rig`]'s controller running on its own.
+    struct Running {
+        log: Log,
+        backend: StubBackend,
+        link: StubLink,
+        _stop: tokio::sync::oneshot::Sender<()>,
+    }
+
+    impl Running {
+        /// The platform saw a change.
+        fn event(&self) {
+            self.backend.wake.wake();
+        }
+
+        fn reported(&self, observation: &str) -> bool {
+            said(&self.log)
+                .iter()
+                .any(|line| line.starts_with(&format!("report {observation}")))
+        }
+    }
+
+    /// R4: a runner that exits is reported lost at the event, not at the
+    /// next periodic observation a `poll_wait` later.
+    #[tokio::test(start_paused = true)]
+    async fn a_runner_exit_is_reported_long_before_the_next_periodic_observation() {
+        let rig = Rig::new(desired(RunnerState::Running, DesiredAction::Run, false));
+        rig.backend.state().work = Some(workload(2, WorkloadPhase::Running));
+        let running = rig.run();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!running.reported("WorkloadLost"));
+
+        running.backend.state().work = Some(workload(2, WorkloadPhase::Exited { code: Some(1) }));
+        running.event();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            running.reported("WorkloadLost"),
+            "reported at the event, {:?}",
+            said(&running.log)
+        );
+    }
+
+    /// D58: an event only makes the controller observe; a workload still
+    /// being deleted is not a confirmed loss, however it was noticed.
+    #[tokio::test(start_paused = true)]
+    async fn an_event_alone_never_confirms_a_loss() {
+        let rig = Rig::new(desired(RunnerState::Unknown, DesiredAction::Hold, false));
+        rig.backend.state().work = Some(workload(2, WorkloadPhase::Deleting));
+        let running = rig.run();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(running.backend.state().observed, 1);
+
+        running.event();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(running.backend.state().observed, 2, "observed at the event");
+        assert!(
+            !running.reported("LossConfirmed"),
+            "{:?}",
+            said(&running.log)
+        );
+    }
+
+    /// In standby the backend is not this controller's to touch: events
+    /// neither reach it nor hurry the lease attempts.
+    #[tokio::test(start_paused = true)]
+    async fn events_in_standby_touch_nothing() {
+        let rig = Rig::new(desired(RunnerState::Running, DesiredAction::Run, false));
+        *rig.link.held_elsewhere.lock().unwrap() = true;
+        let running = rig.run();
+
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            running.event();
+        }
+
+        assert_eq!(running.backend.state().observed, 0);
+        assert_eq!(
+            *running.link.acquires.lock().unwrap(),
+            1,
+            "at the retry pace"
+        );
+    }
+
+    /// A reader's deaths wake the controller like any event, yet a dying
+    /// reader is replaced at most once per `reader_restart_interval`.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_reader_deaths_replaces_the_reader_once_per_restart_interval() {
+        let rig = Rig::with_restart_interval(
+            desired(RunnerState::Stopped, DesiredAction::KeepPaused, true),
+            Duration::from_secs(5),
+        );
+        let running = rig.run();
+
+        // Whatever reader lives dies, every 200 ms, for 12 s.
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if let Some(reader) = running.backend.state().reader.as_mut() {
+                reader.phase = WorkloadPhase::Exited { code: Some(1) };
+            }
+            running.event();
+        }
+
+        assert_eq!(
+            count(&running.log, "start_reader"),
+            3,
+            "at 0 s and about 5 s and 10 s"
+        );
+        assert!(!running.reported("WorkloadLost"), "a reader is no workload");
     }
 
     #[tokio::test]

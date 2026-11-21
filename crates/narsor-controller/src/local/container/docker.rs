@@ -113,6 +113,21 @@ pub struct ImageInfo {
     pub labels: BTreeMap<String, String>,
 }
 
+/// One container event of [`DockerTransport::follow_container_events`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerEvent {
+    /// What happened (`start`, `die`, `destroy`, ...).
+    pub action: String,
+    /// The container's name.
+    pub name: String,
+    /// The container's labels, and what else Docker says of it.
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// The container events [`DockerCli`] follows: the ones that change what an
+/// observation sees.
+const FOLLOWED_EVENTS: [&str; 4] = ["start", "die", "destroy", "oom"];
+
 /// One `docker build`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildRequest {
@@ -203,6 +218,19 @@ pub trait DockerTransport: fmt::Debug + Send + Sync {
     /// The last `tail` lines the container's process wrote, its standard
     /// output and error together.
     fn container_logs(&self, name: &str, tail: usize) -> DockerResult<String>;
+
+    /// Follows the daemon's events of the containers carrying `label`
+    /// (`key=value`) and hands each to `on_event`, until the stream ends
+    /// (`Ok`) or `on_event` returns false. Blocks for as long as the stream
+    /// lasts, which is meant to be forever: run it on a thread of its own.
+    ///
+    /// `on_event` may also get `None` while no event comes, just to tell
+    /// whether it still wants them.
+    fn follow_container_events(
+        &self,
+        label: &str,
+        on_event: &mut dyn FnMut(Option<ContainerEvent>) -> bool,
+    ) -> DockerResult<()>;
 }
 
 /// The transport that runs the `docker` CLI.
@@ -324,6 +352,51 @@ impl DockerTransport for DockerCli {
         }
     }
 
+    fn follow_container_events(
+        &self,
+        label: &str,
+        on_event: &mut dyn FnMut(Option<ContainerEvent>) -> bool,
+    ) -> DockerResult<()> {
+        use std::io::BufRead as _;
+
+        let args = container_events_args(label);
+        let mut child = Command::new(&self.program)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| spawn_failure(&error, &args))?;
+        let stderr = read_all(child.stderr.take().expect("stderr is piped"));
+        let stdout = io::BufReader::new(child.stdout.take().expect("stdout is piped"));
+        for line in stdout.lines() {
+            let Ok(line) = line else { break };
+            let Some(event) = parse_container_event(&line) else {
+                tracing::debug!(%line, "docker events: an event that cannot be read");
+                continue;
+            };
+            if !on_event(Some(event)) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(());
+            }
+        }
+        let status = child.wait().map_err(|error| DockerError::Failed {
+            command: command_line(&args),
+            message: format!("cannot wait for docker: {error}"),
+        })?;
+        let stderr = stderr.join().unwrap_or_default();
+        docker_output(
+            CallOutput {
+                status,
+                stdout: Vec::new(),
+                stderr,
+            },
+            &args,
+        )
+        .map(drop)
+    }
+
     fn container_logs(&self, name: &str, tail: usize) -> DockerResult<String> {
         let args = container_logs_args(name, tail);
         // `docker logs` replays the container's standard error on its own
@@ -336,6 +409,47 @@ impl DockerTransport for DockerCli {
         }
         Err(classify_failure(&command_line(&args), &tail_text(&stderr)))
     }
+}
+
+pub(crate) fn container_events_args(label: &str) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "events".into(),
+        "--format".into(),
+        "{{json .}}".into(),
+        "--filter".into(),
+        "type=container".into(),
+        "--filter".into(),
+        format!("label={label}").into(),
+    ];
+    for event in FOLLOWED_EVENTS {
+        args.push("--filter".into());
+        args.push(format!("event={event}").into());
+    }
+    args
+}
+
+/// One line of `docker events --format '{{json .}}'`; `None` when it is no
+/// container event.
+pub(crate) fn parse_container_event(line: &str) -> Option<ContainerEvent> {
+    let event: Value = serde_json::from_str(line).ok()?;
+    if event["Type"] != "container" {
+        return None;
+    }
+    let actor = &event["Actor"];
+    let attributes: BTreeMap<String, String> = actor["Attributes"]
+        .as_object()
+        .map(|attributes| {
+            attributes
+                .iter()
+                .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(ContainerEvent {
+        action: event["Action"].as_str()?.to_string(),
+        name: attributes.get("name").cloned().unwrap_or_default(),
+        attributes,
+    })
 }
 
 fn list_images_args(labels: &[String]) -> Vec<OsString> {
@@ -792,6 +906,24 @@ mod tests {
         for forbidden in ["--privileged", "--pid", "--ipc", "--userns", "--cap-add"] {
             assert!(!args.iter().any(|arg| arg.starts_with(forbidden)));
         }
+    }
+
+    #[test]
+    fn a_docker_events_line_reads_as_the_containers_event() {
+        let args = strings(container_events_args("io.narsor.managed=true"));
+        assert!(args.starts_with(&["events".into(), "--format".into(), "{{json .}}".into()]));
+        assert!(args.contains(&"label=io.narsor.managed=true".to_string()));
+        assert!(args.contains(&"event=die".to_string()));
+
+        let line = r#"{"status":"die","id":"abc","from":"narsor-task:1","Type":"container","Action":"die","Actor":{"ID":"abc","Attributes":{"exitCode":"137","io.narsor.managed":"true","name":"narsor-local-1"}},"scope":"local","time":1}"#;
+        let event = parse_container_event(line).expect("a container event");
+        assert_eq!(event.action, "die");
+        assert_eq!(event.name, "narsor-local-1");
+        assert_eq!(event.attributes["io.narsor.managed"], "true");
+
+        let network = r#"{"Type":"network","Action":"connect","Actor":{"ID":"n","Attributes":{}}}"#;
+        assert_eq!(parse_container_event(network), None);
+        assert_eq!(parse_container_event("not json"), None);
     }
 
     #[test]

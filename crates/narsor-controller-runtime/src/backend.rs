@@ -1,6 +1,7 @@
 //! Platform-neutral contract shared by execution backends and the reconciler.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use std::fmt;
 
@@ -404,6 +405,74 @@ pub trait ExecutionBackend: Send + Sync + 'static {
     /// observes their task. `None` (the default): the launch is enough.
     fn launch_specs(&self) -> Option<LaunchSpecs> {
         None
+    }
+
+    /// Resolves when the backend saw a change worth observing again since
+    /// it last resolved: a runner process exited, a container or a Pod
+    /// changed (R4, KTD5). The controller only wakes on it and runs its next
+    /// step early; the step observes, checks its lease and reports as
+    /// always, so an event never confirms a loss by itself. A change seen
+    /// while nobody waits is kept for the next wait. Must be cancel-safe:
+    /// the controller drops it whenever the long-poll or a sleep ends first.
+    ///
+    /// Never resolves by default: the controller then observes at its
+    /// periodic pace alone. An adapter with a native event source holds a
+    /// [`WakeSignal`], hands its clones to whatever follows the platform's
+    /// events, and answers here with its [`WakeListener::woken`].
+    fn changed(&self) -> impl Future<Output = ()> + Send {
+        std::future::pending()
+    }
+}
+
+/// The producer side of a backend's wake (see
+/// [`ExecutionBackend::changed`]): whatever follows the platform's events
+/// (a signal handler, an event stream) calls [`Self::wake`]. Cloning shares
+/// it; every [`WakeListener`] subscribed to it sees every wake.
+#[derive(Debug, Clone)]
+pub struct WakeSignal(Arc<tokio::sync::watch::Sender<u64>>);
+
+impl Default for WakeSignal {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(0)))
+    }
+}
+
+impl WakeSignal {
+    /// A signal nobody listens to yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Tells every listener the backend saw a change.
+    pub fn wake(&self) {
+        self.0.send_modify(|wakes| *wakes = wakes.wrapping_add(1));
+    }
+
+    /// A listener that sees the wakes from now on.
+    pub fn listen(&self) -> WakeListener {
+        WakeListener(tokio::sync::Mutex::new(self.0.subscribe()))
+    }
+
+    /// Whether no listener is left: an event follower can stop.
+    pub fn unheard(&self) -> bool {
+        self.0.receiver_count() == 0
+    }
+}
+
+/// The consumer side of a [`WakeSignal`]: what a backend's
+/// [`ExecutionBackend::changed`] waits on.
+#[derive(Debug)]
+pub struct WakeListener(tokio::sync::Mutex<tokio::sync::watch::Receiver<u64>>);
+
+impl WakeListener {
+    /// Resolves at the first wake this listener has not seen yet; a wake
+    /// that came while nobody waited resolves it at once. Cancel-safe.
+    pub async fn woken(&self) {
+        let mut receiver = self.0.lock().await;
+        if receiver.changed().await.is_err() {
+            // Every signal is gone: nothing will ever wake it.
+            std::future::pending::<()>().await;
+        }
     }
 }
 /// What platform a backend runs task workloads on.

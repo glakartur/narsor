@@ -1050,4 +1050,82 @@ mod containers {
             .expect_err("the build still fails");
         assert!(refused.message.contains("component 'glab'"), "{refused}");
     }
+
+    /// Waits, in real time, up to `limit` for `check`.
+    async fn eventually(limit: Duration, check: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while !check() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// R4: a managed container that dies wakes the controller, whose
+    /// observation then sees it exited; an event of a container without the
+    /// managed label wakes nothing.
+    #[tokio::test]
+    async fn a_managed_containers_death_wakes_the_controller_and_a_strangers_does_not() {
+        let fixture = Fixture::new();
+        fixture.store().set("claude-token", "t").unwrap();
+        let (task, run) = fixture.running("task-1").await;
+        let backend = fixture.backend_ref();
+        let wait = |limit| tokio::time::timeout(limit, backend.changed());
+        assert!(
+            wait(Duration::from_millis(50)).await.is_err(),
+            "nothing yet"
+        );
+
+        fixture
+            .docker
+            .emit_event("die", "someone-elses", BTreeMap::new());
+        assert!(
+            wait(Duration::from_millis(300)).await.is_err(),
+            "not a managed container"
+        );
+
+        fixture.docker.kill_container(&run.name);
+        fixture
+            .docker
+            .emit_event("die", &run.name, run.labels.clone());
+        wait(Duration::from_secs(5))
+            .await
+            .expect("woken by the death");
+
+        let observed = backend.observe(&task).await.unwrap().workload.unwrap();
+        assert_eq!(observed.phase, WorkloadPhase::Exited { code: Some(137) });
+    }
+
+    /// An event stream that ends is followed again, and wakes as before.
+    #[tokio::test]
+    async fn an_ended_event_stream_is_followed_again() {
+        let fixture = Fixture::new();
+        let backend = fixture.backend_ref();
+        let wait = |limit| tokio::time::timeout(limit, backend.changed());
+        assert!(
+            wait(Duration::from_millis(50)).await.is_err(),
+            "nothing yet"
+        );
+        assert!(
+            eventually(Duration::from_secs(5), || fixture.docker.event_follows()
+                == 1)
+            .await
+        );
+
+        fixture.docker.end_event_stream();
+
+        assert!(
+            eventually(Duration::from_secs(5), || fixture.docker.event_follows()
+                == 2)
+            .await,
+            "followed again"
+        );
+        let labels = BTreeMap::from([(MANAGED_LABEL.to_string(), "true".to_string())]);
+        fixture.docker.emit_event("die", "narsor-task-1", labels);
+        wait(Duration::from_secs(5))
+            .await
+            .expect("woken after the restart");
+    }
 }

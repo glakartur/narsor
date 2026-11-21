@@ -64,6 +64,36 @@ impl ContractTarget for FakeTarget {
 
 contract_suite!(fake, crate::backend_contract::FakeTarget);
 
+/// R4: a workload the platform loses wakes the controller at once — the
+/// loss is reported long before the periodic observation would notice it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_workload_is_reported_at_the_platform_event_not_at_the_idle_pace() {
+    use backend_contract_support::Harness;
+    use narsor_engine::orchestration::RunnerState;
+
+    let mut h = Harness::<FakeTarget>::without_auto_resume()
+        .await
+        .expect("the fake runs anywhere");
+    // Without an event, the next observation would come in 40 s at the
+    // earliest: the lease is renewed every 40 s, and nothing else wakes it.
+    h.start_controller_with(|config| {
+        config.poll_wait = Duration::from_secs(120);
+        config.lease_ttl = Duration::from_secs(120);
+    });
+    h.running("task-1").await;
+
+    let killed = std::time::Instant::now();
+    h.kill_workload("task-1");
+    h.wait_runner_state("task-1", RunnerState::Interrupted)
+        .await;
+
+    assert!(
+        killed.elapsed() < Duration::from_secs(5),
+        "reported after {:?}",
+        killed.elapsed()
+    );
+}
+
 /// R2: the launch spec is served to the lease holder only, and only for the
 /// task's current generation; a command itself carries none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -324,6 +324,10 @@ impl<B: ExecutionBackend> ExecutionBackend for Probed<B> {
         self.inner.launch_specs()
     }
 
+    fn changed(&self) -> impl std::future::Future<Output = ()> + Send {
+        self.inner.changed()
+    }
+
     fn resources(&self, task_id: &TaskId, resource_key: &str) -> BackendResult<TaskResources> {
         self.inner.resources(task_id, resource_key)
     }

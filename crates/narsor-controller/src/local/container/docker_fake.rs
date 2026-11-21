@@ -7,20 +7,27 @@
 //! It keeps images and containers in memory, records every call, and can be
 //! told to fail: an unavailable or rootless daemon, a daemon that stops
 //! answering, failing builds, a hook that runs inside a build and one that
-//! runs before every call (to make them slow or to wait on the test).
+//! runs before every call (to make them slow or to wait on the test). It
+//! hands the container events a test emits to whoever follows them, and can
+//! end that stream.
 //!
 //! With [`FakeDocker::run_programs`] a started container also runs its
 //! program as a host process, so a test can drive a real (stub) runner
 //! through the container lifecycle without a Docker daemon.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use super::docker::{
-    BuildRequest, ContainerState, DockerError, DockerResult, DockerTransport, ImageInfo, RunRequest,
+    BuildRequest, ContainerEvent, ContainerState, DockerError, DockerResult, DockerTransport,
+    ImageInfo, RunRequest,
 };
+
+/// How often a follower with no event is asked whether it still wants them.
+const IDLE_TICK: Duration = Duration::from_millis(20);
 
 /// One call the fake received.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +42,15 @@ pub enum DockerCall {
     InspectContainer(String),
     RemoveContainer(String),
     ContainerLogs(String),
+    /// A follow of the events of containers with this label.
+    FollowContainerEvents(String),
+}
+
+/// What the event stream delivers next.
+#[derive(Debug)]
+enum FeedItem {
+    Event(ContainerEvent),
+    End,
 }
 
 type BuildHook = Arc<dyn Fn(&BuildRequest) + Send + Sync>;
@@ -46,6 +62,9 @@ pub struct FakeDocker {
     state: Mutex<FakeState>,
     build_hook: Mutex<Option<BuildHook>>,
     call_hook: Mutex<Option<CallHook>>,
+    /// The events and stream ends emitted and not yet delivered.
+    feed: Mutex<VecDeque<FeedItem>>,
+    fed: Condvar,
 }
 
 #[derive(Debug, Default)]
@@ -209,6 +228,41 @@ impl FakeDocker {
         for name in names {
             self.kill_container(&name);
         }
+    }
+
+    /// Emits a container event to the follower: an event of a container
+    /// called `name` with `labels`. Unlike Docker the fake does not filter
+    /// the stream by label; the follower sees every event.
+    pub fn emit_event(&self, action: &str, name: &str, labels: BTreeMap<String, String>) {
+        let mut attributes = labels;
+        attributes.insert("name".into(), name.into());
+        self.feed_item(FeedItem::Event(ContainerEvent {
+            action: action.into(),
+            name: name.into(),
+            attributes,
+        }));
+    }
+
+    /// Ends the current event stream, as a restarted daemon would.
+    pub fn end_event_stream(&self) {
+        self.feed_item(FeedItem::End);
+    }
+
+    fn feed_item(&self, item: FeedItem) {
+        self.feed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(item);
+        self.fed.notify_all();
+    }
+
+    /// How many times the event stream was followed.
+    pub fn event_follows(&self) -> usize {
+        self.lock()
+            .calls
+            .iter()
+            .filter(|call| matches!(call, DockerCall::FollowContainerEvents(_)))
+            .count()
     }
 
     /// Sets what an existing container's process wrote.
@@ -457,6 +511,34 @@ impl DockerTransport for FakeDocker {
         state.stop_process(name);
         state.containers.remove(name);
         Ok(())
+    }
+
+    fn follow_container_events(
+        &self,
+        label: &str,
+        on_event: &mut dyn FnMut(Option<ContainerEvent>) -> bool,
+    ) -> DockerResult<()> {
+        drop(self.begin(DockerCall::FollowContainerEvents(label.to_string()))?);
+        loop {
+            let mut feed = self.feed.lock().unwrap_or_else(PoisonError::into_inner);
+            if feed.is_empty() {
+                feed = self
+                    .fed
+                    .wait_timeout(feed, IDLE_TICK)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            let item = feed.pop_front();
+            drop(feed);
+            let wanted = match item {
+                Some(FeedItem::End) => return Ok(()),
+                Some(FeedItem::Event(event)) => on_event(Some(event)),
+                None => on_event(None),
+            };
+            if !wanted {
+                return Ok(());
+            }
+        }
     }
 
     fn container_logs(&self, name: &str, _tail: usize) -> DockerResult<String> {
