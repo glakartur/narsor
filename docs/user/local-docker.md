@@ -67,12 +67,15 @@ storage. When `controller.local.home` is not set, Docker mode uses
 ## The task image
 
 The task image is defined once, in `runtime.yaml` under `task_image`: a base
-image and a list of components installed on it, in order.
+image, a list of components installed on it, in order, and optionally
+secrets for every task of the image.
 
 ```yaml
 # {catalog}/runtime.yaml
 task_image:
   base: debian:trixie-slim
+  secrets:                                   # for every task, no component
+    - { name: db-password, env: DATABASE_PASSWORD }
   components:
     - name: base-tools                       # [a-z0-9][a-z0-9-]*, unique
       install: components/base-tools.sh      # a path inside the catalogue
@@ -105,6 +108,12 @@ task_image:
   delivered as an environment variable (`env: NAME`) or as a file under the
   private HOME (`file: relative/path`). Names such as `PATH`, `LD_*`,
   `NARSOR_*` and the harness API key variables are refused.
+- **`task_image.secrets`** (optional) — token store entries that every
+  task of the image receives, independent of the components. Use it for a
+  value that no installed tool owns, for example a database password for the
+  tests a task runs. The entries have the same form and the same rules as the
+  secrets of a component. Two entries may not deliver the same environment
+  variable or the same file, at the image level or in a component.
 - **`home`** (optional) — host files or directories (`from`, absolute or
   starting with `~`) copied into the private HOME (`to`, relative) at every
   start of the runner. They are mounted read-only; a target is replaced as a
@@ -183,6 +192,36 @@ anything starts, with the name of the missing entry.
 
 A token delivered as `env` is in the environment of every step of the task,
 agent and script steps alike.
+
+### Secrets for every task
+
+A secret that no component owns goes in `task_image.secrets`. For example, a
+database password for the integration tests of your tasks:
+
+```console
+$ narsor-cli secret set db-password          # paste it, then Ctrl-D
+```
+
+```yaml
+# {catalog}/runtime.yaml
+task_image:
+  base: debian:trixie-slim
+  secrets:
+    - { name: db-password, env: DATABASE_PASSWORD }
+  components:
+    - …
+```
+
+Each Docker-mode task then has `DATABASE_PASSWORD` in its environment; a
+`{ name: …, file: relative/path }` entry puts the value in a file under the
+private HOME instead. Like a component secret, the entry must be in the token
+store before a task starts, or the task is refused with the name of the
+entry and `narsor-cli secret set <name>`.
+
+The scope is **every Docker-mode task**: all workflows and all steps of each
+task receive the value. Process-mode tasks do not receive it. Secrets for
+selected workflows or steps only are a follow-up
+(`docs/follow-ups/2026-11-21-per-workflow-secrets.md`).
 
 ### Claude Code
 

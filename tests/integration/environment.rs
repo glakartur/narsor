@@ -17,9 +17,10 @@ use environment_support::{
     workflow_yaml,
 };
 use narsor_engine::domain::{
-    ImageDigest, ImageSource, ImageSpec, LaunchDefinitionError, RefOrigin, ResolvedEnvironment,
-    ResourceProfile, SecretDelivery, TaskLaunchSpec, TaskRepository, TaskRepositorySource,
-    TaskWorkspace, LEGACY_SHAPE_LAUNCH_SPEC_VERSION, TASK_LAUNCH_SPEC_VERSION,
+    ComponentSecret, ImageDigest, ImageSource, ImageSpec, LaunchDefinitionError, RefOrigin,
+    ResolvedEnvironment, ResourceProfile, SecretDelivery, TaskLaunchSpec, TaskRepository,
+    TaskRepositorySource, TaskWorkspace, LEGACY_SHAPE_LAUNCH_SPEC_VERSION,
+    TASK_LAUNCH_SPEC_VERSION,
 };
 use narsor_engine::environment::{
     BackendKind, BackendRecord, EnvironmentCatalog, LaunchError, LaunchIntent, LaunchResolver,
@@ -347,7 +348,8 @@ fn a_local_task_seals_the_global_task_image_with_its_script_text() {
     .unwrap();
     write_task_image(
         &root,
-        "  base: debian:trixie-slim\n  components:\n    \
+        "  base: debian:trixie-slim\n  \
+         secrets: [{ name: db-password, env: DATABASE_PASSWORD }]\n  components:\n    \
          - { name: glab, install: components/glab.sh, \
              secrets: [{ name: gitlab-token, env: GITLAB_TOKEN }] }\n    \
          - { name: tools, install: { inline: \"echo tools\" }, version: { inline: \"echo 1\" } }\n",
@@ -371,6 +373,13 @@ fn a_local_task_seals_the_global_task_image_with_its_script_text() {
     assert_eq!(
         task_image.components[0].secrets[0].delivery,
         SecretDelivery::Env("GITLAB_TOKEN".to_string())
+    );
+    assert_eq!(
+        task_image.secrets,
+        [ComponentSecret {
+            name: "db-password".to_string(),
+            delivery: SecretDelivery::Env("DATABASE_PASSWORD".to_string()),
+        }]
     );
     assert!(
         environment.base_image.is_none(),

@@ -852,6 +852,23 @@ pub struct TaskImage {
     /// The components, in installation order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<TaskImageComponent>,
+    /// Secrets from the controller's token store every task of the image
+    /// receives, independent of any component. Absent from the serialized
+    /// form when empty, so an image without them keeps its identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<ComponentSecret>,
+}
+
+impl TaskImage {
+    /// Every secret the image names: its own, then those of its components
+    /// in installation order.
+    pub fn all_secrets(&self) -> impl Iterator<Item = &ComponentSecret> {
+        self.secrets.iter().chain(
+            self.components
+                .iter()
+                .flat_map(|component| &component.secrets),
+        )
+    }
 }
 
 /// One component of a [`TaskImage`]: one layer of the built image.
@@ -1101,12 +1118,24 @@ mod tests {
                 secrets: Vec::new(),
                 home: Vec::new(),
             }],
+            secrets: Vec::new(),
         });
         let with_image = with_image.sealed();
         assert_ne!(with_image.identity, plain.identity);
+        let stored = serde_json::to_value(&with_image).unwrap();
+        assert!(
+            stored["task_image"].get("secrets").is_none(),
+            "an image without image-level secrets keeps the identity it had before them"
+        );
         let mut edited = with_image.clone();
         edited.task_image.as_mut().unwrap().components[0].install = "other\n".to_string();
         assert_ne!(edited.sealed().identity, with_image.identity);
+        let mut with_secret = with_image.clone();
+        with_secret.task_image.as_mut().unwrap().secrets = vec![ComponentSecret {
+            name: "db-password".to_string(),
+            delivery: SecretDelivery::Env("DATABASE_PASSWORD".to_string()),
+        }];
+        assert_ne!(with_secret.sealed().identity, with_image.identity);
     }
 
     #[test]

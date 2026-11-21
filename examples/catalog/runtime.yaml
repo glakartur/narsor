@@ -8,6 +8,12 @@ task_image:
   # Pin a digest (debian:trixie-slim@sha256:…) for repeatable builds; a tag
   # is pulled again at every version check.
   base: debian:trixie-slim
+  # Token store entries every Docker-mode task receives, independent of the
+  # components (same form as a component's secrets). Each must be in the
+  # token store before a task starts.
+  # secrets:
+  #   # narsor-cli secret set db-password
+  #   - { name: db-password, env: DATABASE_PASSWORD }
   components:
     # Installed in order, one image layer each. A bare string is a path
     # relative to this catalogue; `{ inline: "…" }` is the script itself.

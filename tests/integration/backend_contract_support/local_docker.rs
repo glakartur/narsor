@@ -105,6 +105,7 @@ impl ContractTarget for LocalDockerTarget {
         environment.task_image = Some(TaskImage {
             base: ImageSpec::pinned("debian:trixie-slim"),
             components: Vec::new(),
+            secrets: Vec::new(),
         });
         TaskLaunchSpec::new(
             definition.id.clone(),

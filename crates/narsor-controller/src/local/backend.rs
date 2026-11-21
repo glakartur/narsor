@@ -406,8 +406,8 @@ struct ContainerInputs {
     home_sources: Vec<(PathBuf, String, String)>,
     /// The token store entries the task needs.
     secret_names: Vec<String>,
-    /// Whether components of the task image name secrets.
-    component_secrets: bool,
+    /// Whether the task image (itself or its components) names secrets.
+    task_image_secrets: bool,
 }
 
 impl LocalBackend {
@@ -1277,7 +1277,7 @@ impl LocalBackend {
                 .map_err(|error| error.to_string())?;
             mounts.push(mount(&secrets_dir, true));
             args.extend(["--secrets-dir".into(), secrets_dir.into()]);
-            if inputs.component_secrets {
+            if inputs.task_image_secrets {
                 args.push("--task-image-secrets".into());
             }
         }
@@ -1580,7 +1580,7 @@ fn container_inputs(
     }
     let mut home_sources = Vec::new();
     let mut secret_names = BTreeSet::new();
-    let mut component_secrets = false;
+    let mut task_image_secrets = false;
     let components = spec
         .environment
         .task_image
@@ -1621,10 +1621,15 @@ fn container_inputs(
             let target = format!("{HOME_SOURCES_IN_CONTAINER}/{}-{index}", component.name);
             home_sources.push((host, target, source.to.clone()));
         }
-        for secret in &component.secrets {
-            component_secrets = true;
-            secret_names.insert(secret.name.clone());
-        }
+    }
+    for secret in spec
+        .environment
+        .task_image
+        .iter()
+        .flat_map(TaskImage::all_secrets)
+    {
+        task_image_secrets = true;
+        secret_names.insert(secret.name.clone());
     }
     secret_names.extend(
         spec.environment
@@ -1636,7 +1641,7 @@ fn container_inputs(
         local_sources,
         home_sources,
         secret_names: secret_names.into_iter().collect(),
-        component_secrets,
+        task_image_secrets,
     })
 }
 
@@ -2424,6 +2429,7 @@ mod tests {
                             home: Vec::new(),
                         },
                     ],
+                    secrets: Vec::new(),
                 }
             }
 
@@ -2542,6 +2548,13 @@ mod tests {
         async fn a_container_starts_once_its_image_is_built_with_only_what_the_task_needs() {
             let fixture = Fixture::new();
             fixture.store().set("claude-token", "oauth-secret").unwrap();
+            fixture.store().set("db-password", "db-secret").unwrap();
+            let mut environment = fixture.environment();
+            environment.task_image.as_mut().unwrap().secrets = vec![ComponentSecret {
+                name: "db-password".into(),
+                delivery: SecretDelivery::Env("DATABASE_PASSWORD".into()),
+            }];
+            let launch = fixture.launch("task-1", environment);
             let (release, wait) = mpsc::channel::<()>();
             let wait = Mutex::new(wait);
             fixture.docker.on_build(move |_| {
@@ -2552,7 +2565,7 @@ mod tests {
             let started = Instant::now();
             let provisioned = fixture
                 .backend_ref()
-                .provision(&task, &fixture.default_launch("task-1"))
+                .provision(&task, &launch)
                 .await
                 .unwrap();
 
@@ -2628,6 +2641,11 @@ mod tests {
             assert_eq!(
                 fs::read_to_string(secrets.join("claude-token")).unwrap(),
                 "oauth-secret"
+            );
+            assert_eq!(
+                fs::read_to_string(secrets.join("db-password")).unwrap(),
+                "db-secret",
+                "an image-level secret is copied like a component's"
             );
 
             // AE5: no host harness directory, no host HOME, keys or socket.

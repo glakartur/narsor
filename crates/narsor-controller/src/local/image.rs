@@ -1035,6 +1035,7 @@ mod tests {
             let image = TaskImage {
                 base: ImageSpec::pinned(BASE),
                 components: vec![component("a", None), component("b", Some(&version))],
+                secrets: Vec::new(),
             };
             let setup = Self {
                 temp,
@@ -1119,6 +1120,7 @@ mod tests {
         TaskImage {
             base: ImageSpec::pinned(BASE),
             components: vec![component("c", None)],
+            secrets: Vec::new(),
         }
     }
 
@@ -1466,6 +1468,7 @@ mod tests {
         let image = TaskImage {
             base: ImageSpec::pinned(BASE),
             components: vec![component("node-js", Some("echo 22")), component("uv", None)],
+            secrets: Vec::new(),
         };
 
         let file = dockerfile(

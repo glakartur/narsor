@@ -27,7 +27,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::domain::{ResolvedEnvironment, SecretDelivery, SecretReference, SecretValue};
+use crate::domain::{ResolvedEnvironment, SecretDelivery, SecretReference, SecretValue, TaskImage};
 
 use super::home::API_KEY_ENVS;
 use super::RunnerError;
@@ -132,9 +132,10 @@ impl MountedSecrets {
         self.materialize_named(references, home)
     }
 
-    /// [`Self::materialize`], plus the secrets the components of the sealed
-    /// task image name (`--task-image-secrets`): what the local controller
-    /// copies from its token store for a container in Docker mode (KTD10).
+    /// [`Self::materialize`], plus the secrets the sealed task image names,
+    /// its own and its components' (`--task-image-secrets`): what the local
+    /// controller copies from its token store for a container in Docker
+    /// mode (KTD10).
     pub fn materialize_with_task_image(
         &self,
         environment: &ResolvedEnvironment,
@@ -144,13 +145,12 @@ impl MountedSecrets {
             .secrets
             .iter()
             .map(|reference| (reference.name.as_str(), &reference.delivery));
-        let components = environment
+        let task_image = environment
             .task_image
             .iter()
-            .flat_map(|image| &image.components)
-            .flat_map(|component| &component.secrets)
+            .flat_map(TaskImage::all_secrets)
             .map(|secret| (secret.name.as_str(), &secret.delivery));
-        self.materialize_named(references.chain(components), home)
+        self.materialize_named(references.chain(task_image), home)
     }
 
     fn materialize_named<'a>(
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn task_image_secrets_are_materialized_only_when_asked_for() {
         use crate::domain::{ComponentSecret, ImageSpec, TaskImage, TaskImageComponent};
-        let (_dir, secrets) = mounted(&[("gitlab-token", "glpat-1\n")]);
+        let (_dir, secrets) = mounted(&[("gitlab-token", "glpat-1\n"), ("db-password", "pw-1\n")]);
         let mut environment = ResolvedEnvironment::harness_only("claude-code");
         environment.task_image = Some(TaskImage {
             base: ImageSpec::pinned("debian:trixie-slim"),
@@ -337,6 +337,10 @@ mod tests {
                 }],
                 home: Vec::new(),
             }],
+            secrets: vec![ComponentSecret {
+                name: "db-password".into(),
+                delivery: SecretDelivery::Env("DATABASE_PASSWORD".into()),
+            }],
         });
 
         let plain = secrets.materialize(&environment, None).unwrap();
@@ -348,12 +352,18 @@ mod tests {
         assert!(with_image
             .variables()
             .any(|(name, value)| name == "GITLAB_TOKEN" && value == "glpat-1"));
+        assert!(
+            with_image
+                .variables()
+                .any(|(name, value)| name == "DATABASE_PASSWORD" && value == "pw-1"),
+            "an image-level secret reaches the harness like a component's"
+        );
 
         let (_empty, none_mounted) = mounted(&[]);
         let error = none_mounted
             .materialize_with_task_image(&environment, None)
             .unwrap_err();
-        assert!(error.to_string().contains("gitlab-token"), "{error}");
+        assert!(error.to_string().contains("db-password"), "{error}");
     }
 
     /// R19: an `env` secret becomes the tool's variable and a `file` secret

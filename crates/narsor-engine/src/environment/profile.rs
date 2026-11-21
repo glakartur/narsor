@@ -27,6 +27,7 @@
 //!   gh: { reference: ghcr.io/narsor/tools/gh:2.60, digest_policy: resolve }
 //! task_image:
 //!   base: debian:trixie-slim
+//!   secrets: [{ name: db-password, env: DATABASE_PASSWORD }] # every task
 //!   components:
 //!     - name: glab
 //!       install: components/glab.sh          # a path inside the catalogue,
@@ -204,6 +205,10 @@ pub struct TaskImageConfig {
     /// The components, in installation order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<ComponentConfig>,
+    /// Token store entries every task of the image receives, independent
+    /// of any component.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<ComponentSecretConfig>,
 }
 
 /// One component of the task image as `runtime.yaml` writes it.
@@ -264,8 +269,9 @@ impl<'de> Deserialize<'de> for ScriptSource {
     }
 }
 
-/// One token store entry a component needs, as `runtime.yaml` writes it:
-/// `{ name, env: VAR }` or `{ name, file: path/under/home }`.
+/// One token store entry the task image or one of its components needs, as
+/// `runtime.yaml` writes it: `{ name, env: VAR }` or
+/// `{ name, file: path/under/home }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentSecretConfig {
@@ -286,6 +292,50 @@ impl ComponentSecretConfig {
             (None, Some(file)) => Ok(SecretDelivery::File(file.clone())),
             _ => Err("set exactly one of 'env' and 'file'".to_string()),
         }
+    }
+
+    /// Adds the problems of the entry at `field` to `problems`, and refuses
+    /// a target (an environment variable or a file) that an entry checked
+    /// before already delivers: `targets` maps each target to that entry.
+    fn check(
+        &self,
+        field: &str,
+        targets: &mut BTreeMap<String, String>,
+        problems: &mut Vec<String>,
+    ) {
+        if !is_reference_name(&self.name) {
+            problems.push(format!(
+                "{field}.name: '{}' is not a usable name",
+                self.name
+            ));
+        }
+        let delivery = match self.delivery() {
+            Ok(delivery) => delivery,
+            Err(problem) => return problems.push(format!("{field}: {problem}")),
+        };
+        let problem = delivery.problem().or_else(|| match &delivery {
+            SecretDelivery::Env(name) => reserved_env_problem(name),
+            SecretDelivery::File(_) => None,
+        });
+        if let Some(problem) = problem {
+            return problems.push(format!("{field}: {problem}"));
+        }
+        let target = delivery.to_string();
+        match targets.get(&target) {
+            Some(first) => {
+                problems.push(format!("{field}: {target} is already delivered by {first}"))
+            }
+            None => {
+                targets.insert(target, field.to_string());
+            }
+        }
+    }
+
+    fn sealed(&self) -> Option<ComponentSecret> {
+        Some(ComponentSecret {
+            name: self.name.clone(),
+            delivery: self.delivery().ok()?,
+        })
     }
 }
 
@@ -309,6 +359,14 @@ impl TaskImageConfig {
         if let Err(error) = ImageReference::parse(&self.base.reference) {
             problems.push(format!("task_image.base: {error}"));
         }
+        let mut targets = BTreeMap::new();
+        for (index, secret) in self.secrets.iter().enumerate() {
+            secret.check(
+                &format!("task_image.secrets[{index}]"),
+                &mut targets,
+                &mut problems,
+            );
+        }
         let mut names = BTreeSet::new();
         for (index, component) in self.components.iter().enumerate() {
             let field = format!("task_image.components[{index}]");
@@ -331,22 +389,11 @@ impl TaskImageConfig {
                 }
             }
             for (secret_index, secret) in component.secrets.iter().enumerate() {
-                let field = format!("{field}.secrets[{secret_index}]");
-                if !is_reference_name(&secret.name) {
-                    problems.push(format!(
-                        "{field}.name: '{}' is not a usable name",
-                        secret.name
-                    ));
-                }
-                let problem = secret.delivery().map_or_else(Some, |delivery| {
-                    delivery.problem().or_else(|| match &delivery {
-                        SecretDelivery::Env(name) => reserved_env_problem(name),
-                        SecretDelivery::File(_) => None,
-                    })
-                });
-                if let Some(problem) = problem {
-                    problems.push(format!("{field}: {problem}"));
-                }
+                secret.check(
+                    &format!("{field}.secrets[{secret_index}]"),
+                    &mut targets,
+                    &mut problems,
+                );
             }
             for (home_index, home) in component.home.iter().enumerate() {
                 let field = format!("{field}.home[{home_index}]");
@@ -390,12 +437,7 @@ impl TaskImageConfig {
             let secrets = component
                 .secrets
                 .iter()
-                .filter_map(|secret| {
-                    Some(ComponentSecret {
-                        name: secret.name.clone(),
-                        delivery: secret.delivery().ok()?,
-                    })
-                })
+                .filter_map(ComponentSecretConfig::sealed)
                 .collect();
             let home = component
                 .home
@@ -419,6 +461,11 @@ impl TaskImageConfig {
             Ok(TaskImage {
                 base: self.base.clone(),
                 components,
+                secrets: self
+                    .secrets
+                    .iter()
+                    .filter_map(ComponentSecretConfig::sealed)
+                    .collect(),
             })
         } else {
             Err(problems)
@@ -525,7 +572,9 @@ mod tests {
     #[test]
     fn a_runtime_with_only_a_task_image_is_valid() {
         let runtime = runtime(&format!(
-            "task_image:\n  base: debian:trixie-slim\n  components:\n{VALID_COMPONENT}"
+            "task_image:\n  base: debian:trixie-slim\n  \
+             secrets: [{{ name: db-password, env: DATABASE_PASSWORD }}]\n  \
+             components:\n{VALID_COMPONENT}"
         ));
         assert!(runtime.bundle.is_none());
         assert_eq!(runtime.problems(), Vec::<String>::new());
@@ -535,79 +584,103 @@ mod tests {
     fn an_unusable_task_image_is_refused_with_the_field_it_names() {
         let cases = [
             (
-                "{ name: one, install: ../outside.sh }",
+                "components: [{ name: one, install: ../outside.sh }]",
                 "components[0].install",
             ),
             (
-                "{ name: one, install: /etc/profile }",
+                "components: [{ name: one, install: /etc/profile }]",
                 "components[0].install",
             ),
-            ("{ name: Glab, install: a.sh }", "components[0].name"),
+            ("components: [{ name: Glab, install: a.sh }]", "components[0].name"),
             (
-                "{ name: one, install: a.sh, secrets: [{ name: t, env: PATH }] }",
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t, env: PATH }] }]",
                 "components[0].secrets[0]",
             ),
             (
-                "{ name: one, install: a.sh, secrets: [{ name: t, env: LD_PRELOAD }] }",
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t, env: LD_PRELOAD }] }]",
                 "components[0].secrets[0]",
             ),
             (
-                "{ name: one, install: a.sh, secrets: [{ name: t, env: NARSOR_TOKEN }] }",
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t, env: NARSOR_TOKEN }] }]",
                 "components[0].secrets[0]",
             ),
             (
-                "{ name: one, install: a.sh, secrets: [{ name: t, env: ANTHROPIC_API_KEY }] }",
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t, env: ANTHROPIC_API_KEY }] }]",
                 "components[0].secrets[0]",
             ),
             (
-                "{ name: one, install: a.sh, secrets: [{ name: t, env: 1X }] }",
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t, env: 1X }] }]",
                 "components[0].secrets[0]",
             ),
             (
-                "{ name: one, install: a.sh, secrets: [{ name: t, file: ../x }] }",
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t, file: ../x }] }]",
                 "components[0].secrets[0]",
             ),
             (
-                "{ name: one, install: a.sh, secrets: [{ name: t }] }",
+                "components: [{ name: one, install: a.sh, secrets: [{ name: t }] }]",
                 "components[0].secrets[0]",
             ),
             (
-                "{ name: one, install: a.sh, home: [{ from: ~/.x, to: ../x }] }",
+                "components: [{ name: one, install: a.sh, home: [{ from: ~/.x, to: ../x }] }]",
                 "components[0].home[0].to",
             ),
             (
-                "{ name: one, install: a.sh, home: [{ from: /, to: x }] }",
+                "components: [{ name: one, install: a.sh, home: [{ from: /, to: x }] }]",
                 "components[0].home[0].from",
             ),
             (
-                "{ name: one, install: a.sh, home: [{ from: /var/run/docker.sock, to: x }] }",
+                "components: [{ name: one, install: a.sh, home: [{ from: /var/run/docker.sock, to: x }] }]",
                 "components[0].home[0].from",
             ),
             (
-                "{ name: one, install: a.sh, home: [{ from: relative/x, to: x }] }",
+                "components: [{ name: one, install: a.sh, home: [{ from: relative/x, to: x }] }]",
                 "components[0].home[0].from",
+            ),
+            (
+                "secrets: [{ name: t, env: NARSOR_TOKEN }]",
+                "secrets[0]",
+            ),
+            (
+                "secrets: [{ name: t, env: X, file: x }]",
+                "secrets[0]",
             ),
         ];
-        for (component, field) in cases {
+        for (body, field) in cases {
             let problems = runtime(&format!(
-                "task_image:\n  base: debian:trixie-slim\n  components:\n    - {component}\n"
+                "task_image:\n  base: debian:trixie-slim\n  {body}\n"
             ))
             .problems();
             assert!(
                 problems
                     .iter()
                     .any(|problem| problem.starts_with(&format!("task_image.{field}"))),
-                "{component}: {problems:?}"
+                "{body}: {problems:?}"
             );
         }
 
-        let duplicate = runtime(
-            "task_image:\n  base: debian:trixie-slim\n  components:\n    \
-             - { name: one, install: a.sh }\n    - { name: one, install: b.sh }\n",
-        );
-        assert_eq!(
-            duplicate.problems(),
-            vec!["task_image.components[1].name: 'one' is listed twice".to_string()]
-        );
+        let duplicates = [
+            (
+                "components: [{ name: one, install: a.sh }, { name: one, install: b.sh }]",
+                "task_image.components[1].name: 'one' is listed twice",
+            ),
+            (
+                "secrets: [{ name: db, env: DB_PASSWORD }]\n  components: \
+                 [{ name: one, install: a.sh, secrets: [{ name: db2, env: DB_PASSWORD }] }]",
+                "task_image.components[0].secrets[0]: env DB_PASSWORD is already delivered by \
+                 task_image.secrets[0]",
+            ),
+            (
+                "components: [{ name: one, install: a.sh, secrets: [{ name: a, file: .netrc }] }, \
+                 { name: two, install: b.sh, secrets: [{ name: b, file: .netrc }] }]",
+                "task_image.components[1].secrets[0]: file ~/.netrc is already delivered by \
+                 task_image.components[0].secrets[0]",
+            ),
+        ];
+        for (body, problem) in duplicates {
+            let duplicate = runtime(&format!(
+                "task_image:\n  base: debian:trixie-slim\n  {body}\n"
+            ));
+            assert_eq!(duplicate.problems(), vec![problem.to_string()], "{body}");
+        }
     }
 }
