@@ -105,7 +105,9 @@ use narsor_controller_runtime::backend::{
     Removal, StorageState, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase,
     WorkloadState,
 };
-use narsor_engine::domain::{TaskId, TaskImage, TaskLaunchSpec, TaskRepositorySource};
+use narsor_engine::domain::{
+    SecretDelivery, TaskId, TaskImage, TaskLaunchSpec, TaskRepositorySource,
+};
 use narsor_engine::environment::{BackendCapabilities, BackendKind};
 use narsor_engine::workspace::provisioner::USER_GIT_ACCESS_ENVS;
 
@@ -406,8 +408,9 @@ struct ContainerInputs {
     home_sources: Vec<(PathBuf, String, String)>,
     /// The token store entries the task needs.
     secret_names: Vec<String>,
-    /// Whether the task image (itself or its components) names secrets.
-    task_image_secrets: bool,
+    /// The secrets the task image (itself or its components) names, as
+    /// `--deliver-secret` values: the runner knows nothing of task images.
+    secret_grants: Vec<String>,
 }
 
 impl LocalBackend {
@@ -1277,8 +1280,9 @@ impl LocalBackend {
                 .map_err(|error| error.to_string())?;
             mounts.push(mount(&secrets_dir, true));
             args.extend(["--secrets-dir".into(), secrets_dir.into()]);
-            if inputs.task_image_secrets {
-                args.push("--task-image-secrets".into());
+            for grant in &inputs.secret_grants {
+                args.push("--deliver-secret".into());
+                args.push(grant.into());
             }
         }
         for source in &inputs.local_sources {
@@ -1580,7 +1584,7 @@ fn container_inputs(
     }
     let mut home_sources = Vec::new();
     let mut secret_names = BTreeSet::new();
-    let mut task_image_secrets = false;
+    let mut secret_grants = Vec::new();
     let components = spec
         .environment
         .task_image
@@ -1628,8 +1632,11 @@ fn container_inputs(
         .iter()
         .flat_map(TaskImage::all_secrets)
     {
-        task_image_secrets = true;
         secret_names.insert(secret.name.clone());
+        secret_grants.push(match &secret.delivery {
+            SecretDelivery::Env(variable) => format!("{}=env:{variable}", secret.name),
+            SecretDelivery::File(path) => format!("{}=file:{path}", secret.name),
+        });
     }
     secret_names.extend(
         spec.environment
@@ -1641,7 +1648,7 @@ fn container_inputs(
         local_sources,
         home_sources,
         secret_names: secret_names.into_iter().collect(),
-        task_image_secrets,
+        secret_grants,
     })
 }
 
@@ -2633,7 +2640,13 @@ mod tests {
             assert_eq!(run.workdir.as_deref(), Some(storage.as_path()));
             assert_eq!(arg_after(run, "--home"), ["private"]);
             assert_eq!(arg_after(run, "--secrets-dir"), [secrets.to_str().unwrap()]);
-            assert!(run.args.iter().any(|arg| arg == "--task-image-secrets"));
+            assert_eq!(
+                arg_after(run, "--deliver-secret"),
+                [
+                    "db-password=env:DATABASE_PASSWORD",
+                    "claude-token=env:CLAUDE_CODE_OAUTH_TOKEN"
+                ]
+            );
             assert_eq!(
                 arg_after(run, "--home-source"),
                 ["/run/narsor/home/claude-code-0=.claude/skills"]

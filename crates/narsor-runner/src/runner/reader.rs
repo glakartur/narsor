@@ -434,7 +434,7 @@ mod tests {
             control_plane: "http://control-plane.invalid".to_string(),
             credential_file: PathBuf::from("/no-credential"),
             secrets_dir: None,
-            task_image_secrets: false,
+            secret_grants: Vec::new(),
             harness_home: HarnessHome::default(),
             home_sources: Vec::new(),
             agent_args: Default::default(),

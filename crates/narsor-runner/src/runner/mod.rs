@@ -140,7 +140,7 @@ use narsor_protocol::controller::{
 pub use home::{HarnessHome, HomeMode};
 pub use init::{initialize, Initialization};
 pub use preflight::{BaseImageContract, ContractViolation};
-pub use secrets::{MountedSecrets, ProcessEnvironment};
+pub use secrets::{MountedSecrets, ProcessEnvironment, SecretGrant};
 pub use storage::{SessionRecord, TaskStorage};
 
 /// Variable naming the directory of delivered materials (U9).
@@ -297,9 +297,9 @@ pub struct RunnerConfig {
     pub credential_file: PathBuf,
     /// The read-only directory of mounted secrets, one file per reference.
     pub secrets_dir: Option<PathBuf>,
-    /// Whether the secrets the sealed task image's components name are
-    /// delivered too (the local controller's Docker mode).
-    pub task_image_secrets: bool,
+    /// Mounted secrets the backend grants beside the ones the environment
+    /// names (`--deliver-secret`).
+    pub secret_grants: Vec<secrets::SecretGrant>,
     /// Which HOME and harness configuration every action sees.
     pub harness_home: HarnessHome,
     /// Read-only sources copied into the private HOME at every start
@@ -390,15 +390,11 @@ pub async fn run(
         .await);
     }
 
-    let secrets = MountedSecrets::new(config.secrets_dir.clone());
+    let secrets =
+        MountedSecrets::new(config.secrets_dir.clone()).with_grants(config.secret_grants.clone());
     let private_home = storage.home_dir();
     let home = (config.harness_home.mode == HomeMode::Private).then_some(private_home.as_path());
-    let materialized = if config.task_image_secrets {
-        secrets.materialize_with_task_image(&spec.environment, home)
-    } else {
-        secrets.materialize(&spec.environment, home)
-    };
-    let mut environment = match materialized {
+    let mut environment = match secrets.materialize(&spec.environment, home) {
         Ok(environment) => environment,
         Err(error) => {
             return Ok(

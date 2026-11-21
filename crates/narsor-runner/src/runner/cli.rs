@@ -9,6 +9,7 @@
 //!               [--home private|host] [--codex-home <dir>] \
 //!               [--claude-config-dir <dir>] [--claude-profile-source <dir>]
 //!               [--home-source <source>=<target>]...
+//!               [--deliver-secret <name>=env:<VAR>|file:<path>]...
 //!               [--pinned-git-credential-only] [--read-only]
 //! ```
 //!
@@ -34,6 +35,9 @@
 //! * `--home-source` — repeatable: a read-only file or directory copied over
 //!   `<target>` (relative to the private HOME) at every start, replacing
 //!   what was there; see [`super::home_sources`]. Refused with `--home host`.
+//! * `--deliver-secret` — repeatable: a file of `--secrets-dir` delivered
+//!   as an environment variable or a file below the private HOME, beside
+//!   the secrets the task's environment names; see [`super::secrets`].
 //!
 //! * `--pinned-git-credential-only` — a Git workspace is cloned with none of
 //!   the user's own git configuration, SSH keys or agent, over `https`
@@ -68,6 +72,7 @@ use clap::Args;
 use crate::domain::TaskId;
 
 use super::home_sources::HomeSource;
+use super::secrets::SecretGrant;
 use super::{
     run, BaseImageContract, HarnessHome, HomeMode, ProcessEnvironment, RunnerConfig, RunnerError,
     RunnerExit, RunnerTiming, PROBLEM_OWNER_DECISION,
@@ -148,10 +153,11 @@ pub struct RunnerArgs {
     #[arg(long, value_name = "DIRECTORY")]
     pub claude_profile_source: Option<PathBuf>,
 
-    /// Also deliver the secrets the components of the sealed task image
-    /// name, from `--secrets-dir` (the local controller's Docker mode).
-    #[arg(long)]
-    pub task_image_secrets: bool,
+    /// A file of `--secrets-dir` to deliver beside the secrets the task's
+    /// environment names, as `<name>=env:<VARIABLE>` or
+    /// `<name>=file:<path relative to HOME>`; repeatable.
+    #[arg(long = "deliver-secret", value_name = "NAME=env:VAR|file:PATH")]
+    pub secret_grants: Vec<SecretGrant>,
 
     /// A read-only file or directory copied over a target relative to the
     /// private HOME at every start, as `<source>=<target>`; repeatable.
@@ -161,8 +167,8 @@ pub struct RunnerArgs {
     /// Only answer reads of the storage (conversation pages, events, the
     /// conductor's chat) and change nothing on it: no preparation,
     /// initialization, session, snapshot or work. `--launch-spec`,
-    /// `--secrets-dir`, `--home`, the harness directories and the home
-    /// sources are ignored.
+    /// `--secrets-dir`, `--home`, the harness directories, the home sources
+    /// and the granted secrets are ignored.
     #[arg(long)]
     pub read_only: bool,
 
@@ -265,7 +271,7 @@ pub fn runner_config(args: RunnerArgs) -> Result<RunnerConfig, String> {
         control_plane: required(args.control_plane, "--control-plane")?,
         credential_file: required(args.credential_file, "--credential-file")?,
         secrets_dir: args.secrets_dir,
-        task_image_secrets: args.task_image_secrets,
+        secret_grants: args.secret_grants,
         harness_home: HarnessHome {
             mode: args.home,
             codex_home: args.codex_home,
