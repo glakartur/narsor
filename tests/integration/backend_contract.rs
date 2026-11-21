@@ -147,6 +147,311 @@ async fn the_launch_spec_is_served_to_the_current_working_runner_only() {
 }
 
 // ---------------------------------------------------------------------------
+// Incremental command reads (U3), with a controller driven by hand
+// ---------------------------------------------------------------------------
+
+mod incremental_reads {
+    use super::FakeTarget;
+    use crate::backend_contract_support::Harness;
+    use narsor_engine::controller_protocol::{
+        CommandsResponse, ControllerClient, DesiredAction, DesiredCommand, ObservedSummary,
+        ReportRequest,
+    };
+    use narsor_engine::domain::TaskId;
+    use narsor_engine::orchestration::{Observation, OwnerCommand, RunnerSnapshot, RunnerState};
+    use std::time::{Duration, Instant};
+
+    /// A controller identity holding the lease, reading and reporting by
+    /// hand.
+    struct Reader {
+        client: ControllerClient,
+        epoch: u64,
+        cursor: Option<u64>,
+    }
+
+    impl Reader {
+        async fn new(h: &Harness<FakeTarget>) -> Self {
+            let client = ControllerClient::new(&h.url, h.enroll());
+            let epoch = client.acquire_lease(Some(60)).await.expect("lease").epoch;
+            Self {
+                client,
+                epoch,
+                cursor: None,
+            }
+        }
+
+        /// A read since the last one, waiting up to `wait_secs`.
+        async fn read(&mut self, wait_secs: u64) -> CommandsResponse {
+            let response = self
+                .client
+                .commands(wait_secs, self.cursor)
+                .await
+                .expect("commands");
+            self.cursor = Some(response.cursor);
+            response
+        }
+
+        /// The one command of an incremental read, which must be `task`'s.
+        async fn changed(&mut self, task: &str) -> DesiredCommand {
+            let response = self.read(0).await;
+            assert!(!response.full, "{response:?}");
+            match <[DesiredCommand; 1]>::try_from(response.commands) {
+                Ok([command]) if command.task_id.as_str() == task => command,
+                Ok(other) => panic!("expected one command of {task}, got {other:?}"),
+                Err(commands) => panic!("expected one command of {task}, got {commands:?}"),
+            }
+        }
+
+        async fn nothing_changed(&mut self) {
+            let response = self.read(0).await;
+            assert!(
+                !response.full && response.commands.is_empty(),
+                "{response:?}"
+            );
+        }
+
+        async fn report(&self, h: &Harness<FakeTarget>, task: &str, observation: Observation) {
+            self.client
+                .report(&ReportRequest {
+                    task_id: task.to_string(),
+                    lease_epoch: self.epoch,
+                    desired_generation: h.record(task).generation,
+                    observation,
+                    resource: None,
+                    summary: ObservedSummary::default(),
+                    observed_at: chrono::Utc::now(),
+                })
+                .await
+                .expect("report");
+        }
+    }
+
+    /// A runner snapshot of `task`'s first launch, as its runner sends one.
+    fn runner_reports(
+        h: &Harness<FakeTarget>,
+        task: &str,
+        sequence: u64,
+        event_cursor: u64,
+        safe_point: bool,
+    ) {
+        let snapshot: RunnerSnapshot = serde_json::from_value(serde_json::json!({
+            "snapshot_sequence": sequence,
+            "execution_status": "running",
+            "event_cursor": event_cursor,
+            "safe_point": safe_point,
+            "observed_at": chrono::Utc::now(),
+        }))
+        .expect("a snapshot");
+        let task_id = TaskId::parse(task).unwrap();
+        h.service
+            .control_plane()
+            .record_runner_snapshot(&task_id, "inc-1", 1, snapshot)
+            .expect("record the snapshot");
+        h.service.notify(&task_id);
+    }
+
+    /// R3, KTD1: after a full read, an incremental read carries exactly the
+    /// tasks whose desired state changed — also when no generation moved:
+    /// the start accepted, runner progress, the runner ready, a safe point,
+    /// an admission, a reader lease — and nothing on an idle backend or for
+    /// a progress-only snapshot. An archived task is forgotten once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_change_a_controller_acts_on_reaches_the_next_incremental_read() {
+        let h = Harness::<FakeTarget>::without_auto_resume()
+            .await
+            .expect("the fake runs anywhere");
+        h.set_limit(1);
+        h.create("task-1");
+        h.create("task-2");
+        let mut c = Reader::new(&h).await;
+
+        let full = c.read(0).await;
+        assert!(full.full);
+        let names: Vec<_> = full.commands.iter().map(|c| c.task_id.as_str()).collect();
+        assert_eq!(names, ["task-1"], "task-2 waits for a slot");
+        let generation = full.commands[0].generation;
+        c.nothing_changed().await;
+
+        c.report(&h, "task-1", Observation::StartAccepted).await;
+        let provisioning = c.changed("task-1").await;
+        assert_eq!(provisioning.action, DesiredAction::Provision);
+        runner_reports(&h, "task-1", 1, 1, false);
+        let progress = c.changed("task-1").await;
+        assert_eq!(progress.runner.expect("progress").incarnation, "inc-1");
+        c.report(&h, "task-1", Observation::RunnerReady).await;
+        let running = c.changed("task-1").await;
+        assert_eq!(running.action, DesiredAction::Run);
+        assert_eq!(running.generation, generation, "no generation moved");
+
+        // A snapshot that only moves the event cursor changes nothing.
+        runner_reports(&h, "task-1", 2, 5, false);
+        c.nothing_changed().await;
+
+        h.must("task-1", OwnerCommand::Pause, "pause-1");
+        let pausing = c.changed("task-1").await;
+        assert_eq!(pausing.action, DesiredAction::PauseAtSafePoint);
+        runner_reports(&h, "task-1", 3, 6, true);
+        let acknowledged = c.changed("task-1").await;
+        assert!(
+            acknowledged
+                .runner
+                .expect("progress")
+                .safe_point_acknowledged
+        );
+        c.report(&h, "task-1", Observation::PausedAtSafePoint).await;
+        let response = c.read(0).await;
+        let actions: Vec<_> = response
+            .commands
+            .iter()
+            .map(|c| (c.task_id.as_str(), c.action))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                ("task-1", DesiredAction::KeepPaused),
+                ("task-2", DesiredAction::Start)
+            ],
+            "the freed slot admits task-2"
+        );
+
+        h.lease_reader("task-1", 60);
+        assert!(c.changed("task-1").await.reader_needed);
+
+        // Room for both, so the archive's slot does not take task-2's back.
+        h.set_limit(2);
+
+        h.archive_in_control_plane("task-1", "archive-1");
+        assert_eq!(c.changed("task-1").await.action, DesiredAction::Archive);
+        c.report(&h, "task-1", Observation::ResourcesDeleted).await;
+        assert_eq!(c.changed("task-1").await.action, DesiredAction::Forget);
+        c.nothing_changed().await;
+    }
+
+    /// KTD1: a cursor the control plane does not know — one from before it
+    /// restarted, or from under another lease epoch — is answered in full.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unknown_cursor_or_a_new_lease_epoch_is_answered_in_full() {
+        let h = Harness::<FakeTarget>::without_auto_resume()
+            .await
+            .expect("the fake runs anywhere");
+        h.create("task-1");
+        let mut c = Reader::new(&h).await;
+        let cursor = c.read(0).await.cursor;
+
+        // A control plane that restarted remembers no delivery.
+        c.cursor = Some(cursor.wrapping_add(1_000_000));
+        let restarted = c.read(0).await;
+        assert!(
+            restarted.full && restarted.commands.len() == 1,
+            "{restarted:?}"
+        );
+
+        c.client.release_lease(c.epoch).await.expect("release");
+        c.epoch = c.client.acquire_lease(Some(60)).await.expect("lease").epoch;
+        let reacquired = c.read(0).await;
+        assert!(
+            reacquired.full && reacquired.commands.len() == 1,
+            "{reacquired:?}"
+        );
+        assert_eq!(reacquired.lease_epoch, c.epoch);
+    }
+
+    /// KTD1: heartbeats and progress-only snapshots do not end a long-poll;
+    /// a reader lease running out does, with no mutation, at its expiry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_long_poll_sleeps_through_progress_and_wakes_at_a_reader_lease_expiry() {
+        let h = Harness::<FakeTarget>::without_auto_resume()
+            .await
+            .expect("the fake runs anywhere");
+        h.create("task-1");
+        h.create("task-2");
+        let mut c = Reader::new(&h).await;
+        c.read(0).await;
+        // task-2 is lost and waits for its owner, who may read it.
+        c.report(&h, "task-2", Observation::StartAccepted).await;
+        c.report(
+            &h,
+            "task-2",
+            Observation::WorkloadLost { state_known: true },
+        )
+        .await;
+        c.report(&h, "task-1", Observation::StartAccepted).await;
+        runner_reports(&h, "task-1", 1, 1, false);
+        c.read(0).await;
+
+        let polled = Instant::now();
+        let client = &c.client;
+        let (response, ()) = tokio::join!(client.commands(1, c.cursor), async {
+            for sequence in 2..5 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                client.heartbeat().await.expect("heartbeat");
+                runner_reports(&h, "task-1", sequence, sequence * 10, false);
+            }
+        });
+        let response = response.expect("commands");
+        c.cursor = Some(response.cursor);
+        assert!(response.commands.is_empty(), "{response:?}");
+        assert!(polled.elapsed() >= Duration::from_millis(900), "it slept");
+
+        h.lease_reader("task-2", 1);
+        assert!(c.changed("task-2").await.reader_needed);
+        let polled = Instant::now();
+        let response = c.read(20).await;
+        let expired = polled.elapsed();
+
+        let [command] = <[DesiredCommand; 1]>::try_from(response.commands).expect("one");
+        assert_eq!(command.task_id.as_str(), "task-2");
+        assert!(!command.reader_needed);
+        assert!(
+            expired < Duration::from_secs(5),
+            "answered at the expiry, not the wait: {expired:?}"
+        );
+    }
+
+    /// D58: the resume policy's commands reach the controller once each, in
+    /// the order they were issued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn policy_resumes_are_delivered_once_and_in_order() {
+        let h = Harness::<FakeTarget>::without_auto_resume()
+            .await
+            .expect("the fake runs anywhere");
+        h.create("task-1");
+        let mut c = Reader::new(&h).await;
+        c.read(0).await;
+        let mut delivered = Vec::new();
+        for attempt in 0..2 {
+            c.report(&h, "task-1", Observation::StartAccepted).await;
+            c.report(
+                &h,
+                "task-1",
+                Observation::WorkloadLost { state_known: true },
+            )
+            .await;
+            assert_eq!(h.runner_state("task-1"), RunnerState::Interrupted);
+            assert_eq!(c.changed("task-1").await.action, DesiredAction::Hold);
+            // The second loss waits out its backoff.
+            tokio::time::sleep(Duration::from_millis(150 * attempt)).await;
+            h.service.auto_resume_pass();
+            h.service.auto_resume_pass();
+            let resumed = c.changed("task-1").await;
+            delivered.push((resumed.generation, resumed.action));
+            c.nothing_changed().await;
+        }
+
+        let first = delivered[0].0;
+        assert_eq!(
+            delivered,
+            [
+                (first, DesiredAction::Provision),
+                (first + 1, DesiredAction::Provision)
+            ],
+            "{:?}",
+            h.events("task-1")
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The local adapter
 // ---------------------------------------------------------------------------
 

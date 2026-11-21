@@ -401,19 +401,20 @@ impl ControllerClient {
             .await
     }
 
-    /// `GET /controller/v1/commands` — waits up to `wait_secs` for something
-    /// new; `all` asks for a full resync.
+    /// `GET /controller/v1/commands` — without `since` the whole desired
+    /// state at once; with the cursor of the last response applied, what
+    /// changed since, waiting up to `wait_secs` for a change.
     pub async fn commands(
         &self,
         wait_secs: u64,
-        all: bool,
+        since: Option<u64>,
     ) -> Result<CommandsResponse, ClientError> {
         self.transport
             .get(
                 "/controller/v1/commands",
                 &CommandsQuery {
                     wait_secs: Some(wait_secs),
-                    all,
+                    since,
                 },
                 Duration::from_secs(wait_secs),
             )

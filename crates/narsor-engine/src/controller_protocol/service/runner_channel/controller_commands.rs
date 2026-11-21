@@ -1,117 +1,125 @@
 //! The commands a controller long-polls for and acknowledges.
 
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
 use chrono::{DateTime, Utc};
 
+use super::long_poll::Checked;
 use crate::controller_protocol::credentials::ControllerIdentity;
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::ProtocolService;
 use crate::controller_protocol::wire::*;
-use crate::domain::{BackendId, TaskId, TaskLaunchSpec};
+use crate::domain::{TaskId, TaskLaunchSpec};
 use crate::orchestration::{RunnerState, TaskRecord};
 
 impl ProtocolService {
-    /// The backend's desired commands this controller has not acknowledged
-    /// (or all of them), read under its unexpired lease.
-    pub fn commands(
-        &self,
-        identity: &ControllerIdentity,
-        all: bool,
-    ) -> ProtocolResult<CommandsResponse> {
-        self.commands_and_readers(identity, all)
-            .map(|(response, _)| response)
-    }
-
-    /// [`Self::commands`], and the tasks a read-only runner is wanted for,
-    /// from the same read of the records.
-    fn commands_and_readers(
-        &self,
-        identity: &ControllerIdentity,
-        all: bool,
-    ) -> ProtocolResult<(CommandsResponse, std::collections::BTreeSet<TaskId>)> {
-        let lease = self.require_lease(identity)?;
-        // Decide admission before answering: the controller asking is the
-        // proof its backend is online, and its limit is read fresh.
-        self.reschedule(&identity.backend_id);
-        let now = self.control.now();
-        let acknowledged = self
-            .credentials
-            .controller(&identity.controller_id)?
-            .ok_or(ProtocolError::Unauthorized)?
-            .acknowledged;
-        let tasks = self.control.list_tasks()?;
-        let ours = || {
-            tasks
-                .iter()
-                .filter(|record| record.assignment.backend_id == identity.backend_id)
-        };
-        let readers = ours()
-            .filter(|record| record.reader_lease_active(now))
-            .map(|record| record.task_id.clone())
-            .collect();
-        let commands = ours()
-            .filter(|record| {
-                all || record.generation
-                    > acknowledged
-                        .get(record.task_id.as_str())
-                        .copied()
-                        .unwrap_or(0)
-            })
-            // A queued task is offered only once the scheduler admitted it.
-            .filter(|record| {
-                record.runner_state != RunnerState::Queued || record.reservation.is_some()
-            })
-            .map(|record| desired_command(record, now))
-            .collect::<ProtocolResult<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
-        let response = CommandsResponse {
-            lease_epoch: lease.epoch,
-            commands,
-        };
-        Ok((response, readers))
-    }
-
-    /// [`Self::commands`] as a long-poll: answers as soon as there is at
-    /// least one command, or empty after `query.wait_secs`.
+    /// The backend's desired state for this controller, read under its
+    /// unexpired lease, as a long-poll (KTD1). A full read (no `since`, or
+    /// a cursor this control plane does not know) answers at once with
+    /// every task. An incremental read answers as soon as a task's desired
+    /// state differs from what the response at `since` delivered — or one
+    /// left the desired state, which is answered with a `Forget` — and
+    /// empty after `query.wait_secs`. A reader lease running out changes a
+    /// task's desired state with no mutation: the wait ends then, too.
     pub async fn wait_for_commands(
         &self,
         identity: &ControllerIdentity,
         query: CommandsQuery,
     ) -> ProtocolResult<CommandsResponse> {
         let wait = self.long_poll(query.wait_secs);
-        // A reader the control plane starts or stops asking for changes no
-        // generation, so no acknowledged-generation filter would ever show
-        // it: the controller is woken by the set of wanted readers changing.
-        let readers_at_start = self.readers_wanted(&identity.backend_id)?;
         let found = self
-            .wait_for(wait, None, || {
-                let (response, readers) = self.commands_and_readers(identity, query.all)?;
-                let readers_changed = readers != readers_at_start;
-                Ok((!response.commands.is_empty() || readers_changed).then_some(response))
+            .wait_for_or_until(wait, None, || {
+                self.read_commands(identity, query.since, true)
             })
             .await?;
         match found {
             Some(response) => Ok(response),
-            None => self.commands(identity, query.all),
+            None => match self.read_commands(identity, query.since, false)? {
+                Checked::Found(response) => Ok(response),
+                Checked::NotYet { .. } => unreachable!("a read that does not wait answers"),
+            },
         }
     }
 
-    /// The tasks of `backend_id` a read-only runner is wanted for now.
-    fn readers_wanted(
+    /// One read of the desired state against what was delivered at `since`.
+    /// With `wait_for_change`, an incremental read that finds nothing new
+    /// answers `NotYet`, with the earliest reader-lease expiry to look again
+    /// at.
+    fn read_commands(
         &self,
-        backend_id: &BackendId,
-    ) -> ProtocolResult<std::collections::BTreeSet<TaskId>> {
+        identity: &ControllerIdentity,
+        since: Option<u64>,
+        wait_for_change: bool,
+    ) -> ProtocolResult<Checked<CommandsResponse>> {
+        let desired = self.desired_state(identity)?;
+        let controller = &identity.controller_id;
+        let Some(delivered) = self
+            .deliveries
+            .delivered(controller, since, desired.lease_epoch)
+        else {
+            let cursor = self
+                .deliveries
+                .record(controller, desired.lease_epoch, &desired.commands);
+            return Ok(Checked::Found(CommandsResponse {
+                lease_epoch: desired.lease_epoch,
+                cursor,
+                full: true,
+                commands: desired.commands,
+            }));
+        };
+        let changed = changes(&delivered, &desired.commands);
+        if changed.is_empty() && wait_for_change {
+            let recheck_at = desired.next_reader_expiry.map(|until| {
+                let left = (until - self.control.now())
+                    .to_std()
+                    .unwrap_or_default()
+                    .max(MIN_RECHECK);
+                tokio::time::Instant::now() + left
+            });
+            return Ok(Checked::NotYet { recheck_at });
+        }
+        let cursor = self
+            .deliveries
+            .record(controller, desired.lease_epoch, &desired.commands);
+        Ok(Checked::Found(CommandsResponse {
+            lease_epoch: desired.lease_epoch,
+            cursor,
+            full: false,
+            commands: changed,
+        }))
+    }
+
+    /// Every task of the controller's backend it should act on, as of now.
+    fn desired_state(&self, identity: &ControllerIdentity) -> ProtocolResult<DesiredState> {
+        let lease = self.require_lease(identity)?;
+        // Decide admission before answering: the controller asking is the
+        // proof its backend is online, and its limit is read fresh.
+        self.reschedule(&identity.backend_id);
         let now = self.control.now();
-        Ok(self
-            .control
-            .list_tasks()?
-            .into_iter()
+        let tasks = self.control.list_tasks()?;
+        let ours = || {
+            tasks
+                .iter()
+                .filter(|record| record.assignment.backend_id == identity.backend_id)
+        };
+        let next_reader_expiry = ours()
+            .filter(|record| record.reader_lease_active(now))
+            .filter_map(|record| record.reader_lease.as_ref().map(|lease| lease.until))
+            .min();
+        let commands = ours()
+            // A queued task is offered only once the scheduler admitted it.
             .filter(|record| {
-                record.assignment.backend_id == *backend_id && record.reader_lease_active(now)
+                record.runner_state != RunnerState::Queued || record.reservation.is_some()
             })
-            .map(|record| record.task_id)
-            .collect())
+            .filter_map(|record| desired_command(record, now))
+            .collect();
+        Ok(DesiredState {
+            lease_epoch: lease.epoch,
+            commands,
+            next_reader_expiry,
+        })
     }
 
     /// Records acknowledgements; duplicates and reorderings are harmless.
@@ -192,13 +200,49 @@ impl ProtocolService {
     }
 }
 
-/// The desired state of one task as of `now`. `reader_needed` is the reader
-/// lease as it stands now, so a lease that ran out stops being asked for
-/// without waiting for the periodic pass to remove it.
-fn desired_command(
-    record: &TaskRecord,
-    now: DateTime<Utc>,
-) -> ProtocolResult<Option<DesiredCommand>> {
+/// Least wait before a reader-lease expiry is looked at again: a clock a
+/// hair behind the timer must not spin the long-poll.
+const MIN_RECHECK: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The desired state of a backend as one read saw it.
+struct DesiredState {
+    lease_epoch: u64,
+    /// One command per task the controller acts on, in the order of the
+    /// task list.
+    commands: Vec<DesiredCommand>,
+    /// When the first active reader lease of the backend runs out.
+    next_reader_expiry: Option<DateTime<Utc>>,
+}
+
+/// The commands of `current` that differ from what was `delivered`, and a
+/// `Forget` — the last delivered command, with that action — for each
+/// delivered task no longer in it.
+fn changes(
+    delivered: &BTreeMap<TaskId, DesiredCommand>,
+    current: &[DesiredCommand],
+) -> Vec<DesiredCommand> {
+    let live: HashSet<&TaskId> = current.iter().map(|command| &command.task_id).collect();
+    let changed = current
+        .iter()
+        .filter(|command| delivered.get(&command.task_id) != Some(*command))
+        .cloned();
+    let gone = delivered
+        .values()
+        .filter(|command| !live.contains(&command.task_id))
+        .map(|command| DesiredCommand {
+            action: DesiredAction::Forget,
+            ..command.clone()
+        });
+    changed.chain(gone).collect()
+}
+
+/// The desired state of one task as of `now`; `None` once it is archived.
+/// It holds only what the controller acts on (KTD1): `reader_needed` is the
+/// reader lease as it stands now, so a lease that ran out stops being asked
+/// for without waiting for the periodic pass to remove it; the runner's
+/// progress leaves out its event cursor and timestamps, so a heartbeat or a
+/// progress snapshot changes no command.
+fn desired_command(record: &TaskRecord, now: DateTime<Utc>) -> Option<DesiredCommand> {
     let action = match record.runner_state {
         RunnerState::Queued => DesiredAction::Start,
         RunnerState::Provisioning => DesiredAction::Provision,
@@ -207,9 +251,9 @@ fn desired_command(
         RunnerState::Stopped => DesiredAction::KeepPaused,
         RunnerState::Interrupted | RunnerState::Unknown => DesiredAction::Hold,
         RunnerState::Archiving => DesiredAction::Archive,
-        RunnerState::Archived => return Ok(None),
+        RunnerState::Archived => return None,
     };
-    Ok(Some(DesiredCommand {
+    Some(DesiredCommand {
         task_id: record.task_id.clone(),
         generation: record.generation,
         runner_state: record.runner_state,
@@ -219,11 +263,84 @@ fn desired_command(
         runner: record.runner.as_ref().map(|runner| RunnerProgress {
             incarnation: runner.incarnation.clone(),
             launch_generation: runner.launch_generation,
-            execution_status: runner.snapshot.execution_status,
-            event_cursor: runner.snapshot.event_cursor,
             safe_point_acknowledged: runner.safe_point_generation == Some(record.generation),
-            received_at: runner.received_at,
         }),
         reader_needed: record.reader_lease_active(now),
-    }))
+    })
+}
+
+/// The desired state delivered to each controller, in memory only (KTD1):
+/// a control plane that restarted knows no cursor and answers the next read
+/// in full, which is always safe.
+///
+/// A delivery is kept under the cursor of its response, and an incremental
+/// read is answered against the one its `since` names — so a response the
+/// controller never received (a dropped long-poll) costs nothing: it asks
+/// again from the last one it applied. The last few are kept per controller.
+pub(in crate::controller_protocol::service) struct Deliveries {
+    next_cursor: AtomicU64,
+    by_controller: Mutex<HashMap<String, VecDeque<Delivery>>>,
+}
+
+/// How many deliveries are kept per controller: the one it applied last and
+/// a few answered since that it may not have received.
+const KEPT_DELIVERIES: usize = 4;
+
+struct Delivery {
+    cursor: u64,
+    lease_epoch: u64,
+    commands: Arc<BTreeMap<TaskId, DesiredCommand>>,
+}
+
+impl Default for Deliveries {
+    fn default() -> Self {
+        // Cursors of an earlier run of the control plane must not name a
+        // delivery of this one: they start somewhere new each time.
+        let start = uuid::Uuid::new_v4().as_u64_pair().0 >> 2;
+        Self {
+            next_cursor: AtomicU64::new(start),
+            by_controller: Mutex::default(),
+        }
+    }
+}
+
+impl Deliveries {
+    /// What the response at `since` delivered to `controller`, if it was
+    /// answered under this `lease_epoch` and is still kept. Deliveries
+    /// before it are dropped: the controller applied a later one.
+    fn delivered(
+        &self,
+        controller: &str,
+        since: Option<u64>,
+        lease_epoch: u64,
+    ) -> Option<Arc<BTreeMap<TaskId, DesiredCommand>>> {
+        let since = since?;
+        let mut by_controller = self.by_controller.lock().expect("deliveries");
+        let kept = by_controller.get_mut(controller)?;
+        let at = kept
+            .iter()
+            .position(|delivery| delivery.cursor == since && delivery.lease_epoch == lease_epoch)?;
+        kept.drain(..at);
+        Some(Arc::clone(&kept[0].commands))
+    }
+
+    /// Keeps `commands` as delivered to `controller`; the response's cursor.
+    fn record(&self, controller: &str, lease_epoch: u64, commands: &[DesiredCommand]) -> u64 {
+        let cursor = self.next_cursor.fetch_add(1, Ordering::Relaxed);
+        let commands = commands
+            .iter()
+            .map(|command| (command.task_id.clone(), command.clone()))
+            .collect();
+        let mut by_controller = self.by_controller.lock().expect("deliveries");
+        let kept = by_controller.entry(controller.to_string()).or_default();
+        kept.push_back(Delivery {
+            cursor,
+            lease_epoch,
+            commands: Arc::new(commands),
+        });
+        while kept.len() > KEPT_DELIVERIES {
+            kept.pop_front();
+        }
+        cursor
+    }
 }

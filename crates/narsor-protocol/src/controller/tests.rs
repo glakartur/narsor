@@ -960,6 +960,8 @@ fn queue_views_round_trip_and_old_fields_are_optional() {
 fn a_command_carries_the_launch_digest_and_no_launch_spec() {
     let response = super::CommandsResponse {
         lease_epoch: 1,
+        cursor: 7,
+        full: true,
         commands: vec![super::DesiredCommand {
             task_id: crate::identifier::TaskId::parse("task-1").unwrap(),
             generation: 2,

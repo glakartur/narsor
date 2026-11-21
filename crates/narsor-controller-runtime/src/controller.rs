@@ -8,12 +8,21 @@
 //!    third of its validity, heartbeat in between. Another controller's
 //!    unexpired lease puts this one in standby: it does not touch the
 //!    backend at all until it holds the lease itself.
-//! 2. **Read the whole desired state** (`all=true`) and acknowledge every
-//!    generation in it. Reading everything every step is what makes a
-//!    restart, a reconnect and a lease handoff the same, boring case: the
-//!    controller never relies on remembering what it did, only on what the
-//!    control plane wants and what the backend shows (R14).
-//! 3. **Reconcile every task**: observe its resources by deterministic
+//! 2. **Know the whole desired state** and acknowledge every generation in
+//!    it. The controller keeps it in a cache (KTD2): after it acquires the
+//!    lease, after `forget_all`, when the cached state was read under
+//!    another lease epoch and every [`ControllerConfig::full_read_interval`]
+//!    it reads all of it; otherwise it reads only what changed since the
+//!    response it applied last — usually nothing, and usually during the
+//!    long-poll between steps, so the step itself reads nothing at all. A
+//!    task that left the desired state comes as a `Forget`, and a full read
+//!    prunes whatever it does not name. Reading everything after a restart
+//!    or a lease change is what makes a restart, a reconnect and a lease
+//!    handoff the same, boring case: the controller never relies on
+//!    remembering what it did, only on what the control plane wants and what
+//!    the backend shows (R14).
+//! 3. **Reconcile every cached task**, every step, whether its desired state
+//!    changed or not: observe its resources by deterministic
 //!    identity, act, report. The rules are those of
 //!    [`DesiredAction`]; in short — report `StartAccepted` before creating
 //!    anything, never create a workload while one of the task's exists,
@@ -71,7 +80,7 @@
 //! `start`/`resume`, or the control plane's resume policy, which acts on
 //! Interrupted tasks alone.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::time::Duration;
 
@@ -125,11 +134,13 @@ pub trait ControllerLink: Send + Sync + 'static {
     ) -> impl Future<Output = Result<LeaseView, ClientError>> + Send;
     /// `POST /controller/v1/heartbeat`.
     fn heartbeat(&self) -> impl Future<Output = Result<HeartbeatResponse, ClientError>> + Send;
-    /// `GET /controller/v1/commands`.
+    /// `GET /controller/v1/commands`: the whole desired state without
+    /// `since`, else what changed since the response with that cursor,
+    /// waiting up to `wait_secs` for a change.
     fn commands(
         &self,
         wait_secs: u64,
-        all: bool,
+        since: Option<u64>,
     ) -> impl Future<Output = Result<CommandsResponse, ClientError>> + Send;
     /// `POST /controller/v1/acks`.
     fn acknowledge(
@@ -193,6 +204,12 @@ pub struct ControllerConfig {
     /// storage is busy, its image will not start) is not restarted in a
     /// tight loop while the owner's lease lasts.
     pub reader_restart_interval: Duration,
+    /// How often the whole desired state is read even though nothing
+    /// suggests the cached one is wrong: a safety net under the incremental
+    /// reads (KTD2). Five minutes by default — rare enough that an idle
+    /// backend's traffic stays near nothing, often enough that a change an
+    /// incremental read could ever miss is caught within minutes.
+    pub full_read_interval: Duration,
 }
 
 impl ControllerConfig {
@@ -207,6 +224,7 @@ impl ControllerConfig {
             heartbeat_interval: Duration::from_secs(15),
             observe_failures_before_unknown: 3,
             reader_restart_interval: Duration::from_secs(5),
+            full_read_interval: Duration::from_secs(300),
         }
     }
 
@@ -341,6 +359,63 @@ pub struct Controller<B, L> {
     /// needs them after creation (KTD4). A verified spec of a generation
     /// never changes, so a lease change keeps them.
     launch_specs: LaunchSpecs,
+    /// The desired state as last read (KTD2), every task of which is
+    /// reconciled at every step.
+    desired: DesiredCache,
+}
+
+/// The cached desired state and where it was read.
+#[derive(Debug, Default)]
+struct DesiredCache {
+    commands: BTreeMap<TaskId, DesiredCommand>,
+    /// The cursor of the response applied last; `None` until a full read.
+    cursor: Option<u64>,
+    /// The lease epoch the state was read under.
+    lease_epoch: Option<u64>,
+    /// When the whole desired state was read last.
+    full_read_at: Option<Instant>,
+    /// Whether the long-poll since the last step brought the cache up to
+    /// date, so the next step needs no read of its own.
+    fresh: bool,
+}
+
+impl DesiredCache {
+    /// Whether the next read must be a full one.
+    fn needs_full_read(&self, epoch: u64, interval: Duration) -> bool {
+        self.cursor.is_none()
+            || self.lease_epoch != Some(epoch)
+            || self.full_read_at.is_none_or(|at| at.elapsed() >= interval)
+    }
+
+    /// Takes a response in; true when tasks may have left the cache (a full
+    /// read, or a `Forget`), so what is kept about them is pruned.
+    fn apply(&mut self, response: CommandsResponse) -> bool {
+        let mut forgot = response.full;
+        if response.full {
+            self.commands = response
+                .commands
+                .into_iter()
+                .filter(|command| command.action != DesiredAction::Forget)
+                .map(|command| (command.task_id.clone(), command))
+                .collect();
+            self.full_read_at = Some(Instant::now());
+        } else {
+            for command in response.commands {
+                if command.action == DesiredAction::Forget {
+                    forgot |= self.commands.remove(&command.task_id).is_some();
+                } else {
+                    self.commands.insert(command.task_id.clone(), command);
+                }
+            }
+        }
+        self.cursor = Some(response.cursor);
+        self.lease_epoch = Some(response.lease_epoch);
+        forgot
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
@@ -360,6 +435,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             readers_clear: HashSet::new(),
             reader_retry_at: HashMap::new(),
             launch_specs,
+            desired: DesiredCache::default(),
         }
     }
 
@@ -417,8 +493,9 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         }
     }
 
-    /// The wait after a step.
-    async fn pause(&self, outcome: StepOutcome) {
+    /// The wait after a step. While idle it long-polls for a change of the
+    /// desired state, and a change it brings is applied to the cache at once.
+    async fn pause(&mut self, outcome: StepOutcome) {
         match outcome {
             StepOutcome::Settling => tokio::time::sleep(self.config.settle_interval).await,
             StepOutcome::Standby | StepOutcome::Disconnected => {
@@ -432,49 +509,80 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
                 });
                 let wait = self.config.poll_wait.min(until_renewal);
                 let wait_secs = wait.as_secs();
-                if wait_secs == 0 {
+                let epoch = self.lease.map(|lease| lease.epoch);
+                if wait_secs == 0 || epoch.is_none() {
                     tokio::time::sleep(wait.max(self.config.settle_interval)).await;
-                } else if let Err(error) = self.link.commands(wait_secs, false).await {
-                    // Whatever it was, the next step finds out properly.
-                    tracing::debug!(%error, "controller: long-poll failed");
-                    tokio::time::sleep(self.config.settle_interval).await;
+                    return;
+                }
+                match self.link.commands(wait_secs, self.desired.cursor).await {
+                    // Read under another epoch, it is not this lease's to
+                    // apply: the next step finds out properly.
+                    Ok(response) if Some(response.lease_epoch) == epoch => {
+                        self.apply(response);
+                        self.desired.fresh = true;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        // Whatever it was, the next step finds out properly.
+                        tracing::debug!(%error, "controller: long-poll failed");
+                        tokio::time::sleep(self.config.settle_interval).await;
+                    }
                 }
             }
         }
     }
 
     async fn try_step(&mut self) -> Result<Progress, Interrupt> {
+        // Fresh only for the step right after the long-poll that read it.
+        let fresh = std::mem::take(&mut self.desired.fresh);
         let epoch = self.ensure_lease().await?;
-        let response = self.call(self.link.commands(0, true)).await?;
-        let Ok(response) = response else {
-            return Ok(Progress::Settling);
-        };
-        if response.lease_epoch != epoch {
-            return Err(Interrupt::Fenced(format!(
-                "commands were read under epoch {}, not {epoch}",
-                response.lease_epoch
-            )));
+        let full = self
+            .desired
+            .needs_full_read(epoch, self.config.full_read_interval);
+        if full || !fresh {
+            let since = if full { None } else { self.desired.cursor };
+            let response = self.call(self.link.commands(0, since)).await?;
+            let Ok(response) = response else {
+                return Ok(Progress::Settling);
+            };
+            if response.lease_epoch != epoch {
+                return Err(Interrupt::Fenced(format!(
+                    "commands were read under epoch {}, not {epoch}",
+                    response.lease_epoch
+                )));
+            }
+            self.apply(response);
         }
 
-        // Archived tasks drop out of the desired state; so does what this
-        // controller remembered about them.
-        let live: HashSet<&TaskId> = response.commands.iter().map(|c| &c.task_id).collect();
-        self.acknowledged.retain(|task, _| live.contains(task));
-        self.observe_failures.retain(|task, _| live.contains(task));
-        self.last_status.retain(|task, _| live.contains(task));
-        self.exited_before_ack.retain(|task| live.contains(task));
-        self.readers_clear.retain(|task| live.contains(task));
-        self.reader_retry_at.retain(|task, _| live.contains(task));
-        self.launch_specs.retain(|task| live.contains(task));
-        self.acknowledge(&response.commands).await?;
-
+        let commands: Vec<DesiredCommand> = self.desired.commands.values().cloned().collect();
+        self.acknowledge(&commands).await?;
         let mut progress = Progress::Settled;
-        for command in &response.commands {
+        for command in &commands {
             if self.reconcile(epoch, command).await? == Progress::Settling {
                 progress = Progress::Settling;
             }
         }
         Ok(progress)
+    }
+
+    /// Applies a read of the desired state to the cache. Tasks that left it
+    /// (archived, or no longer admitted) take what this controller
+    /// remembered about them along.
+    fn apply(&mut self, response: CommandsResponse) {
+        if !self.desired.apply(response) {
+            return;
+        }
+        let live = &self.desired.commands;
+        self.acknowledged.retain(|task, _| live.contains_key(task));
+        self.observe_failures
+            .retain(|task, _| live.contains_key(task));
+        self.last_status.retain(|task, _| live.contains_key(task));
+        self.exited_before_ack
+            .retain(|task| live.contains_key(task));
+        self.readers_clear.retain(|task| live.contains_key(task));
+        self.reader_retry_at
+            .retain(|task, _| live.contains_key(task));
+        self.launch_specs.retain(|task| live.contains_key(task));
     }
 
     /// Holds the lease: acquires, renews or heartbeats as due.
@@ -623,6 +731,8 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             // reader waits for it to be no longer alive.
             DesiredAction::Hold => self.tend_reader(&context, true).await,
             DesiredAction::Archive => self.archive(&context).await,
+            // Never cached: applying a read drops the task instead.
+            DesiredAction::Forget => Ok(Progress::Settled),
         }
     }
 
@@ -1388,8 +1498,10 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
     }
 
     /// Forgets everything remembered between steps: after a lease change the
-    /// next step starts from the control plane and the backend alone.
+    /// next step starts from the control plane (a full read) and the backend
+    /// alone.
     fn forget_all(&mut self) {
+        self.desired.clear();
         self.acknowledged.clear();
         self.observe_failures.clear();
         self.last_status.clear();
@@ -1473,7 +1585,7 @@ mod tests {
         ArchiveProgress, BackendCapabilities, BackendKind, BackendResult, Provisioned, ReaderStart,
         StorageState,
     };
-    use narsor_protocol::controller::ReportResponse;
+    use narsor_protocol::controller::{ReportResponse, RunnerProgress};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -1519,6 +1631,8 @@ mod tests {
         failing_starts: u32,
         /// The launch spec of the last workload or reader created.
         launched_spec: Option<Value>,
+        /// How many times a task was observed.
+        observed: usize,
     }
 
     impl StubBackend {
@@ -1531,6 +1645,7 @@ mod tests {
                     slow_removals: 0,
                     failing_starts: 0,
                     launched_spec: None,
+                    observed: 0,
                 })),
                 specs: LaunchSpecs::default(),
             }
@@ -1565,6 +1680,7 @@ mod tests {
             })
         }
         async fn observe(&self, _task: &TaskResources) -> BackendResult<TaskObservation> {
+            self.state().observed += 1;
             Ok(TaskObservation {
                 workload: self.state().work.clone(),
                 storage: StorageState::Present,
@@ -1647,11 +1763,19 @@ mod tests {
         }
     }
 
-    /// A control plane that serves one scripted desired command.
+    /// A control plane that serves a scripted desired state: in full without
+    /// a cursor (or with one it did not hand out last), else what changed
+    /// since its last answer.
     #[derive(Clone)]
     struct StubLink {
         log: Log,
-        command: Arc<Mutex<DesiredCommand>>,
+        commands: Arc<Mutex<Vec<DesiredCommand>>>,
+        /// What it answered last, under which cursor.
+        delivered: Arc<Mutex<(u64, BTreeMap<TaskId, DesiredCommand>)>>,
+        /// Every read: whether it was full and how many commands it carried.
+        reads: Arc<Mutex<Vec<(bool, usize)>>>,
+        /// The lease epoch it grants and reads under.
+        epoch: Arc<Mutex<u64>>,
         /// Whether the control plane refuses a reader credential.
         refuse_reader: Arc<Mutex<bool>>,
         /// What launch-spec fetches answer before they serve `spec`.
@@ -1664,13 +1788,26 @@ mod tests {
         fn say(&self, entry: &str) {
             self.log.lock().unwrap().push(entry.to_string());
         }
+
+        /// Makes `command` the whole desired state.
+        fn set(&self, command: DesiredCommand) {
+            *self.commands.lock().unwrap() = vec![command];
+        }
+
+        fn reads(&self) -> Vec<(bool, usize)> {
+            self.reads.lock().unwrap().clone()
+        }
+
+        fn lease(&self) -> LeaseView {
+            lease(*self.epoch.lock().unwrap())
+        }
     }
 
-    fn lease() -> LeaseView {
+    fn lease(epoch: u64) -> LeaseView {
         LeaseView {
             backend_id: narsor_protocol::identifier::BackendId::parse("b").unwrap(),
             controller_id: "c".into(),
-            epoch: 1,
+            epoch,
             acquired_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::minutes(1),
         }
@@ -1678,25 +1815,57 @@ mod tests {
 
     impl ControllerLink for StubLink {
         async fn acquire_lease(&self, _ttl: Option<u64>) -> Result<LeaseView, ClientError> {
-            Ok(lease())
+            Ok(self.lease())
         }
         async fn renew_lease(
             &self,
             _epoch: u64,
             _ttl: Option<u64>,
         ) -> Result<LeaseView, ClientError> {
-            Ok(lease())
+            Ok(self.lease())
         }
         async fn release_lease(&self, _epoch: u64) -> Result<LeaseView, ClientError> {
-            Ok(lease())
+            Ok(self.lease())
         }
         async fn heartbeat(&self) -> Result<HeartbeatResponse, ClientError> {
             unreachable!("a fresh lease is not heartbeated")
         }
-        async fn commands(&self, _wait: u64, _all: bool) -> Result<CommandsResponse, ClientError> {
+        async fn commands(
+            &self,
+            _wait: u64,
+            since: Option<u64>,
+        ) -> Result<CommandsResponse, ClientError> {
+            let current = self.commands.lock().unwrap().clone();
+            let mut delivered = self.delivered.lock().unwrap();
+            let full = since != Some(delivered.0);
+            let commands: Vec<DesiredCommand> = if full {
+                current.clone()
+            } else {
+                let changed = current
+                    .iter()
+                    .filter(|c| delivered.1.get(&c.task_id) != Some(*c))
+                    .cloned();
+                let gone = delivered
+                    .1
+                    .values()
+                    .filter(|d| !current.iter().any(|c| c.task_id == d.task_id))
+                    .map(|d| DesiredCommand {
+                        action: DesiredAction::Forget,
+                        ..d.clone()
+                    });
+                changed.chain(gone).collect()
+            };
+            delivered.0 += 1;
+            delivered.1 = current
+                .into_iter()
+                .map(|c| (c.task_id.clone(), c))
+                .collect();
+            self.reads.lock().unwrap().push((full, commands.len()));
             Ok(CommandsResponse {
-                lease_epoch: 1,
-                commands: vec![self.command.lock().unwrap().clone()],
+                lease_epoch: *self.epoch.lock().unwrap(),
+                cursor: delivered.0,
+                full,
+                commands,
             })
         }
         async fn acknowledge(&self, acks: Vec<CommandAck>) -> Result<AckResponse, ClientError> {
@@ -1708,7 +1877,13 @@ mod tests {
                 applied: true,
                 runner_state: match report.observation {
                     Observation::StartAccepted => RunnerState::Provisioning,
-                    _ => self.command.lock().unwrap().runner_state,
+                    _ => self
+                        .commands
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|c| c.task_id.as_str() == report.task_id)
+                        .map_or(RunnerState::Archived, |c| c.runner_state),
                 },
                 generation: report.desired_generation,
             })
@@ -1798,21 +1973,41 @@ mod tests {
 
     impl Rig {
         fn new(command: DesiredCommand) -> Self {
-            Self::with_restart_interval(command, Duration::from_secs(60))
+            Self::with_config(command, |_| {})
+        }
+
+        /// Makes `commands` the whole desired state.
+        fn desire(&self, commands: Vec<DesiredCommand>) {
+            *self.link.commands.lock().unwrap() = commands;
+        }
+
+        fn observed(&self) -> usize {
+            self.backend.state().observed
         }
 
         fn with_restart_interval(command: DesiredCommand, interval: Duration) -> Self {
+            Self::with_config(command, |config| config.reader_restart_interval = interval)
+        }
+
+        fn with_config(
+            command: DesiredCommand,
+            configure: impl FnOnce(&mut ControllerConfig),
+        ) -> Self {
             let log: Log = Arc::default();
             let backend = StubBackend::new(&log);
             let link = StubLink {
                 log: Arc::clone(&log),
-                command: Arc::new(Mutex::new(command)),
+                commands: Arc::new(Mutex::new(vec![command])),
+                delivered: Arc::default(),
+                reads: Arc::default(),
+                epoch: Arc::new(Mutex::new(1)),
                 refuse_reader: Arc::new(Mutex::new(false)),
                 fetch_failures: Arc::default(),
                 spec: Arc::new(Mutex::new(serde_json::to_value(launch_spec()).unwrap())),
             };
             let mut config = ControllerConfig::new("http://cp.test");
-            config.reader_restart_interval = interval;
+            config.reader_restart_interval = Duration::from_secs(60);
+            configure(&mut config);
             Self {
                 controller: Controller::new(backend.clone(), link.clone(), config),
                 log,
@@ -2021,8 +2216,11 @@ mod tests {
         let mut rig = Rig::new(desired(RunnerState::Queued, DesiredAction::Start, false));
 
         rig.controller.step().await;
-        *rig.link.command.lock().unwrap() =
-            desired(RunnerState::Provisioning, DesiredAction::Provision, false);
+        rig.link.set(desired(
+            RunnerState::Provisioning,
+            DesiredAction::Provision,
+            false,
+        ));
         rig.controller.step().await;
 
         assert_eq!(
@@ -2071,8 +2269,11 @@ mod tests {
             assert_eq!(count(&rig.log, "provision"), 0, "{name}");
             assert_eq!(count(&rig.log, "issue_runner_credential"), 0, "{name}");
 
-            *rig.link.command.lock().unwrap() =
-                desired(RunnerState::Provisioning, DesiredAction::Provision, false);
+            rig.link.set(desired(
+                RunnerState::Provisioning,
+                DesiredAction::Provision,
+                false,
+            ));
             rig.controller.step().await;
             assert_eq!(count(&rig.log, "fetch_launch_spec"), 2, "{name}");
             assert_eq!(count(&rig.log, "provision"), 1, "{name}");
@@ -2144,6 +2345,206 @@ mod tests {
         assert!(specs
             .take_credential_or_request(&task, 2, "task-1-g2")
             .is_some());
+    }
+
+    fn stopped(task: &str) -> DesiredCommand {
+        DesiredCommand {
+            task_id: TaskId::parse(task).unwrap(),
+            resource_key: task.into(),
+            ..desired(RunnerState::Stopped, DesiredAction::KeepPaused, false)
+        }
+    }
+
+    fn progress(safe_point_acknowledged: bool) -> Option<RunnerProgress> {
+        Some(RunnerProgress {
+            incarnation: "inc".into(),
+            launch_generation: 2,
+            safe_point_acknowledged,
+        })
+    }
+
+    /// KTD2: once the desired state is cached, an idle backend's reads carry
+    /// no command — the step after a long-poll reads nothing at all — and
+    /// every cached task is still observed at every step.
+    #[tokio::test]
+    async fn an_idle_step_transfers_no_commands_and_still_observes_every_task() {
+        let mut rig = Rig::new(stopped("task-1"));
+        rig.desire(vec![
+            stopped("task-1"),
+            stopped("task-2"),
+            stopped("task-3"),
+        ]);
+
+        rig.controller.step().await;
+        rig.controller.pause(StepOutcome::Idle).await;
+        rig.controller.step().await;
+        rig.controller.step().await;
+
+        assert_eq!(
+            rig.link.reads(),
+            [(true, 3), (false, 0), (false, 0)],
+            "a full read, the long-poll, no read after it, then an empty one"
+        );
+        assert_eq!(rig.observed(), 9, "three tasks, three steps");
+    }
+
+    /// R3: what changes with no new generation — runner progress, a safe
+    /// point, a reader lease, an admission — reaches the cached command and
+    /// the controller acts on it.
+    #[tokio::test]
+    async fn a_change_without_a_new_generation_is_acted_on() {
+        let running = Some(workload(2, WorkloadPhase::Running));
+        let cases = [
+            (
+                "runner ready",
+                running.clone(),
+                Some(desired(
+                    RunnerState::Provisioning,
+                    DesiredAction::Provision,
+                    false,
+                )),
+                DesiredCommand {
+                    runner: progress(false),
+                    ..desired(RunnerState::Provisioning, DesiredAction::Provision, false)
+                },
+                "report RunnerReady",
+            ),
+            (
+                "safe point acknowledged",
+                running.clone(),
+                Some(DesiredCommand {
+                    runner: progress(false),
+                    ..desired(
+                        RunnerState::PauseRequested,
+                        DesiredAction::PauseAtSafePoint,
+                        false,
+                    )
+                }),
+                DesiredCommand {
+                    runner: progress(true),
+                    ..desired(
+                        RunnerState::PauseRequested,
+                        DesiredAction::PauseAtSafePoint,
+                        false,
+                    )
+                },
+                "report PausedAtSafePoint",
+            ),
+            (
+                "reader lease started",
+                None,
+                Some(desired(
+                    RunnerState::Stopped,
+                    DesiredAction::KeepPaused,
+                    false,
+                )),
+                desired(RunnerState::Stopped, DesiredAction::KeepPaused, true),
+                "start_reader",
+            ),
+            (
+                "reader lease expired",
+                None,
+                Some(desired(
+                    RunnerState::Stopped,
+                    DesiredAction::KeepPaused,
+                    true,
+                )),
+                desired(RunnerState::Stopped, DesiredAction::KeepPaused, false),
+                "stop_reader",
+            ),
+            (
+                "queued task admitted",
+                None,
+                None,
+                desired(RunnerState::Queued, DesiredAction::Start, false),
+                "report StartAccepted",
+            ),
+        ];
+        for (name, work, before, after, acted) in cases {
+            let mut rig = Rig::new(after.clone());
+            rig.desire(before.into_iter().collect());
+            rig.backend.state().work = work;
+
+            rig.controller.step().await;
+            rig.controller.step().await;
+            assert_eq!(count(&rig.log, acted), 0, "{name}: {:?}", said(&rig.log));
+            rig.link.set(after);
+            rig.controller.step().await;
+
+            assert_eq!(count(&rig.log, acted), 1, "{name}: {:?}", said(&rig.log));
+            let reads = rig.link.reads();
+            assert!(
+                reads[1..].iter().all(|(full, _)| !full),
+                "{name}: incremental reads only: {reads:?}"
+            );
+        }
+    }
+
+    /// A task that left the desired state is forgotten: it is no longer
+    /// observed, and nothing is said about it again.
+    #[tokio::test]
+    async fn a_forgotten_task_leaves_the_cache() {
+        let mut rig = Rig::new(stopped("task-1"));
+        rig.desire(vec![stopped("task-1"), stopped("task-2")]);
+        rig.controller.step().await;
+
+        rig.desire(vec![stopped("task-1")]);
+        rig.controller.step().await;
+        let after_forget = rig.observed();
+        rig.controller.step().await;
+
+        assert_eq!(rig.link.reads(), [(true, 2), (false, 1), (false, 0)]);
+        assert_eq!(after_forget, 2 + 1, "the forgotten task is not observed");
+        assert_eq!(rig.observed(), 2 + 1 + 1);
+    }
+
+    /// KTD2: a lease epoch other than the cache's makes the next read full.
+    #[tokio::test]
+    async fn a_new_lease_epoch_reads_the_whole_desired_state() {
+        let mut rig = Rig::new(stopped("task-1"));
+        rig.controller.step().await;
+        rig.controller.step().await;
+
+        // Another controller held the lease meanwhile; this one reacquires.
+        *rig.link.epoch.lock().unwrap() = 2;
+        assert_eq!(rig.controller.step().await, StepOutcome::Standby);
+        rig.controller.step().await;
+
+        assert_eq!(
+            rig.link.reads(),
+            [(true, 1), (false, 0), (false, 0), (true, 1)]
+        );
+        assert_eq!(
+            rig.controller.status(),
+            ControllerStatus::Active { epoch: 2 }
+        );
+    }
+
+    /// The periodic full read prunes a task whose departure an incremental
+    /// read never said (a control plane that lost what it delivered).
+    #[tokio::test]
+    async fn the_full_read_interval_prunes_what_incremental_reads_missed() {
+        let interval = Duration::from_millis(50);
+        let mut rig = Rig::with_config(stopped("task-1"), |config| {
+            config.full_read_interval = interval;
+        });
+        rig.desire(vec![stopped("task-1"), stopped("task-2")]);
+        rig.controller.step().await;
+
+        rig.desire(vec![stopped("task-1")]);
+        rig.link
+            .delivered
+            .lock()
+            .unwrap()
+            .1
+            .remove(&TaskId::parse("task-2").unwrap());
+        rig.controller.step().await;
+        assert_eq!(rig.observed(), 2 + 2, "still cached");
+        tokio::time::sleep(interval).await;
+        rig.controller.step().await;
+
+        assert_eq!(rig.link.reads(), [(true, 2), (false, 0), (true, 1)]);
+        assert_eq!(rig.observed(), 2 + 2 + 1, "pruned by the full read");
     }
 
     #[test]

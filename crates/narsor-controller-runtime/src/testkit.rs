@@ -524,9 +524,13 @@ impl<L: ControllerLink> ControllerLink for SeverableLink<L> {
         self.inner.heartbeat().await
     }
 
-    async fn commands(&self, wait_secs: u64, all: bool) -> Result<CommandsResponse, ClientError> {
+    async fn commands(
+        &self,
+        wait_secs: u64,
+        since: Option<u64>,
+    ) -> Result<CommandsResponse, ClientError> {
         self.check()?;
-        let response = self.inner.commands(wait_secs, all).await;
+        let response = self.inner.commands(wait_secs, since).await;
         // A long-poll that outlived the partition must not deliver.
         self.check()?;
         response

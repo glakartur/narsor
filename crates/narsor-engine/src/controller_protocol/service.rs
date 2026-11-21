@@ -180,6 +180,8 @@ pub struct ProtocolService {
     harness_usages: scheduling::HarnessUsages,
     /// Most tasks processed at once across all backends; `None` for no limit.
     max_concurrent_tasks: Mutex<Option<u32>>,
+    /// The desired state delivered to each controller, in memory only.
+    deliveries: runner_channel::Deliveries,
 }
 
 impl std::fmt::Debug for ProtocolService {
@@ -238,6 +240,7 @@ impl ProtocolService {
             conductor_reads: Mutex::new(ConductorRelay::default()),
             harness_usages: Mutex::default(),
             max_concurrent_tasks: Mutex::new(Some(DEFAULT_MAX_CONCURRENT_TASKS)),
+            deliveries: runner_channel::Deliveries::default(),
         }
     }
 
