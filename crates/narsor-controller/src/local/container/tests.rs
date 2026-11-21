@@ -9,7 +9,7 @@ use crate::local::process::process_alive;
 use crate::local::test_support::Scratch;
 use crate::local::workload::LastRunner;
 use narsor_controller_runtime::backend::{ExecutionBackend, Removal, StorageState};
-use narsor_engine::domain::TaskId;
+use narsor_model::domain::TaskId;
 
 /// KTD7: a container gets the pass-through variables, the configured
 /// ones and the mark; nothing else of the controller's environment.
@@ -97,7 +97,7 @@ mod containers {
     use super::*;
     use crate::local::container::docker_fake::{DockerCall, FakeDocker};
     use crate::local::container::image::{BuildSettings, TaskImageBuilds};
-    use narsor_engine::domain::{
+    use narsor_model::domain::{
         ComponentSecret, HomeSource, ImageDigest, ImageSource, ImageSpec, ResolvedEnvironment,
         ResolvedImage, ResourceProfile, SecretDelivery, TaskImageComponent, TaskRepository,
         TaskWorkspace,

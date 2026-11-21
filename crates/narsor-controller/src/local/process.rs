@@ -50,8 +50,8 @@ use std::time::{Duration, Instant};
 use narsor_controller_runtime::backend::{
     BackendError, BackendResult, TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
 };
-use narsor_engine::config::{CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV, ENV_PREFIX};
-use narsor_engine::workspace::provisioner::USER_GIT_ACCESS_ENVS;
+use narsor_shared::config::{CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV, ENV_PREFIX};
+use narsor_shared::git::USER_GIT_ACCESS_ENVS;
 
 use super::backend::LocalBackendConfig;
 use super::workload::{
@@ -363,7 +363,7 @@ impl ProcessRunners {
 /// which a runner never inherits.
 fn is_controller_setting(name: &OsStr) -> bool {
     name.as_encoded_bytes().starts_with(ENV_PREFIX.as_bytes())
-        && name != OsStr::new(narsor_engine::config::AGENT_ARGS_ENV)
+        && name != OsStr::new(narsor_shared::config::AGENT_ARGS_ENV)
 }
 
 /// Variables through which a runner or a harness would reach the user's
@@ -507,7 +507,7 @@ mod tests {
             assert!(is_controller_setting(name.as_ref()), "{name}");
         }
         assert!(!is_controller_setting(
-            narsor_engine::config::AGENT_ARGS_ENV.as_ref()
+            narsor_shared::config::AGENT_ARGS_ENV.as_ref()
         ));
         for name in ["PATH", "HOME", "RUST_LOG", "narsor_lower", "XNARSOR_"] {
             assert!(!is_controller_setting(name.as_ref()), "{name}");

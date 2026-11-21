@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-narsor-engine = { path = "../narsor-engine" }
+narsor-model = { path = "../narsor-model" }
+narsor-shared = { path = "../narsor-shared" }
 narsor-controller-client = { path = "../narsor-controller-client" }
 narsor-protocol = { path = "../narsor-protocol" }
 narsor-controller-runtime = { path = "../narsor-controller-runtime" }

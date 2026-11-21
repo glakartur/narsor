@@ -48,7 +48,7 @@
 //! (`--config <file>`) or `--no-config` when none won, and only its
 //! `NARSOR_GLOBAL__*` and `NARSOR_CONTROLLER__*` variables (R21). The child
 //! reads its own section from them, the same way
-//! [`narsor_engine::config::local_controller::resolve`] does for the
+//! [`narsor_shared::config::local_controller::resolve`] does for the
 //! daemon's check before it starts.
 //!
 //! # Stopping
@@ -86,8 +86,8 @@ use container::{image, secrets, ContainerMode};
 use narsor_controller_client::controller_runtime::load_or_enroll_with_options;
 use narsor_controller_client::{ClientOptions, ControllerClient};
 use narsor_controller_runtime::{Controller, ControllerConfig};
-use narsor_engine::config::local_controller::{self, LocalMode};
-use narsor_engine::config::{Flags, HarnessHome, HomeMode, Resolved, SettingKey, Source};
+use narsor_shared::config::local_controller::{self, LocalMode};
+use narsor_shared::config::{Flags, HarnessHome, HomeMode, Resolved, SettingKey, Source};
 
 /// What the lock file's name adds to the credential file's.
 const LOCK_SUFFIX: &str = ".lock";
@@ -464,11 +464,11 @@ fn read_config(args: &LocalArgs) -> Result<Resolved, ControllerError> {
 /// all with `no_config`, else from the cascade; and the process
 /// environment.
 fn resolve_config(file: Option<&Path>, no_config: bool) -> Resolved {
-    let environment = narsor_engine::config::resolve::environment_from_process();
+    let environment = narsor_shared::config::resolve::environment_from_process();
     if no_config || file.is_some() {
         local_controller::resolve(file, &environment)
     } else {
-        narsor_engine::config::resolve(&Flags::default(), &environment, local_controller::SCOPE)
+        narsor_shared::config::resolve(&Flags::default(), &environment, local_controller::SCOPE)
     }
 }
 
@@ -477,11 +477,11 @@ fn resolve_config(file: Option<&Path>, no_config: bool) -> Resolved {
 /// problem) or 1, without starting anything (`narsor-cli config show`).
 pub fn check_command(file: Option<&Path>) -> ! {
     let resolved = resolve_config(file, false);
-    let mut problems = narsor_engine::config::Problem::of_resolution(&resolved);
+    let mut problems = narsor_shared::config::Problem::of_resolution(&resolved);
     if resolved.is_ok() {
         problems.extend(local_controller::problems(&resolved));
     }
-    narsor_engine::config::CheckReport::build("narsor-controller", &resolved, &problems)
+    narsor_shared::config::CheckReport::build("narsor-controller", &resolved, &problems)
         .print_and_exit()
 }
 
@@ -530,8 +530,8 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
     )?;
     let config = read_config(&args)?;
     // R26: an un-migrated configuration runs on built-in values; say so.
-    let environment = narsor_engine::config::resolve::environment_from_process();
-    if let Some(warning) = narsor_engine::config::legacy::warning(&config, &environment) {
+    let environment = narsor_shared::config::resolve::environment_from_process();
+    if let Some(warning) = narsor_shared::config::legacy::warning(&config, &environment) {
         eprintln!("narsor-controller: warning: {warning}");
     }
     let setup = configure(&args, place, &config)?;
@@ -714,7 +714,7 @@ pub fn check_transport(
             "{flag} '{url}' must not carry user information"
         )));
     }
-    let place = if narsor_engine::config::is_loopback_host(&parsed) {
+    let place = if narsor_shared::config::is_loopback_host(&parsed) {
         ControlPlanePlace::Loopback
     } else {
         ControlPlanePlace::Remote
@@ -852,7 +852,7 @@ fn holder_pid(file: &mut fs::File) -> String {
 mod tests {
     use super::*;
     use crate::controller::ConnectionArgs;
-    use narsor_engine::config::Environment;
+    use narsor_shared::config::Environment;
 
     fn args() -> LocalArgs {
         LocalArgs {

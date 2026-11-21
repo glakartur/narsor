@@ -62,8 +62,8 @@ use narsor_controller_client::ControllerClient;
 use narsor_controller_runtime::{
     Controller, ControllerConfig, EnrollmentError, ENROLLMENT_CODE_ENV,
 };
-use narsor_engine::config::CLAUDE_CONFIG_DIR_ENV;
 use narsor_protocol::harness::{display_name, CLAUDE_CODE};
+use narsor_shared::config::CLAUDE_CONFIG_DIR_ENV;
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_FAILURE: i32 = 1;

@@ -40,9 +40,9 @@ graph TD
   server --> cr[narsor-controller-runtime]
   runner[narsor-runner] --> exec[narsor-exec]
   runner --> cc[narsor-controller-client]
-  ctrl[narsor-controller] --> engine
-  ctrl --> cc
+  ctrl[narsor-controller] --> cc
   ctrl --> cr
+  ctrl --> model
   engine --> exec
   engine --> cc
   engine --> cr
@@ -52,6 +52,7 @@ graph TD
   cc --> model
   cc --> cr
   model --> shared[narsor-shared]
+  ctrl --> shared
   api --> shared
   cr --> shared
   web --> shared
@@ -67,7 +68,7 @@ graph TD
 | `narsor-observer-worker` | api-client, protocol |
 | `narsor-server` | api-client, engine, controller-runtime, protocol, shared |
 | `narsor-runner` | exec, controller-client, protocol |
-| `narsor-controller` | engine, controller-client, controller-runtime, protocol |
+| `narsor-controller` | model, controller-client, controller-runtime, protocol, shared |
 | `narsor-engine` | exec, model, store, controller-client, controller-runtime, protocol, shared |
 | `narsor-exec` | model, store, protocol, shared |
 | `narsor-controller-client` | model, controller-runtime, protocol, shared |
@@ -82,9 +83,11 @@ Rules this graph keeps:
 
 - Clients (`narsor`, `narsor-web`, `narsor-observer-worker`) do not depend on
   `narsor-engine`. They reach the engine only through `narsor-api-client`.
-- Only `narsor-server` and `narsor-controller` link `narsor-engine` (the
-  control plane). `narsor-runner` links only the execution layer
-  (`narsor-exec`) and the protocol client (`narsor-controller-client`).
+- Only `narsor-server` links `narsor-engine` (the control plane).
+  `narsor-runner` links only the execution layer (`narsor-exec`) and the
+  protocol client (`narsor-controller-client`). `narsor-controller` links
+  neither: it needs only the domain types (`narsor-model`), configuration
+  and Git rules (`narsor-shared`) and the controller crates.
 - `narsor-protocol` has no workspace dependencies.
 
 The root package lists every crate under `[dev-dependencies]`. Only the

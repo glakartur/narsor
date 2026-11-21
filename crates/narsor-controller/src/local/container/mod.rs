@@ -38,7 +38,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use narsor_controller_runtime::backend::{
     BackendError, BackendResult, TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
 };
-use narsor_engine::domain::{SecretDelivery, TaskImage, TaskLaunchSpec, TaskRepositorySource};
+use narsor_model::domain::{SecretDelivery, TaskImage, TaskLaunchSpec, TaskRepositorySource};
 
 use super::backend::LocalBackendConfig;
 use super::workload::{

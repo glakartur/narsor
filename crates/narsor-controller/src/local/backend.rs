@@ -35,11 +35,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use narsor_controller_runtime::backend::{
-    ArchiveProgress, BackendError, BackendResult, ExecutionBackend, Provisioned, ReaderStart,
-    Removal, StorageState, TaskObservation, TaskResources, WorkloadLaunch, WorkloadState,
+    ArchiveProgress, BackendCapabilities, BackendError, BackendKind, BackendResult,
+    ExecutionBackend, Provisioned, ReaderStart, Removal, StorageState, TaskObservation,
+    TaskResources, WorkloadLaunch, WorkloadState,
 };
-use narsor_engine::domain::{TaskId, TaskLaunchSpec};
-use narsor_engine::environment::{BackendCapabilities, BackendKind};
+use narsor_model::domain::{TaskId, TaskLaunchSpec};
 
 use super::container::docker::DockerTransport;
 use super::container::{ContainerMode, ContainerRunners};

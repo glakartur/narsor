@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use narsor_controller_runtime::backend::{ExecutionBackend, TaskResources, WorkloadLaunch};
-use narsor_engine::domain::{TaskId, TaskLaunchSpec};
+use narsor_model::domain::{TaskId, TaskLaunchSpec};
 
 use super::backend::{LocalBackend, LocalBackendConfig};
 use super::workload::Role;
@@ -46,7 +46,7 @@ impl Scratch {
     }
 
     pub(super) fn launch(&self, incarnation: &str) -> WorkloadLaunch {
-        use narsor_engine::domain::{ResolvedEnvironment, ResourceProfile, TaskWorkspace};
+        use narsor_model::domain::{ResolvedEnvironment, ResourceProfile, TaskWorkspace};
         let spec = TaskLaunchSpec::new(
             "wf",
             1,
