@@ -74,13 +74,15 @@ use crate::controller::{
 use untrusted::UntrustedServer;
 
 pub mod backend;
-pub mod docker;
-pub mod docker_fake;
-pub mod image;
-pub mod secrets;
+pub mod container;
+mod process;
+#[cfg(test)]
+mod test_support;
 mod untrusted;
-use backend::{ContainerMode, LaunchCheck, LocalBackend, LocalBackendConfig};
-use docker::{DockerCli, DockerTransport};
+mod workload;
+use backend::{LaunchCheck, LocalBackend, LocalBackendConfig};
+use container::docker::{DockerCli, DockerTransport};
+use container::{image, secrets, ContainerMode};
 use narsor_controller_client::controller_runtime::load_or_enroll_with_options;
 use narsor_controller_client::{ClientOptions, ControllerClient};
 use narsor_controller_runtime::{Controller, ControllerConfig};
@@ -644,7 +646,7 @@ fn container_mode(
             .map(PathBuf::from),
         config_file,
         runner_args: Vec::new(),
-        start_window: backend::DEFAULT_START_WINDOW,
+        start_window: container::DEFAULT_START_WINDOW,
     }
 }
 

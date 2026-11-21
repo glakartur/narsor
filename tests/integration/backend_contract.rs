@@ -198,8 +198,11 @@ async fn a_container_removed_from_outside_is_resumed_on_the_same_image() {
         .container_of(&h.resources("task-1"))
         .expect("the task's container");
 
-    narsor_controller::local::docker::DockerTransport::remove_container(&*h.target.docker, &first)
-        .expect("remove the container");
+    narsor_controller::local::container::docker::DockerTransport::remove_container(
+        &*h.target.docker,
+        &first,
+    )
+    .expect("remove the container");
     h.wait_for("the replacement container", |h| {
         h.counters().workloads_created == 2 && h.runner_state("task-1") == RunnerState::Running
     })
