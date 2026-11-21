@@ -7,6 +7,12 @@ edition = "2021"
 name = "narsor_exec"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Runs `harness: github-copilot` steps through the GitHub Copilot SDK.
+# Without it such a step fails with an error that names narsor-runner.
+copilot-sdk = ["dep:github-copilot-sdk"]
+
 [dependencies]
 narsor-model = { path = "../narsor-model" }
 narsor-protocol = { path = "../narsor-protocol" }
@@ -17,7 +23,11 @@ base64 = "0.23"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
-github-copilot-sdk = "1.0"
+# The GitHub Copilot harness. Optional and off by default: only
+# `narsor-runner` runs agent steps, so only it enables `copilot-sdk`.
+# `bundled-cli` (the SDK's default) is off on purpose: it embeds the whole
+# Copilot CLI runtime (~200 MB). The operator installs the `copilot` CLI.
+github-copilot-sdk = { version = "1.0", default-features = false, features = ["runtime"], optional = true }
 libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls"] }
 serde = { version = "1", features = ["derive"] }

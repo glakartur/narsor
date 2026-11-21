@@ -386,7 +386,7 @@ impl SessionRunner {
             Err(error) => {
                 let started = !matches!(
                     error.error_type.as_deref(),
-                    Some("harness_not_found") | Some("spawn_failed")
+                    Some("harness_not_found") | Some("harness_unavailable") | Some("spawn_failed")
                 );
                 conversation.append_outcome(
                     &if started {

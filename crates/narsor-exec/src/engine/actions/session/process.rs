@@ -87,6 +87,9 @@ pub(crate) async fn run_harness_invocation(
     conversation: &ConversationSink,
     usage: Option<UsageRelay<'_>>,
 ) -> Result<SpawnEnding, ActionError> {
+    // A unit struct when the `copilot-sdk` feature is off.
+    #[allow(clippy::default_constructed_unit_structs)]
+    let sdk_runtime = GitHubCopilotSdkRuntime::default();
     run_harness_invocation_with_sdk(
         program,
         args,
@@ -98,7 +101,7 @@ pub(crate) async fn run_harness_invocation(
         parser,
         conversation,
         usage,
-        &GitHubCopilotSdkRuntime::default(),
+        &sdk_runtime,
     )
     .await
 }
