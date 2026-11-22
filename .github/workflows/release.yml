@@ -48,14 +48,14 @@ jobs:
           trap 'rm -rf "$temp_dir"' EXIT
           tar -xzf "$archive" -C "$temp_dir"
           "$temp_dir/narsor-cli" --version
-          for binary in narsor narsor-cli narsor-web narsor-server narsor-controller narsor-runner narsor-observer-worker; do
+          for binary in narsor narsor-cli narsor-web narsor-server narsor-controller narsor-runner narsor-observer-worker narsor-migrate; do
             reported="$("$temp_dir/$binary" --version)"
             [[ "$reported" == "$binary $NARSOR_BUILD_VERSION" ]] \
               || { echo "$binary reports '$reported', expected $NARSOR_BUILD_VERSION" >&2; exit 1; }
           done
           grep -Fq "\"version\": \"$NARSOR_BUILD_VERSION\"" "$temp_dir/manifest.json"
           "$temp_dir/narsor-cli" validate tests/fixtures/cli/greet.yaml
-          for binary in narsor narsor-web narsor-server narsor-controller narsor-runner narsor-observer-worker; do
+          for binary in narsor narsor-web narsor-server narsor-controller narsor-runner narsor-observer-worker narsor-migrate; do
             "$temp_dir/$binary" --help >/dev/null
           done
 
