@@ -879,6 +879,7 @@ narsor-cli task list [--archived] [--json]       # the attention mark `?`/`!`, t
 narsor-cli task show <task> [--json]             # title, links, what it waits on, observations
 narsor-cli task pause|resume|start|archive <task> [--expected-generation N]
 narsor-cli task move <task> --before <other> | --after <other> | --top | --bottom
+narsor-cli task refresh-env <task>               # re-resolve a stopped task's environment from the catalogue
 narsor-cli task input <task> --field reason=ok [--data k=v] [--variable k=v] \
   [--label approved] [--comment …] [--waiting-id <id>]
 narsor-cli task interrupt <task> [--wait-secs N]

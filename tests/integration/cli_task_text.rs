@@ -11,7 +11,7 @@ use narsor::api::{ClientError, HarnessSelectionSnapshot};
 use narsor::cli::task_text::{
     activity_age, age, attention_lines, command_outcome, conversation_lines, conversation_origin,
     default_harness_line, detail_lines, event_line, header_lines, list_line, next_waiting,
-    queue_badge, record_unreadable_detail, safe_json, state_hint, Tone,
+    queue_badge, record_unreadable_detail, refresh_outcome_lines, safe_json, state_hint, Tone,
 };
 use narsor_engine::controller_protocol::{
     ConversationResponse, ConversationUnavailableReason, ExecutionEventsSource, QueueView,
@@ -24,6 +24,9 @@ use narsor_engine::orchestration::{
     RunnerState, TaskEvent, TaskEventKind, EXHAUSTION_REASON_PREFIX, UNSPECIFIED_LOSS,
 };
 use narsor_protocol::api::{PositionUsage, TokenCounts};
+use narsor_protocol::controller::{
+    EnvironmentDiff, EnvironmentRefreshResult, NamedChanges, OwnerRef, ValueChange,
+};
 
 use crate::task_app_support;
 use task_app_support::{
@@ -552,6 +555,66 @@ fn an_exhaustion_event_names_the_attempts_and_the_loss_once() {
             "automatic resume gave up after 1 attempt: {UNSPECIFIED_LOSS}"
         )),
         "{single}"
+    );
+}
+
+fn refresh_diff() -> Box<EnvironmentDiff> {
+    Box::new(EnvironmentDiff {
+        task_image_components: NamedChanges {
+            added: vec!["cargo".into(), "jq".into()],
+            removed: vec!["node".into()],
+            changed: vec![],
+        },
+        profile: Some(ValueChange {
+            before: Some("default v1".into()),
+            after: Some("default v2".into()),
+        }),
+        ..EnvironmentDiff::default()
+    })
+}
+
+#[test]
+fn a_refresh_shows_what_changed_and_both_identities() {
+    let lines = refresh_outcome_lines(
+        "t-1",
+        &EnvironmentRefreshResult::Refreshed {
+            old_identity: "sha256:aaaa".into(),
+            new_identity: "sha256:bbbb".into(),
+            generation: 8,
+            diff: refresh_diff(),
+        },
+    );
+    let text = lines.join("\n");
+    assert!(text.contains("4 change(s), now generation 8"), "{text}");
+    assert!(text.contains("sha256:aaaa → sha256:bbbb"), "{text}");
+    assert!(
+        text.contains("task image components: added cargo, jq; removed node"),
+        "{text}"
+    );
+    assert!(text.contains("profile: default v1 → default v2"), "{text}");
+    assert!(!text.contains("tools"), "unchanged parts stay out: {text}");
+
+    let unchanged = refresh_outcome_lines(
+        "t-1",
+        &EnvironmentRefreshResult::Unchanged {
+            identity: "sha256:aaaa".into(),
+        },
+    );
+    assert_eq!(unchanged.len(), 1, "{unchanged:?}");
+    assert!(unchanged[0].contains("nothing changed"), "{unchanged:?}");
+}
+
+#[test]
+fn a_refresh_event_names_who_refreshed_and_the_change_count() {
+    let line = event_line(&resume_event(TaskEventKind::EnvironmentRefreshed {
+        requested_by: OwnerRef("alice".into()),
+        old_identity: format!("sha256:{}", "a".repeat(64)),
+        new_identity: format!("sha256:{}", "b".repeat(64)),
+        diff: refresh_diff(),
+    }));
+    assert!(
+        line.ends_with("environment refreshed by alice: 4 change(s), aaaaaaaaaaaa → bbbbbbbbbbbb"),
+        "{line}"
     );
 }
 
