@@ -146,7 +146,7 @@ Today the owner sees only parts of the state. `narsor-cli show --details` prints
 - KTD5. **The flattening function is in the client library.** It is in `src/client/state_rows.rs`, registered in `src/client_lib.rs`. It takes an `ExecutionState` and returns ordered rows (path, display value, line count). Both the TUI and the CLI use it (R9). A non-`available` section gives one row whose path is the section name and whose value is its message or reason in parentheses, for example `conductor: (no conductor state)`.
 - KTD6. **One fixture keeps the Rust and JS flattening equal.** `crates/narsor-web/ui-tests/fixtures/state-rows.json` holds input states and the expected rows, starting with AE1. A Rust test (via `include_str!`) and a `node --test` test both check it. Without it, nothing would catch the two copies drifting apart (success criterion "same rows").
 - KTD7. **TUI read model.** A new `DetailJob::State` runs through `Background`, like the *Info* tab's `Drift` read. `TaskApp::start_detail_reads` starts it only when *Stan* is the active tab and the tab needs a read: it was never read, the owner asked for a refresh, or the answer was `reader_starting` and `READER_RETRY` (2 s) has passed. The list refresh (`DetailState::invalidate_changed`) does not invalidate it (R10).
-- KTD8. **TUI refresh key `R`.** There is no manual refresh key in the TUI task view today, so R10's "refresh key of the other tabs" does not exist. The plan binds `R` in `Context::Details`, scoped to the *Stan* tab ("zakładka Stan: odczytaj stan ponownie"). `r` is `RetrySend`, and `R` is free in `Context::Details` (Q5).
+- KTD8. **TUI refresh key `Ctrl+R`.** There is no manual refresh key in the TUI task view today, so R10's "refresh key of the other tabs" does not exist. The owner chose `Ctrl+R` (answer to Q5). The plan binds `Ctrl+R` in `Context::Details`, scoped to the *Stan* tab ("zakładka Stan: odczytaj stan ponownie"). `r` is `RetrySend` and stays unchanged. Implementation must check that no other binding or terminal handling uses `Ctrl+R` in `Context::Details`.
 - KTD9. **Web read model.** The state view uses `useRead` (`crates/narsor-web/ui/js/ui/read.js`) keyed on the task id and a local refresh counter, not on the revision. `useRead` retries only a thrown error with code `conversation_reader_starting`, so the view's load function turns a `200 unavailable(reader_starting)` answer into that error. The existing 1500 ms retry then applies. Every other `unavailable` answer stays data, and the view shows its reason (R3). Only an "Odśwież" button increases the counter. The global key handler in `ui/js/ui/app.js` already maps `u`, `Enter` and `Space` to other actions, so the view binds no refresh key.
 - KTD11. **Loading and failure display, TUI and web.** Before the first answer, the tab shows a short "odczytuję stan…" line. A re-read keeps the old rows and the old read time, with a marker that a read is running. A `503` or connection error keeps the old rows and shows a retryable error note. When there are no old rows, the note is shown alone. The texts follow the existing error texts of the *Dyrygent* tab in each interface.
 - KTD10. **Reading the state is a details read.** `ProtocolService::execution_state` calls `note_details_read` like `execution_details`, so reading a stopped task extends its slot release deadline in the same way (D62).
@@ -194,7 +194,7 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 - A per-section size limit of 1 MiB (KTD4, Q2).
 - Arrays stay one row, as R7 says, including the arrays of objects in the conductor (`queue`, `unapplied_decisions`) (Q3). The array branch of the flattening is one place in each implementation, so a later change touches only that branch and the fixture.
 - Per-section read status (KTD3, Q4).
-- `R` is the refresh key of the *Stan* tab (KTD8, Q5).
+- `Ctrl+R` is the refresh key of the *Stan* tab (KTD8, Q5).
 - The *Stan* tab sits after *Dyrygent* and before *Info*, in the TUI and in the web (origin Z6).
 - The TUI and web `reader_starting` retries have no attempt limit, like the *Dyrygent* tab. The CLI waits up to `READER_WAIT` (30 s), like `show --details`.
 
@@ -376,7 +376,7 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 - `src/tui/task_app/tabs/state.rs` (new: rows, fold set by path, cursor, scroll, `apply`, `on_action`, `render`), `src/tui/task_app/tabs.rs`
 - `src/tui/task_app/detail.rs` (`TaskDetail` field, read start in `start_detail_reads`, `render_view`)
 - `src/tui/task_app/background.rs` (`DetailJob::State`)
-- `src/tui/keymap.rs` (`R` → refresh in `Context::Details`, help text)
+- `src/tui/keymap.rs` (`Ctrl+R` → refresh in `Context::Details`, help text)
 - Tests: `tests/integration/tui_state.rs`, `tests/integration/tui_render.rs`
 
 **Approach:**
@@ -394,7 +394,7 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 **Test scenarios:**
 - Covers AE2. A three-line `plan` shows `› context:variables:plan: <first line>`. `Enter` shows `⌄` and three lines. `Enter` again folds it.
 - Covers AE3. A `reader_starting` answer shows the starting message, and a new read starts after `READER_RETRY` without a key press. An `available` answer then shows rows and the read time.
-- Happy path: opening *Stan* starts one read. A list refresh with a changed revision does not start another. `R` starts one.
+- Happy path: opening *Stan* starts one read. A list refresh with a changed revision does not start another. `Ctrl+R` starts one.
 - Edge case: an unfolded value taller than the viewport scrolls line by line on `j` until its last line is in view, and the next `j` moves to the next row. `k` does the reverse.
 - Edge case: after a refresh, an unfolded row whose path still exists stays unfolded, and a removed path is forgotten.
 - Edge case: a one-line value whose row is wider than the tab is folded with `›` and clipped, and a short value has `·`.
@@ -402,7 +402,7 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 - Error path: a `503` on a re-read keeps the old rows and shows the retryable error note.
 - Edge case: `[` and `]` reach *Stan* between *Dyrygent* and *Info*.
 
-**Verification:** State and render tests pass, and the help lists `R` for the *Stan* tab.
+**Verification:** State and render tests pass, and the help lists `Ctrl+R` for the *Stan* tab.
 
 ### U7. Web state tab
 
@@ -446,7 +446,7 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 
 **Files:**
 - `docs/sources/narsor-owner-api-wire-reference.md` (T16 row and section, like T15)
-- `docs/user/tui.md` (*Stan* tab, `R`)
+- `docs/user/tui.md` (*Stan* tab, `Ctrl+R`)
 - `docs/user/web.md` (state view)
 - `docs/dev/components.md` (the new relayed read beside the others)
 
@@ -500,7 +500,7 @@ These questions do not block implementation. The plan builds the first option of
   1. (recommended) Each section has its own status (`available`, `absent`, `unreadable` with a reason). The whole read fails only when the execution record cannot load.
   2. Keep only the whole-read failure of R3.
 - Q5. **TUI refresh key** (Product Contract, R10; Planning Contract, KTD8). The origin R10 refers to "the refresh key of the other tabs", but the TUI task view has no manual refresh key. Its tabs refresh automatically.
-  1. (recommended) A new key `R` in the *Stan* tab only.
+  1. Decided by the owner: key `Ctrl+R` in the *Stan* tab only.
   2. Re-read the state when the task's revision changes. This is a background read, which R10 and Z7 exclude.
 
 ---
