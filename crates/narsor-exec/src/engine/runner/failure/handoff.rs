@@ -96,10 +96,10 @@ impl StepFailure {
 
     /// The session the step failed in, when the record names one.
     pub(crate) fn session(&self) -> Option<ResumableSession> {
-        Some(ResumableSession {
-            harness: self.harness.clone()?,
-            harness_session_id: self.harness_session_id.clone()?,
-        })
+        metadata::agent_session::session_of(
+            self.harness.clone(),
+            self.harness_session_id.clone(),
+        )
     }
 }
 

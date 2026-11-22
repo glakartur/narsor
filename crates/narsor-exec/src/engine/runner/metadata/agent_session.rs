@@ -25,6 +25,15 @@ impl From<ReportedSession> for ResumableSession {
     }
 }
 
+impl From<AgentSessionProvenance> for ResumableSession {
+    fn from(session: AgentSessionProvenance) -> Self {
+        Self {
+            harness: session.harness,
+            harness_session_id: session.session_id,
+        }
+    }
+}
+
 /// Whether `harness` can continue a session of its own. Every harness of
 /// this version can; a name it does not know is taken as one that cannot.
 fn resumes_sessions(harness: &str) -> bool {
@@ -150,10 +159,7 @@ pub fn resumable_agent_session(
         .ok()
         .flatten()
         .and_then(|mut sessions| sessions.remove(state_id))
-        .map(|session| ResumableSession {
-            harness: session.harness,
-            harness_session_id: session.session_id,
-        })
+        .map(ResumableSession::from)
     };
     in_flight
         .or_else(failed)
@@ -165,7 +171,7 @@ pub fn resumable_agent_session(
 
 /// A session from a record that names its harness and its id, when it
 /// names both.
-fn session_of(harness: Option<String>, id: Option<String>) -> Option<ResumableSession> {
+pub(crate) fn session_of(harness: Option<String>, id: Option<String>) -> Option<ResumableSession> {
     Some(ResumableSession {
         harness: harness?,
         harness_session_id: id?,

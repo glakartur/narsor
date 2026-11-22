@@ -280,10 +280,7 @@ impl Engine {
         let state_id = execution.current_state.clone().unwrap_or_default();
         let sessions: BTreeMap<String, AgentSessionProvenance> =
             read_engine_record(&execution, METADATA_AGENT_SESSIONS_KEY)?.unwrap_or_default();
-        let session = sessions.get(&state_id).map(|session| ResumableSession {
-            harness: session.harness.clone(),
-            harness_session_id: session.session_id.clone(),
-        });
+        let session = sessions.get(&state_id).cloned().map(ResumableSession::from);
         match leave_owner_message(
             &mut execution,
             &state_id,
