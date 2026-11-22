@@ -14,7 +14,7 @@ execution: code
 - **Objective:** On *Przebieg*, the operator sees one row per step by default, so more steps fit on the screen. When they need the agent details, they press `v` to show the full rows.
 - **Means:** One session-wide view flag in the TUI detail state, read by the axis layout, flipped by a new keymap action bound to `v` on the step list (KTD1, KTD2, KTD3).
 - **Product authority:** The request from the operator (2026-11-22). The Product Contract below wins on behaviour. Assumptions taken without the operator are listed in "Założenia do potwierdzenia" and under Planning Contract › Assumptions.
-- **Open blockers:** None. One non-blocking question for the operator is in "Pytania otwarte dla użytkownika"; the plan uses its recommended option until the operator answers.
+- **Open blockers:** None. Q1 (axis width) was answered by the operator on 2026-11-22: option 1.
 - **Execution profile:** One PR. TUI-only change in the `narsor` binary (`src/tui/`), plus user documentation.
 - **Stop conditions:** Stop and ask if the change needs a new config key, a persisted setting, a protocol change, or a change to the first-row columns. Those are out of scope.
 - **Who finishes:** The implementer (`ce-work` or a person) builds, tests and opens the PR. The operator answers the open question before merge if they want the other option.
@@ -23,7 +23,7 @@ execution: code
 
 ## Product Contract
 
-Product Contract preservation: Product Contract unchanged (R1–R8, AE1–AE3, A1–A5 kept as written). Added A6 as the working assumption for the 2026-11-22 review finding on axis width; Q1 keeps the choice open for the operator.
+Product Contract preservation: Product Contract unchanged (R1–R8, AE1–AE3, A1–A5 kept as written). Added A6 for the 2026-11-22 review finding on axis width; the operator confirmed it (Q1, option 1).
 
 ### Summary
 
@@ -72,7 +72,7 @@ Today each step with a model, effort or harness takes two rows on the axis. On a
 - A3. The view is kept in TUI memory for the session only (R7). It is not written to disk, and each new TUI start uses the one-line view (R3).
 - A4. One view applies to all tasks, not one view per task.
 - A5. The label in the key help is Polish and short, like the other TUI labels (`widok`, description for example "jedno- albo wieloliniowa lista kroków").
-- A6. In the one-line view, the axis width comes from the first-row columns only. The step content gets the space that the second row needed, so the split between the axis and the step content can move when the operator presses `v`. The selected step stays visible across that width change (R6). Reason: the one-line view exists to save space; a width kept for a hidden row saves nothing. See question Q1.
+- A6. In the one-line view, the axis width comes from the first-row columns only. The step content gets the space that the second row needed, so the split between the axis and the step content can move when the operator presses `v`. The selected step stays visible across that width change (R6). Reason: the one-line view exists to save space; a width kept for a hidden row saves nothing. Confirmed by the operator (Q1, option 1): the one-line view hides extra data to save screen space.
 
 ### Pytania otwarte dla użytkownika
 
@@ -80,7 +80,7 @@ Today each step with a model, effort or harness takes two rows on the axis. On a
   1. (Recommended) The axis becomes narrower in the one-line view; the step content gets the free columns. The split moves on `v`, and the step content wraps again to the new width.
   2. The axis keeps the multi-line width in both views; the split stays the same on `v`, and the one-line view has empty space on the right of the axis.
 
-  Not blocking: the plan implements option 1. Option 2 changes KTD4, the U1 width test scenario and the A6 manual check in the Verification Contract.
+  Answered by the operator on 2026-11-22: option 1. Option 2 would have changed KTD4, the U1 width test scenario and the A6 manual check in the Verification Contract.
 
 ### Outstanding Questions
 
@@ -199,4 +199,4 @@ U1 → U2 → U3. U2 needs the enum and the new `render` parameter from U1. U3 d
 - The keymap test that said `v` does nothing on the axis now asserts the new action, and no other test was weakened.
 - `docs/user/tui.md` matches the behaviour.
 - No dead code from abandoned approaches remains in the diff.
-- Q1 is answered by the operator, or the PR description says that option 1 is in place and what to change for option 2 (KTD4).
+- Q1 is answered by the operator (option 1); nothing more to do.
