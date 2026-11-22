@@ -62,8 +62,7 @@ impl ProtocolService {
     /// With no free slot the task goes back to the queue instead, at its
     /// own place, and starts when its turn comes: the work never starts an
     /// agent without a slot, and never moves the task past the tasks the
-    /// owner put in front of it. The resume's key derives from the work's own key, so a
-    /// retry of the work resumes the task once. A task that is not paused
+    /// owner put in front of it. A retry of the work resumes the task once. A task that is not paused
     /// (running, or already resumed or queued) needs nothing. Called for a
     /// retry too: a first call that stored the work and failed before the
     /// resume is repaired by it.

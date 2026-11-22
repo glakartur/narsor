@@ -2066,7 +2066,6 @@ fn key_of(fx: &Fixture, id: &str) -> u64 {
 
 #[test]
 fn a_move_into_a_gap_with_room_writes_only_the_moved_task() {
-    // Acceptance: a move between two keys with room changes one record.
     let fx = Fixture::new();
     create_spaced(&fx, &["p", "n", "x"]);
     let neighbours = ["p", "n"].map(|id| stored_json(&fx, id));
@@ -2116,7 +2115,6 @@ fn a_move_refused_at_its_commit_keeps_the_order_and_the_room_it_made() {
 
 #[test]
 fn an_archived_task_has_no_place_in_the_queue_and_cannot_anchor_a_move() {
-    // Acceptance: an archived task between two tasks is not a neighbour.
     let fx = Fixture::new();
     create_spaced(&fx, &["p", "z", "n", "x"]);
     let archived = fx.command("z", OwnerCommand::Archive, "archive-z");
@@ -2137,6 +2135,14 @@ fn an_archived_task_has_no_place_in_the_queue_and_cannot_anchor_a_move() {
         matches!(refused, OrchestrationError::InvalidMoveAnchor { reason, .. } if reason.contains("archived")),
         "{refused:?}"
     );
+
+    // A task created later takes a key above an archived task's, even when
+    // the clock has not moved.
+    let fx = Fixture::new();
+    fx.create("old");
+    fx.command("old", OwnerCommand::Archive, "archive-old");
+    fx.create("new");
+    assert!(key_of(&fx, "new") > key_of(&fx, "old"));
 }
 
 #[test]
@@ -2635,7 +2641,6 @@ fn release_the_slot_of_t1(fx: &Fixture, lease: &BackendLease) {
 
 #[test]
 fn an_answered_task_waits_at_its_own_place_and_starts_on_its_turn() {
-    // Acceptance: an answer to a task that waits for the owner, with no
     // free slot, sends it back to the queue without moving it.
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
@@ -2654,7 +2659,6 @@ fn an_answered_task_waits_at_its_own_place_and_starts_on_its_turn() {
 
 #[test]
 fn an_answered_task_stays_behind_the_tasks_the_owner_moved_in_front_of_it() {
-    // Acceptance: the owner's earlier move holds through the answer.
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
     paused_behind_a_running_task(&fx, &lease);
@@ -5744,7 +5748,6 @@ fn two_safe_points_decided_at_once_stop_one_task_for_an_overshoot_of_one() {
 
 #[test]
 fn a_task_stopped_by_a_lowered_limit_goes_back_to_the_queue_with_its_own_key() {
-    // Acceptance: the limit stop and the return to the queue keep the key.
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
     two_running_asked_to_stop(&fx, &lease);

@@ -25,10 +25,6 @@ pub use narsor_protocol::controller::{
 };
 
 /// Current schema version of [`TaskRecord`].
-///
-/// Version 2 replaced the owner `priority` with a dense queue rank. Version 3
-/// replaced the rank with the sparse [`TaskRecord::position_key`]. The store
-/// migrates an older record when it first reads it (see [`super::store`]).
 pub const TASK_RECORD_VERSION: u32 = 3;
 
 /// How much a read of a task's details adds to its slot-release wait at
@@ -287,12 +283,8 @@ pub struct TaskRecord {
     /// keep a key but are not part of the order.
     #[serde(default)]
     pub position_key: u64,
-    /// The dense rank a version 2 record carried, read only to give such a
-    /// record its key once and never written back.
     #[serde(default, rename = "rank", skip_serializing)]
     pub(crate) legacy_rank: Option<u32>,
-    /// The priority a version 1 record carried, read only to give such a
-    /// record its key once and never written back.
     #[serde(default, rename = "priority", skip_serializing)]
     pub(crate) legacy_priority: Option<i32>,
     /// When the task was created.

@@ -25,7 +25,7 @@ use super::model::{
     ResumeState, RunnerState, SlotReleaseClass, SlotReleaseReason, TaskAssignment, TaskEvent,
     TaskEventKind, TaskRecord, WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
 };
-use super::position::key_at;
+use super::position::{key_after, key_at};
 use super::resume::{
     auto_resume_key, count_loss, loss_from_history, owner_slot_release_key, slot_release_key,
     ResumePolicy,
@@ -157,16 +157,12 @@ impl ControlPlane {
             .unwrap_or(0)
             + 1;
         let now = self.clock.now();
-        // A new task joins the end of its backend's queue: its creation time
-        // is its key, unless a key of the backend (an archived task's too)
-        // is not below it. The schedule lock keeps a concurrent move from
-        // writing keys under it.
-        let position_key = tasks
+        let last_key = tasks
             .iter()
             .filter(|task| task.assignment.backend_id == request.backend_id)
             .map(|task| task.position_key)
-            .max()
-            .map_or(key_at(now), |last| key_at(now).max(last.saturating_add(1)));
+            .max();
+        let position_key = key_after(key_at(now), last_key);
         // An observer's task says so from its first event on (R19).
         let created = match &request.provenance {
             Some(provenance) => TaskEventKind::CreatedByObserver {

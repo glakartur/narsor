@@ -22,11 +22,7 @@
 //!
 //! A task's `position_key` orders it among the tasks of its backend, lowest
 //! first, and is only ever written under that backend's `schedule.lock`.
-//! Version 2 records carried a dense `rank` instead, and version 1 records a
-//! `priority`. The first read of an older record gives the whole backend
-//! keys in its old order (version 2 by rank; version 1 by priority, highest
-//! first; creation order among equal ones), under the same lock, and
-//! rewrites each record at version 3.
+//! An older record is migrated on first read, under that same lock.
 //! [`OrchestrationStore::lock_task`] and
 //! [`OrchestrationStore::lock_schedule`] migrate *before* they lock, so code
 //! that holds either lock never meets an older record and the migration
@@ -53,7 +49,7 @@ use super::model::{
     BackendLease, DefaultBackendSelection, TaskEvent, TaskRecord, BACKEND_LEASE_VERSION,
     DEFAULT_BACKEND_SELECTION_VERSION, TASK_RECORD_VERSION,
 };
-use super::position::key_at;
+use super::position::{key_after, key_at};
 use crate::domain::{BackendId, TaskId};
 use crate::persistence::atomic::{
     cleanup_orphaned_temp_files, read_json, subdirectories, write_json_atomic,
@@ -266,20 +262,7 @@ impl OrchestrationStore {
     }
 
     /// Gives position keys to a backend whose records are not all at the
-    /// current version, in the order its queue has now.
-    ///
-    /// Records that already have a key come first, in theirs, and keep it.
-    /// Version 2 records follow by their rank, then version 1 records in the
-    /// order they used to be admitted in (priority, highest first), creation
-    /// order among equal ones. Along that order each record gets its creation
-    /// time as its key when that is greater than the key before it, else the
-    /// key before it + 1, so the order stays as the owner set it.
-    ///
-    /// A backend holds records at the current version and older ones only
-    /// when an earlier migration was interrupted, and what it had written
-    /// then is exactly the front of the order it was writing, so resuming
-    /// continues it. Idempotent: once every record is at the current version
-    /// a second call writes nothing.
+    /// current version, in the order its queue has now. Idempotent.
     fn migrate_backend(&self, backend_id: &BackendId) -> Result<()> {
         let _schedule =
             FileLock::acquire(self.paths.backend_schedule_lock_file(backend_id.as_str()))?;
@@ -293,8 +276,6 @@ impl OrchestrationStore {
             .partition(|record| record.record_version < TASK_RECORD_VERSION);
         legacy.sort_by_key(|record| {
             (
-                // Version 2 records lead: next to version 1 records they are
-                // the front an interrupted migration from version 1 wrote.
                 record.record_version < 2,
                 record.legacy_rank.unwrap_or(0),
                 std::cmp::Reverse(record.legacy_priority.unwrap_or(0)),
@@ -309,10 +290,7 @@ impl OrchestrationStore {
                 continue;
             }
             let created = key_at(record.created_at);
-            let key = match previous {
-                Some(previous) if created <= previous => previous.saturating_add(1),
-                _ => created,
-            };
+            let key = key_after(created, previous);
             previous = Some(key);
             let _task = FileLock::acquire(
                 self.paths

@@ -363,14 +363,9 @@ impl ControlPlane {
 
     /// Moves a queued task within its backend's queue.
     ///
-    /// The queue is the backend's tasks that are not archived, in key order.
-    /// The moved task gets a key between those of its new neighbours. When
-    /// no integer is free there, a few neighbours get new keys first, each
-    /// one inside the gap to its own outer neighbour, so their order never
-    /// changes (see [`position::plan_move`]). All under the backend's
-    /// schedule lock, so a concurrent admission, creation or move sees
-    /// either the old order or the new one. Admitted and finished tasks keep
-    /// their place in the list.
+    /// The moved task gets a key between those of its new neighbours; when
+    /// no integer is free there, a few neighbours get new keys first (see
+    /// [`position::plan_move`]).
     ///
     /// Only a `Queued` task can be moved — admission order never touches a
     /// task that holds compute. An archived anchor is refused: it has no
@@ -418,7 +413,7 @@ impl ControlPlane {
         let slot = after
             .iter()
             .position(|id| *id == task_id)
-            .unwrap_or_default();
+            .expect("the moved task is in the new order");
         let keys: Vec<(TaskId, u64)> = tasks
             .iter()
             .map(|task| (task.task_id.clone(), task.position_key))
@@ -434,7 +429,7 @@ impl ControlPlane {
         })?;
         let (_, key) = writes
             .pop()
-            .unwrap_or((task_id.clone(), moved.position_key));
+            .expect("a plan ends with the moved task's write");
         let rank = u32::try_from(slot + 1).unwrap_or(u32::MAX);
         // The event goes to the mover's own stream, so it names only the
         // mover's tasks: the ids of another owner's tasks on a shared
@@ -514,6 +509,9 @@ impl ControlPlane {
     /// The 1-based position of `record` in its backend's queue, 0 for an
     /// archived task, which has none (see [`queue_positions`]).
     pub fn queue_position(&self, record: &TaskRecord) -> Result<u32> {
+        if !in_queue(record) {
+            return Ok(0);
+        }
         let tasks = self.backend_tasks(&record.assignment.backend_id)?;
         Ok(queue_positions(&tasks)
             .get(&record.task_id)
@@ -606,16 +604,11 @@ pub fn queue_positions(tasks: &[TaskRecord]) -> HashMap<TaskId, u32> {
             .then_with(|| queue_order(left, right))
     });
     let mut positions = HashMap::with_capacity(queued.len());
-    let mut position = 0u32;
-    for (index, task) in queued.iter().enumerate() {
-        let same_backend =
-            index > 0 && queued[index - 1].assignment.backend_id == task.assignment.backend_id;
-        position = if same_backend {
-            position.saturating_add(1)
-        } else {
-            1
-        };
-        positions.insert(task.task_id.clone(), position);
+    let mut counts: HashMap<&BackendId, u32> = HashMap::new();
+    for task in queued {
+        let count = counts.entry(&task.assignment.backend_id).or_insert(0);
+        *count = count.saturating_add(1);
+        positions.insert(task.task_id.clone(), *count);
     }
     positions
 }

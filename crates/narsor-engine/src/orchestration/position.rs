@@ -1,19 +1,18 @@
-//! Position keys: the sparse integers that order a backend's queue.
-//!
-//! A task's key is written only when the task is created, when the owner
-//! moves it, and when a move needs room and shifts a few neighbours. Every
-//! other transition leaves it alone, so a task keeps its place.
-//!
-//! [`plan_move`] decides a whole move before anything is written: the keys
-//! the neighbours get, in the order to write them, and the moved task's key
-//! last. It is pure, so a move that finds no room writes nothing.
-
 use chrono::{DateTime, Utc};
 
 /// The key of a task created at `time`: microseconds since the Unix epoch,
 /// 0 for a time before it.
 pub(crate) fn key_at(time: DateTime<Utc>) -> u64 {
     u64::try_from(time.timestamp_micros()).unwrap_or(0)
+}
+
+/// The key of a task created at `created`, strictly above `previous` when
+/// there is one: `created`, else `previous` + 1.
+pub(crate) fn key_after(created: u64, previous: Option<u64>) -> u64 {
+    match previous {
+        Some(previous) if created <= previous => previous.saturating_add(1),
+        _ => created,
+    }
 }
 
 /// The virtual key after the last task: `now` if it is greater than the
@@ -75,12 +74,15 @@ pub(crate) fn plan_move<Id: Clone + PartialEq>(
         between(low, high)
     };
 
+    let finish = |mut writes: Vec<(Id, u64)>, key: u64| {
+        writes.push((moved.clone(), key));
+        Ok(writes)
+    };
     let mut writes = Vec::new();
     let mut round = 1;
     loop {
         if let Some(key) = gap(&keys) {
-            writes.push((moved.clone(), key));
-            return Ok(writes);
+            return finish(writes, key);
         }
         if round > before_gap && round > after_gap {
             return Err(NoSpace);
@@ -95,8 +97,7 @@ pub(crate) fn plan_move<Id: Clone + PartialEq>(
                 writes.push((order[index].0.clone(), key));
             }
             if let Some(key) = gap(&keys) {
-                writes.push((moved.clone(), key));
-                return Ok(writes);
+                return finish(writes, key);
             }
         }
         for distance in (1..=round.min(after_gap)).rev() {
@@ -111,8 +112,7 @@ pub(crate) fn plan_move<Id: Clone + PartialEq>(
                 writes.push((order[index].0.clone(), key));
             }
             if let Some(key) = gap(&keys) {
-                writes.push((moved.clone(), key));
-                return Ok(writes);
+                return finish(writes, key);
             }
         }
         round += 1;
