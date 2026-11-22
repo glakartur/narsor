@@ -298,7 +298,7 @@ impl LocalBackend {
         // Everything the Docker mode can refuse is refused before anything
         // of the task is created; there is no fallback to a host process.
         let container = match &self.config.container_mode {
-            Some(mode) => Some((mode, self.containers.preflight(mode, &spec)?)),
+            Some(mode) => Some((mode, self.containers.preflight(mode, &task.task_id, &spec)?)),
             None => None,
         };
         if created_storage {

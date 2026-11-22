@@ -52,7 +52,9 @@ use narsor_controller_runtime::backend::{
     WorkloadState,
 };
 use narsor_controller_runtime::LaunchSpecs;
-use narsor_model::domain::{SecretDelivery, TaskImage, TaskLaunchSpec, TaskRepositorySource};
+use narsor_model::domain::{
+    SecretDelivery, TaskId, TaskImage, TaskLaunchSpec, TaskRepositorySource,
+};
 
 use super::backend::LocalBackendConfig;
 use super::workload::{
@@ -231,14 +233,16 @@ impl ContainerRunners {
     pub(super) fn preflight(
         &self,
         mode: &ContainerMode,
+        task: &TaskId,
         spec: &TaskLaunchSpec,
     ) -> BackendResult<TaskImage> {
         let image = spec.environment.task_image.clone().ok_or_else(|| {
-            BackendError::rejected(
+            BackendError::rejected(format!(
                 "the docker work mode needs a task image, and this task has none: define \
-                 `task_image` in runtime.yaml (a task created before that has none sealed and \
-                 must be created again), or set controller.local.mode to 'process'",
-            )
+                 `task_image` in runtime.yaml, then run `narsor-cli task refresh-env {task}` \
+                 (a task created before that has none sealed), or set controller.local.mode \
+                 to 'process'"
+            ))
         })?;
         if !spec.environment.step_images.is_empty() {
             let steps: Vec<String> = spec

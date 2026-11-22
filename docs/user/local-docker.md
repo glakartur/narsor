@@ -114,7 +114,8 @@ task_image:
   image layer per component. A bare string is a path relative to the
   catalogue directory (it must stay inside it); `{ inline: "…" }` is the
   script text itself. The scripts are read when a task is created and sealed
-  into the task, so a later edit affects only new tasks.
+  into the task, so a later edit affects only new tasks and tasks whose
+  environment you refresh (see "Refresh the environment of a task").
 - **`version`** (optional) — a script that prints the version to install. It
   runs **on the host**, not in the image, with only `PATH`, `HOME` and
   `LANG`, for at most 60 s; its output (up to 1 KiB) becomes the build
@@ -176,7 +177,9 @@ The next task start then checks every definition again.
 
 A **resumed** task runs on the image it last ran on, as long as that image
 exists and was built from the same definition, so a resume never changes the
-tools under a running piece of work. A new task gets the current image.
+tools under a running piece of work. A new task gets the current image. Only
+a refresh of the task's environment gives it a new definition (see "Refresh
+the environment of a task").
 
 A build that fails is reported in the controller log (in the daemon log,
 prefix `narsor-controller:`). When the cause can pass on its own (the Docker
@@ -190,6 +193,65 @@ Every `docker` call has a deadline: 15 minutes for a pull or a build, 30 s for
 the other calls. A call that does not end in time is stopped and counts as a
 daemon that does not answer, so the controller tries again later. A daemon
 that does not answer when a task starts delays the task; it does not fail it.
+
+### Refresh the environment of a task
+
+A task keeps the environment it was created with. A task created before
+`task_image` was in `runtime.yaml` has no task image, and the Docker mode
+refuses it:
+
+```text
+the docker work mode needs a task image, and this task has none: define
+`task_image` in runtime.yaml, then run `narsor-cli task refresh-env <task>` …
+```
+
+To fix it, define `task_image`, stop the task if it runs, and refresh its
+environment:
+
+```console
+$ narsor-cli task pause <task>          # only when the task runs
+$ narsor-cli task refresh-env <task>
+$ narsor-cli task resume <task>
+```
+
+The TUI and the web offer the same action as *Odśwież środowisko*. Use it
+also when you add a component or a secret to `runtime.yaml` and want an
+existing task to get it.
+
+**What a refresh changes.** The control plane resolves the environment of
+the task from the current catalogue again, with the rules of task creation:
+the task image (its components and their scripts), the images, the runtime
+bundle, the tools, the profile (by the id the task has) and the secret
+names. It stores the result in the task's launch spec under a new
+generation and records an event with the old and new environment identity
+and the difference. The next start uses the new environment: the task image
+has a new definition, so the controller builds or reuses the image of that
+definition, not the image the task ran on before. When the catalogue
+resolves to the same environment, the refresh reports that nothing changed
+and records nothing.
+
+**What a refresh keeps.** The workflow and its version, the inputs, the
+workspace (repositories, branch, commit, git credentials), the resources,
+the title and the ticket do not change. The execution continues on the same
+task storage from where it stopped.
+
+**When a refresh is refused.**
+
+- The task has a live workload (it runs, starts, is pausing, or the
+  controller does not know yet if it still runs): pause it first and wait
+  until it stops.
+- The task is finished or archived.
+- The catalogue does not resolve (for example, an invalid `runtime.yaml` or
+  a profile that no longer exists): the refusal gives the reason, and the
+  task keeps its old environment.
+
+The refresh does not check the token store. When the new environment needs
+a secret that is not in the store, the next start of the task is refused
+with the `narsor-cli secret set <name>` command to run (see "Tokens").
+
+`narsor-cli task show` and the *Info* tab of the TUI and the web mark a task
+whose environment differs from what the catalogue resolves to now, or show a
+catalogue problem.
 
 ## Tokens
 

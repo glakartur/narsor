@@ -194,7 +194,11 @@ accepted for a loopback host only).
 
 Everything below lives under the catalogue directory (`server.catalog`) of the
 control plane and is read when a task is **created**: the result is sealed
-into the task's immutable launch spec and never re-read for that task.
+into the task's launch spec. It is read again for that task only when the
+owner refreshes the task's environment (`narsor-cli task refresh-env
+<task>`), which seals the environment again under a new generation and
+keeps the workflow, inputs and workspace (see
+[Updates](updates.md#update-to-the-environment-refresh)).
 
 | What | File |
 | --- | --- |
@@ -293,7 +297,8 @@ local Docker mode is different: it lets `docker` pull a tag of
 
 A workflow's `globals.image` overrides the repository image. Digests are
 recorded in the task's `ResolvedEnvironment`; a later change of any
-component affects only tasks created afterwards. Two tasks with the same
+component affects only tasks created afterwards and tasks whose environment
+the owner refreshes. Two tasks with the same
 images, bundle, tools, profile and harness have the same
 `environment_identity`. The harness recorded there is the task's fallback, not
 a pin: a running task follows the installation's default harness (see
