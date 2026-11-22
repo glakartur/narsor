@@ -1,5 +1,5 @@
-//! Conversation, execution-event and execution-details reads relayed
-//! through a runner.
+//! Conversation, execution-event, execution-details and execution-state
+//! reads relayed through a runner.
 
 use std::collections::HashMap;
 
@@ -71,6 +71,60 @@ pub enum ExecutionDetailsResponse {
     /// Not readable right now.
     Unavailable {
         /// Why the details cannot be read.
+        reason: ConversationUnavailableReason,
+        /// Human-readable explanation.
+        message: String,
+    },
+}
+
+/// A runner's request for the complete state of its execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionStateRequest {
+    pub request_id: String,
+}
+
+/// Every value the workflow of one execution sees now: the execution
+/// context, the local values of each step and the conductor's state.
+///
+/// Each section is read and reported on its own, so a part that cannot be
+/// read never looks empty.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionState {
+    /// The execution context as stored, every section of it.
+    pub context: StateSection,
+    /// The local values of each step: `state_id -> { NAME: value }`.
+    pub locals: StateSection,
+    /// The conductor's state, with its generated title when it has one.
+    pub conductor: StateSection,
+}
+
+/// One section of an [`ExecutionState`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum StateSection {
+    /// The section, as raw JSON.
+    Available { value: Value },
+    /// The execution has nothing for this section.
+    Absent { message: String },
+    /// The section could not be read.
+    Unreadable { reason: String },
+}
+
+/// Result of the owner task's execution-state request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ExecutionStateResponse {
+    /// The state, read from the task's storage.
+    Available {
+        state: Box<ExecutionState>,
+        /// Where it was read from.
+        source: ExecutionEventsSource,
+        /// When the control plane received it.
+        read_at: DateTime<Utc>,
+    },
+    /// Not readable right now.
+    Unavailable {
+        /// Why the state cannot be read.
         reason: ConversationUnavailableReason,
         /// Human-readable explanation.
         message: String,

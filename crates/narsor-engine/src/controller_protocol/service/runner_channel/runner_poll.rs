@@ -218,6 +218,7 @@ impl ProtocolService {
                 execution_events: self.lock_event_reads().requests_of(&identity.task_id),
                 conductor_reads: self.lock_conductor_reads().requests_of(&identity.task_id),
                 execution_details: self.lock_detail_reads().requests_of(&identity.task_id),
+                execution_states: Vec::new(),
                 materials,
                 default_harness: self.default_harness_of(&record),
             })

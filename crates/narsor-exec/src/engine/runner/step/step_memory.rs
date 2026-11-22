@@ -218,6 +218,14 @@ pub(crate) fn step_locals(
     Ok(locals.remove(state_id).unwrap_or_default())
 }
 
+/// The local values of every step, keyed by step id, then by the declared
+/// name.
+pub(crate) fn all_step_locals(
+    execution: &WorkflowExecution,
+) -> Result<BTreeMap<StateId, Map<String, Value>>, EngineError> {
+    read_locals(execution)
+}
+
 /// The label each step last chose, by step id: what `steps.ID.label` reads.
 pub(crate) fn last_choice_labels(
     execution: &WorkflowExecution,

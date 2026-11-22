@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::api::HumanInputDeliveryDto;
 use crate::controller::{
     ConductorReadRequest, ConversationPageRequest, ExecutionDetailsRequest, ExecutionEventsRequest,
-    InputView, OperatorCommand, OperatorCommandView, RunnerLaunchView, RunnerState,
+    ExecutionStateRequest, InputView, OperatorCommand, OperatorCommandView, RunnerLaunchView,
+    RunnerState,
 };
 
 /// Directive returned to a runner.
@@ -101,6 +102,8 @@ pub struct RunnerPollResponse {
     pub conductor_reads: Vec<ConductorReadRequest>,
     #[serde(default)]
     pub execution_details: Vec<ExecutionDetailsRequest>,
+    #[serde(default)]
+    pub execution_states: Vec<ExecutionStateRequest>,
     #[serde(default)]
     pub materials: Vec<crate::api::MaterialAnnouncement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

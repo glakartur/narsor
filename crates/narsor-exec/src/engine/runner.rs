@@ -160,6 +160,7 @@ pub use metadata::pending_step::PendingStep;
 pub use output::rejection::{owed_reprompt, OutputRejection};
 pub use output::rescue_record::{owed_output_rescue, OutputRescue};
 pub use step::action_kind::ActionKind;
+pub(crate) use step::step_memory::all_step_locals;
 pub use step::step_memory::{
     StepAttempt, StepAttempts, METADATA_STEP_ATTEMPTS_KEY, METADATA_STEP_LOCALS_KEY,
 };
