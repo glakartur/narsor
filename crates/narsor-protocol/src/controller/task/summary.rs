@@ -120,7 +120,54 @@ pub struct TaskSummary {
     /// client then shows the runner status unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_automation: Option<TaskGateAutomationView>,
+    /// Whether the task's stored environment still matches the current
+    /// catalogue (R10, R11). Worked out only for a single task fetched with
+    /// [`TaskQuery::drift`], because it reads the catalogue: `None` in lists,
+    /// in the summaries of action responses, and from a server before the
+    /// field — a client then shows no marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_drift: Option<EnvironmentDrift>,
     pub as_of: DateTime<Utc>,
+}
+
+/// `GET /control/v1/tasks/:task_id` query.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskQuery {
+    /// `true`: also compare the task's stored environment with the current
+    /// catalogue ([`TaskSummary::environment_drift`]). It reads the
+    /// catalogue, so pollers leave it out.
+    #[serde(default)]
+    pub drift: bool,
+}
+
+/// How a task's stored environment stands against the current catalogue.
+///
+/// A client that meets a status it does not know reads `Unrecognized` and
+/// shows no marker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum EnvironmentDrift {
+    /// The catalogue resolves to the stored environment.
+    Current,
+    /// The catalogue resolves to another environment: the owner can take it
+    /// with the environment refresh ([`super::TaskActionId::RefreshEnvironment`]).
+    Differs {
+        /// The identity the catalogue resolves to now.
+        catalogue_identity: String,
+    },
+    /// The catalogue does not resolve for this task, so drift is not known;
+    /// this is a catalogue problem, not drift.
+    CatalogueProblem {
+        /// Stable reason code, like the refusal of a refresh.
+        code: String,
+        /// Why, in words for the owner or operator.
+        reason: String,
+    },
+    /// The task has ended (finished or archived): its environment is never
+    /// used again.
+    NotApplicable,
+    #[serde(other)]
+    Unrecognized,
 }
 
 /// The observer queue entry of a task's current wait episode, as the task

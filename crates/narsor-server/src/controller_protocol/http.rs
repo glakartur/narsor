@@ -434,9 +434,17 @@ async fn get_task(
     State(service): State<Service>,
     Extension(owner): Extension<OwnerRef>,
     Path(task_id): Path<String>,
+    Query(query): Query<TaskQuery>,
 ) -> ProtocolResult<Json<TaskSummary>> {
     Ok(Json(
-        blocking(&service, move |s| s.task(&owner, &task_id)).await?,
+        blocking(&service, move |s| {
+            if query.drift {
+                s.task_with_drift(&owner, &task_id)
+            } else {
+                s.task(&owner, &task_id)
+            }
+        })
+        .await?,
     ))
 }
 

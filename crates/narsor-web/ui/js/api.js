@@ -168,6 +168,8 @@ export class Api {
   // Tasks
   tasks(archived = false) { return this.get('/control/v1/tasks', { archived }); }
   task(taskId) { return this.get(`/control/v1/tasks/${path(taskId)}`); }
+  /** The task with its environment compared with the catalogue: costs the server a catalogue read. */
+  taskWithDrift(taskId, signal) { return this.get(`/control/v1/tasks/${path(taskId)}`, { drift: true }, { signal }); }
   createTask(request) { return this.post('/control/v1/tasks', request); }
   command(taskId, command, expectedGeneration, key = idempotencyKey()) {
     return this.post(`/control/v1/tasks/${path(taskId)}/commands`, {

@@ -99,6 +99,13 @@ test('streamEvents throws when the stream cannot open', async () => {
     (error) => error.code === 'invalid_cursor' && error.kind === 'request');
 });
 
+test('taskWithDrift asks the single-task route for the catalogue comparison', async () => {
+  const seen = [];
+  const api = new Api('http://h/', 't', fakeFetch(200, '{"task_id":"task-1"}', seen));
+  await api.taskWithDrift('task-1');
+  assert.equal(seen[0].url, 'http://h/control/v1/tasks/task-1?drift=true');
+});
+
 test('refreshEnvironment posts the generation the owner saw to the refresh route', async () => {
   const seen = [];
   const api = new Api('http://h/', 't', fakeFetch(200, '{"outcome":{"type":"unchanged","identity":"e"}}', seen));

@@ -971,3 +971,48 @@ fn an_archived_task_without_a_timeline_says_its_storage_was_deleted() {
         .iter()
         .any(|line| line.contains("not reported yet") && line.starts_with("Timeline")));
 }
+
+#[test]
+fn show_names_the_refresh_when_the_environment_differs_and_a_catalogue_problem_is_not_drift() {
+    use narsor_protocol::controller::EnvironmentDrift;
+    let shown = |runner_state: &str, drift: EnvironmentDrift| {
+        let mut subject = task("t-1", "local", runner_state, 1);
+        subject.environment_drift = Some(drift);
+        detail_lines(&subject, None, None)
+            .into_iter()
+            .find(|line| line.text.starts_with("Environment"))
+    };
+    let differs = || EnvironmentDrift::Differs {
+        catalogue_identity: "env-2".to_string(),
+    };
+
+    let stopped = shown("stopped", differs()).expect("a drift line");
+    assert_eq!(
+        stopped.text,
+        "Environment differs from the catalogue — run `narsor-cli task refresh-env t-1`"
+    );
+    assert_eq!(stopped.tone, Tone::Warning);
+    let running = shown("running", differs()).expect("a drift line");
+    assert!(
+        running.text.ends_with("once the task is paused"),
+        "{running:?}"
+    );
+
+    let problem = shown(
+        "stopped",
+        EnvironmentDrift::CatalogueProblem {
+            code: "invalid_runtime".to_string(),
+            reason: "runtime.yaml: task_image is broken".to_string(),
+        },
+    )
+    .expect("a catalogue problem line");
+    assert!(
+        problem.text.contains("runtime.yaml: task_image is broken"),
+        "{problem:?}"
+    );
+    assert!(!problem.text.contains("refresh-env"), "{problem:?}");
+
+    for quiet in [EnvironmentDrift::Current, EnvironmentDrift::NotApplicable] {
+        assert_eq!(shown("stopped", quiet.clone()), None, "{quiet:?}");
+    }
+}

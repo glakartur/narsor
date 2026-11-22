@@ -24,10 +24,10 @@ use crate::tui::task_app::list::{attention_of, Attention};
 use narsor_protocol::api::{Position, PositionStatus};
 use narsor_protocol::controller::PendingInputRefView;
 use narsor_protocol::controller::{
-    AttentionItem, AttentionKind, ConversationAttemptSummary, EnvironmentDiff,
+    AttentionItem, AttentionKind, ConversationAttemptSummary, EnvironmentDiff, EnvironmentDrift,
     EnvironmentRefreshResult, GateAutomationPhase, GateHookView, InputStatus, NamedChanges,
-    OperatorCommand, OwnerCommand, QueueReason, RunnerState, SlotReleaseReason, TaskEvent,
-    TaskEventKind, TaskState,
+    OperatorCommand, OwnerCommand, QueueReason, RunnerState, SlotReleaseReason, TaskActionId,
+    TaskEvent, TaskEventKind, TaskState,
 };
 use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, WorkspaceHeader};
 
@@ -528,6 +528,38 @@ pub fn state_hint(task: &TaskSummary) -> Option<ToneLine> {
     Some(hint)
 }
 
+/// Whether the task's stored environment differs from the catalogue, or the
+/// catalogue cannot say (R10, R11). `None` when it matches, when the task has
+/// ended, and when the summary did not carry the comparison.
+pub fn environment_drift_line(task: &TaskSummary) -> Option<ToneLine> {
+    match task.environment_drift.as_ref()? {
+        EnvironmentDrift::Differs { .. } => {
+            let mut text = format!(
+                "Environment differs from the catalogue — run `narsor-cli task refresh-env {}`",
+                task.task_id
+            );
+            let offered = task
+                .actions
+                .iter()
+                .flatten()
+                .any(|offer| offer.id == TaskActionId::RefreshEnvironment);
+            if !offered {
+                text.push_str(" once the task is paused");
+            }
+            Some(ToneLine::new(text, Tone::Warning))
+        }
+        EnvironmentDrift::CatalogueProblem { reason, .. } => Some(ToneLine::new(
+            format!(
+                "Environment cannot be compared with the catalogue: {}",
+                without_unsafe_chars(reason)
+            ),
+            Tone::Warning,
+        )),
+        EnvironmentDrift::Current | EnvironmentDrift::NotApplicable => None,
+        EnvironmentDrift::Unrecognized => None,
+    }
+}
+
 /// What the gate's entry or exit scripts mean for the owner, while they
 /// hold the gate of a task that still waits there (running, or waiting
 /// for an answer, not interrupted): an entry script failed for good, or an
@@ -705,6 +737,9 @@ pub fn detail_lines(
     lines.splice(1..1, header_lines(task));
     if let Some(hint) = state_hint(task) {
         lines.push(hint);
+    }
+    if let Some(drift) = environment_drift_line(task) {
+        lines.push(drift);
     }
     lines.extend(attention_lines(task));
     lines.extend(gate_lines(task));

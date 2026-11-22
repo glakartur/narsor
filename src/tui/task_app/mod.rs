@@ -300,8 +300,14 @@ impl DetailState {
         self.tab
     }
 
-    /// Shows `tab`.
+    /// Shows `tab`. Opening *Info* compares every task's environment with
+    /// the catalogue afresh: the catalogue moves without the task knowing.
     pub fn set_tab(&mut self, tab: DetailTab) {
+        if tab == DetailTab::Info && self.tab != DetailTab::Info {
+            for view in self.views.values_mut() {
+                view.info_mut().invalidate_drift();
+            }
+        }
         self.tab = tab;
     }
 
@@ -1002,7 +1008,8 @@ impl TaskApp {
 
     /// `[` / `]`: the tab `by` places along, on its timeline.
     fn shift_tab(&mut self, by: isize) {
-        self.detail.tab = self.detail.tab.shifted(by);
+        let tab = self.detail.tab.shifted(by);
+        self.detail.set_tab(tab);
         self.back_to_axis();
     }
 

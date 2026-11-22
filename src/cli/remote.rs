@@ -1087,7 +1087,7 @@ pub async fn task(
         }
         TaskCommand::Show { task_id, json } => {
             let task = client
-                .control_task(&task_id)
+                .control_task_with_drift(&task_id)
                 .await
                 .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
             if json {

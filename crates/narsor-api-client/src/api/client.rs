@@ -474,6 +474,14 @@ impl ApiClient {
         self.get_json(&url).await
     }
 
+    /// One remote task's summary with how its stored environment stands
+    /// against the current catalogue. It makes the server read the
+    /// catalogue, so pollers use [`Self::control_task`].
+    pub async fn control_task_with_drift(&self, task_id: &str) -> Result<TaskSummary, ClientError> {
+        let url = format!("{}/control/v1/tasks/{task_id}?drift=true", self.base_url);
+        self.get_json(&url).await
+    }
+
     /// An owner command (pause, resume, start, archive) on a remote task.
     pub async fn control_command(
         &self,

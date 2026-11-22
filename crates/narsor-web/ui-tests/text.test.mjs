@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { harnessShort, harnessText, usageGroups } from '../ui/js/text.js';
+import { driftRow, harnessShort, harnessText, usageGroups } from '../ui/js/text.js';
 
 test('usage groups follow the TUI format and colour by status', () => {
   const now = '2026-11-13T10:00:00Z';
@@ -130,4 +130,18 @@ test('a conversation keeps its bottom line when its height changes', () => {
   assert.equal(bottomAnchoredScrollTop({ scrollTop: 10, scrollHeight: 3000, oldHeight: 500, newHeight: 600 }), 0);
   assert.equal(bottomAnchoredScrollTop({ scrollTop: 2400, scrollHeight: 3000, oldHeight: 600, newHeight: 300 }), 2700);
   assert.equal(bottomAnchoredScrollTop({ scrollTop: 0, scrollHeight: 200, oldHeight: 600, newHeight: 300 }), 0);
+});
+
+test('the catalogue row names the refresh, a catalogue problem or a failed check, and nothing otherwise', () => {
+  const read = (environment_drift, extra = {}) => ({ data: { environment_drift }, error: null, loading: false, ...extra });
+  assert.deepEqual(driftRow(read({ status: 'differs', catalogue_identity: 'e2' })),
+    { text: 'różni się od katalogu — użyj akcji „Odśwież środowisko”', role: 'attention' });
+  assert.deepEqual(driftRow(read({ status: 'catalogue_problem', code: 'invalid_runtime', reason: 'runtime.yaml is broken' })),
+    { text: 'katalogu nie da się odczytać: runtime.yaml is broken', role: 'attention' });
+  assert.deepEqual(driftRow({ data: null, error: 'brak połączenia z serwerem', loading: false }),
+    { text: 'nie udało się sprawdzić zgodności z katalogiem', role: 'done' });
+  for (const quiet of [
+    read({ status: 'current' }), read({ status: 'not_applicable' }), read({ status: 'from_the_future' }), read(undefined),
+    read({ status: 'differs' }, { loading: true }),
+  ]) assert.equal(driftRow(quiet), null, JSON.stringify(quiet));
 });

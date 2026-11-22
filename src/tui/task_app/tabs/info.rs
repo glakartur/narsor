@@ -1,10 +1,13 @@
 //! *Info*: what the control plane knows about the task — what it was sealed
 //! with, the workflow, the workspace, the runner, the controller.
 //!
-//! Everything is read from the task summary the list already holds, so the tab
-//! never waits for a read and has nothing that can fail. Ages are counted from
-//! the moment the summary was made (`as_of`), not from the clock of this
-//! terminal.
+//! Everything but one row is read from the task summary the list already
+//! holds, so the tab never waits for it. The one row is whether the task's
+//! environment still matches the catalogue: the tab reads the task once more
+//! with that comparison when it opens and again when the task's generation
+//! moves (an environment refresh is a new generation). While the read runs
+//! the row is absent; a failed read says so. Ages are counted from the moment
+//! the summary was made (`as_of`), not from the clock of this terminal.
 
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
@@ -15,22 +18,44 @@ use ratatui::Frame;
 use crate::controller_protocol::{Freshness, TaskSummary};
 use crate::tui::keymap::Action;
 use crate::tui::style::{Role, Styles};
-use narsor_protocol::controller::{QueueReason, TaskState};
+use narsor_protocol::controller::{EnvironmentDrift, QueueReason, TaskState};
 
 use super::super::super::scroll::one_line;
 use super::super::detail::short_age;
 use crate::cli::task_text::{task_state_name, without_slot};
 
-/// What the tab remembers per task: how far it is scrolled.
+/// What the tab remembers per task: how far it is scrolled and what the
+/// last comparison with the catalogue said.
 #[derive(Debug, Clone)]
 pub struct Info {
     top: usize,
     height: usize,
+    drift: Option<DriftRead>,
+}
+
+/// The answer of one comparison of the task's environment with the catalogue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriftOutcome {
+    /// What the server said; `None` from a server that does not compare.
+    Known(Option<EnvironmentDrift>),
+    /// The read failed: nobody knows.
+    Unknown,
+}
+
+/// A comparison and the generation of the task it was made for.
+#[derive(Debug, Clone)]
+struct DriftRead {
+    generation: u64,
+    outcome: DriftOutcome,
 }
 
 impl Default for Info {
     fn default() -> Self {
-        Self { top: 0, height: 10 }
+        Self {
+            top: 0,
+            height: 10,
+            drift: None,
+        }
     }
 }
 
@@ -38,6 +63,36 @@ impl Info {
     /// The first line shown.
     pub fn top(&self) -> usize {
         self.top
+    }
+
+    /// Whether the comparison with the catalogue is due for a task at
+    /// `generation`: never made, forgotten, or made for another generation.
+    pub fn needs_drift_read(&self, generation: u64) -> bool {
+        self.drift
+            .as_ref()
+            .is_none_or(|read| read.generation != generation)
+    }
+
+    /// Forgets the comparison, so the tab reads it again and shows no marker
+    /// until the answer is back.
+    pub fn invalidate_drift(&mut self) {
+        self.drift = None;
+    }
+
+    /// Takes the answer of a comparison made for `generation` in.
+    pub fn apply_drift(&mut self, generation: u64, outcome: DriftOutcome) {
+        self.drift = Some(DriftRead {
+            generation,
+            outcome,
+        });
+    }
+
+    /// The comparison for a task at `generation`, when one was made for it.
+    pub fn drift(&self, generation: u64) -> Option<&DriftOutcome> {
+        self.drift
+            .as_ref()
+            .filter(|read| read.generation == generation)
+            .map(|read| &read.outcome)
     }
 
     /// What a key does.
@@ -112,8 +167,38 @@ fn presence(present: bool) -> &'static str {
     }
 }
 
-/// The lines of the tab for `task`.
-pub fn lines(task: &TaskSummary, styles: &Styles, stale: bool) -> Vec<Line<'static>> {
+/// The row of the comparison with the catalogue: `None` while it is read,
+/// when the environment matches and when the task has ended.
+pub fn drift_text(outcome: Option<&DriftOutcome>) -> Option<(String, Role)> {
+    match outcome? {
+        DriftOutcome::Unknown => Some((
+            "nie udało się sprawdzić zgodności z katalogiem".to_string(),
+            Role::Done,
+        )),
+        DriftOutcome::Known(drift) => match drift.as_ref()? {
+            EnvironmentDrift::Differs { .. } => Some((
+                "różni się od katalogu — użyj akcji „Odśwież środowisko”".to_string(),
+                Role::Attention,
+            )),
+            EnvironmentDrift::CatalogueProblem { reason, .. } => Some((
+                format!("katalogu nie da się odczytać: {reason}"),
+                Role::Attention,
+            )),
+            EnvironmentDrift::Current
+            | EnvironmentDrift::NotApplicable
+            | EnvironmentDrift::Unrecognized => None,
+        },
+    }
+}
+
+/// The lines of the tab for `task`; `drift` is the comparison of its
+/// environment with the catalogue, when one was made for its generation.
+pub fn lines(
+    task: &TaskSummary,
+    drift: Option<&DriftOutcome>,
+    styles: &Styles,
+    stale: bool,
+) -> Vec<Line<'static>> {
     let mut sheet = Sheet {
         styles,
         stale,
@@ -130,6 +215,9 @@ pub fn lines(task: &TaskSummary, styles: &Styles, stale: bool) -> Vec<Line<'stat
     );
     sheet.row("launch digest", task.launch_digest.clone(), Role::Calm);
     sheet.row("środowisko", task.environment_identity.clone(), Role::Calm);
+    if let Some((text, role)) = drift_text(drift) {
+        sheet.row("katalog", text, role);
+    }
     if let Some(ticket) = task.ticket.as_deref().filter(|ticket| !ticket.is_empty()) {
         sheet.row("ticket", ticket, Role::Calm);
     }
@@ -317,7 +405,7 @@ pub fn render(
     task: &TaskSummary,
     stale: bool,
 ) {
-    let lines = lines(task, styles, stale);
+    let lines = lines(task, info.drift(task.generation), styles, stale);
     info.height = usize::from(area.height).max(1);
     info.top = info.top.min(lines.len().saturating_sub(info.height));
     let shown: Vec<Line> = lines.into_iter().skip(info.top).take(info.height).collect();

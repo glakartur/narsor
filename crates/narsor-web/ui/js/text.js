@@ -207,6 +207,24 @@ export function archivedRun(read) {
   return { kind: 'steps', usage: usageLine(sumUsage(timeline.positions)), timeline };
 }
 
+/**
+ * The *Info* row that says whether the task's environment still matches the
+ * catalogue, from the read of the task with `?drift=true` (`{data, error,
+ * loading}`), as `{text, role}` — or `null`: while it is read, when the
+ * environment matches, when the task has ended and when the server does not
+ * compare. Texts as in `src/tui/task_app/tabs/info.rs`.
+ */
+export function driftRow(read) {
+  if (read.loading) return null;
+  if (read.error) return { text: 'nie udało się sprawdzić zgodności z katalogiem', role: 'done' };
+  const drift = read.data?.environment_drift;
+  switch (drift?.status) {
+    case 'differs': return { text: 'różni się od katalogu — użyj akcji „Odśwież środowisko”', role: 'attention' };
+    case 'catalogue_problem': return { text: `katalogu nie da się odczytać: ${drift.reason ?? ''}`, role: 'attention' };
+    default: return null;
+  }
+}
+
 /** Whether a conversation read stops after `page`, asked `from`. */
 export function pagingDone(page, from) {
   if (page?.status !== 'recorded') return true;

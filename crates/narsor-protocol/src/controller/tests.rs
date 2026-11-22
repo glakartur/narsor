@@ -103,6 +103,60 @@ fn task_summary_state_since_is_optional_on_the_wire() {
 }
 
 #[test]
+fn environment_drift_is_absent_from_an_older_server_and_an_unknown_status_falls_back() {
+    let older = serde_json::json!({
+        "task_id": "task-1",
+        "backend_id": "local",
+        "runner_state": "stopped",
+        "generation": 1,
+        "revision": 1,
+        "rank": 1,
+        "created_at": "2026-10-03T12:00:00Z",
+        "queue_sequence": 1,
+        "workflow_id": "workflow",
+        "workflow_version": 1,
+        "launch_digest": "",
+        "environment_identity": "",
+        "archive": null,
+        "observation": null,
+        "runner": null,
+        "controller": null,
+        "inputs": [],
+        "as_of": "2026-10-03T12:00:00Z"
+    });
+    let summary: super::TaskSummary = serde_json::from_value(older.clone()).unwrap();
+    assert_eq!(summary.environment_drift, None);
+    assert!(serde_json::to_value(&summary)
+        .unwrap()
+        .get("environment_drift")
+        .is_none());
+
+    let mut newer = older;
+    newer["environment_drift"] = serde_json::json!({ "status": "drifting_sideways", "x": 1 });
+    let summary: super::TaskSummary = serde_json::from_value(newer).unwrap();
+    assert_eq!(
+        summary.environment_drift,
+        Some(super::EnvironmentDrift::Unrecognized)
+    );
+
+    let problem: super::EnvironmentDrift = serde_json::from_value(serde_json::json!({
+        "status": "catalogue_problem", "code": "invalid_runtime", "reason": "broken"
+    }))
+    .unwrap();
+    assert_eq!(
+        problem,
+        super::EnvironmentDrift::CatalogueProblem {
+            code: "invalid_runtime".into(),
+            reason: "broken".into()
+        }
+    );
+    assert_eq!(
+        serde_json::from_value::<super::TaskQuery>(serde_json::json!({})).unwrap(),
+        super::TaskQuery { drift: false }
+    );
+}
+
+#[test]
 fn task_event_keeps_the_durable_tagged_wire_shape() {
     let kind = super::TaskEventKind::RunnerReported {
         incarnation: "pod-1".into(),

@@ -21,7 +21,9 @@ use narsor_engine::orchestration::{
     OwnerRef, RunnerState, TaskEventKind, TaskRecord,
 };
 use narsor_engine::persistence::ServerStatePaths;
-use narsor_protocol::controller::{CreateTaskRequest, LaunchRequest, TaskActionId, TaskSummary};
+use narsor_protocol::controller::{
+    CreateTaskRequest, EnvironmentDrift, LaunchRequest, TaskActionId, TaskSummary,
+};
 use narsor_server::api::{start_with_services, ApiHandle, ApiServices};
 
 const TASK: &str = "task-refresh";
@@ -406,5 +408,61 @@ async fn the_offer_and_the_refresh_refuse_a_running_task_and_allow_it_once_the_w
         accepted.outcome,
         EnvironmentRefreshResult::Unchanged { .. }
     ));
+    fx.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_single_task_view_says_whether_the_environment_still_matches_the_catalogue() {
+    let fx = Fixture::new().await;
+    let stored = fx.interrupted_task().await;
+    let drift = || async {
+        fx.client
+            .control_task_with_drift(TASK)
+            .await
+            .unwrap()
+            .environment_drift
+    };
+
+    assert_eq!(drift().await, Some(EnvironmentDrift::Current));
+    // Cost guard: only the single-task fetch that asks reads the catalogue.
+    let listed = fx.client.control_tasks().await.unwrap();
+    assert!(listed
+        .tasks
+        .iter()
+        .all(|task| task.environment_drift.is_none()));
+    assert_eq!(
+        fx.client
+            .control_task(TASK)
+            .await
+            .unwrap()
+            .environment_drift,
+        None
+    );
+
+    fx.write_task_image(
+        "  base: debian:trixie-slim\n  components:\n    \
+         - { name: glab, install: { inline: \"apt-get install -y glab\" } }\n",
+    );
+    match drift().await {
+        Some(EnvironmentDrift::Differs { catalogue_identity }) => {
+            assert_ne!(catalogue_identity, stored.launch_spec.environment.identity);
+        }
+        other => panic!("the catalogue added a component: {other:?}"),
+    }
+
+    fx.write_task_image(
+        "  base: debian:trixie-slim\n  components:\n    \
+         - { name: glab, install: components/missing.sh }\n",
+    );
+    match drift().await {
+        Some(EnvironmentDrift::CatalogueProblem { code, reason }) => {
+            assert_eq!(code, "invalid_runtime", "{reason}");
+            assert!(
+                reason.contains("task_image.components[0].install"),
+                "{reason}"
+            );
+        }
+        other => panic!("a broken runtime.yaml is a catalogue problem, not drift: {other:?}"),
+    }
     fx.server.shutdown().await;
 }
