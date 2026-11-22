@@ -1316,8 +1316,8 @@ async fn a_base_image_without_git_fails_before_any_work() {
     let root = TempRoot::new();
     let storage = root.dir("storage");
     let spec = spec(ONE_STEP, "claude-code");
-    let plane = ControlPlane::serving(Some(serde_json::to_value(&spec).unwrap())).await;
-    let mut config = plane.config(&root, &storage, &spec.digest);
+    let plane = SpecPlane::serving(Some(serde_json::to_value(&spec).unwrap()));
+    let mut config = pinned_config(&root, &storage, &spec.digest);
     // Every basic tool but git, as empty programs: none of them is run.
     config.contract.path = Some(
         harness_path(
@@ -1327,9 +1327,7 @@ async fn a_base_image_without_git_fails_before_any_work() {
         .into_os_string(),
     );
 
-    let exit = run(config, |_| panic!("no environment is applied"))
-        .await
-        .expect("the runner ends");
+    let exit = run_on(&plane, config).await;
 
     let RunnerExit::Problem(problem) = exit else {
         panic!("a problem: {exit:?}");
@@ -1359,64 +1357,59 @@ async fn a_base_image_without_git_fails_before_any_work() {
 // ---------------------------------------------------------------------------
 
 /// A control plane that serves one launch spec to the runner (or, with
-/// `None`, answers `503` as an unreachable one would) and counts the
-/// fetches. Snapshots are refused: a problem is not reported here.
-struct ControlPlane {
-    url: String,
-    fetches: Arc<std::sync::atomic::AtomicUsize>,
-    server: JoinHandle<()>,
+/// `None`, is unreachable) and counts the fetches.
+struct SpecPlane {
+    spec: Option<Value>,
+    fetches: std::sync::atomic::AtomicUsize,
 }
 
-impl ControlPlane {
-    async fn serving(spec: Option<Value>) -> Self {
-        use axum::http::StatusCode;
-        use axum::routing::get;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let fetches = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&fetches);
-        let router = axum::Router::new().route(
-            "/runner/v1/launch-spec",
-            get(move || {
-                counted.fetch_add(1, Ordering::SeqCst);
-                let spec = spec.clone();
-                async move { spec.map(axum::Json).ok_or(StatusCode::SERVICE_UNAVAILABLE) }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        Self {
-            url,
-            fetches,
-            server,
-        }
-    }
-
-    /// A runner configuration that reaches this control plane with a
-    /// credential and was passed `digest` by its controller.
-    fn config(&self, root: &TempRoot, storage: &Path, digest: &str) -> RunnerConfig {
-        let credential = root.0.join("credential");
-        fs::write(&credential, "nsr.test\n").unwrap();
-        RunnerConfig {
-            control_plane: self.url.clone(),
-            credential_file: credential,
-            launch_digest: Some(digest.to_string()),
-            ..offline_config(root, storage, "pod-1")
-        }
+impl SpecPlane {
+    fn serving(spec: Option<Value>) -> Arc<Self> {
+        Arc::new(Self {
+            spec,
+            fetches: Default::default(),
+        })
     }
 
     fn fetches(&self) -> usize {
         self.fetches.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// A runner link that fetches the spec from this control plane.
+    fn link(self: &Arc<Self>, config: &RunnerConfig) -> Link {
+        Link {
+            spec_source: Some(Arc::clone(self) as Arc<dyn LaunchSpecSource>),
+            ..Link::new(config)
+        }
+    }
 }
 
-impl Drop for ControlPlane {
-    fn drop(&mut self) {
-        self.server.abort();
+impl LaunchSpecSource for SpecPlane {
+    fn launch_spec(&self) -> LaunchSpecFetch {
+        self.fetches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let answer = self
+            .spec
+            .clone()
+            .ok_or_else(|| ClientError::Unavailable("connection refused".into()));
+        Box::pin(async move { answer })
     }
+}
+
+/// A runner configuration whose controller passed `digest`.
+fn pinned_config(root: &TempRoot, storage: &Path, digest: &str) -> RunnerConfig {
+    RunnerConfig {
+        launch_digest: Some(digest.to_string()),
+        ..offline_config(root, storage, "pod-1")
+    }
+}
+
+/// [`run`] of a working runner whose launch spec `plane` serves.
+async fn run_on(plane: &Arc<SpecPlane>, config: RunnerConfig) -> RunnerExit {
+    let link = plane.link(&config);
+    work(config, link, |_| panic!("no environment is applied"))
+        .await
+        .expect("the runner ends")
 }
 
 /// A served spec is taken only when it recomputes to the digest the
@@ -1439,10 +1432,10 @@ async fn a_fetched_spec_is_accepted_only_with_the_pinned_digest() {
     for (name, served, accepted) in cases {
         let root = TempRoot::new();
         let storage = TaskStorage::new(root.dir("storage"));
-        let plane = ControlPlane::serving(Some(serde_json::to_value(served).unwrap())).await;
-        let config = plane.config(&root, storage.root(), &honest.digest);
+        let plane = SpecPlane::serving(Some(serde_json::to_value(served).unwrap()));
+        let config = pinned_config(&root, storage.root(), &honest.digest);
 
-        let loaded = load_spec(&config, &storage, &mut Link::new(&config)).await;
+        let loaded = load_spec(&config, &storage, &mut plane.link(&config)).await;
 
         match loaded {
             Ok(spec) => assert!(accepted && spec == honest, "{name}"),
@@ -1463,13 +1456,11 @@ async fn a_spec_with_another_digest_is_reported_and_initializes_nothing() {
     let root = TempRoot::new();
     let storage = root.dir("storage");
     let served = spec(ONE_STEP, "codex");
-    let plane = ControlPlane::serving(Some(serde_json::to_value(&served).unwrap())).await;
+    let plane = SpecPlane::serving(Some(serde_json::to_value(&served).unwrap()));
     let pinned = spec(ONE_STEP, "claude-code").digest;
-    let config = plane.config(&root, &storage, &pinned);
+    let config = pinned_config(&root, &storage, &pinned);
 
-    let exit = run(config, |_| panic!("no environment is applied"))
-        .await
-        .expect("the runner ends");
+    let exit = run_on(&plane, config).await;
 
     let RunnerExit::Problem(problem) = exit else {
         panic!("a problem: {exit:?}");
@@ -1492,10 +1483,10 @@ async fn a_restart_on_initialized_storage_fetches_nothing() {
     let spec = spec(ONE_STEP, "claude-code");
     let fixture = Fixture::start(&root, &spec, Agent::new(vec![], Reply::Hang));
     let storage = fixture.session.storage.clone();
-    let plane = ControlPlane::serving(Some(serde_json::to_value(&spec).unwrap())).await;
-    let config = plane.config(&root, storage.root(), &spec.digest);
+    let plane = SpecPlane::serving(Some(serde_json::to_value(&spec).unwrap()));
+    let config = pinned_config(&root, storage.root(), &spec.digest);
 
-    let loaded = load_spec(&config, &storage, &mut Link::new(&config))
+    let loaded = load_spec(&config, &storage, &mut plane.link(&config))
         .await
         .expect("the storage's copy");
 
@@ -1509,13 +1500,11 @@ async fn a_restart_on_initialized_storage_fetches_nothing() {
 async fn an_unreachable_control_plane_is_retried_then_reported() {
     let root = TempRoot::new();
     let storage = root.dir("storage");
-    let plane = ControlPlane::serving(None).await;
-    let mut config = plane.config(&root, &storage, "sha256:pinned");
+    let plane = SpecPlane::serving(None);
+    let mut config = pinned_config(&root, &storage, "sha256:pinned");
     config.timing.problem_report_deadline = Duration::from_millis(200);
 
-    let exit = run(config, |_| panic!("no environment is applied"))
-        .await
-        .expect("the runner ends");
+    let exit = run_on(&plane, config).await;
 
     let RunnerExit::Problem(problem) = exit else {
         panic!("a problem: {exit:?}");

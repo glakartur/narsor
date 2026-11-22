@@ -19,5 +19,3 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
-[dev-dependencies]
-axum = "0.8"

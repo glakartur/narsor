@@ -339,9 +339,18 @@ pub async fn run(
     if config.read_only {
         return reader::run(config).await;
     }
+    let link = Link::new(&config);
+    work(config, link, apply_environment).await
+}
+
+/// [`run`] of a working runner, over `link`.
+async fn work(
+    config: RunnerConfig,
+    mut link: Link,
+    apply_environment: impl FnOnce(&ProcessEnvironment),
+) -> Result<RunnerExit, RunnerError> {
     let storage = TaskStorage::new(&config.storage);
     let _lock = storage.lock()?;
-    let mut link = Link::new(&config);
     let store = storage.store();
 
     let spec = match load_spec(&config, &storage, &mut link).await {
@@ -635,8 +644,8 @@ async fn fetch_launch_spec(
 ) -> Result<serde_json::Value, RunnerError> {
     let deadline = Instant::now() + timing.problem_report_deadline;
     loop {
-        let error = match link.client() {
-            Some(client) => match client.launch_spec().await {
+        let error = match link.spec_source() {
+            Some(source) => match source.launch_spec().await {
                 Ok(spec) => {
                     link.succeeded();
                     return Ok(spec);
@@ -759,6 +768,25 @@ async fn send_until(link: &mut Link, timing: &RunnerTiming, snapshot: &RunnerSna
     }
 }
 
+/// The future of one launch-spec fetch.
+type LaunchSpecFetch = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, ClientError>> + Send>,
+>;
+
+/// What serves the task's launch spec to a working runner's first start:
+/// the [`RunnerClient`] in production. The seam lets tests answer, refuse
+/// and count fetches without a server.
+trait LaunchSpecSource: Send + Sync {
+    fn launch_spec(&self) -> LaunchSpecFetch;
+}
+
+impl LaunchSpecSource for RunnerClient {
+    fn launch_spec(&self) -> LaunchSpecFetch {
+        let client = self.clone();
+        Box::pin(async move { client.launch_spec().await })
+    }
+}
+
 /// The control-plane side of one runner: credential, client and backoff.
 struct Link {
     base_url: String,
@@ -771,6 +799,8 @@ struct Link {
     /// it is the one call a credential that ran out may still make.
     renewal_wanted: bool,
     launch: Option<RunnerLaunchView>,
+    /// Serves the launch spec instead of the client (tests only).
+    spec_source: Option<Arc<dyn LaunchSpecSource>>,
 }
 
 impl Link {
@@ -784,7 +814,18 @@ impl Link {
             expires_at: None,
             renewal_wanted: false,
             launch: None,
+            spec_source: None,
         }
+    }
+
+    /// What the launch spec is fetched from: the client, reading the
+    /// credential file when there is none yet.
+    fn spec_source(&mut self) -> Option<Arc<dyn LaunchSpecSource>> {
+        if let Some(source) = &self.spec_source {
+            return Some(Arc::clone(source));
+        }
+        self.client()
+            .map(|client| Arc::new(client) as Arc<dyn LaunchSpecSource>)
     }
 
     /// The client, reading the credential file when there is none yet.
