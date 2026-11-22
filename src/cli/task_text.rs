@@ -24,9 +24,10 @@ use crate::tui::task_app::list::{attention_of, Attention};
 use narsor_protocol::api::{Position, PositionStatus};
 use narsor_protocol::controller::PendingInputRefView;
 use narsor_protocol::controller::{
-    AttentionItem, AttentionKind, ConversationAttemptSummary, GateAutomationPhase, GateHookView,
-    InputStatus, OperatorCommand, OwnerCommand, QueueReason, RunnerState, SlotReleaseReason,
-    TaskEvent, TaskEventKind, TaskState,
+    AttentionItem, AttentionKind, ConversationAttemptSummary, EnvironmentDiff,
+    EnvironmentRefreshResult, GateAutomationPhase, GateHookView, InputStatus, NamedChanges,
+    OperatorCommand, OwnerCommand, QueueReason, RunnerState, SlotReleaseReason, TaskEvent,
+    TaskEventKind, TaskState,
 };
 use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, WorkspaceHeader};
 
@@ -1239,11 +1240,16 @@ pub fn event_line(event: &TaskEvent) -> String {
             "the read-only runner ran idle and is no longer wanted".to_string()
         }
         TaskEventKind::EnvironmentRefreshed {
-            requested_by, diff, ..
+            requested_by,
+            old_identity,
+            new_identity,
+            diff,
         } => format!(
-            "environment refreshed by {} ({} change(s))",
+            "environment refreshed by {}: {} change(s), {} → {}",
             requested_by.0,
-            diff.change_count()
+            diff.change_count(),
+            short_identity(old_identity),
+            short_identity(new_identity)
         ),
         TaskEventKind::Unrecognized => "an event this version does not know".to_string(),
     };
@@ -1352,6 +1358,96 @@ pub fn command_outcome(
         }
         Err(error) => ToneLine::new(format!("{verb} failed: {error}"), Tone::Error),
     }
+}
+
+/// An environment identity short enough for one event line: the digest
+/// without its algorithm prefix, cut to twelve characters.
+fn short_identity(identity: &str) -> String {
+    let digest = identity.strip_prefix("sha256:").unwrap_or(identity);
+    digest.chars().take(12).collect()
+}
+
+/// What `task refresh-env` prints about the outcome of a refresh: the new
+/// generation, both identities and the difference part by part, or a single
+/// line when nothing changed.
+pub fn refresh_outcome_lines(task_id: &str, outcome: &EnvironmentRefreshResult) -> Vec<String> {
+    let lines = match outcome {
+        EnvironmentRefreshResult::Refreshed {
+            old_identity,
+            new_identity,
+            generation,
+            diff,
+        } => {
+            let mut lines = vec![
+                format!(
+                    "Environment of {task_id} refreshed: {} change(s), now generation {generation}.",
+                    diff.change_count()
+                ),
+                format!("  identity: {old_identity} → {new_identity}"),
+            ];
+            lines.extend(environment_diff_lines(diff));
+            lines.push("The task runs in it from its next start or resume.".to_string());
+            lines
+        }
+        EnvironmentRefreshResult::Unchanged { identity } => vec![format!(
+            "Environment of {task_id} is up to date, nothing changed ({identity})."
+        )],
+        EnvironmentRefreshResult::Unrecognized => vec![format!(
+            "The control plane refreshed {task_id} with an outcome this version does not know; \
+             it is newer than this client. See `narsor-cli task show {task_id}`."
+        )],
+    };
+    // Names and values come from the catalogue: nothing a terminal would act
+    // on gets through.
+    lines
+        .iter()
+        .map(|line| without_unsafe_chars(line))
+        .collect()
+}
+
+/// One indented line per part of the environment that changed.
+fn environment_diff_lines(diff: &EnvironmentDiff) -> Vec<String> {
+    let values = [
+        ("task image base", &diff.task_image_base),
+        ("base image", &diff.base_image),
+        ("runtime bundle", &diff.runtime_bundle),
+        ("profile", &diff.profile),
+    ]
+    .into_iter()
+    .filter_map(|(part, change)| {
+        let change = change.as_ref()?;
+        let side = |value: &Option<String>| value.clone().unwrap_or_else(|| "(none)".into());
+        Some(format!(
+            "  {part}: {} → {}",
+            side(&change.before),
+            side(&change.after)
+        ))
+    });
+    let names = [
+        ("task image components", &diff.task_image_components),
+        ("task image secrets", &diff.task_image_secrets),
+        ("secrets", &diff.secrets),
+        ("step images", &diff.step_images),
+        ("tools", &diff.tools),
+    ]
+    .into_iter()
+    .filter(|(_, changes)| !changes.is_empty())
+    .map(|(part, changes)| format!("  {part}: {}", named_changes(changes)));
+    values.chain(names).collect()
+}
+
+/// `added a, b; removed c; changed d`, leaving out what is empty.
+fn named_changes(changes: &NamedChanges) -> String {
+    [
+        ("added", &changes.added),
+        ("removed", &changes.removed),
+        ("changed", &changes.changed),
+    ]
+    .into_iter()
+    .filter(|(_, names)| !names.is_empty())
+    .map(|(verb, names)| format!("{verb} {}", names.join(", ")))
+    .collect::<Vec<_>>()
+    .join("; ")
 }
 
 /// An owner command as a word.
