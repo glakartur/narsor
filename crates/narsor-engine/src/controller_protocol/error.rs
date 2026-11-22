@@ -131,6 +131,10 @@ impl From<OrchestrationError> for ProtocolError {
             E::InputAlreadySettled { .. } => Self::conflict("input_already_settled", message),
             E::TaskNotAcceptingInput { .. } => Self::conflict("task_not_accepting_input", message),
             E::OperatorCommandRefused { .. } => Self::conflict("operator_command_refused", message),
+            // The offer's own code and words: the guard is the offer's.
+            E::EnvironmentRefreshRefused { reason, .. } => {
+                Self::conflict("action_unavailable", reason)
+            }
             E::OperatorCommandAlreadySettled { .. } => {
                 Self::conflict("operator_command_already_settled", message)
             }

@@ -9,7 +9,9 @@ use crate::domain::human_input::HumanInputDelivery;
 pub use crate::domain::runner_snapshot::{
     PendingInputRef, RunnerSnapshot, RETIRED_CONDUCTOR_HARNESS,
 };
-use crate::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec, WorkspaceHeader};
+use crate::domain::{
+    BackendId, EnvironmentDiff, ExecutionStatus, TaskId, TaskLaunchSpec, WorkspaceHeader,
+};
 use chrono::{DateTime, Utc};
 use narsor_protocol::api::{ConversationState, Timeline};
 use narsor_protocol::controller::{MoveTaskTarget, STORAGE_DELETED_AT_ARCHIVE};
@@ -138,6 +140,62 @@ pub fn derive_task_state(
             _ => TaskState::Running,
         },
     }
+}
+
+/// Why the owner cannot refresh the environment of a task now; `None` when
+/// they can (R4, R5). The one rule the control plane's mutation and the
+/// action offer both ask, so what a client is offered and what the control
+/// plane accepts cannot disagree.
+///
+/// Only a task without a live workload is refreshed: `Stopped`,
+/// `Interrupted` (its workload is gone, whether or not the resume policy
+/// still tries) and `Queued` without a reservation. A task whose work ended
+/// (`Finished`), or that is archived or being archived, is refused whatever
+/// its runner state. `holds_slot` is [`TaskRecord::holds_capacity`]: for a
+/// `Queued` task, whether the scheduler admitted it. The reasons are for the
+/// owner, in Polish like the rest of the offer.
+pub fn environment_refresh_refusal(
+    runner_state: RunnerState,
+    task_state: TaskState,
+    holds_slot: bool,
+) -> Option<String> {
+    if runner_state.is_archival() {
+        return Some("zadanie jest archiwizowane".to_string());
+    }
+    if task_state == TaskState::Finished {
+        return Some("zadanie jest zakończone".to_string());
+    }
+    let reason = match runner_state {
+        RunnerState::Stopped | RunnerState::Interrupted => return None,
+        RunnerState::Queued if !holds_slot => return None,
+        RunnerState::Queued => {
+            "zadanie zostało dopuszczone i zaraz ruszy — gdy ruszy, wstrzymaj je, a potem \
+             odśwież środowisko"
+        }
+        RunnerState::Provisioning | RunnerState::Running => {
+            "zadanie działa — wstrzymaj je, a potem odśwież środowisko"
+        }
+        RunnerState::PauseRequested => {
+            "zadanie jest wstrzymywane — poczekaj, aż się zatrzyma, a potem odśwież środowisko"
+        }
+        RunnerState::Unknown => {
+            "nie wiadomo, czy zadanie jeszcze działa — poczekaj, aż kontroler to ustali, \
+             a potem odśwież środowisko"
+        }
+        RunnerState::Archiving | RunnerState::Archived => "zadanie jest archiwizowane",
+    };
+    Some(reason.to_string())
+}
+
+/// What [`super::ControlPlane::refresh_environment`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentRefreshOutcome {
+    /// The task's launch spec carries the new environment under a new
+    /// generation; this is what changed.
+    Refreshed(Box<EnvironmentDiff>),
+    /// The new environment has the identity of the stored one: nothing was
+    /// written and nothing announced (R8).
+    Unchanged,
 }
 
 /// Current schema version of [`BackendLease`].
@@ -688,6 +746,12 @@ impl TaskRecord {
             .as_ref()
             .and_then(|runner| runner.snapshot.pending_input.as_ref())
             .map(|pending| pending.id.as_str())
+    }
+
+    /// Why the owner cannot refresh the task's environment now; see
+    /// [`environment_refresh_refusal`].
+    pub fn environment_refresh_refusal(&self) -> Option<String> {
+        environment_refresh_refusal(self.runner_state, self.task_state(), self.holds_capacity())
     }
 
     /// Whether the task can take no more answers: finished, archived (or

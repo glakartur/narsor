@@ -1238,6 +1238,13 @@ pub fn event_line(event: &TaskEvent) -> String {
         TaskEventKind::ReaderLeaseEnded => {
             "the read-only runner ran idle and is no longer wanted".to_string()
         }
+        TaskEventKind::EnvironmentRefreshed {
+            requested_by, diff, ..
+        } => format!(
+            "environment refreshed by {} ({} change(s))",
+            requested_by.0,
+            diff.change_count()
+        ),
         TaskEventKind::Unrecognized => "an event this version does not know".to_string(),
     };
     // Notes, reasons and details come from operators and runners: nothing a

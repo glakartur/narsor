@@ -9,10 +9,10 @@ use narsor_engine::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
 use narsor_engine::orchestration::scheduler::{BackendLoad, LimitStopDecision};
 use narsor_engine::orchestration::{
     exhaustion_loss, loss_state, BackendAvailability, BackendLease, Clock, CommandActor,
-    CommandRequest, ControlPlane, ControllerReport, LossState, MoveTarget, NewTask, Observation,
-    ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity,
-    ResumeExhaustion, ResumePolicy, ResumeState, RunnerSnapshot, RunnerState, SchedulingPolicy,
-    TaskEventKind, TaskRecord, WorkloadLoss,
+    CommandRequest, ControlPlane, ControllerReport, EnvironmentRefreshOutcome, LossState,
+    MoveTarget, NewTask, Observation, ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef,
+    QueueReason, ResourceIdentity, ResumeExhaustion, ResumePolicy, ResumeState, RunnerSnapshot,
+    RunnerState, SchedulingPolicy, TaskEventKind, TaskRecord, WorkloadLoss,
 };
 use narsor_engine::persistence::paths::{temp_path_for, ServerStatePaths};
 use narsor_engine::persistence::ExecutionStore;
@@ -5871,4 +5871,348 @@ fn a_gate_step_and_queue_from_the_runner_are_cleaned() {
         "{:?}",
         gate.watch.queue
     );
+}
+
+// ---------------------------------------------------------------------------
+// Refreshing the environment of a task (U3 of the environment refresh)
+// ---------------------------------------------------------------------------
+
+fn owner() -> OwnerRef {
+    OwnerRef::new("oidc:https://issuer|artur")
+}
+
+/// The task's environment as a refresh resolves it from a catalogue that
+/// gained a task image with one component.
+fn environment_with_task_image(
+    fx: &Fixture,
+    id: &str,
+) -> narsor_engine::domain::ResolvedEnvironment {
+    use narsor_engine::domain::{ImageSpec, TaskImage, TaskImageComponent};
+    let mut environment = fx.control.task(&task(id)).unwrap().launch_spec.environment;
+    environment.task_image = Some(TaskImage {
+        base: ImageSpec::pinned("debian:trixie-slim"),
+        components: vec![TaskImageComponent {
+            name: "glab".to_string(),
+            install: "apt-get install -y glab\n".to_string(),
+            version: None,
+            secrets: Vec::new(),
+            home: Vec::new(),
+        }],
+        secrets: Vec::new(),
+    });
+    environment.sealed()
+}
+
+fn refresh(
+    fx: &Fixture,
+    id: &str,
+    expected_generation: Option<u64>,
+) -> Result<(TaskRecord, EnvironmentRefreshOutcome), OrchestrationError> {
+    let environment = environment_with_task_image(fx, id);
+    fx.control
+        .refresh_environment(&task(id), environment, owner(), expected_generation)
+}
+
+#[test]
+fn refreshing_a_stopped_task_reseals_its_spec_under_a_new_generation_the_controller_fetches() {
+    use narsor_engine::controller_protocol::{ControllerIdentity, ProtocolError, ProtocolService};
+    let fx = stopped_fixture();
+    let before = fx.control.task(&task("task-1")).unwrap();
+
+    let (record, outcome) = refresh(&fx, "task-1", Some(before.generation)).expect("refreshed");
+
+    let EnvironmentRefreshOutcome::Refreshed(diff) = outcome else {
+        panic!("the environment changed: {outcome:?}");
+    };
+    assert_eq!(diff.task_image_components.added, vec!["glab".to_string()]);
+    assert_eq!(record.generation, before.generation + 1);
+    assert_eq!(record.runner_state, RunnerState::Stopped);
+    assert_eq!(record.resume, before.resume);
+    let (old, new) = (&before.launch_spec, &record.launch_spec);
+    assert_ne!(new.digest, old.digest);
+    assert!(new.digest_is_valid());
+    assert!(new.environment.task_image.is_some());
+    assert_eq!(
+        (
+            &new.workflow_id,
+            new.workflow_version,
+            &new.inputs,
+            &new.workspace
+        ),
+        (
+            &old.workflow_id,
+            old.workflow_version,
+            &old.inputs,
+            &old.workspace
+        )
+    );
+    assert_eq!(
+        (&new.definition, new.resources),
+        (&old.definition, old.resources)
+    );
+    let events: Vec<TaskEventKind> = fx
+        .control
+        .events_since(&task("task-1"), before.revision)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.kind)
+        .collect();
+    assert_eq!(
+        events,
+        vec![TaskEventKind::EnvironmentRefreshed {
+            requested_by: owner(),
+            old_identity: old.environment.identity.clone(),
+            new_identity: new.environment.identity.clone(),
+            diff,
+        }]
+    );
+
+    // The controller fetches the spec by the new generation and verifies it
+    // against the digest its command carries; the old generation is gone.
+    let service = ProtocolService::new(
+        fx.reopen(),
+        crate::environment_support::seeded_resolver(fx.root.path()),
+    );
+    let controller = ControllerIdentity {
+        controller_id: "controller-a".to_string(),
+        backend_id: backend_id("k8s"),
+    };
+    let served = service
+        .launch_spec(&controller, "task-1", record.generation)
+        .expect("the spec of the new generation");
+    served
+        .check_pinned_digest(&new.digest)
+        .expect("the served spec verifies against the new digest");
+    let stale = service
+        .launch_spec(&controller, "task-1", before.generation)
+        .unwrap_err();
+    assert!(
+        matches!(&stale, ProtocolError::Conflict { code, .. } if *code == "stale_generation"),
+        "{stale:?}"
+    );
+}
+
+#[test]
+fn an_unchanged_environment_writes_nothing_and_a_stale_generation_is_refused() {
+    let fx = stopped_fixture();
+    let before = fx.control.task(&task("task-1")).unwrap();
+    let same = before.launch_spec.environment.clone();
+
+    let (record, outcome) = fx
+        .control
+        .refresh_environment(&task("task-1"), same, owner(), Some(before.generation))
+        .expect("an unchanged environment is no error");
+
+    assert_eq!(outcome, EnvironmentRefreshOutcome::Unchanged);
+    assert_eq!(
+        (record.generation, record.revision),
+        (before.generation, before.revision)
+    );
+    assert!(fx
+        .control
+        .events_since(&task("task-1"), before.revision)
+        .unwrap()
+        .is_empty());
+
+    let stale = refresh(&fx, "task-1", Some(before.generation - 1)).unwrap_err();
+    assert!(
+        matches!(stale, OrchestrationError::StaleGeneration { .. }),
+        "{stale:?}"
+    );
+    assert_eq!(
+        fx.control.task(&task("task-1")).unwrap().revision,
+        before.revision
+    );
+}
+
+/// Drives a fresh task to `Stopped` with its execution completed: the runner
+/// reports the finished run at its safe point, and the pause completes.
+fn stopped_finished(fx: &Fixture, id: &str, lease: &BackendLease) {
+    fx.running(id, lease);
+    fx.command(id, OwnerCommand::Pause, "pause-1");
+    let mut snapshot = safe_point_snapshot(1);
+    snapshot.execution_status = ExecutionStatus::Completed;
+    fx.control
+        .record_runner_snapshot(&task(id), "pod-g1", 1, snapshot)
+        .expect("finished run at a safe point");
+    let generation = fx.control.task(&task(id)).unwrap().generation;
+    let stopped = fx
+        .control
+        .report(report(
+            id,
+            lease,
+            generation,
+            Observation::PausedAtSafePoint,
+            None,
+        ))
+        .expect("pause completes")
+        .task;
+    assert_eq!(stopped.runner_state, RunnerState::Stopped);
+    assert_eq!(
+        stopped.task_state(),
+        narsor_engine::orchestration::TaskState::Finished
+    );
+}
+
+#[test]
+fn a_task_with_a_live_workload_or_whose_work_ended_is_not_refreshed() {
+    type Setup = fn(&Fixture, &BackendLease);
+    let cases: [(&str, Setup, &str); 8] = [
+        (
+            "running",
+            |fx, lease| {
+                fx.running("task-1", lease);
+            },
+            "wstrzymaj je",
+        ),
+        (
+            "provisioning",
+            |fx, lease| {
+                fx.create("task-1");
+                fx.observe("task-1", lease, Observation::StartAccepted)
+                    .unwrap();
+            },
+            "wstrzymaj je",
+        ),
+        (
+            "pause requested",
+            |fx, lease| {
+                fx.running("task-1", lease);
+                fx.command("task-1", OwnerCommand::Pause, "pause-1");
+            },
+            "jest wstrzymywane",
+        ),
+        (
+            "unknown",
+            |fx, lease| {
+                fx.running("task-1", lease);
+                fx.observe(
+                    "task-1",
+                    lease,
+                    Observation::WorkloadLost { state_known: false },
+                )
+                .unwrap();
+            },
+            "nie wiadomo",
+        ),
+        (
+            "queued and admitted",
+            |fx, _| {
+                fx.create("task-1");
+                fx.admit("task-1");
+                assert!(fx
+                    .control
+                    .task(&task("task-1"))
+                    .unwrap()
+                    .reservation
+                    .is_some());
+            },
+            "dopuszczone",
+        ),
+        (
+            "stopped and finished",
+            |fx, lease| {
+                stopped_finished(fx, "task-1", lease);
+            },
+            "zadanie jest zakończone",
+        ),
+        (
+            "archiving",
+            |fx, lease| {
+                fx.running("task-1", lease);
+                fx.command("task-1", OwnerCommand::Archive, "archive-1");
+            },
+            "archiwizowane",
+        ),
+        (
+            "archived",
+            |fx, _| {
+                fx.create("task-1");
+                fx.command("task-1", OwnerCommand::Archive, "archive-1");
+            },
+            "archiwizowane",
+        ),
+    ];
+    for (case, setup, expected) in cases {
+        let fx = Fixture::new();
+        let lease = fx.lease("k8s", "controller-a");
+        setup(&fx, &lease);
+        let before = fx.control.task(&task("task-1")).unwrap();
+
+        let refused = refresh(&fx, "task-1", Some(before.generation)).unwrap_err();
+
+        let OrchestrationError::EnvironmentRefreshRefused { reason, .. } = &refused else {
+            panic!("{case}: {refused:?}");
+        };
+        assert!(reason.contains(expected), "{case}: {reason}");
+        let after = fx.control.task(&task("task-1")).unwrap();
+        assert_eq!(after.revision, before.revision, "{case}");
+        assert_eq!(after.launch_spec, before.launch_spec, "{case}");
+    }
+}
+
+#[test]
+fn a_queued_or_interrupted_task_is_refreshed_in_place_and_old_policy_commands_go_stale() {
+    type Setup = fn(&Fixture, &BackendLease);
+    let cases: [(&str, Setup, RunnerState); 3] = [
+        (
+            "queued, not admitted",
+            |fx, _| {
+                fx.create("task-1");
+            },
+            RunnerState::Queued,
+        ),
+        (
+            "interrupted, attempt planned",
+            |fx, lease| {
+                fx.running("task-1", lease);
+                lose(fx, "task-1", lease, true, "exited");
+            },
+            RunnerState::Interrupted,
+        ),
+        (
+            "interrupted, auto-resume exhausted",
+            |fx, lease| {
+                fx.running("task-1", lease);
+                lose(fx, "task-1", lease, true, "exited");
+                for _ in 2..=6 {
+                    lose_again_while_provisioning(fx, "task-1", lease, "exited");
+                }
+                assert!(fx
+                    .control
+                    .task(&task("task-1"))
+                    .unwrap()
+                    .resume
+                    .exhausted
+                    .is_some());
+            },
+            RunnerState::Interrupted,
+        ),
+    ];
+    for (case, setup, state) in cases {
+        let fx = Fixture::new();
+        let lease = long_lease(&fx, "controller-a");
+        setup(&fx, &lease);
+        let before = fx.control.task(&task("task-1")).unwrap();
+
+        let (record, outcome) = refresh(&fx, "task-1", Some(before.generation))
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+
+        assert!(
+            matches!(outcome, EnvironmentRefreshOutcome::Refreshed(_)),
+            "{case}"
+        );
+        assert_eq!(record.runner_state, state, "{case}");
+        assert_eq!(record.generation, before.generation + 1, "{case}");
+        assert_eq!(record.resume, before.resume, "{case}");
+        assert_eq!(record.reservation, before.reservation, "{case}");
+        let late = fx
+            .control
+            .auto_resume(&task("task-1"), before.generation)
+            .unwrap_err();
+        assert!(
+            matches!(late, OrchestrationError::StaleGeneration { .. }),
+            "{case}: {late:?}"
+        );
+    }
 }

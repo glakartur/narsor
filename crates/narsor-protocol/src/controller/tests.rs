@@ -166,6 +166,56 @@ fn observer_events_carry_their_provenance_and_unknown_ones_with_fields_are_unrec
 }
 
 #[test]
+fn an_environment_refresh_event_decodes_and_an_older_client_reads_it_as_unrecognized() {
+    let raw = serde_json::json!({
+        "type": "environment_refreshed",
+        "requested_by": "oidc:https://issuer|artur",
+        "old_identity": "sha256:old",
+        "new_identity": "sha256:new",
+        "diff": {
+            "task_image_components": { "added": ["glab"] },
+            "base_image": { "before": null, "after": "debian@sha256:abc" },
+            "a_part_from_a_newer_server": { "added": ["x"] }
+        }
+    });
+    let kind: super::TaskEventKind = serde_json::from_value(raw).unwrap();
+    let super::TaskEventKind::EnvironmentRefreshed {
+        requested_by,
+        old_identity,
+        new_identity,
+        diff,
+    } = &kind
+    else {
+        panic!("decoded as {kind:?}");
+    };
+    assert_eq!(requested_by.0, "oidc:https://issuer|artur");
+    assert_eq!(
+        (old_identity.as_str(), new_identity.as_str()),
+        ("sha256:old", "sha256:new")
+    );
+    assert_eq!(diff.task_image_components.added, vec!["glab".to_string()]);
+    assert_eq!(diff.change_count(), 2);
+    // Unchanged parts stay off the wire.
+    let written = serde_json::to_value(&kind).unwrap();
+    assert!(written["diff"].get("tools").is_none());
+    assert_eq!(
+        serde_json::from_value::<super::TaskEventKind>(written).unwrap(),
+        kind
+    );
+
+    // A build from before the refresh: the variant is unknown to it.
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    #[serde(rename_all = "snake_case", tag = "type")]
+    enum OlderKind {
+        Created,
+        #[serde(other)]
+        Unrecognized,
+    }
+    let older: OlderKind = serde_json::from_value(serde_json::to_value(&kind).unwrap()).unwrap();
+    assert_eq!(older, OlderKind::Unrecognized);
+}
+
+#[test]
 fn observer_effect_requests_refuse_fields_a_script_may_not_choose() {
     let refused = serde_json::json!({
         "data": {},

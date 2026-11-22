@@ -35,6 +35,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::BackendId;
+pub use narsor_protocol::controller::{EnvironmentDiff, NamedChanges, ValueChange};
 
 /// Prefix of every SHA-256 digest this crate writes.
 pub const SHA256_PREFIX: &str = "sha256:";
@@ -1008,6 +1009,121 @@ impl ResolvedEnvironment {
     pub fn image_for_state(&self, state: &str) -> Option<&ResolvedImage> {
         self.step_images.get(state).or(self.base_image.as_ref())
     }
+
+    /// What changed from this environment to `newer`, part by part (R9).
+    ///
+    /// Covers what a refresh re-resolves from the catalogue: the task image
+    /// (base, components, image-level secrets), the secret references, the
+    /// base and step images, the runtime bundle, the tools and the profile.
+    /// The harness is kept by a refresh and is not compared.
+    pub fn diff(&self, newer: &Self) -> EnvironmentDiff {
+        let no_components = Vec::new();
+        let no_secrets = Vec::new();
+        let (old_components, old_image_secrets) = self
+            .task_image
+            .as_ref()
+            .map_or((&no_components, &no_secrets), |image| {
+                (&image.components, &image.secrets)
+            });
+        let (new_components, new_image_secrets) = newer
+            .task_image
+            .as_ref()
+            .map_or((&no_components, &no_secrets), |image| {
+                (&image.components, &image.secrets)
+            });
+        EnvironmentDiff {
+            task_image_base: value_change(
+                self.task_image
+                    .as_ref()
+                    .map(|image| image.base.reference.clone()),
+                newer
+                    .task_image
+                    .as_ref()
+                    .map(|image| image.base.reference.clone()),
+            ),
+            task_image_components: named_changes(
+                by_name(old_components, |component| &component.name),
+                by_name(new_components, |component| &component.name),
+            ),
+            task_image_secrets: named_changes(
+                by_name(old_image_secrets, |secret| &secret.name),
+                by_name(new_image_secrets, |secret| &secret.name),
+            ),
+            secrets: named_changes(
+                by_name(&self.secrets, |secret| &secret.name),
+                by_name(&newer.secrets, |secret| &secret.name),
+            ),
+            base_image: value_change(pinned(&self.base_image), pinned(&newer.base_image)),
+            step_images: named_changes(
+                self.step_images.iter().collect(),
+                newer.step_images.iter().collect(),
+            ),
+            runtime_bundle: value_change(
+                pinned(&self.runtime_bundle),
+                pinned(&newer.runtime_bundle),
+            ),
+            tools: named_changes(self.tools.iter().collect(), newer.tools.iter().collect()),
+            profile: profile_change(&self.profile, &newer.profile),
+        }
+    }
+}
+
+/// `items` keyed by the name `name` gives each.
+fn by_name<T>(items: &[T], name: impl Fn(&T) -> &String) -> BTreeMap<&String, &T> {
+    items.iter().map(|item| (name(item), item)).collect()
+}
+
+/// The names added, removed and changed from `old` to `new`, in name order.
+fn named_changes<T: PartialEq>(
+    old: BTreeMap<&String, &T>,
+    new: BTreeMap<&String, &T>,
+) -> NamedChanges {
+    let mut changes = NamedChanges::default();
+    for (name, before) in &old {
+        match new.get(name) {
+            None => changes.removed.push((*name).clone()),
+            Some(after) if after != before => changes.changed.push((*name).clone()),
+            Some(_) => {}
+        }
+    }
+    changes.added = new
+        .keys()
+        .filter(|name| !old.contains_key(*name))
+        .map(|name| (*name).clone())
+        .collect();
+    changes
+}
+
+/// The change from `before` to `after`; `None` when they are equal.
+fn value_change(before: Option<String>, after: Option<String>) -> Option<ValueChange> {
+    (before != after).then_some(ValueChange { before, after })
+}
+
+/// The pinned reference of `image`, what a backend pulls.
+fn pinned(image: &Option<ResolvedImage>) -> Option<String> {
+    image.as_ref().map(|image| image.pinned.clone())
+}
+
+/// The profile as `{id} v{version}`; with its content digest as well when
+/// only the content changed, so the two sides never read the same.
+fn profile_change(before: &ResolvedProfile, after: &ResolvedProfile) -> Option<ValueChange> {
+    if before == after {
+        return None;
+    }
+    let label = |profile: &ResolvedProfile| format!("{} v{}", profile.id, profile.version);
+    let (old, new) = (label(before), label(after));
+    let (old, new) = if old == new {
+        (
+            format!("{old} ({})", before.digest),
+            format!("{new} ({})", after.digest),
+        )
+    } else {
+        (old, new)
+    };
+    Some(ValueChange {
+        before: Some(old),
+        after: Some(new),
+    })
 }
 
 #[cfg(test)]
@@ -1147,6 +1263,115 @@ mod tests {
             delivery: SecretDelivery::Env("DATABASE_PASSWORD".to_string()),
         }];
         assert_ne!(with_secret.sealed().identity, with_image.identity);
+    }
+
+    fn image(reference: &str, digest_hex: char, source: ImageSource) -> ResolvedImage {
+        let digest =
+            ImageDigest::parse(format!("sha256:{}", digest_hex.to_string().repeat(64))).unwrap();
+        ResolvedImage {
+            reference: reference.to_string(),
+            pinned: format!("{}@{digest}", reference.split(':').next().unwrap()),
+            digest,
+            tag_resolved: false,
+            source,
+        }
+    }
+
+    fn component(name: &str, install: &str) -> TaskImageComponent {
+        TaskImageComponent {
+            name: name.to_string(),
+            install: install.to_string(),
+            version: None,
+            secrets: Vec::new(),
+            home: Vec::new(),
+        }
+    }
+
+    fn secret(name: &str, variable: &str) -> SecretReference {
+        SecretReference {
+            backend: BackendId::parse("local").unwrap(),
+            name: name.to_string(),
+            tool: "gh".to_string(),
+            key: name.to_string(),
+            delivery: SecretDelivery::Env(variable.to_string()),
+        }
+    }
+
+    #[test]
+    fn the_diff_of_two_environments_names_every_part_that_changed() {
+        let mut old = ResolvedEnvironment::harness_only("claude-code");
+        old.base_image = Some(image("ubuntu:24.04", 'a', ImageSource::GlobalTaskImage));
+        old.tools.insert(
+            "gh".into(),
+            image("tools/gh:1", 'b', ImageSource::Tool { tool: "gh".into() }),
+        );
+        old.secrets = vec![secret("github", "GH_TOKEN"), secret("jira", "JIRA_TOKEN")];
+        let old = old.sealed();
+        assert!(
+            old.diff(&old.clone()).is_empty(),
+            "an environment does not differ from itself"
+        );
+
+        let mut new = old.clone();
+        new.base_image = Some(image("ubuntu:24.04", 'c', ImageSource::GlobalTaskImage));
+        new.tools.clear();
+        new.secrets = vec![
+            secret("github", "GITHUB_TOKEN"),
+            secret("gitlab", "GL_TOKEN"),
+        ];
+        new.profile.version = 2;
+        new.task_image = Some(TaskImage {
+            base: ImageSpec::pinned("debian:trixie-slim"),
+            components: vec![component("glab", "apt-get install -y glab\n")],
+            secrets: vec![ComponentSecret {
+                name: "db".into(),
+                delivery: SecretDelivery::Env("DB_PASSWORD".into()),
+            }],
+        });
+        let new = new.sealed();
+
+        let diff = old.diff(&new);
+
+        let names = |added: &[&str], removed: &[&str], changed: &[&str]| NamedChanges {
+            added: added.iter().map(|name| name.to_string()).collect(),
+            removed: removed.iter().map(|name| name.to_string()).collect(),
+            changed: changed.iter().map(|name| name.to_string()).collect(),
+        };
+        assert_eq!(
+            diff,
+            EnvironmentDiff {
+                task_image_base: Some(ValueChange {
+                    before: None,
+                    after: Some("debian:trixie-slim".into()),
+                }),
+                task_image_components: names(&["glab"], &[], &[]),
+                task_image_secrets: names(&["db"], &[], &[]),
+                secrets: names(&["gitlab"], &["jira"], &["github"]),
+                base_image: Some(ValueChange {
+                    before: old.base_image.as_ref().map(|image| image.pinned.clone()),
+                    after: new.base_image.as_ref().map(|image| image.pinned.clone()),
+                }),
+                step_images: NamedChanges::default(),
+                runtime_bundle: None,
+                tools: names(&[], &["gh"], &[]),
+                profile: Some(ValueChange {
+                    before: Some("none v0".into()),
+                    after: Some("none v2".into()),
+                }),
+            }
+        );
+        assert_eq!(diff.change_count(), 9);
+
+        // A component whose script changed is changed, not added again; a
+        // profile edited without a version bump still reads as two values.
+        let mut edited = new.clone();
+        edited.task_image.as_mut().unwrap().components[0].install = "other\n".into();
+        edited.profile.digest = canonical_sha256(&serde_json::json!("edited"));
+        let diff = new.diff(&edited.sealed());
+        assert_eq!(diff.task_image_components, names(&[], &[], &["glab"]));
+        assert_eq!(diff.change_count(), 2);
+        let profile = diff.profile.expect("the profile content changed");
+        assert_ne!(profile.before, profile.after);
     }
 
     #[test]

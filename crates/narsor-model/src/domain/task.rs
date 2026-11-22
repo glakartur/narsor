@@ -304,6 +304,15 @@ impl TaskLaunchSpec {
         self
     }
 
+    /// Returns the spec with `environment` in place of its own, resealed:
+    /// the environment refresh, the one change a sealed spec allows. Every
+    /// other field is kept.
+    pub fn with_environment(mut self, environment: ResolvedEnvironment) -> Self {
+        self.environment = environment;
+        self.digest = self.compute_digest();
+        self
+    }
+
     /// Recomputes the digest from the content fields.
     ///
     /// SHA-256 over the canonical JSON rendering (see
