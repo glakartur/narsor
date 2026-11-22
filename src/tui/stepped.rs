@@ -681,11 +681,10 @@ pub fn render(
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let body = area;
     match form.stage {
         Stage::Choice => {
             let chooser = &mut form.level_mut().chooser;
-            chooser::render_footer(frame, body, chooser, styles, focused);
+            chooser::render_footer(frame, area, chooser, styles, focused);
         }
         Stage::Fields => {
             let Some(leaf) = form.leaf.as_ref() else {
@@ -700,19 +699,19 @@ pub fn render(
                 .unwrap_or_default();
             frame.render_widget(
                 Paragraph::new(Line::styled(description, styles.of(Role::Done))),
-                Rect::new(body.x, body.y, body.width, 1),
+                Rect::new(area.x, area.y, area.width, 1),
             );
             let fields = Rect::new(
-                body.x,
-                body.y.saturating_add(1),
-                body.width,
-                body.height.saturating_sub(1),
+                area.x,
+                area.y.saturating_add(1),
+                area.width,
+                area.height.saturating_sub(1),
             );
             chooser::render_fields(frame, fields, &leaf.fields, styles, focused);
         }
         Stage::Confirm => {
-            let lines = confirm_lines(form, styles, body.width);
-            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+            let lines = confirm_lines(form, styles, area.width);
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
         }
     }
 }
