@@ -49,7 +49,8 @@ repositories use the same frames.
 
 **The list** is the queue: tasks stand in the order of the scheduler (`rank`),
 are never grouped or sorted by state, and change place only by an explicit
-action (`Ctrl+↑` / `Ctrl+↓` / `m`, the TUI's `narsor-cli task move`). A row takes three
+action (`Ctrl+↑` / `Ctrl+↓` / `m`, the TUI's `narsor-cli task move`). A resume,
+an answer or a comment does not move a task. A row takes three
 lines and has one icon column that says the state of the task:
 
 | Icon | State |
