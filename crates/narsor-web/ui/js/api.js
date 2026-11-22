@@ -212,6 +212,9 @@ export class Api {
   executionEvents(taskId, after, limit, signal) {
     return this.get(`/control/v1/tasks/${path(taskId)}/execution-events`, { after, limit }, { signal, timeoutMs: RELAYED_TIMEOUT_MS });
   }
+  executionState(taskId, signal) {
+    return this.get(`/control/v1/tasks/${path(taskId)}/execution-state`, undefined, { signal, timeoutMs: RELAYED_TIMEOUT_MS });
+  }
   conductor(taskId, after, limit, signal) {
     return this.get(`/control/v1/tasks/${path(taskId)}/conductor`, { after, limit }, { signal, timeoutMs: RELAYED_TIMEOUT_MS });
   }

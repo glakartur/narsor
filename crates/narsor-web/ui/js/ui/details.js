@@ -1,5 +1,5 @@
 // The details of the selected task: the header (workspaces, status row,
-// usage row, notice) and the five tabs, in the TUI's order. The answer
+// usage row, notice) and the six tabs, in the TUI's order. The answer
 // panel and the action panel come in U7–U8.
 
 import { html } from '../lib.js';
@@ -15,12 +15,14 @@ import { Conversation } from './tabs/conversation.js';
 import { Events } from './tabs/events.js';
 import { Info } from './tabs/info.js';
 import { Progress } from './tabs/progress.js';
+import { State } from './tabs/state.js';
 
 export const TABS = [
   ['conversation', 'Rozmowa'],
   ['progress', 'Przebieg'],
   ['events', 'Zdarzenia'],
   ['conductor', 'Dyrygent'],
+  ['state', 'Stan'],
   ['info', 'Info'],
 ];
 
@@ -114,6 +116,7 @@ function DetailsBody({ store, state, task, now, onBack, onActions, onQueue }) {
   else if (tab === 'progress') content = html`<${Progress} api=${api} task=${task} timeline=${timeline} now=${now} />`;
   else if (tab === 'events') content = html`<${Events} api=${api} task=${task} />`;
   else if (tab === 'conductor') content = html`<${Conductor} store=${store} task=${task} />`;
+  else if (tab === 'state') content = html`<${State} key=${task.task_id} api=${api} task=${task} />`;
   else content = html`<${Info} api=${api} task=${task} />`;
 
   return html`
