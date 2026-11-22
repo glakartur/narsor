@@ -13,17 +13,17 @@ execution: code
 ## Goal Capsule
 
 - **Objective:** When a task stops because its workload was lost or its step failed, the owner can write to the agent ("Napisz do agenta"). The agent continues the current step in the same harness session and keeps its context. When the session cannot be continued, the owner is told before sending that a new session starts.
-- **Product authority:** Issue #140. Assumptions taken without the owner are listed in "Założenia do potwierdzenia" and "Assumptions". The questions in "Pytania otwarte dla użytkownika" have a recommended answer, and the plan follows it.
-- **Means:** The harness session id becomes durable as soon as the harness reports it (KTD1). One engine lookup finds the session of the current step (KTD2). An owner recovery that carries a message resumes that session (KTD3). The control plane offers the comment action in four more owner/runner states (KTD6).
+- **Product authority:** Issue #140. Assumptions taken without the owner are listed in "Założenia do potwierdzenia" and "Assumptions". The questions in "Pytania otwarte dla użytkownika" were answered by the owner in the PR, and the plan follows the answers.
+- **Means:** The harness session id becomes durable in `timeline.json` as soon as the harness reports it (KTD1). One engine lookup finds the session of the current step (KTD2). An owner recovery that carries a message resumes that session (KTD3). The control plane offers the comment action in four more owner/runner states (KTD6).
 - **Execution profile:** One pull request. Units U1 to U7, in dependency order.
-- **Stop conditions:** Stop and report if a harness cannot report its session id before the step ends (U1), or if the event log cannot be read during recovery or snapshot building without a full scan that is too slow for a long run (U2).
+- **Stop conditions:** Stop and report if a harness cannot report its session id before the step ends (U1), or if `timeline.json` or the event log cannot be read during recovery or snapshot building without a full scan that is too slow for a long run (U2).
 - **Who finishes:** The implementer runs `cargo test --workspace` and opens the PR. The owner answers "Pytania otwarte dla użytkownika" in review.
 
 ---
 
 ## Product Contract
 
-Product Contract preservation: changed: R7 — the durable record of the in-flight session is an event in the event log, not a field in the execution metadata, because the engine cannot save metadata during a step (KTD1). The behavior that R7 asks for does not change. This change is open as Q1 in "Pytania otwarte dla użytkownika". The other R/F/AE IDs are unchanged. "Outstanding Questions → Deferred to Planning" is resolved in place (KTD1, KTD5, KTD4). The section "Pytania otwarte dla użytkownika" now holds Q1 and Q2.
+Product Contract preservation: changed: R7 — the durable record of the in-flight session is a field of the attempt in `timeline.json`, not a field in the execution metadata, because the engine cannot save metadata during a step (KTD1). The owner chose this in Q1. The behavior that R7 asks for does not change. The other R/F/AE IDs are unchanged. "Outstanding Questions → Deferred to Planning" is resolved in place (KTD1, KTD5, KTD4). The owner answered Q1 (record in `timeline.json`) and Q2 (restart at once). Both are in the plan: KTD1, KTD7.
 
 ### Summary
 
@@ -52,7 +52,7 @@ Three gaps cause this (verified in the code):
 
 **Session continuity (engine)**
 
-- R7. The engine durably records the harness session id of the running step as soon as the harness reports it, before the step ends. After the step completes, the record no longer counts as the in-flight session. (The record is an event, not a metadata field: see the preservation note and KTD1.)
+- R7. The engine durably records the harness session id of the running step as soon as the harness reports it, before the step ends. After the step completes, the record no longer counts as the in-flight session. (The record is a field of `timeline.json`, not a metadata field: see the preservation note and KTD1.)
 - R8. The step failure record stores the session id when it is known.
 - R9. A recovery that carries an owner message resumes the known harness session of the current step with that text, instead of restarting the action. The step's output contract applies to the result, as for a reprompt.
 - R10. Session lookup order for R9: the in-flight session of the current state, then the step failure record (R8), then the output rejection or rescue record, then `completed_agent_sessions` for the state. For a `Failed` execution the failure record is the source of the failed attempt's session, because a step failure clears the rejection and rescue records. The lookup must not fall through to an older session of the same state while the failure record holds one.
@@ -87,7 +87,7 @@ Three gaps cause this (verified in the code):
 ### Key Decisions
 
 - **When no session can be resumed, offer the action with a warning instead of hiding it.** Reason: the owner can still give the agent direction, and the text is not lost. Decided in issue #140. Governs R5, R11.
-- **The engine records the session id early, before the step ends.** Reason: a pod loss mid-step otherwise leaves no record of the session. Governs R7.
+- **The engine records the session id early, before the step ends, in `timeline.json`.** Reason: a pod loss mid-step otherwise leaves no record of the session. Governs R7.
 - **The text goes through the recovery path, not as an answer to a waiting request.** Reason: the runner already carries pending comments into recovery and marks them once. Governs R9, R12, R13.
 
 ### Scope Boundaries
@@ -97,7 +97,7 @@ Three gaps cause this (verified in the code):
 - The `runner_alive` result for `HumanNeeded` + `Stopped` + `holds_slot` ("Stop" and "Przejście ręczne" offered for a stopped runner): a separate issue, out of scope.
 - No change to "Uruchom od nowa" and "Wybierz krok". They still start a new session.
 - An automatic resume by the resume policy (no owner message) keeps today's behavior: it restarts the action. Only a recovery with an owner message continues the session (R9).
-- Considered and not built: a check that the harness's session files still exist before the offer says "the agent continues". The harness home lives on task storage (private HOME) or on the host, so it survives a pod loss. When a resume fails at run time, the existing `RESUME_SESSION_REJECTED` path catches it (KTD7). Evidence that would change this: a backend whose harness home does not survive the workload.
+- Considered and not built: a check that the harness's session files still exist before the offer says "the agent continues". The harness home lives on task storage (private HOME) or on the host, so it survives a pod loss. When a resume fails at run time, the `RESUME_SESSION_REJECTED` branch restarts the action at once with the text as the note (KTD7). Evidence that would change this: a backend whose harness home does not survive the workload.
 
 ### Dependencies / Assumptions
 
@@ -116,12 +116,8 @@ Three gaps cause this (verified in the code):
 
 ### Pytania otwarte dla użytkownika
 
-- Q1. **Product Contract / R7 — where the in-flight session id is recorded.** The requirements said "in the execution metadata". The engine keeps the execution in memory during a step and saves it as a whole at the end, so a metadata write during the step would be lost or overwritten. Options:
-  1. (Recommended) Record it as a new event in the event log (`AgentSessionIdentified`). The event log is append-only and already durable during a step. The timeline also shows the id at once.
-  2. Add a save path for metadata during a step. This needs a second writer for `state.json` next to the running pass, with a merge or lock against the final save.
-- Q2. **R11 / KTD7 — the harness refuses the stored session at run time** (for example its session files are gone). Options:
-  1. (Recommended) Keep today's behavior of `RESUME_SESSION_REJECTED`: the task waits for the owner with the text filled in, and Enter starts a new session with it. The owner sees that the session was lost, and no text is lost.
-  2. Restart the action at once with the text as the operator recovery note, with no stop for the owner.
+- Q1. **R7 – where the in-flight session id is recorded.** Answered by the owner: in `timeline.json`, not in `state.json` and not in a new event. See KTD1.
+- Q2. **R11 / KTD7 – the harness refuses the stored session at run time.** Answered by the owner: restart the action at once with the text as the operator recovery note. See KTD7.
 
 ### Sources / Research
 
@@ -149,13 +145,13 @@ Three gaps cause this (verified in the code):
 
 ### Key Technical Decisions
 
-- KTD1. **The in-flight session id is a new event, `EventData::AgentSessionIdentified`, appended when the harness first reports an id (and again if the id changes).** It carries `session_id` (narsor's agent session), `action_execution_id`, `harness` and `harness_session_id`. Reason: the event log is the only store that is durable during a step. `WorkflowExecution.metadata` is saved as a whole by the pass that holds the claim, so a side-channel metadata write would be overwritten (research: `execute_rendered` in `crates/narsor-exec/src/engine/runner/step/attempt.rs` holds only a reference while the harness runs). `EventData` already ends in `#[serde(other)] Unrecognized`, so older clients read the new event without failing. Governs R7. Open as Q1.
-- KTD2. **One engine read, `resumable_agent_session`, implements the R10 lookup, and both the recovery and the snapshot flag call it.** It returns the harness and the harness session id, or nothing. The in-flight source is the latest `AgentSessionIdentified` or `AgentSessionFailed` with an id for the latest action attempt of the current state, and only when no `AgentSessionCompleted` follows it for that attempt. Reason: the flag that the owner sees (R6) and the session that the recovery resumes (R9) cannot disagree when they come from one function. This mirrors the "one rule for offer and check" pattern of D66.
+- KTD1. **The in-flight session id is a field of the attempt in `timeline.json`, written when the harness first reports an id (and again if the id changes).** The writer is a new method on the sink that already writes the usage readings during a step (`ReadingSink` / `FileReadingSink` in `crates/narsor-exec/src/engine/timeline_file.rs`). It does not touch `state.json`. Reason: the owner chose this in Q1. The file is already written during a step under its own lock, so no second writer for `state.json` is needed, and a metadata write during the step would be overwritten by the final save. Known limit: the file is derived, and a lost file loses its readings, so it also loses the in-flight id. The recovery then gives the text as the operator recovery note (R11). The id of a completed or failed attempt stays in the event log (`AgentSessionCompleted`, `AgentSessionFailed`). No new event type is added. Governs R7. Answered in Q1.
+- KTD2. **One engine read, `resumable_agent_session`, implements the R10 lookup, and both the recovery and the snapshot flag call it.** It returns the harness and the harness session id, or nothing. The in-flight source is the id in `timeline.json` for the latest action attempt of the current state (or the latest `AgentSessionFailed` with an id), and only when no `AgentSessionCompleted` follows it for that attempt. Reason: the flag that the owner sees (R6) and the session that the recovery resumes (R9) cannot disagree when they come from one function. This mirrors the "one rule for offer and check" pattern of D66.
 - KTD3. **The owner message rides on `Recovery` as its own field (key and text), not inside the comment.** `prepare_recover` resolves the session through KTD2 before it clears the step failure, rejection and rescue records. With a session, it stores the text as an `agent_input` with that harness and session (the existing `store_agent_input`, `PromptAuthor::User`). Without one, it stores the text as the operator recovery note (R11). The decision comment of the runner (for example "owner resume after the task's workload stopped unexpectedly") stays the recovery note in both cases, so the agent also learns why it was resumed. `prepare_harness_attempt` already applies `continue_session` and sets `skip_output_contract`, because the session holds the contract from its first prompt. The contract still validates the result (R9). Governs R9, R11.
 - KTD4. **Attempt budget: the continue-session recovery is an ordinary owner recovery.** `run_action` starts a new action attempt with a full `retry_policy` round, as for "Uruchom od nowa" today. `max_entries` is not checked on recovery today, and this does not change. Resolves the deferred question and Assumption 4.
 - KTD5. **The snapshot flag is `agent_session_resumable: bool` on `RunnerSnapshotRequest`, the model `RunnerSnapshot` and `RunnerView`, with `#[serde(default)]`.** The runner sets it from KTD2 in every snapshot. `false` covers both "no session" and "an older runner", which is what Assumption 6 asks for. Reason: `TaskSummary` already carries the runner view, and `comment_effect` reads the summary on the server. For a lost workload, the value that counts is the last snapshot before the loss. A new event makes the runner report within `report_interval` (1 s by default), so the flag follows the event closely. Resolves the deferred question on the flag.
 - KTD6. **The control plane widens the comment path only.** `comment_reason`, the pause branch of `submit_comment` and `store_resume_message` accept the R1 states. The resume after a comment goes through a variant of `resume_for_work` that also accepts `Interrupted` and `Unknown`, used only by `submit_comment`. Reason: `submit_input` and operator commands also call `resume_for_work`, and their behavior must not change. Governs R1–R4.
-- KTD7. **A session that the harness refuses at run time keeps the existing `RESUME_SESSION_REJECTED` path.** The task waits for the owner with the text filled in, and Enter starts a new session. Reason: the path exists, it loses no text, and it shows the owner that the session is gone. R11's "harness cannot resume" is read as a capability of the harness, known before the run. Open as Q2.
+- KTD7. **A session that the harness refuses at run time restarts the action at once, with the text as the operator recovery note.** When the refused session came with an owner message from a continue-session recovery, the `RESUME_SESSION_REJECTED` branch in `crates/narsor-exec/src/engine/runner/step/attempt.rs` does not stop for the owner. It stores the text as the operator recovery note and starts the next attempt as a new session. Reason: the owner chose this in Q2. The text is not lost, and the owner does not press Enter. A refused session with no owner message keeps today's behavior. Governs R11. Answered in Q2.
 - KTD8. **Exactly once (R13) has two guards.** The engine writes `resume_message_key` in the same save as the `agent_input` or note, inside `prepare_recover`. A repeated recovery with the same key stores nothing again. The runner mark `resume-message:<key>` stays as it is (written after the recovery call succeeds). Reason: today the mark is best effort in `recover` (a failed write only logs a warning), so the engine key closes the window in which the mark is lost.
 
 ### High-Level Technical Design
@@ -166,12 +162,12 @@ Where the session id comes from and where it is read:
 sequenceDiagram
     participant H as Harness process
     participant S as SessionRunner (per-line loop)
-    participant E as Event log
+    participant E as timeline.json and event log
     participant R as Runner snapshot
     participant CP as Control plane
     participant O as Owner (TUI)
     H->>S: stdout line with session id
-    S->>E: AgentSessionIdentified (KTD1)
+    S->>E: timeline.json: session id of the attempt (KTD1)
     R->>E: resumable_agent_session (KTD2)
     R->>CP: snapshot, agent_session_resumable (KTD5)
     Note over H,R: workload is lost or the step fails
@@ -230,7 +226,7 @@ U1 → U2 → U3 → U4. U2 → U5 → U6. U7 last. U5 and U6 can be built while
 
 | Risk | Mitigation |
 |---|---|
-| The last snapshot before a pod loss was sent before `AgentSessionIdentified`, so the offer warns although the recovery will resume the session. | Safe direction (Assumption 6). The recovery still uses KTD2 on the event log, so the agent still gets the session. |
+| The last snapshot before a pod loss was sent before the session id reached `timeline.json`, so the offer warns although the recovery will resume the session. | Safe direction (Assumption 6). The recovery still uses KTD2 on the event log, so the agent still gets the session. |
 | `Error`/`Unknown` may still have a live workload. A resume would put two runners on one storage. | No new risk: the lifecycle already allows an owner `Resume` from `Unknown`, and the offer already has "Uruchom od nowa" there. The controller's loss confirmation rules (D58) stay as they are. |
 | The resumed agent repeats side effects of the lost part of the step. | Accepted, as for automatic resume (D58). The agent keeps its context, which lowers the risk compared to today's restart. |
 | The message is lost when the pod dies after `take_agent_input` saved and before the harness read the prompt. | Same window as today's comment in a pause. The `resume_message_key` keeps it from being given twice. A test covers the repeated recovery (U3). |
@@ -248,31 +244,30 @@ U1 → U2 → U3 → U4. U2 → U5 → U6. U7 last. U5 and U6 can be built while
 
 ### U1. Report the harness session id during the run
 
-- **Goal:** Append `AgentSessionIdentified` as soon as a harness reports its session id (R7).
+- **Goal:** Write the harness session id into `timeline.json` as soon as a harness reports it (R7).
 - **Requirements:** R7; F1. KTD1.
 - **Dependencies:** none.
 - **Files:**
-  - `crates/narsor-protocol/src/event.rs` (new variant)
+  - `crates/narsor-exec/src/engine/timeline_file.rs` (a per-attempt session id field, a `record_session` method on `ReadingSink` and `FileReadingSink`, and a read for U2)
   - `crates/narsor-exec/src/engine/actions/harness/mod.rs` (`HarnessStreamParser`: a read of the session id the parser holds now)
   - `crates/narsor-exec/src/engine/actions/harness/claude_code.rs`, `codex.rs`, `opencode.rs`, `github_copilot.rs`, `copilot_sdk.rs` (expose the id each parser already holds)
   - `crates/narsor-exec/src/engine/actions/session/process.rs` (per-line loop of `spawn_and_wait`)
   - `crates/narsor-exec/src/engine/actions/session.rs`, `crates/narsor-exec/src/engine/actions/session/conversation.rs` (pass the `AgentEventSink` to the loop)
-  - `crates/narsor-exec/src/engine/timeline.rs` (set `harness_session_id` of the position from the new event)
   - Tests: `tests/integration/actions_agent.rs`, `tests/integration/timeline.rs`
 - **Approach:**
   1. Add a parser read that returns the session id known so far. The parsers already keep it in their state. `finish()` is unchanged.
-  2. After each stdout line, compare the id with the last reported one. When it is new, append the event through the session's `AgentEventSink`, in the shape of the `UsageRelay` that the loop already gets.
+  2. After each stdout line, compare the id with the last reported one. When it is new, write it through the session's `ReadingSink`, in the shape of the `UsageRelay` that the loop already gets.
   3. The copilot SDK path feeds its records into the github_copilot parser through `feed_copilot_sdk_record`. Apply the same check at that feed site.
-  4. The timeline reads the event the way it reads `AgentSessionFailed`, without setting `harness_session_interrupted`.
+  4. When the file is rebuilt from the log, the stored session ids are put back on it, as the readings are.
 - **Patterns to follow:** `UsageRelay` / `UsageReporter` in `conversation.rs`; `docs/solutions/design-patterns/latest-value-reports-coalesce-per-key-one-send-at-a-time-2026-10-31.md`.
 - **Test scenarios:**
-  - A recorded claude_code stream whose first line is the `system` line gives one `AgentSessionIdentified` with that id, before `AgentSessionCompleted`.
-  - A stream where the id is reported on several lines (opencode repeats `sessionID`) gives one event, not one per line.
-  - A harness process killed after its id line (the test fake stops mid-run) leaves the event in the log.
-  - A stream without an id gives no event.
+  - A recorded claude_code stream whose first line is the `system` line puts that id on the attempt in `timeline.json` before the step ends.
+  - A stream where the id is reported on several lines (opencode repeats `sessionID`) is written once, not once per line.
+  - A harness process killed after its id line (the test fake stops mid-run) leaves the id in `timeline.json`.
+  - A stream without an id writes no id.
   - The timeline position of an attempt that was cut after the event shows its `harness_session_id`.
-  - An event log line with the new `type` reads as `Unrecognized` in a decoder without the variant (raw-JSON test, as for D58 enums).
-- **Verification:** the event exists in the log before the step ends for each of the five parsers' fixtures.
+  - A `timeline.json` without the new field still reads, and a rebuild of the file keeps the ids.
+- **Verification:** the id is in `timeline.json` before the step ends for each of the five parsers' fixtures.
 
 ### U2. One session lookup and a failure record with the session
 
@@ -284,7 +279,7 @@ U1 → U2 → U3 → U4. U2 → U5 → U6. U7 last. U5 and U6 can be built while
   - `crates/narsor-exec/src/engine/runner/metadata/` (a new module for `resumable_agent_session`, next to `pending_step.rs`)
   - Tests: `tests/integration/engine_recovery.rs`
 - **Approach:**
-  1. `record_step_failure` gets the failed attempt's session from the event log (`AgentSessionFailed` with an id, else the latest `AgentSessionIdentified` of that attempt). A timeout or spawn error has no id in `AgentSessionFailed` today, so the event of U1 is the source then.
+  1. `record_step_failure` gets the failed attempt's session from the event log (`AgentSessionFailed` with an id, else the id of that attempt in `timeline.json`). A timeout or spawn error has no id in `AgentSessionFailed` today, so the file of U1 is the source then.
   2. `resumable_agent_session(execution, events)` walks R10 in order. It returns the step failure's session when the execution is `Failed`, and it does not fall through to `completed_agent_sessions` while the failure record holds one.
   3. A harness with no resume support gives nothing. All five built-in harnesses support it. If the harness registry has no such flag, treat an unknown harness name as not resumable.
 - **Test scenarios:**
@@ -304,6 +299,7 @@ U1 → U2 → U3 → U4. U2 → U5 → U6. U7 last. U5 and U6 can be built while
 - **Files:**
   - `crates/narsor-exec/src/engine/runner/failure/handoff.rs` (`Recovery` gains the owner message; a constructor for it)
   - `crates/narsor-exec/src/engine/runner/lifecycle/resume.rs` (`prepare_recover`)
+  - `crates/narsor-exec/src/engine/runner/step/attempt.rs` (the `RESUME_SESSION_REJECTED` branch, KTD7)
   - `crates/narsor-exec/src/engine/runner/human_input/operations.rs`, `human_input/agent_input.rs` (share the "message to session or note" step with `leave_resume_message`)
   - Tests: `tests/integration/engine_recovery.rs`
 - **Approach:**
@@ -319,6 +315,7 @@ U1 → U2 → U3 → U4. U2 → U5 → U6. U7 last. U5 and U6 can be built while
   - Covers AE3. No session: the attempt starts fresh, and the prompt ends with the operator recovery note that holds the decision comment and the text.
   - Covers AE4. Two recoveries with the same message key (the second after a new loss): the text is given once.
   - The runner's decision comment is in the resumed prompt as the recovery note.
+  - The harness refuses the stored session on a recovery with an owner message: the action restarts at once as a new session with the text as the operator recovery note, and the task does not wait for the owner (KTD7).
 - **Verification:** the scenarios pass, and the existing recovery tests in `engine_recovery.rs` pass unchanged.
 
 ### U4. Runner delivery for recover and for a failed execution
@@ -420,4 +417,4 @@ U1 → U2 → U3 → U4. U2 → U5 → U6. U7 last. U5 and U6 can be built while
 - Old event logs, old `step_failure` records and snapshot JSON without the new field still read.
 - `docs/dev/architecture.md` and `docs/user/tui.md` are updated (U7).
 - No code from abandoned attempts is left in the diff.
-- Q1 and Q2 of "Pytania otwarte dla użytkownika" are answered by the owner in the PR, or the recommended options are confirmed.
+- The answers to Q1 and Q2 (KTD1, KTD7) are implemented.
