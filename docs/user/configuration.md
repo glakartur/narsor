@@ -61,7 +61,7 @@ section belongs to one program:
 
 **Section ownership.** A program reads `global` and its own sections, and
 nothing else, with two named exceptions: the clients (`narsor-cli`, `narsor`,
-`narsor-web`) read `server.state` to find the local daemon, and `narsor-cli`
+`narsor-web`) read `server.state` to find the local daemon in `state/run/`, and `narsor-cli`
 reads the whole `tui` section. A program checks only what it reads, so an
 error in the `web` section does not stop the server or a runner, and an error
 in `global` stops every program. Each setting has exactly one place in the
@@ -144,8 +144,8 @@ its new one; the program still starts on the values it found.
 | `global.root` | `NARSOR_GLOBAL__ROOT` (flag `--root`) | `./.narsor` |
 | `global.log_level` | `NARSOR_GLOBAL__LOG_LEVEL` | `off` |
 | `server.catalog` | `NARSOR_SERVER__CATALOG` | `.` (the root) |
-| `server.state` | `NARSOR_SERVER__STATE` | `.` (the root) |
-| `server.work` | `NARSOR_SERVER__WORK` | `.` (the root) |
+| `server.state` | `NARSOR_SERVER__STATE` | `state` (below the root) |
+| `server.work` | `NARSOR_SERVER__WORK` | `work` (below the root) |
 | `server.agent_harness` | `NARSOR_SERVER__AGENT_HARNESS` | `claude-code` |
 | `server.max_concurrent_tasks` | `NARSOR_SERVER__MAX_CONCURRENT_TASKS` | `1` |
 | `server.defaults.backend` | `NARSOR_SERVER__DEFAULTS__BACKEND` | `local` |
@@ -265,14 +265,14 @@ installation. The three directories of the server are resolved against it:
 
 | `server.state` | Result with `global.root: /srv/narsor` |
 |---|---|
-| not set (built-in `.`) | `/srv/narsor` |
-| `state` | `/srv/narsor/state` |
+| not set (built-in `state`) | `/srv/narsor/state` |
+| `.` | `/srv/narsor` |
 | `/var/lib/narsor-state` | `/var/lib/narsor-state` |
 
 The same rule applies to `server.catalog` and `server.work`. A relative value
 is joined to the root, an absolute value is used as is. `--root` sets
-`global.root` only, so `--root /x` with nothing else puts all three
-directories at `/x`, as before. The clients resolve `server.state` the same
+`global.root` only, so `--root /x` with nothing else puts the catalogue at
+`/x`, the state root at `/x/state` and the work root at `/x/work`. The clients resolve `server.state` the same
 way to find the local daemon. `config show` shows the joined path; its
 source is the source of the directory's own key.
 
@@ -433,36 +433,84 @@ their variables on purpose, and raised the JSON to `version: 2`; see
 
 ## The on-disk layout
 
-With the built-in directories, everything is under the root (`global.root`,
-`--root`, `./.narsor` by default). `server.state`, `server.catalog` and
-`server.work` move their parts elsewhere (see
-[Directories relative to the root](#directories-relative-to-the-root)):
+`server.state` and `server.work` are **roots**, not directories of one
+program. Each program appends only its own name to them and keeps its files
+there: `state/<program>/` and `work/<program>/`. The catalogue
+(`server.catalog`, the root by default) holds the workflow definitions, the
+repository registry and the other catalogue files. With the built-in values
+(`global.root`, `--root`, `./.narsor` by default):
 
 ```text
-{root}/
-├── repositories.json               # the repository registry (`repo add` …)
-├── executions/{execution_id}/      # executions created before the task scheduler
-│   ├── state.json                  # WorkflowExecution: status, current state, context
-│   ├── context.json                # the context projection (variables, artifacts, workspace)
-│   ├── pending_input.json          # the question an input-needed execution is waiting on
-│   ├── definition.yaml             # pinned copy of the workflow definition for this execution
-│   ├── checkpoint.<repo>.bundle    # per workflow repository: git bundle of its delta against base_commit
-│   ├── checkpoint.<repo>.git/      # scratch area for materialising that checkpoint
-│   ├── events/{sequence:08}.json   # append-only event log
-│   ├── conversations/{action_execution_id}.jsonl(.zst)  # per-attempt agent conversation record
-│   └── artifacts/{artifact_id}/    # files produced by actions
-├── orchestration/                  # durable queued tasks, their order (rank), leases
-├── local-controller/credential     # the daemon-owned local controller's identity
-├── local-controller/secrets/       # the token store of the Docker mode (`secret set`), 0700
-├── local-controller/images/        # the Docker mode's task image cache and refresh marker
-├── local-controller/storage/{task_id}/   # under `server.work` (the root by default)
-│   ├── state/                      # execution history once the runner initializes it
-│   └── workspace/                  # provisioned only after scheduler admission
-├── local-controller/tasks/{task_id}.json # under `server.work`: last runner kind and image of a task
-└── narsor.log                # only written by `tui`, and only with RUST_LOG set
+{root}/                              # the catalogue (server.catalog)
+├── backups/                         # 0700: backups of narsor-migrate (layout-migration-*.tar.zst)
+├── state/                           # the state root (server.state)
+│   ├── run/                         # 0700: the meeting place of the server and its clients
+│   │   ├── daemon.json              # discovery: address, token, pid (0600)
+│   │   ├── daemon.lock              # autostart lock (+ daemon.lock.guard)
+│   │   └── narsor-server.log        # output of a server that a client started
+│   ├── narsor-server/               # narsor-server
+│   │   ├── auth/                    # installation owner, claim code
+│   │   ├── orchestration/           # task records and events, leases, controllers, enrollments
+│   │   ├── materials/               # task materials
+│   │   ├── observer-queues/         # queue entries, automation state
+│   │   ├── agent-harness.json       # the default harness selection
+│   │   ├── daemon.instance.lock     # held by the running server
+│   │   └── layout-migrated          # marker of the one-time layout migration (narsor-migrate)
+│   ├── narsor-controller-local/     # the local controller (narsor-controller local)
+│   │   ├── credential(.lock)        # its identity, written at enrollment
+│   │   ├── controller-id            # label of the Docker images it builds
+│   │   ├── secrets/                 # token store of the Docker mode (`secret set`), 0700
+│   │   ├── images/                  # task image cache and refresh marker
+│   │   ├── tasks/{task_id}.json     # last runner kind and image of a task
+│   │   └── layout-migrated
+│   ├── narsor-web/                  # web-session, web-open.html (0600)
+│   └── narsor/                      # the TUI: narsor.log, only with RUST_LOG set
+└── work/                            # the work root (server.work)
+    └── narsor-controller-local/
+        ├── storage/{task_id}/       # task storage
+        │   ├── state/               # execution history, written by the runner
+        │   └── workspace/           # provisioned after scheduler admission
+        ├── workloads/{task_id}/     # one directory per live working runner
+        └── readers/{task_id}-reader/  # one directory per live read-only runner
 ```
 
-Every write of `state.json`, `context.json` and `repositories.json` is atomic
-(temporary file in the same directory, `fsync`, `rename`), and event numbering
-increases monotonically without gaps. An interrupted write leaves the previous
-version of the file intact.
+`narsor-server` runs no workflow and has no work directory. A hand-started
+controller (`narsor-controller local`) takes the roots as flags:
+`--state-root` (by default `$XDG_STATE_HOME/narsor`) and `--work-root`.
+
+### `state/run/`: the only shared directory
+
+A program reads and writes only its own directories. `state/run/` is the one
+exception: each file there has one writer and named readers.
+
+| File | Writer | Readers |
+|---|---|---|
+| `daemon.json` | `narsor-server` (atomic, `0600`), deleted when it stops | `narsor-cli`, `narsor`, `narsor-web` (they delete a stale one) |
+| `daemon.lock`, `daemon.lock.guard` | the client that starts a server (autostart) | the other clients, which wait for it |
+| `narsor-server.log` | created by the client that starts a server; the server writes its output | that client, which shows its end when the start fails |
+
+The server and every client create `state/run/` with mode `0700`, tighten a
+wider one of the same user, and refuse a symbolic link or a directory of
+another user.
+
+### Delegation instead of shared paths
+
+No program spells another program's directory. When a program needs another
+one to act on its files, it starts that program with the **roots**, and the
+other program finds its own directory:
+
+- `narsor-server` starts the local controller with `--state-root` and
+  `--work-root`;
+- `narsor-cli secret set` and `narsor-cli image refresh` run
+  `narsor-controller` with `--state-root`;
+- the controller gives each runner the paths of one task only (workload
+  directory, task storage, secrets directory).
+
+An older installation keeps its files at the old places until the first start
+of a new `narsor-server`, which moves them once. See
+[Updates](../operations/updates.md#update-to-a-directory-per-program-state-ownership).
+
+Every write of `state.json` and `context.json` is atomic (temporary file in
+the same directory, `fsync`, `rename`), and event numbering increases
+monotonically without gaps. An interrupted write leaves the previous version
+of the file intact.

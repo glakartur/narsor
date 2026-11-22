@@ -5,7 +5,12 @@
 //! container needs, write a container record and ask the image build job
 //! for the task image, and return at once; `observe` reports `Starting`
 //! while the image builds, then copies the task's secrets into the workload
-//! directory and starts the container (KTD5–KTD7, KTD10, KTD12). There is no
+//! directory and starts the container (KTD5–KTD7, KTD10, KTD12). The launch
+//! spec it starts the container from is kept in memory ([`LaunchSpecs`]);
+//! after a controller restart the controller fetches it again. The runner
+//! fetches the spec itself (R5) with a credential issued when the container
+//! starts — an image build can outlast the one issued at creation — which
+//! the controller hands over through the same cache. There is no
 //! fallback to a host process (R4). The read-only runner (D63) stays a host
 //! process in both modes.
 //!
@@ -14,6 +19,13 @@
 //! controller restarted in the process mode still removes what a Docker-mode
 //! one left. A container needs none of the care a process group needs: its
 //! name is the workload's uid, and removing it takes everything in it.
+//!
+//! In the Docker mode the controller also follows the daemon's events of
+//! the managed containers ([`ContainerRunners::follow_events`]): a container
+//! that dies wakes it at once (R4). The stream is only a wake-up; what a
+//! container's state is, observing tells. When the stream ends it is
+//! followed again after a pause, and meanwhile the periodic observation
+//! notices what it would have.
 //!
 //! - [`docker`]: the `docker` CLI behind the [`DockerTransport`] trait.
 //! - [`docker_fake`]: an in-memory Docker for tests.
@@ -36,16 +48,20 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use narsor_controller_runtime::backend::{
-    BackendError, BackendResult, TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
+    BackendError, BackendResult, TaskResources, WakeSignal, WorkloadLaunch, WorkloadPhase,
+    WorkloadState,
 };
+use narsor_controller_runtime::LaunchSpecs;
 use narsor_model::domain::{SecretDelivery, TaskImage, TaskLaunchSpec, TaskRepositorySource};
 
 use super::backend::LocalBackendConfig;
 use super::workload::{
-    io_error, task_args, ContainerRecord, ExitRecord, LastRunner, Look, Role, TaskRecord,
-    WorkloadKind, WorkloadRecord, WorkloadStore, WORKLOAD_MARK_ENV,
+    io_error, task_args, write_credential, ContainerRecord, ExitRecord, LastRunner, Look, Role,
+    TaskRecord, WorkloadKind, WorkloadRecord, WorkloadStore, WORKLOAD_MARK_ENV,
 };
-use docker::{ContainerState, DockerError, DockerTransport, Mount, RunRequest, UserIds};
+use docker::{
+    ContainerEvent, ContainerState, DockerError, DockerTransport, Mount, RunRequest, UserIds,
+};
 use image::{definition_hash, BuildState, TaskImageBuilds, DEFINITION_LABEL, MANAGED_LABEL};
 use secrets::{SecretError, SecretStore};
 
@@ -78,6 +94,14 @@ const PASS_THROUGH_ENV: [&str; 9] = [
 /// How many lines of a container's output tell why it could not start.
 const LOG_TAIL: usize = 50;
 
+/// The first pause before an ended event stream is followed again; it
+/// doubles while the stream keeps ending without an event, up to
+/// [`EVENTS_RETRY_MAX`].
+const EVENTS_RETRY_MIN: Duration = Duration::from_millis(100);
+
+/// The longest pause before an ended event stream is followed again.
+const EVENTS_RETRY_MAX: Duration = Duration::from_secs(30);
+
 /// How long after its start a container's failure is checked for a runner
 /// that cannot execute in the image.
 pub const DEFAULT_START_WINDOW: Duration = Duration::from_secs(15);
@@ -89,6 +113,9 @@ pub struct ContainerMode {
     pub builds: TaskImageBuilds,
     /// The controller's token store (KTD10).
     pub secrets: SecretStore,
+    /// The state root the controller was given: no host path mounted into
+    /// a container may overlap it.
+    pub state_root: PathBuf,
     /// The host user and group the container runs as (KTD5).
     pub user: UserIds,
     /// The controller user's HOME, which a leading `~` of a home source
@@ -124,18 +151,46 @@ struct ContainerInputs {
 pub(super) struct ContainerRunners {
     config: Arc<LocalBackendConfig>,
     store: WorkloadStore,
+    /// The launch specs of the workloads created, until their container
+    /// starts (shared with the controller).
+    specs: LaunchSpecs,
 }
 
 impl ContainerRunners {
-    /// Containers run as `config` says, recorded in `store`.
-    pub(super) fn new(config: Arc<LocalBackendConfig>, store: WorkloadStore) -> Self {
-        Self { config, store }
+    /// Containers run as `config` says, recorded in `store`, started from
+    /// the launch specs in `specs`.
+    pub(super) fn new(
+        config: Arc<LocalBackendConfig>,
+        store: WorkloadStore,
+        specs: LaunchSpecs,
+    ) -> Self {
+        Self {
+            config,
+            store,
+            specs,
+        }
     }
 
     fn docker(&self) -> BackendResult<&Arc<dyn DockerTransport>> {
         self.config.docker.as_ref().ok_or_else(|| {
             BackendError::transient("this controller has no Docker transport to reach containers")
         })
+    }
+
+    /// In the Docker mode, follows the events of the managed containers on
+    /// a thread of its own and wakes `wake` at each, until nobody listens to
+    /// it any more. Nothing in the process mode.
+    pub(super) fn follow_events(&self, wake: WakeSignal) {
+        let (Some(_), Some(docker)) = (&self.config.container_mode, &self.config.docker) else {
+            return;
+        };
+        let docker = Arc::clone(docker);
+        let spawned = std::thread::Builder::new()
+            .name("docker-events".into())
+            .spawn(move || follow_managed_events(docker.as_ref(), &wake));
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "local backend: cannot follow Docker events; observing containers periodically");
+        }
     }
 
     /// Removes the task images no per-task record names and no cached
@@ -214,7 +269,7 @@ impl ContainerRunners {
             }
         })?;
         let inputs =
-            container_inputs(mode, spec, self.store.root()).map_err(BackendError::rejected)?;
+            container_inputs(mode, spec, self.store.work_dir()).map_err(BackendError::rejected)?;
         let mut missing = Vec::new();
         for name in &inputs.secret_names {
             match mode.secrets.read(name) {
@@ -285,6 +340,8 @@ impl ContainerRunners {
             let _ = fs::remove_dir_all(&dir);
             return Err(error);
         }
+        self.specs
+            .insert(&task.task_id, launch.generation, launch.launch_spec.clone());
         Ok(WorkloadState {
             uid: record.uid,
             resource_generation: record.resource_generation,
@@ -319,11 +376,24 @@ impl ContainerRunners {
                     .to_string(),
             ));
         };
-        let dir = self.store.workload_dir(task, role);
-        let spec = match read_spec(&dir) {
-            Ok(spec) => spec,
-            Err(problem) => return Ok(ended(task, record, None, problem)),
+        // The spec the workload was created with, kept in memory; after a
+        // controller restart it is asked for, and the controller fetches it
+        // at its next observation of the task (KTD4). Until then the
+        // container waits as for its image.
+        let Some(spec) = self
+            .specs
+            .get_or_request(&task.task_id, record.launch_generation)
+        else {
+            return Ok(Look::phase(WorkloadPhase::Starting));
         };
+        let spec = match serde_json::from_value::<TaskLaunchSpec>(spec) {
+            Ok(spec) => spec,
+            Err(error) => {
+                let problem = format!("the launch spec is malformed: {error}");
+                return Ok(ended(task, record, None, problem));
+            }
+        };
+        let dir = self.store.workload_dir(task, role);
         let image_id = match &container.image {
             Some(id) => id.clone(),
             None => {
@@ -382,6 +452,18 @@ impl ContainerRunners {
             }
             Err(error) => return Err(docker_error(&error)),
         }
+        // The credential issued at creation may have run out while the image
+        // built: the runner starts with a fresh one, issued for the same
+        // incarnation at the controller's next observation of the task.
+        let Some(credential) = self.specs.take_credential_or_request(
+            &task.task_id,
+            record.launch_generation,
+            &record.incarnation,
+        ) else {
+            return Ok(Look::phase(WorkloadPhase::Starting));
+        };
+        write_credential(dir, &credential)
+            .map_err(|error| io_error("write the runner credential", error))?;
         let request = match self.run_request(mode, task, record, container, spec, dir, &image_id) {
             Ok(request) => request,
             Err(problem) => return Ok(ended(task, record, None, problem)),
@@ -474,7 +556,7 @@ impl ContainerRunners {
         dir: &Path,
         image_id: &str,
     ) -> Result<RunRequest, String> {
-        let inputs = container_inputs(mode, spec, self.store.root())?;
+        let inputs = container_inputs(mode, spec, self.store.work_dir())?;
         let storage = self.store.storage_dir(task);
         let mut mounts = vec![
             mount(&storage, false),
@@ -489,6 +571,7 @@ impl ContainerRunners {
             task.task_id.as_str(),
             &storage,
             dir,
+            &spec.compute_digest(),
             &container.control_plane,
             &record.incarnation,
         );
@@ -560,12 +643,56 @@ impl ContainerRunners {
 /// workspace sources and the home sources (a leading `~` is the
 /// controller's HOME; each must exist), none of which may overlap a
 /// [`protected_dirs`] entry, and the secrets of the store it needs.
+/// Follows the managed containers' events for as long as `wake` is heard,
+/// following again after a pause whenever the stream ends.
+fn follow_managed_events(docker: &dyn DockerTransport, wake: &WakeSignal) {
+    let label = format!("{MANAGED_LABEL}=true");
+    let mut retry = EVENTS_RETRY_MIN;
+    loop {
+        let mut heard = false;
+        let ended = docker.follow_container_events(&label, &mut |event| {
+            if let Some(event) = event {
+                heard = true;
+                if is_managed(&event) {
+                    wake.wake();
+                }
+            }
+            !wake.unheard()
+        });
+        if wake.unheard() {
+            return;
+        }
+        match ended {
+            Ok(()) => {
+                tracing::debug!("local backend: the Docker event stream ended; following it again")
+            }
+            Err(error) => {
+                tracing::warn!(%error, "local backend: cannot follow Docker events; trying again")
+            }
+        }
+        if heard {
+            retry = EVENTS_RETRY_MIN;
+        }
+        std::thread::sleep(retry);
+        retry = (retry * 2).min(EVENTS_RETRY_MAX);
+    }
+}
+
+/// Whether the event is of a container this mode manages: the stream is
+/// filtered by the label already, and is checked again here.
+fn is_managed(event: &ContainerEvent) -> bool {
+    event
+        .attributes
+        .get(MANAGED_LABEL)
+        .is_some_and(|value| value == "true")
+}
+
 fn container_inputs(
     mode: &ContainerMode,
     spec: &TaskLaunchSpec,
-    root: &Path,
+    work_dir: &Path,
 ) -> Result<ContainerInputs, String> {
-    let protected = protected_dirs(mode, root);
+    let protected = protected_dirs(mode, work_dir);
     let mut local_sources = Vec::new();
     for repository in &spec.workspace.repositories {
         if let TaskRepositorySource::Local { path } = &repository.source {
@@ -579,7 +706,7 @@ fn container_inputs(
             }
             if let Some(dir) = overlapping(&protected, &path) {
                 return Err(format!(
-                    "the local workspace source '{}' overlaps the controller's own directory {}, \
+                    "the local workspace source '{}' overlaps Narsor's protected directory {}, \
                      so it cannot be mounted into a task's container",
                     path.display(),
                     dir.display()
@@ -615,7 +742,7 @@ fn container_inputs(
             }
             if let Some(protected) = overlapping(&protected, &host) {
                 return Err(format!(
-                    "the home source '{}' of component '{}' overlaps the controller's own \
+                    "the home source '{}' of component '{}' overlaps Narsor's protected \
                      directory {}, so it cannot be mounted into a task's container",
                     source.from,
                     component.name,
@@ -659,31 +786,13 @@ fn container_inputs(
 }
 
 /// The directories no host path mounted into a container may overlap: the
-/// controller's directory (the token store and the controller credential),
-/// the directory above it (the daemon state directory, with `daemon.json`
-/// and the owner token of the local API) and the backend `root` (the
-/// storage and credentials of other tasks). All canonical. The directory
-/// above the controller's is left out when it is `/` or holds the HOME
-/// (a controller directory placed by hand), as it then is no state
-/// directory and would refuse every source.
-fn protected_dirs(mode: &ContainerMode, root: &Path) -> Vec<PathBuf> {
+/// whole state root the controller was given (its own credential and token
+/// store, the daemon's records and discovery file with the owner token of
+/// the local API, every other binary's state) and the controller's work
+/// directory (the storage and credentials of other tasks). Both canonical.
+fn protected_dirs(mode: &ContainerMode, work_dir: &Path) -> Vec<PathBuf> {
     let canonical = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let controller = mode.secrets.dir().parent().map(canonical);
-    let state = controller
-        .as_deref()
-        .and_then(Path::parent)
-        .filter(|state| state.parent().is_some())
-        .filter(|state| {
-            !mode
-                .host_home
-                .as_deref()
-                .is_some_and(|home| canonical(home).starts_with(state))
-        })
-        .map(Path::to_path_buf);
-    [controller, state, Some(canonical(root))]
-        .into_iter()
-        .flatten()
-        .collect()
+    vec![canonical(&mode.state_root), canonical(work_dir)]
 }
 
 /// The protected directory `path` (canonicalized) is in or holds, if any.
@@ -772,15 +881,6 @@ fn ended(
         phase: Some(WorkloadPhase::Exited { code }),
         updated: Some(updated),
     }
-}
-
-/// The launch spec in a workload directory; a problem when it cannot be
-/// read.
-fn read_spec(dir: &Path) -> Result<TaskLaunchSpec, String> {
-    let path = dir.join("launch-spec.json");
-    let bytes =
-        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    serde_json::from_slice(&bytes).map_err(|error| format!("the launch spec is malformed: {error}"))
 }
 
 fn mount(path: &Path, read_only: bool) -> Mount {

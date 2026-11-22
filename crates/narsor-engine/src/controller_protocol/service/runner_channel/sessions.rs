@@ -4,6 +4,7 @@ use crate::controller_protocol::credentials::{ControllerIdentity, RunnerIdentity
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::ProtocolService;
 use crate::controller_protocol::wire::*;
+use crate::domain::TaskLaunchSpec;
 use crate::orchestration::{RunnerState, TaskRecord};
 
 impl ProtocolService {
@@ -105,6 +106,21 @@ impl ProtocolService {
             RunnerRole::Worker => Ok(()),
             RunnerRole::Reader => Err(ProtocolError::Forbidden),
         }
+    }
+
+    /// The task's sealed launch spec, to its working runner on its first
+    /// start (R5, KTD3). Only a worker credential of a launch no start or
+    /// resume superseded gets it — the gate already refuses an older
+    /// incarnation's — and a reader never does: it reads the storage copy.
+    /// The runner checks the content digest itself; the spec is never
+    /// logged.
+    pub fn runner_launch_spec(&self, identity: &RunnerIdentity) -> ProtocolResult<TaskLaunchSpec> {
+        Self::require_worker(identity)?;
+        let record = self.control.task(&identity.task_id)?;
+        if record.supersedes_launch(identity.launch_generation) {
+            return Err(ProtocolError::Unauthorized);
+        }
+        Ok(record.launch_spec)
     }
 
     /// Extends the runner's credential.

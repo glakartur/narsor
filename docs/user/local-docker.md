@@ -202,8 +202,9 @@ $ printf '%s' "$TOKEN" | narsor-cli secret set gitlab-token
 ```
 
 The value comes from standard input, never from the command line. The store
-is `<server.state>/local-controller/secrets/` (directory `0700`, files
-`0600`). At each start the controller copies the tokens a task needs into the
+is `<server.state>/narsor-controller-local/secrets/` (directory `0700`,
+files `0600`; `server.state` is the state root, see
+[the on-disk layout](configuration.md#the-on-disk-layout)). At each start the controller copies the tokens a task needs into the
 task's workload directory and mounts them read-only; the runner delivers each
 one as the component asks. A task whose token is missing is refused before
 anything starts, with the name of the missing entry.
@@ -270,11 +271,19 @@ Each working runner is one container, named after its workload and labelled
   `--pull never`, and your uid and gid (`--user`);
 - `--network host` — the runner reaches the local daemon on loopback, and the
   tools have the host's network;
+- a runner credential issued when the container starts (an image build can
+  take longer than the credential issued at task start lives), in the
+  workload directory; the runner fetches the task's launch spec from the
+  control plane with it;
 - mounts at the **same paths** as on the host: the task storage
   (read-write); the workload directory, the configuration file, the secrets
   directory, local workspace sources and home sources (read-only, home
   sources under `/run/narsor/home/`); the host's runner binary at
-  `/opt/narsor/bin/narsor-runner` (read-only);
+  `/opt/narsor/bin/narsor-runner` (read-only). A local workspace source
+  or a home source that overlaps a protected directory is refused: the
+  whole state root (`server.state`, with the files of every Narsor program)
+  and the controller's work directory
+  (`<server.work>/narsor-controller-local/`, the storage of every task);
 - an environment of `TERM`, `LANG`, `LC_*`, `TZ`, the proxy variables and
   the variables the controller itself sets. Nothing else of your environment
   reaches it.
@@ -328,7 +337,10 @@ HOME settings, and tools installed only in the image are missing.
 
 The controller removes old task images by itself: at its start and after a
 new image is first used, it removes the images it built (label
-`io.narsor.controller`) that no task uses and that are not the latest image
+`io.narsor.controller`, whose value is the controller id in
+`<server.state>/narsor-controller-local/controller-id`; an updated
+installation keeps the id of its old directory, so the images it built
+before stay its own) that no task uses and that are not the latest image
 of a definition in use. A definition is in use while a task runs on, or last
 ran on, one of its images, or while it was requested within the update
 interval (at least one day; one week with `update_interval: none`). A

@@ -34,6 +34,7 @@
 
 pub mod gateway;
 pub mod launch;
+pub mod paths;
 pub mod settings;
 
 use axum::extract::Path;

@@ -46,9 +46,9 @@ Choose one role:
 
 | Role | Installed programs | Intended use |
 | --- | --- | --- |
-| `local` | `narsor`, `narsor-cli`, `narsor-web`, `narsor-server`, `narsor-controller`, `narsor-runner`, `narsor-observer-worker` | Run the TUI, CLI and browser interface with the local server and controller. |
+| `local` | `narsor`, `narsor-cli`, `narsor-web`, `narsor-server`, `narsor-controller`, `narsor-runner`, `narsor-observer-worker`, `narsor-migrate` | Run the TUI, CLI and browser interface with the local server and controller. |
 | `frontend` | `narsor`, `narsor-cli`, `narsor-web` | Connect a TUI/CLI or the browser interface ([`narsor-web`](../user/web.md)) to a separately operated server. |
-| `server` | `narsor-server`, `narsor-controller`, `narsor-runner`, `narsor-observer-worker` | Run the network control plane and a separately enrolled workstation backend. Add `--with-frontend` to install the TUI, CLI and `narsor-web` too. |
+| `server` | `narsor-server`, `narsor-controller`, `narsor-runner`, `narsor-observer-worker`, `narsor-migrate` | Run the network control plane and a separately enrolled workstation backend. Add `--with-frontend` to install the TUI, CLI and `narsor-web` too. |
 
 The installer script downloads and verifies the archive, copies the binaries,
 and, only after consent, adds the binary directory to `~/.bashrc`. It then
@@ -73,6 +73,14 @@ their sections (remove the `#` to change one; each comment names the flat key
 the setting replaces). The number of tasks processed in parallel is the
 `server.max_concurrent_tasks` setting (default 1). The file is a tree of
 sections, one per program; see [Configuration](../user/configuration.md#the-tree-of-sections).
+`ROOT/state` and `ROOT/work` are roots: each program keeps its files in a
+directory of its own below them (`state/narsor-server/`,
+`state/narsor-controller-local/`, `work/narsor-controller-local/`, …), and
+the server and its clients meet in `state/run/`; see
+[The on-disk layout](../user/configuration.md#the-on-disk-layout). An
+installation of an older version is moved to this layout once, at the first
+start of the new server; see
+[Updates](updates.md#update-to-a-directory-per-program-state-ownership).
 
 For the `local` role, `narsor-cli init` also asks for the **work mode for
 local tasks**: `process` (the default: tasks run on the host as your user) or
@@ -147,13 +155,29 @@ not writable, the interactive installer asks for another target. A
 non-interactive invocation must use a writable `--config-file`.
 
 If Narsor processes (`narsor`, `narsor-server`, `narsor-controller`,
-`narsor-runner`, `narsor-observer-worker`) of your user are already running, the installer lists them
+`narsor-runner`, `narsor-observer-worker`, `narsor-migrate`) of your user are already running, the installer lists them
 before it replaces the binaries and asks whether to stop them. Stopping them
 interrupts running tasks. A stopped process gets `SIGTERM` and 10 seconds to
 exit, then `SIGKILL`. If you answer no, they keep running the previous version
 until you restart them. Non-interactive installation never stops anything
 unless you pass `--stop-running`; without it the installer only prints the
 list. `--stop-running` also skips the question in an interactive run.
+
+For the `local` and `server` roles the installer then runs `narsor-migrate`,
+which moves the data of an older Narsor to the current on-disk layout once,
+after a backup in `<global.root>/backups/` (see
+[Updates](updates.md#update-to-a-directory-per-program-state-ownership)). It
+reads the same configuration as `narsor-server`: the file given with
+`--config-file` (or `--config`), else the one the server finds. With no data
+of an older version it only prints that there is nothing to migrate. The
+migration needs every Narsor process stopped: if you answered no to stopping
+them, the installer skips it, says so in a highlighted line and prints the
+command to run later. Interactive, `narsor-migrate` shows its plan and asks
+before it changes anything. With `--non-interactive` it migrates only when you
+also pass `--migrate` (which answers its question); without `--migrate` the
+installer prints the plan and the command. Until the data is migrated, the new
+`narsor-server` refuses to start and names the same command. A migration that
+stops makes a non-interactive installation fail.
 
 `--progress` shows a progress bar while the release archive downloads
 (`curl --progress-bar`, or `wget --show-progress`); without it the download is
@@ -180,18 +204,22 @@ curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install
   bash -s -- --uninstall
 ```
 
-It deletes only the five Narsor binaries from the binary directory
+It deletes only the Narsor binaries from the binary directory
 (`~/.local/bin` unless `--bin-dir` is given) and the marked `~/.bashrc` line.
 Configuration and data stay in place. Pass the same `--bin-dir`,
 `--data-dir`, and `--config-file` values you used to install.
 
 `--purge` also removes the configuration file, its `.bak.*` backups and generated `.new` file, and the
-data directory (`--data-dir`, default `~/.narsor`). It first lists
+data directory (`--data-dir`, default `~/.narsor`), with the backups
+`narsor-migrate` wrote in its `backups/`. It first lists
 what it will delete and asks for confirmation; with `--non-interactive`, the
 `--purge` flag is the confirmation. Directories that the configuration names
 outside the data directory are listed and kept, and a data directory that
 contains your home directory is refused. `--purge` runs the installed
-`narsor-cli purge`, so it needs the binaries to still be present.
+`narsor-cli purge`, so it needs the binaries to still be present. A
+controller started by hand keeps its state below its own `--state-root`
+(by default `$XDG_STATE_HOME/narsor/narsor-controller-local/`) and its
+task storages below `--work-root`; `--purge` does not remove them.
 
 ## Frontend connection profile
 

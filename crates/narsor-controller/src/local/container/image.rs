@@ -7,13 +7,13 @@
 //! [`TaskImageBuilds::poll`]; both return at once, so the reconcile step
 //! never waits for a build.
 //!
-//! Each hash has a cache entry, `<controller dir>/images/<hash>.json`, with
+//! Each hash has a cache entry, `<controller state>/images/<hash>.json`, with
 //! the last `version` outputs of the components, the time of that check,
 //! the base image id and the last image id. A request starts a job when:
 //! - there is no image for the hash (or it is gone from Docker);
 //! - the check is older than the update interval (`Some(0)` checks at every
 //!   request, `None` never checks again after the first build);
-//! - the refresh marker `<controller dir>/images/refresh` (written by
+//! - the refresh marker `<controller state>/images/refresh` (written by
 //!   `narsor-cli image refresh`) is newer than the check.
 //!
 //! The job runs every `version` script on the host, pulls the base and
@@ -30,7 +30,7 @@
 //! [`BuildSettings::retry_delay`]).
 //!
 //! [`TaskImageBuilds::collect_garbage`] removes the images this controller
-//! built (the [`CONTROLLER_LABEL`] of its directory) that are neither named
+//! built (its [`CONTROLLER_LABEL`], see [`controller_id`]) that are neither named
 //! by the caller nor the latest image of a definition still in use: one an
 //! image the caller names was built from, or one requested within the update
 //! interval (at least a day; a week without an interval). A definition out
@@ -55,10 +55,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::docker::{BuildRequest, DockerError, DockerTransport, UserIds};
-
-/// The directory of the cache entries and the refresh marker, beside the
-/// controller credential.
-pub const IMAGES_DIR: &str = "images";
+use crate::local::paths::ControllerStatePaths;
 
 /// The file whose modification time asks for a re-check of every
 /// definition.
@@ -70,8 +67,8 @@ pub const MANAGED_LABEL: &str = "io.narsor.managed";
 pub const DEFINITION_LABEL: &str = "io.narsor.definition";
 /// The label with the build time (RFC 3339).
 pub const BUILT_AT_LABEL: &str = "io.narsor.built-at";
-/// The label of the controller that built the image: the first 16 hex
-/// digits of the sha256 of its canonical directory.
+/// The label of the controller that built the image: its `controller-id`
+/// ([`controller_id`]).
 pub const CONTROLLER_LABEL: &str = "io.narsor.controller";
 
 /// How long after a retryable failure the job runs again.
@@ -207,33 +204,32 @@ pub fn definition_hash(image: &TaskImage) -> String {
     hex(&Sha256::digest(canonical))
 }
 
-/// The refresh marker of the controller whose directory is `controller_dir`.
-pub fn refresh_marker(controller_dir: &Path) -> PathBuf {
-    controller_dir.join(IMAGES_DIR).join(REFRESH_MARKER)
+/// The refresh marker of the controller whose state is `paths`.
+pub fn refresh_marker(paths: &ControllerStatePaths) -> PathBuf {
+    paths.images_dir().join(REFRESH_MARKER)
 }
 
 /// Asks for a re-check of every definition at its next request: writes the
 /// refresh marker, whose modification time is the request time.
-pub fn request_refresh(controller_dir: &Path) -> io::Result<PathBuf> {
-    let marker = refresh_marker(controller_dir);
+pub fn request_refresh(paths: &ControllerStatePaths) -> io::Result<PathBuf> {
+    let marker = refresh_marker(paths);
     create_private_dir(marker.parent().expect("the marker has a directory"))?;
     fs::write(&marker, b"")?;
     Ok(marker)
 }
 
 impl TaskImageBuilds {
-    /// The registry of the controller whose directory (the parent of its
-    /// credential) is `controller_dir`.
+    /// The registry of the controller whose state is `paths`.
     pub fn new(
         docker: Arc<dyn DockerTransport>,
-        controller_dir: &Path,
+        paths: &ControllerStatePaths,
         settings: BuildSettings,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 docker,
-                dir: controller_dir.join(IMAGES_DIR),
-                controller_id: controller_id(controller_dir),
+                dir: paths.images_dir(),
+                controller_id: controller_id(paths),
                 settings,
                 slots: Mutex::new(HashMap::new()),
                 gate: RwLock::new(()),
@@ -756,14 +752,59 @@ fn is_network_failure(text: &str) -> bool {
     NETWORK.iter().any(|marker| lower.contains(marker))
 }
 
-/// The [`CONTROLLER_LABEL`] value of the controller whose directory is
-/// `controller_dir`.
-fn controller_id(controller_dir: &Path) -> String {
-    let canonical = fs::canonicalize(controller_dir)
-        .or_else(|_| std::path::absolute(controller_dir))
-        .unwrap_or_else(|_| controller_dir.to_path_buf());
+/// The [`CONTROLLER_LABEL`] value of the controller whose state is `paths`
+/// (KTD8): its `controller-id` file, written once.
+///
+/// A missing file is initialised to the first 16 hex digits of the sha256
+/// of the canonical path of the controller's state directory — the value
+/// the label had when it was computed from the controller's directory at
+/// every start, so a controller keeps recognising the images it built for
+/// as long as its directory does not move. `narsor-migrate`, which moves an
+/// old controller's files, writes this file beforehand from the old
+/// directory with the same formula, so the earlier images stay its own. When the file cannot be
+/// written, the computed value is used for this run.
+pub fn controller_id(paths: &ControllerStatePaths) -> String {
+    let file = paths.controller_id_file();
+    if let Ok(text) = fs::read_to_string(&file) {
+        let id = text.trim();
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    let dir = paths.dir();
+    if let Err(error) = create_private_dir(dir) {
+        tracing::warn!(dir = %dir.display(), %error, "images: cannot create the controller directory");
+    }
+    let id = id_of_directory(dir);
+    if let Err(error) = write_private_file(&file, format!("{id}\n").as_bytes()) {
+        tracing::warn!(file = %file.display(), %error, "images: cannot record the controller id");
+    }
+    id
+}
+
+/// The first 16 hex digits of the sha256 of the canonical path of `dir`.
+fn id_of_directory(dir: &Path) -> String {
+    let canonical = fs::canonicalize(dir)
+        .or_else(|_| std::path::absolute(dir))
+        .unwrap_or_else(|_| dir.to_path_buf());
     let digest = hex(&Sha256::digest(canonical.as_os_str().as_encoded_bytes()));
     digest[..16].to_string()
+}
+
+/// Writes `bytes` to `path` with mode 0600, through a temporary file.
+fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let temporary = path.with_extension("tmp");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)
 }
 
 /// Refuses what would change the Dockerfile's structure: a base with
@@ -1023,7 +1064,7 @@ mod tests {
             let docker = Arc::new(FakeDocker::new());
             let builds = TaskImageBuilds::new(
                 docker.clone(),
-                &temp.path("controller"),
+                &ControllerStatePaths::new(temp.path("state")),
                 settings(update_interval),
             );
             let version = format!(
@@ -1075,7 +1116,7 @@ mod tests {
         fn other_controller(&self, update_interval: Option<Duration>) -> TaskImageBuilds {
             TaskImageBuilds::new(
                 self.docker.clone(),
-                &self.temp.path("other-controller"),
+                &ControllerStatePaths::new(self.temp.path("other-state")),
                 settings(update_interval),
             )
         }
@@ -1181,7 +1222,7 @@ mod tests {
 
         // A refresh checks again; the same versions keep the image.
         std::thread::sleep(Duration::from_millis(20));
-        request_refresh(&setup.temp.path("controller")).unwrap();
+        request_refresh(&ControllerStatePaths::new(setup.temp.path("state"))).unwrap();
         assert_eq!(setup.builds.request(&setup.image), BuildState::Building);
         assert_eq!(setup.wait(), BuildState::Ready(id));
         assert_eq!((setup.version_runs(), setup.build_count()), (2, 1));
@@ -1322,7 +1363,7 @@ mod tests {
         assert_eq!(setup.builds.request(&setup.image), BuildState::Building);
 
         std::thread::sleep(Duration::from_millis(20));
-        request_refresh(&setup.temp.path("controller")).unwrap();
+        request_refresh(&ControllerStatePaths::new(setup.temp.path("state"))).unwrap();
         release.send(()).unwrap();
         release.send(()).unwrap();
         assert!(matches!(setup.wait(), BuildState::Failed(_)));

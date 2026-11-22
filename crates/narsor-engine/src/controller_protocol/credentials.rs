@@ -357,7 +357,7 @@ impl CredentialStore {
         self.control.now()
     }
 
-    fn paths(&self) -> &crate::persistence::StatePaths {
+    fn paths(&self) -> &crate::persistence::ServerStatePaths {
         self.control.store().paths()
     }
 
@@ -373,6 +373,56 @@ impl CredentialStore {
         ttl: Duration,
     ) -> Result<(EnrollmentRecord, BearerToken)> {
         let _lock = self.control.store().lock_enrollments()?;
+        self.write_enrollment(backend_id, name, ttl)
+    }
+
+    /// Creates an unnamed one-time code for `backend_id`, as the daemon
+    /// does for its built-in controller on every start, and first deletes
+    /// the unnamed codes of that backend that expired unredeemed: nobody
+    /// can use them any more, and every start would leave one more.
+    pub fn create_enrollment_replacing_expired(
+        &self,
+        backend_id: &BackendId,
+        ttl: Duration,
+    ) -> Result<(EnrollmentRecord, BearerToken)> {
+        let _lock = self.control.store().lock_enrollments()?;
+        self.prune_expired_enrollments(backend_id);
+        self.write_enrollment(backend_id, None, ttl)
+    }
+
+    /// Deletes the unnamed, unredeemed, expired codes of `backend_id`; the
+    /// caller holds the enrollment lock. A record that cannot be read or
+    /// deleted stays.
+    fn prune_expired_enrollments(&self, backend_id: &BackendId) {
+        let Ok(entries) = std::fs::read_dir(self.paths().orchestration_enrollments_dir()) else {
+            return;
+        };
+        let now = self.now();
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let Ok(record) = read_json::<EnrollmentRecord>(&path) else {
+                continue;
+            };
+            if record.backend_id == *backend_id
+                && record.name.is_none()
+                && record.redeemed_at.is_none()
+                && now >= record.expires_at
+            {
+                if let Err(error) = std::fs::remove_file(&path) {
+                    tracing::warn!(path = %path.display(), %error, "controller protocol: cannot delete an expired enrollment code");
+                }
+            }
+        }
+    }
+
+    fn write_enrollment(
+        &self,
+        backend_id: &BackendId,
+        name: Option<String>,
+        ttl: Duration,
+    ) -> Result<(EnrollmentRecord, BearerToken)> {
         let enrollment_id = format!("enr-{}", uuid::Uuid::new_v4().simple());
         let code = BearerToken::issue(ENROLLMENT_PREFIX, &enrollment_id);
         let now = self.now();
@@ -799,6 +849,64 @@ fn is_plain_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::Clock;
+    use crate::persistence::ServerStatePaths;
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct ManualClock(Mutex<DateTime<Utc>>);
+
+    impl Clock for ManualClock {
+        fn now(&self) -> DateTime<Utc> {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// Each start of the daemon's controller makes a code; the ones that
+    /// expired unused go, the redeemed and the named ones stay.
+    #[test]
+    fn a_new_builtin_code_deletes_the_expired_unused_ones() {
+        let root = std::env::temp_dir().join(format!("narsor-enroll-{}", uuid::Uuid::new_v4()));
+        let clock = Arc::new(ManualClock(Mutex::new(Utc::now())));
+        let control = ControlPlane::with_clock(ServerStatePaths::new(&root), clock.clone());
+        let store = CredentialStore::new(control);
+        let local = BackendId::parse("local").unwrap();
+        let minute = Duration::minutes(1);
+        let (expired, _) = store
+            .create_enrollment_replacing_expired(&local, minute)
+            .unwrap();
+        let (named, _) = store
+            .create_enrollment(&local, Some("by hand".into()), minute)
+            .unwrap();
+        let (redeemed, code) = store
+            .create_enrollment_replacing_expired(&local, minute)
+            .unwrap();
+        let request =
+            pop::signed_enrollment_request(code.expose(), &pop::ControllerKey::generate());
+        store
+            .redeem_enrollment(
+                &request.enrollment_code,
+                &request.public_key,
+                &request.proof,
+            )
+            .unwrap()
+            .unwrap();
+        *clock.0.lock().unwrap() += Duration::minutes(2);
+
+        let (fresh, _) = store
+            .create_enrollment_replacing_expired(&local, minute)
+            .unwrap();
+
+        let file = |record: &EnrollmentRecord| {
+            store
+                .paths()
+                .enrollment_file(&record.enrollment_id)
+                .is_file()
+        };
+        assert!(!file(&expired));
+        assert!(file(&named) && file(&redeemed) && file(&fresh));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn only_the_observer_worker_key_issued_last_matches() {

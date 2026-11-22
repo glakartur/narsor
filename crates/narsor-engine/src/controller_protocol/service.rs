@@ -88,6 +88,9 @@ type EventsRelay = Relay<ExecutionEventsRequest, ExecutionEventsPage>;
 /// Conductor-state requests owners are waiting on (U5), relayed the same way.
 type ConductorRelay = Relay<ConductorReadRequest, crate::conductor::ConductorView>;
 
+/// Execution-details requests owners are waiting on, relayed the same way.
+type DetailsRelay = Relay<ExecutionDetailsRequest, ExecutionDetails>;
+
 /// Timing policy of the protocol.
 #[derive(Debug, Clone)]
 pub struct ProtocolConfig {
@@ -164,6 +167,7 @@ pub struct ProtocolService {
     pages: Mutex<PageRelay>,
     event_reads: Mutex<EventsRelay>,
     conductor_reads: Mutex<ConductorRelay>,
+    detail_reads: Mutex<DetailsRelay>,
     materials: MaterialStore,
     observers: ObserverStore,
     /// The digest of the observer worker's key, in memory only (D5).
@@ -180,6 +184,8 @@ pub struct ProtocolService {
     harness_usages: scheduling::HarnessUsages,
     /// Most tasks processed at once across all backends; `None` for no limit.
     max_concurrent_tasks: Mutex<Option<u32>>,
+    /// The desired state delivered to each controller, in memory only.
+    deliveries: runner_channel::Deliveries,
 }
 
 impl std::fmt::Debug for ProtocolService {
@@ -236,8 +242,10 @@ impl ProtocolService {
             pages: Mutex::new(PageRelay::default()),
             event_reads: Mutex::new(EventsRelay::default()),
             conductor_reads: Mutex::new(ConductorRelay::default()),
+            detail_reads: Mutex::new(DetailsRelay::default()),
             harness_usages: Mutex::default(),
             max_concurrent_tasks: Mutex::new(Some(DEFAULT_MAX_CONCURRENT_TASKS)),
+            deliveries: runner_channel::Deliveries::default(),
         }
     }
 

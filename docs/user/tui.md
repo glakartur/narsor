@@ -297,10 +297,11 @@ exits never needs the field. A forced jump does not apply the `set` of a choice.
 The CLI of the remote-aware commands has a machine form too: `narsor-cli task list
 --json` and `narsor-cli task show <task> --json` print the task summaries of the
 control plane as JSON (text an agent or a runner wrote is cleaned of what a
-terminal would act on). A workflow file, a file validation and the old
-executions of the history belong to the local daemon: any other server refuses
-them with the reason `narsor-cli task capabilities` gives, and a repository is
-registered there by a remote git URL only.
+terminal would act on). A workflow file and a file validation belong to the
+local daemon: any other server refuses them with the reason `narsor-cli task
+capabilities` gives, and a repository is registered there by a remote git URL
+only. The old executions of the history come from the task records, on every
+server and for every backend.
 
 `n` opens the catalogue of workflows (built-in, user and root ones, with the
 source of each and what a copy overrides) with the inputs of the highlighted
@@ -351,7 +352,9 @@ is still told by its icon and its word.
 
 **Logging.** `tui` takes over the alternate screen, so a log line on stderr
 would be written over the panels. With `RUST_LOG` set, the interface's logs are
-appended to `{root}/narsor.log` instead; with `RUST_LOG` unset no
-subscriber is installed at all and the records are dropped. Either way nothing
+appended to `{state}/narsor/narsor.log` instead (`{state}` is the state root, `server.state`; the
+interface's own directory is `narsor/`);
+with `RUST_LOG` unset no subscriber is installed at all and the records are
+dropped. Either way nothing
 reaches the terminal while the interface is up. Every other subcommand keeps
 logging to stderr.

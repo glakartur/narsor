@@ -4,12 +4,42 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use super::*;
-use crate::local::backend::{LocalBackend, LocalBackendConfig};
+use crate::local::backend::LocalBackend;
+use crate::local::paths::{ControllerStatePaths, ControllerWorkPaths};
 use crate::local::process::process_alive;
 use crate::local::test_support::Scratch;
 use crate::local::workload::LastRunner;
 use narsor_controller_runtime::backend::{ExecutionBackend, Removal, StorageState};
 use narsor_model::domain::TaskId;
+
+/// KTD8: the image label of a controller is its `controller-id` file. A
+/// controller without one gets the label computed from its canonical
+/// directory (what the label always was), written down once; a recorded id
+/// is kept even when it differs, so a moved controller keeps its images.
+#[test]
+fn the_controller_id_is_initialised_from_the_controller_directory_and_then_kept() {
+    use sha2::{Digest as _, Sha256};
+    let scratch = Scratch::new();
+    let state = scratch.backend.config.state.clone();
+
+    let id = image::controller_id(&state);
+
+    let canonical = fs::canonicalize(state.dir()).unwrap();
+    let hash: String = Sha256::digest(canonical.as_os_str().as_encoded_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(id, hash[..16]);
+    assert_eq!(
+        fs::read_to_string(state.controller_id_file())
+            .unwrap()
+            .trim(),
+        id
+    );
+
+    fs::write(state.controller_id_file(), "0123456789abcdef\n").unwrap();
+    assert_eq!(image::controller_id(&state), "0123456789abcdef");
+}
 
 /// KTD7: a container gets the pass-through variables, the configured
 /// ones and the mark; nothing else of the controller's environment.
@@ -73,7 +103,7 @@ fn only_a_loader_failure_reads_as_a_runner_that_cannot_run_in_the_image() {
             true,
         ),
         (
-            "runner failed: cannot read /x/launch-spec.json: No such file or directory",
+            "runner failed: cannot read /x/credential: No such file or directory",
             false,
         ),
         (
@@ -147,14 +177,13 @@ mod containers {
             &self.scratch.root
         }
 
-        /// The controller's directory, inside a state directory as the
-        /// server lays it out.
-        fn controller_dir(&self) -> PathBuf {
-            self.root().join("state/controller")
+        /// The controller's state, below the state root `<root>/state`.
+        fn state(&self) -> ControllerStatePaths {
+            self.scratch.backend.config.state.clone()
         }
 
         fn store(&self) -> SecretStore {
-            SecretStore::beside_credential(&self.controller_dir().join("credential"))
+            SecretStore::of(&self.state())
         }
 
         /// A backend over the same root: in the Docker mode, or in the
@@ -165,7 +194,7 @@ mod containers {
             config.container_mode = docker_mode.then(|| ContainerMode {
                 builds: TaskImageBuilds::new(
                     self.docker.clone(),
-                    &self.controller_dir(),
+                    &self.state(),
                     BuildSettings {
                         update_interval: Some(self.update_interval),
                         version_timeout: Duration::from_secs(5),
@@ -175,6 +204,7 @@ mod containers {
                     },
                 ),
                 secrets: self.store(),
+                state_root: self.root().join("state"),
                 user: USER,
                 host_home: Some(self.root().join("home")),
                 config_file: Some(self.root().join("config.yaml")),
@@ -272,17 +302,34 @@ mod containers {
             self.launch(key, self.environment())
         }
 
-        /// Observes until the workload leaves `Starting`.
+        /// Observes until the workload leaves `Starting`, issuing the fresh
+        /// credential its start asks for as the controller would.
         async fn settled(&self, task: &TaskResources) -> Option<WorkloadState> {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 let observed = self.backend_ref().observe(task).await.unwrap().workload;
+                self.issue_wanted_credential(task, FRESH_CREDENTIAL);
                 match &observed {
                     Some(state) if state.phase == WorkloadPhase::Starting => {
                         assert!(Instant::now() < deadline, "still starting");
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                     _ => return observed,
+                }
+            }
+        }
+
+        /// Hands the backend `credential` when it asked for one of `task`.
+        fn issue_wanted_credential(&self, task: &TaskResources, credential: &str) {
+            let specs = self.backend_ref().launch_specs().expect("shared");
+            for generation in 1..=2 {
+                if let Some(incarnation) = specs.credential_request(&task.task_id, generation) {
+                    specs.provide_credential(
+                        &task.task_id,
+                        generation,
+                        &incarnation,
+                        narsor_controller_runtime::backend::RunnerCredential::new(credential),
+                    );
                 }
             }
         }
@@ -310,6 +357,10 @@ mod containers {
             self.backend_ref().store.read_task_record(task)
         }
     }
+
+    /// The credential the test's "controller" issues when a container
+    /// starts.
+    const FRESH_CREDENTIAL: &str = "nsr.fresh";
 
     fn arg_after<'a>(run: &'a RunRequest, flag: &str) -> Vec<&'a str> {
         run.args
@@ -592,17 +643,17 @@ mod containers {
                 "a home source over the controller's token store",
                 healthy,
                 home_source(|fixture| fixture.store().dir().to_path_buf()),
-                "overlaps the controller's own directory",
+                "overlaps Narsor's protected directory",
                 Rejected,
             ),
             (
-                "a home source over the daemon state directory",
+                "a home source inside the state root, beside the controller's directory",
                 |fixture| {
                     fixture.store().set("claude-token", "t").unwrap();
-                    fs::write(fixture.root().join("state/daemon.json"), "{}").unwrap();
+                    fs::create_dir_all(fixture.root().join("state/run")).unwrap();
                 },
-                home_source(|fixture| fixture.root().join("state/daemon.json")),
-                "overlaps the controller's own directory",
+                home_source(|fixture| fixture.root().join("state/run")),
+                "overlaps Narsor's protected directory",
                 Rejected,
             ),
             (
@@ -855,6 +906,87 @@ mod containers {
         assert!(!fixture.backend_ref().storage_dir(&task).exists());
     }
 
+    /// KTD4: a controller restarted while the image builds no longer holds
+    /// the launch spec; the container waits until the controller fetched it
+    /// again, then starts from it.
+    #[tokio::test]
+    async fn after_a_restart_the_container_starts_once_its_spec_is_fetched_again() {
+        let mut fixture = Fixture::new();
+        fixture.store().set("claude-token", "t").unwrap();
+        let (release, wait) = mpsc::channel::<()>();
+        let wait = Mutex::new(wait);
+        fixture.docker.on_build(move |_| {
+            let _ = wait.lock().unwrap().recv();
+        });
+        let task = fixture.task("task-1");
+        let launch = fixture.default_launch("task-1");
+        fixture
+            .backend_ref()
+            .provision(&task, &launch)
+            .await
+            .unwrap();
+
+        fixture.use_backend(true);
+        drop(release);
+        let specs = fixture.backend_ref().launch_specs().expect("shared");
+        let observed = fixture.backend_ref().observe(&task).await.unwrap();
+        assert_eq!(observed.workload.unwrap().phase, WorkloadPhase::Starting);
+        assert!(specs.is_requested(&task.task_id, launch.generation));
+        assert!(fixture.docker.runs().is_empty(), "no start without a spec");
+
+        specs.insert(&task.task_id, launch.generation, launch.launch_spec.clone());
+        let state = fixture.settled(&task).await.unwrap();
+
+        assert_eq!(state.phase, WorkloadPhase::Running);
+        assert_eq!(fixture.docker.runs().len(), 1);
+    }
+
+    /// The image build can outlast the credential issued at creation: the
+    /// container starts only with a fresh one, issued for the same
+    /// incarnation when the start asks for it, in the file the runner reads.
+    /// The workload directory holds no launch spec, only its digest in the
+    /// arguments (R5).
+    #[tokio::test]
+    async fn a_container_starts_with_a_credential_issued_at_its_start() {
+        let fixture = Fixture::new();
+        fixture.store().set("claude-token", "t").unwrap();
+        let task = fixture.task("task-1");
+        let launch = fixture.default_launch("task-1");
+        fixture
+            .backend_ref()
+            .provision(&task, &launch)
+            .await
+            .unwrap();
+        let specs = fixture.backend_ref().launch_specs().expect("shared");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while specs.credential_request(&task.task_id, 1).is_none() {
+            assert!(Instant::now() < deadline, "no credential was asked for");
+            fixture.backend_ref().observe(&task).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(fixture.docker.runs().is_empty(), "no start without it");
+        assert_eq!(
+            specs.credential_request(&task.task_id, 1).as_deref(),
+            Some(launch.incarnation.as_str())
+        );
+
+        let state = fixture.settled(&task).await.unwrap();
+
+        assert_eq!(state.phase, WorkloadPhase::Running);
+        let dir = fixture.backend_ref().store.workload_dir(&task, Role::Work);
+        assert_eq!(
+            fs::read_to_string(dir.join("credential")).unwrap(),
+            FRESH_CREDENTIAL
+        );
+        let run = &fixture.docker.runs()[0];
+        assert_eq!(
+            arg_after(run, "--launch-digest"),
+            [launch.launch_digest().unwrap()]
+        );
+        assert!(!run.args.iter().any(|arg| arg == "--launch-spec"));
+        assert!(!dir.join("launch-spec.json").exists());
+    }
+
     /// A build that cannot reach Docker is tried again after a short
     /// delay: its task waits as for a build and a new task is not
     /// refused meanwhile.
@@ -905,9 +1037,10 @@ mod containers {
             .skip(1)
             .map(|_| "..")
             .collect::<PathBuf>();
-        let relative = up.join(config.root.strip_prefix("/").unwrap());
+        let relative = up.join(fixture.root().strip_prefix("/").unwrap());
         assert!(relative.is_relative());
-        config.root = LocalBackendConfig::with_program(relative, &config.program).root;
+        config.state = ControllerStatePaths::new(relative.join("state"));
+        config.work = ControllerWorkPaths::new(relative.join("work"));
         fixture.scratch.backend = LocalBackend::new(config);
 
         let (_, run) = fixture.running("task-1").await;
@@ -947,5 +1080,80 @@ mod containers {
             .await
             .expect_err("the build still fails");
         assert!(refused.message.contains("component 'glab'"), "{refused}");
+    }
+
+    /// Waits, in real time, up to `limit` for `check`.
+    async fn eventually(limit: Duration, check: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while !check() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// How long a wake or a follow that should come may take.
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// Whether the backend was woken since its last wake was taken. A wake
+    /// is kept until taken, so once the follower handled an event this says
+    /// whether that event woke it, without waiting for anything.
+    async fn woken(backend: &LocalBackend) -> bool {
+        tokio::time::timeout(Duration::ZERO, backend.changed())
+            .await
+            .is_ok()
+    }
+
+    /// R4: a managed container that dies wakes the controller, whose
+    /// observation then sees it exited; an event of a container without the
+    /// managed label wakes nothing.
+    #[tokio::test]
+    async fn a_managed_containers_death_wakes_the_controller_and_a_strangers_does_not() {
+        let fixture = Fixture::new();
+        fixture.store().set("claude-token", "t").unwrap();
+        let (task, run) = fixture.running("task-1").await;
+        let backend = fixture.backend_ref();
+        assert!(!woken(backend).await, "nothing yet");
+
+        fixture
+            .docker
+            .emit_event("die", "someone-elses", BTreeMap::new());
+        let handled = eventually(PATIENCE, || fixture.docker.events_handled() == 1).await;
+        assert!(handled, "the follower saw the event");
+        assert!(!woken(backend).await, "not a managed container");
+
+        fixture.docker.kill_container(&run.name);
+        fixture
+            .docker
+            .emit_event("die", &run.name, run.labels.clone());
+        tokio::time::timeout(PATIENCE, backend.changed())
+            .await
+            .expect("woken by the death");
+
+        let observed = backend.observe(&task).await.unwrap().workload.unwrap();
+        assert_eq!(observed.phase, WorkloadPhase::Exited { code: Some(137) });
+    }
+
+    /// An event stream that ends is followed again, and wakes as before.
+    #[tokio::test]
+    async fn an_ended_event_stream_is_followed_again() {
+        let fixture = Fixture::new();
+        let backend = fixture.backend_ref();
+        assert!(!woken(backend).await, "nothing yet");
+        assert!(eventually(PATIENCE, || fixture.docker.event_follows() == 1).await);
+
+        fixture.docker.end_event_stream();
+
+        assert!(
+            eventually(PATIENCE, || fixture.docker.event_follows() == 2).await,
+            "followed again"
+        );
+        let labels = BTreeMap::from([(MANAGED_LABEL.to_string(), "true".to_string())]);
+        fixture.docker.emit_event("die", "narsor-task-1", labels);
+        tokio::time::timeout(PATIENCE, backend.changed())
+            .await
+            .expect("woken after the restart");
     }
 }

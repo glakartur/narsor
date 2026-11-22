@@ -9,7 +9,7 @@
 //!
 //! narsor-controller kubernetes edit-claude-profile [--claude-command <program>] [--yes] …
 //!
-//! narsor-controller local --control-plane <url> --credential-file <file> --storage <dir> …
+//! narsor-controller local --control-plane <url> [--state-root <dir>] --work-root <dir> …
 //! ```
 //!
 //! The connection arguments ([`ConnectionArgs`]) are shared by every
@@ -97,12 +97,6 @@ pub struct ConnectionArgs {
     #[arg(long, env = "NARSOR_RUNNER_CONTROL_PLANE", value_name = "URL")]
     pub runner_control_plane: Option<String>,
 
-    /// Where the controller credential is kept (written on enrollment);
-    /// for `local`, $XDG_STATE_HOME/narsor/workstation-controller/credential
-    /// by default.
-    #[arg(long, env = "NARSOR_CONTROLLER_CREDENTIAL_FILE", value_name = "FILE")]
-    pub credential_file: Option<PathBuf>,
-
     /// File holding the one-time enrollment code, redeemed when the
     /// credential file does not exist yet. The code can also come from
     /// NARSOR_ENROLLMENT_CODE; it is never accepted on the command line.
@@ -150,18 +144,12 @@ impl std::fmt::Debug for Connection {
 }
 
 impl ConnectionArgs {
-    /// The connection, the enrollment code read from `--enrollment-code-file`
-    /// or [`ENROLLMENT_CODE_ENV`], or a usage error naming what is missing.
-    pub fn resolve(&self) -> Result<Connection, ControllerError> {
-        self.resolve_with_default_credential(None)
-    }
-
-    /// [`Self::resolve`], with `default_credential` standing in for a
-    /// credential file given neither as a flag nor in the environment.
-    pub fn resolve_with_default_credential(
-        &self,
-        default_credential: Option<PathBuf>,
-    ) -> Result<Connection, ControllerError> {
+    /// The connection keeping its credential in `credential_file`, the
+    /// enrollment code read from `--enrollment-code-file` or
+    /// [`ENROLLMENT_CODE_ENV`] (removed from the environment once read), or
+    /// a usage error naming what is missing (`None`: `--credential-file`,
+    /// which `kubernetes` takes).
+    pub fn resolve(&self, credential_file: Option<PathBuf>) -> Result<Connection, ControllerError> {
         if self.enrollment_code.is_some() {
             // The value is not repeated: it is the secret being protected.
             return Err(ControllerError::usage(format!(
@@ -174,21 +162,23 @@ impl ConnectionArgs {
             .control_plane
             .clone()
             .ok_or_else(|| missing_argument("--control-plane <URL>", "NARSOR_CONTROL_PLANE"))?;
-        let credential_file = self
-            .credential_file
-            .clone()
-            .or(default_credential)
-            .ok_or_else(|| {
-                missing_argument(
-                    "--credential-file <FILE>",
-                    "NARSOR_CONTROLLER_CREDENTIAL_FILE",
-                )
-            })?;
+        let credential_file = credential_file.ok_or_else(|| {
+            missing_argument(
+                "--credential-file <FILE>",
+                "NARSOR_CONTROLLER_CREDENTIAL_FILE",
+            )
+        })?;
         let enrollment_code = match &self.enrollment_code_file {
             Some(path) => Some(read_enrollment_code(path)?),
-            None => std::env::var(ENROLLMENT_CODE_ENV)
-                .ok()
-                .filter(|code| !code.is_empty()),
+            None => {
+                let code = std::env::var(ENROLLMENT_CODE_ENV)
+                    .ok()
+                    .filter(|code| !code.is_empty());
+                // Read once, at start, before any child (a runner, the
+                // Docker CLI) is spawned: none of them inherits the code.
+                std::env::remove_var(ENROLLMENT_CODE_ENV);
+                code
+            }
         };
         Ok(Connection {
             runner_control_plane: self
@@ -232,6 +222,10 @@ pub struct KubernetesArgs {
     /// How the control plane is reached.
     #[command(flatten)]
     pub connection: ConnectionArgs,
+
+    /// Where the controller credential is kept (written on enrollment).
+    #[arg(long, env = "NARSOR_CONTROLLER_CREDENTIAL_FILE", value_name = "FILE")]
+    pub credential_file: Option<PathBuf>,
 
     /// The Kubernetes backend configuration (YAML).
     #[arg(long, env = "NARSOR_KUBERNETES_CONFIG", value_name = "FILE")]
@@ -351,7 +345,7 @@ pub(crate) fn exit_code(outcome: Result<(), ControllerError>) -> i32 {
 }
 
 async fn run_kubernetes(args: KubernetesArgs) -> Result<(), ControllerError> {
-    let connection = args.connection.resolve()?;
+    let connection = args.connection.resolve(args.credential_file.clone())?;
     let kubernetes_config = args.kubernetes_config.clone().ok_or_else(|| {
         missing_argument("--kubernetes-config <FILE>", "NARSOR_KUBERNETES_CONFIG")
     })?;

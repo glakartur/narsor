@@ -28,7 +28,7 @@ use crate::observers::{
 use crate::orchestration::{
     Clock, ControlPlane, ExecutionCursor, NewTask, OwnerRef, PendingInputRef, RunnerSnapshot,
 };
-use crate::persistence::StatePaths;
+use crate::persistence::ServerStatePaths;
 use narsor_protocol::controller::{GateWatch, GateWatchChoice};
 
 /// A clock the test moves by hand.
@@ -136,7 +136,8 @@ impl Fixture {
         let clock = Arc::new(ManualClock(Mutex::new(
             Utc.with_ymd_and_hms(2026, 11, 13, 12, 0, 0).unwrap(),
         )));
-        let control = ControlPlane::with_clock(StatePaths::new(root.join("state")), clock.clone());
+        let control =
+            ControlPlane::with_clock(ServerStatePaths::new(root.join("state")), clock.clone());
         let service = ProtocolService::new(
             control,
             Arc::new(NoLaunches {

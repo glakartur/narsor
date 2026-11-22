@@ -20,11 +20,25 @@
 //!    Heartbeat (`POST /controller/v1/heartbeat`) so clients can tell a
 //!    quiet controller from a gone one.
 //! 3. **Fetch** desired commands (`GET /controller/v1/commands`, long-poll
-//!    with `wait_secs`). After a (re)start ask once with `all=true` to
-//!    reconcile every live task; afterwards only commands newer than this
-//!    identity's acknowledged generation are returned.
+//!    with `wait_secs`). Without `since` the read is full: one command per
+//!    task the controller acts on. With `since` — the `cursor` of the last
+//!    response it applied — the read is incremental: only the tasks whose
+//!    command changed since that response (including changes with no new
+//!    generation: runner state, admission, runner progress, reader lease),
+//!    and a `Forget` for each that left the desired state. The control plane
+//!    keeps what it delivered per controller in memory only; an unknown
+//!    cursor (it restarted, the lease epoch changed) is answered in full
+//!    (`full: true`). The long-poll ends on such a change or when a reader
+//!    lease runs out, never on a heartbeat or a progress-only snapshot.
+//!    A command names the task's launch spec by digest only; the controller
+//!    fetches the spec to create a workload or start a reader
+//!    (`GET /controller/v1/tasks/:id/launch-spec?generation=N`, refused for
+//!    a stale generation) and uses it only when its recomputed content
+//!    digest equals the command's. It passes that digest to the runner
+//!    (`--launch-digest`), never the spec itself.
 //! 4. **Acknowledge** (`POST /controller/v1/acks`) the generation it has
 //!    taken over. Acknowledgements only ever raise; repeats are harmless.
+//!    They record what a controller took over; reads do not depend on them.
 //! 5. **Reconcile and report** (`POST /controller/v1/reports`) resource UID,
 //!    resource generation, desired generation and lease epoch. Rules a
 //!    controller must keep:
@@ -49,7 +63,11 @@
 //!
 //! A runner holds a short-lived credential bound to its task, its launch
 //! generation and its incarnation. A newer incarnation's credential, a
-//! newer start/resume or archival makes it stop working. The runner posts
+//! newer start/resume or archival makes it stop working. On its first start
+//! a working runner fetches its task's launch spec (`GET
+//! /runner/v1/launch-spec`, refused to a reader) and accepts it only when
+//! its recomputed content digest equals the one its controller passed; later
+//! starts and the reader use the copy on task storage. The runner posts
 //! snapshots (`POST /runner/v1/snapshots`: cursors and summaries only),
 //! long-polls (`GET /runner/v1/poll`) for its directive and for owner
 //! answers to exactly the input request it waits on, acknowledges each

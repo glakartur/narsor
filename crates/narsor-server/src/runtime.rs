@@ -45,6 +45,7 @@ use narsor_engine::persistence::{DaemonInfo, DefaultHarnessSelector};
 use narsor_engine::workflows::WorkflowResolver;
 
 use narsor_shared::cli_error::{CliError, Result};
+use narsor_shared::config::old_layout::old_state_root;
 
 /// How many times a starting daemon tries the instance lock, and the pause
 /// between tries: about 20 s, longer than a predecessor's shutdown drain.
@@ -88,7 +89,10 @@ const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// `settings` is what [`crate::settings::configure`] made of `config`:
 /// every rule between the settings already held.
 pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<()> {
-    let paths = narsor_engine::persistence::StatePaths::new(config.state_dir());
+    let paths = narsor_engine::persistence::ServerStatePaths::new(config.state_dir());
+    // Clients find this daemon only through the rendezvous directory (R7).
+    let run = narsor_shared::run_paths::RunPaths::new(config.state_dir());
+    let daemon_file = run.daemon_file();
     // One daemon per state directory, held until this function returns. A
     // predecessor that is still shutting down is waited for: two daemons
     // must never drive the same tasks.
@@ -100,6 +104,17 @@ pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<(
     )
     .await
     .map_err(|error| CliError::failure(error.to_string()))?;
+    // An installation of the old layout is moved by `narsor-migrate`, never
+    // here: refused before anything reads the server's files (KTD10).
+    crate::layout_guard::refuse_old_layout(config, &paths).map_err(CliError::failure)?;
+    // Stored observers of older versions are never read or moved:
+    // automations and queues are catalogue files now (R22). Say so once.
+    if let Some(warning) = stored_observers_warning(&old_state_root(config)) {
+        tracing::warn!("daemon: {warning}");
+    }
+    // Refused before anything starts, not after the controller enrolled.
+    run.prepare()
+        .map_err(|error| CliError::failure(error.to_string()))?;
     let runs_local_controller = settings.runs_local_controller();
     let ServerSettings {
         security,
@@ -175,7 +190,6 @@ pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<(
 
     let api_handle = crate::api::serve(
         config.catalog_dir().to_path_buf(),
-        config.work_dir().to_path_buf(),
         ApiServices {
             harness_selector: Some(selector),
             control: Some(Arc::clone(&control)),
@@ -232,7 +246,7 @@ pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<(
         }
         None => None,
     };
-    if let Err(error) = info.write(&paths.daemon_file()) {
+    if let Err(error) = info.write(&daemon_file) {
         if let Some(observer_worker) = observer_worker {
             observer_worker.stop().await;
         }
@@ -252,7 +266,7 @@ pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<(
     let mut terminate = signal(SignalKind::terminate()).map_err(|error| {
         CliError::failure(format!("could not install the SIGTERM handler: {error}"))
     })?;
-    wait_for_sigterm_keeping_discovery(&mut terminate, &paths.daemon_file(), &info).await;
+    wait_for_sigterm_keeping_discovery(&mut terminate, &daemon_file, &info).await;
 
     // A worker's claim held open (a remote worker's too) answers "nothing"
     // now, so the drain below does not wait for its limit (U6).
@@ -285,7 +299,7 @@ pub async fn run_daemon(config: &Resolved, settings: ServerSettings) -> Result<(
              cleanly); exiting anyway"
         );
     }
-    cleanup_discovery_file(&paths.daemon_file());
+    cleanup_discovery_file(&daemon_file);
 
     Ok(())
 }
@@ -326,9 +340,9 @@ fn refuse_declared_local_backend(catalog_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// What the daemon hands its local controller (KTD3): the paths and
-/// launch settings it resolved, the controller's storage and credential
-/// where the in-process controller kept them (R10).
+/// What the daemon hands its local controller (KTD3): the state and work
+/// roots and the launch settings it resolved. The controller derives its
+/// own directories below the roots (KTD7).
 fn local_controller_settings(
     config: &Resolved,
     api: &ApiHandle,
@@ -337,8 +351,8 @@ fn local_controller_settings(
     Ok(LocalControllerSettings {
         program,
         control_plane: format!("http://{}", api.addr()),
-        credential_file: local_controller::credential_file(config.state_dir()),
-        storage: config.work_dir().join("local-controller"),
+        state_root: config.state_dir().to_path_buf(),
+        work_root: config.work_dir().to_path_buf(),
         // The controller reads its own section (R21) from the file this
         // daemon read, on every start: a restart reads the file again.
         config_args: local_controller::config_args(config.file().path()),
@@ -428,7 +442,7 @@ pub fn run_periodic_pass(control: &ProtocolService) -> AutoResumePass {
 /// beside them for the operator.
 fn server_security(
     plan: SecurityPlan,
-    paths: &narsor_engine::persistence::StatePaths,
+    paths: &narsor_engine::persistence::ServerStatePaths,
 ) -> Result<ServerSecurity> {
     let network = match plan {
         SecurityPlan::Trusted { bind, cors } => return Ok(ServerSecurity::Trusted { bind, cors }),
@@ -501,11 +515,6 @@ pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
         Err(error) => {
             tracing::warn!(error = %error, "daemon: control-plane recovery failed");
         }
-    }
-    // Stored observers of older versions are never read: automations and
-    // queues are catalogue files now (R22). Say so once.
-    if let Some(warning) = stored_observers_warning(control.store().paths()) {
-        tracing::warn!("daemon: {warning}");
     }
     let observers = ObserverStore::new(control.store().paths().clone());
     match observers.cleanup_orphaned_temp_files() {

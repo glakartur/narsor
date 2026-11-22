@@ -4,8 +4,6 @@
 //! filesystem under a configurable root (default `./.narsor`):
 //!
 //! ```text
-//! {root}/daemon.json                  -- discovery file of a running daemon
-//! {root}/daemon.lock                  -- exclusive lock guarding daemon spawn
 //! {root}/agent-harness.json            -- durable default-harness override
 //! {root}/executions/{execution_id}/
 //!     state.json                  -- the serialized WorkflowExecution
@@ -49,8 +47,8 @@ pub use daemon_info::{pid_is_alive, DaemonInfo};
 pub use event_log::EventLog;
 pub use execution_store::{ExecutionStore, PENDING_EVENT_FILE, PENDING_INPUT_FILE};
 pub use paths::{
-    CatalogPaths, StatePaths, WorkPaths, AGENT_HARNESS_SELECTION_FILE, CONTEXT_FILE, DEFAULT_ROOT,
-    STATE_FILE, STEP_PROFILE_FILE, TEMP_SUFFIX,
+    CatalogPaths, ServerStatePaths, StatePaths, WorkPaths, AGENT_HARNESS_SELECTION_FILE,
+    CONTEXT_FILE, DEFAULT_ROOT, STATE_FILE, STEP_PROFILE_FILE, TEMP_SUFFIX,
 };
 pub use step_profile::{
     StepProfileEntry, StepProfileResult, MAX_STEP_PROFILE_BYTES, STEP_PROFILE_VERSION,

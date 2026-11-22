@@ -10,7 +10,7 @@ use narsor_engine::domain::{
 use narsor_engine::orchestration::{
     ControlPlane, NewTask, OwnerRef, RunnerObservation, RunnerSnapshot, TaskRecord,
 };
-use narsor_engine::persistence::paths::StatePaths;
+use narsor_engine::persistence::paths::ServerStatePaths;
 
 struct TempRoot(std::path::PathBuf);
 
@@ -54,7 +54,7 @@ fn queued_task(root: &TempRoot, repositories: Vec<TaskRepository>) -> TaskRecord
         ResolvedEnvironment::harness_only("claude-code"),
         ResourceProfile::new(1000, 2048),
     );
-    ControlPlane::new(StatePaths::new(&root.0))
+    ControlPlane::new(ServerStatePaths::new(&root.0))
         .create_task(NewTask::new(
             TaskId::parse("task-1").unwrap(),
             OwnerRef::new("owner"),

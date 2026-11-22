@@ -27,8 +27,12 @@ impl ControllerLink for ControllerClient {
     async fn heartbeat(&self) -> Result<HeartbeatResponse, ClientError> {
         ControllerClient::heartbeat(self).await
     }
-    async fn commands(&self, wait: u64, all: bool) -> Result<CommandsResponse, ClientError> {
-        ControllerClient::commands(self, wait, all).await
+    async fn commands(
+        &self,
+        wait: u64,
+        since: Option<u64>,
+    ) -> Result<CommandsResponse, ClientError> {
+        ControllerClient::commands(self, wait, since).await
     }
     async fn acknowledge(&self, acks: Vec<CommandAck>) -> Result<AckResponse, ClientError> {
         ControllerClient::acknowledge(self, acks).await
@@ -49,6 +53,13 @@ impl ControllerLink for ControllerClient {
         request: &RunnerCredentialRequest,
     ) -> Result<RunnerCredentialResponse, ClientError> {
         ControllerClient::issue_reader_credential(self, task, request).await
+    }
+    async fn fetch_launch_spec(
+        &self,
+        task: &str,
+        generation: u64,
+    ) -> Result<serde_json::Value, ClientError> {
+        ControllerClient::fetch_launch_spec(self, task, generation).await
     }
 }
 

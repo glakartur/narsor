@@ -1,14 +1,14 @@
-//! Directory layout of the three roots.
+//! Directory layout of the catalogue, of task storage and of the server's
+//! own state.
 //!
 //! All path construction lives here so that the layout described in
-//! `docs/dev/domain-model.md` §2.7 is defined exactly once — which is why splitting one
-//! root into three did not scatter it into three modules.
+//! `docs/dev/domain-model.md` §2.7 is defined exactly once.
 //!
-//! The three are separate *types* rather than three fields of one, because the
+//! The roots are separate *types* rather than fields of one, because the
 //! guarantee wanted is about what a consumer can reach: an [`ExecutionStore`]
-//! holding [`StatePaths`] has no method that yields a workflow directory, and
-//! no raw root to join one out of. Sharing would make the split a convention
-//! that holds until someone writes `.join("..")`.
+//! holding [`StatePaths`] has no method that yields a workflow directory or a
+//! control-plane record, and no raw root to join one out of. Sharing would
+//! make the split a convention that holds until someone writes `.join("..")`.
 //!
 //! ```text
 //! {catalog}/repositories/{id}.yaml   -- CatalogPaths: declared, shareable,
@@ -16,28 +16,31 @@
 //! {catalog}/automations/{name}/…     -- automation definition and scripts
 //! {catalog}/queues/{name}.yaml       -- queues served by automations
 //!
-//! {state}/executions/{id}/…          -- StatePaths: owned by one process
-//! {state}/narsor.log
-//! {state}/agent-harness.json          -- operator-selected default harness
-//! {state}/orchestration/…             -- control-plane task records, leases,
+//! {state}/narsor-server/…            -- ServerStatePaths: the server's own state
+//!     daemon.instance.lock            -- held by the running daemon
+//!     auth/…                          -- network-mode installation owner
+//!     agent-harness.json              -- operator-selected default harness
+//!     orchestration/…                 -- control-plane task records, leases,
 //!                                        controller identities, runner sessions
-//! {state}/launch-specs/{task}.json    -- immutable launch input (task storage)
-//! {state}/materials/…                 -- bounded task materials (U9): manifests
+//!     materials/…                     -- bounded task materials (U9): manifests
 //!                                        and blobs, outside any workspace
-//! {state}/observers/…                 -- records of the removed stored observers:
+//!     observers/…                     -- records of the removed stored observers:
 //!                                        never read, only reported at start
-//! {state}/observer-queues/entries/…   -- entries of observer queues (wait
+//!     observer-queues/entries/…       -- entries of observer queues (wait
 //!                                        episodes of decision gates)
-//! {state}/observer-queues/automations/{queue}/{automation}/…
+//!     observer-queues/automations/{queue}/{automation}/…
 //!                                     -- runtime state of a catalogue (queue,
 //!                                        automation) pair: runs, run errors
+//!
+//! {storage}/executions/{id}/…        -- StatePaths: one task storage, written
+//! {storage}/launch-specs/{task}.json    by its runner
 //!
 //! {work}/tasks/{id}/code/…           -- WorkPaths: local scratch, disposable
 //! ```
 //!
-//! All three default to the same `./.narsor`, so a run that configures nothing
-//! puts every file exactly where it was before the split. The layout only
-//! comes apart when someone deliberately takes it apart.
+//! `server.state` and `server.work` are *roots*: every binary appends only
+//! its own directory name to them ([`ServerStatePaths`] appends
+//! [`SERVER_STATE_DIR`]), so no binary spells another binary's directory.
 //!
 //! [`ExecutionStore`]: crate::ExecutionStore
 
@@ -46,8 +49,7 @@ use std::path::{Path, PathBuf};
 
 /// Default root, relative to the process working directory.
 ///
-/// One value shared by all three roots: the split is meant to be invisible
-/// until an operator separates them on purpose.
+/// The default of every root a path type here is built from directly.
 pub const DEFAULT_ROOT: &str = "./.narsor";
 
 /// Directory holding workflow definitions, under the catalogue root.
@@ -79,23 +81,12 @@ pub const TASKS_DIR: &str = "tasks";
 /// Directory inside a task that holds the checkouts.
 pub const CODE_DIR: &str = "code";
 
-/// File the terminal interface appends its log to, under the state root.
-///
-/// State rather than declaration, so it belongs here and not beside the
-/// workflows — and the catalogue may be mounted read-only, which a log file
-/// would not survive.
-pub const LOG_FILE: &str = "narsor.log";
+/// The server's own directory below the state root (`server.state`).
+pub const SERVER_STATE_DIR: &str = "narsor-server";
 
-/// File the daemon writes so other processes can discover it (`DaemonInfo`).
-///
-/// State rather than declaration, for the same reason as [`LOG_FILE`]: it is
-/// written by exactly one running process and would not survive a read-only
-/// mount of the catalogue.
-pub const DAEMON_FILE: &str = "daemon.json";
-
-/// Exclusive lock used to serialize daemon spawn against a race between
-/// several clients discovering no daemon at once.
-pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
+/// Held by the running daemon for its whole life, inside
+/// [`SERVER_STATE_DIR`].
+pub const DAEMON_INSTANCE_LOCK_FILE: &str = "daemon.instance.lock";
 
 /// Network-mode ownership records (U7, R38): the installation owner and,
 /// until somebody claims it, the one-time claim code.
@@ -300,13 +291,14 @@ pub const TEMP_SUFFIX: &str = ".tmp";
 /// Number of digits in an event file name (`00000001.json`).
 const SEQUENCE_WIDTH: usize = 8;
 
-/// Resolves every path of the *state* layout below a configurable root.
+/// Resolves every path of a *task storage* below a configurable root.
 ///
-/// Execution state and the log: everything one process writes while it runs a
-/// task. Splitting the roots does not make this directory safe to share — the
-/// event log's sequence counter is cached in the process and pauses live in a
-/// mutex, so two processes on one state root still overwrite each other's
-/// events. It is separable for mounting, not for sharing.
+/// Execution state: everything one runner writes while it runs a task, and
+/// the launch spec it started from. Splitting the roots does not make this
+/// directory safe to share — the event log's sequence counter is cached in
+/// the process and pauses live in a mutex, so two processes on one root
+/// still overwrite each other's events. It is separable for mounting, not
+/// for sharing.
 ///
 /// The root is configurable precisely so that tests can point it at a
 /// temporary directory; nothing in this layer ever reads a global location.
@@ -324,47 +316,6 @@ impl StatePaths {
     /// The state root itself.
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    /// `{root}/narsor.log`
-    pub fn log_file(&self) -> PathBuf {
-        self.root.join(LOG_FILE)
-    }
-
-    /// `{root}/daemon.json`
-    pub fn daemon_file(&self) -> PathBuf {
-        self.root.join(DAEMON_FILE)
-    }
-
-    /// `{root}/daemon.instance.lock`: held by the running daemon for its
-    /// whole life, so a second daemon cannot start beside it.
-    pub fn daemon_instance_lock_file(&self) -> PathBuf {
-        self.root.join("daemon.instance.lock")
-    }
-
-    /// `{root}/auth`
-    pub fn auth_dir(&self) -> PathBuf {
-        self.root.join(AUTH_DIR)
-    }
-
-    /// `{root}/auth/owner.json`
-    pub fn owner_file(&self) -> PathBuf {
-        self.auth_dir().join(OWNER_FILE)
-    }
-
-    /// `{root}/auth/claim.json`
-    pub fn claim_file(&self) -> PathBuf {
-        self.auth_dir().join(CLAIM_FILE)
-    }
-
-    /// `{root}/auth/claim-code`
-    pub fn claim_code_file(&self) -> PathBuf {
-        self.auth_dir().join(CLAIM_CODE_FILE)
-    }
-
-    /// `{root}/agent-harness.json`
-    pub fn agent_harness_selection_file(&self) -> PathBuf {
-        self.root.join(AGENT_HARNESS_SELECTION_FILE)
     }
 
     /// `{root}/executions`
@@ -399,90 +350,6 @@ impl StatePaths {
         self.execution_dir(execution_id).join(STEP_PROFILE_FILE)
     }
 
-    /// `{root}/orchestration`
-    pub fn orchestration_dir(&self) -> PathBuf {
-        self.root.join(ORCHESTRATION_DIR)
-    }
-
-    /// `{root}/orchestration/tasks`
-    pub fn orchestration_tasks_dir(&self) -> PathBuf {
-        self.orchestration_dir().join(ORCHESTRATION_TASKS_DIR)
-    }
-
-    /// `{root}/orchestration/tasks/create.lock`
-    pub fn orchestration_create_lock_file(&self) -> PathBuf {
-        self.orchestration_tasks_dir().join(TASKS_CREATE_LOCK_FILE)
-    }
-
-    /// `{root}/orchestration/tasks/{task_id}`
-    pub fn orchestration_task_dir(&self, task_id: &str) -> PathBuf {
-        self.orchestration_tasks_dir().join(task_id)
-    }
-
-    /// `{root}/orchestration/tasks/{task_id}/task.json`
-    pub fn orchestration_task_file(&self, task_id: &str) -> PathBuf {
-        self.orchestration_task_dir(task_id).join(TASK_RECORD_FILE)
-    }
-
-    /// `{root}/orchestration/tasks/{task_id}/task.lock`
-    pub fn orchestration_task_lock_file(&self, task_id: &str) -> PathBuf {
-        self.orchestration_task_dir(task_id).join(TASK_LOCK_FILE)
-    }
-
-    /// `{root}/orchestration/tasks/{task_id}/events`
-    pub fn orchestration_task_events_dir(&self, task_id: &str) -> PathBuf {
-        self.orchestration_task_dir(task_id).join(EVENTS_DIR)
-    }
-
-    /// `{root}/orchestration/tasks/{task_id}/events/{sequence:08}.json`
-    pub fn orchestration_task_event_file(&self, task_id: &str, sequence: u64) -> PathBuf {
-        self.orchestration_task_events_dir(task_id)
-            .join(event_file_name(sequence))
-    }
-
-    /// `{root}/orchestration/backends`
-    pub fn orchestration_backends_dir(&self) -> PathBuf {
-        self.orchestration_dir().join(ORCHESTRATION_BACKENDS_DIR)
-    }
-
-    /// `{root}/orchestration/backends/{backend_id}`
-    pub fn orchestration_backend_dir(&self, backend_id: &str) -> PathBuf {
-        self.orchestration_backends_dir().join(backend_id)
-    }
-
-    /// `{root}/orchestration/backends/{backend_id}/lease.json`
-    pub fn backend_lease_file(&self, backend_id: &str) -> PathBuf {
-        self.orchestration_backend_dir(backend_id)
-            .join(BACKEND_LEASE_FILE)
-    }
-
-    /// `{root}/orchestration/backends/{backend_id}/lease.lock`
-    pub fn backend_lease_lock_file(&self, backend_id: &str) -> PathBuf {
-        self.orchestration_backend_dir(backend_id)
-            .join(BACKEND_LEASE_LOCK_FILE)
-    }
-
-    /// `{root}/orchestration/backends/{backend_id}/schedule.lock`
-    pub fn backend_schedule_lock_file(&self, backend_id: &str) -> PathBuf {
-        self.orchestration_backend_dir(backend_id)
-            .join(BACKEND_SCHEDULE_LOCK_FILE)
-    }
-
-    /// `{root}/orchestration/default-backend.json`
-    pub fn default_backend_file(&self) -> PathBuf {
-        self.orchestration_dir().join(DEFAULT_BACKEND_FILE)
-    }
-
-    /// `{root}/orchestration/default-backend.lock`
-    pub fn default_backend_lock_file(&self) -> PathBuf {
-        self.orchestration_dir().join(DEFAULT_BACKEND_LOCK_FILE)
-    }
-
-    /// `{root}/orchestration/global-schedule.lock`
-    pub fn global_schedule_lock_file(&self) -> PathBuf {
-        self.orchestration_dir().join(GLOBAL_SCHEDULE_LOCK_FILE)
-    }
-
     /// `{root}/launch-specs`
     pub fn launch_specs_dir(&self) -> PathBuf {
         self.root.join(LAUNCH_SPECS_DIR)
@@ -491,162 +358,6 @@ impl StatePaths {
     /// `{root}/launch-specs/{task_id}.json`
     pub fn task_launch_spec_file(&self, task_id: &str) -> PathBuf {
         self.launch_specs_dir().join(format!("{task_id}.json"))
-    }
-
-    /// `{root}/orchestration/tasks/{task_id}/runner-session.json`
-    pub fn runner_session_file(&self, task_id: &str) -> PathBuf {
-        self.orchestration_task_dir(task_id)
-            .join(RUNNER_SESSION_FILE)
-    }
-
-    /// `{root}/orchestration/tasks/{task_id}/reader-session.json`: the
-    /// credential of the task's read-only runner, apart from the session of
-    /// the runner that works, so neither replaces the other.
-    pub fn reader_session_file(&self, task_id: &str) -> PathBuf {
-        self.orchestration_task_dir(task_id)
-            .join(READER_SESSION_FILE)
-    }
-
-    /// `{root}/materials`
-    pub fn materials_dir(&self) -> PathBuf {
-        self.root.join(MATERIALS_DIR)
-    }
-
-    /// `{root}/materials/.staging`
-    pub fn materials_staging_dir(&self) -> PathBuf {
-        self.materials_dir().join(MATERIALS_STAGING_DIR)
-    }
-
-    /// `{root}/materials/.locks/{task_id}.lock`
-    pub fn task_materials_lock_file(&self, task_id: &str) -> PathBuf {
-        self.materials_dir()
-            .join(MATERIALS_LOCKS_DIR)
-            .join(format!("{task_id}.lock"))
-    }
-
-    /// `{root}/materials/{task_id}`
-    pub fn task_materials_dir(&self, task_id: &str) -> PathBuf {
-        self.materials_dir().join(task_id)
-    }
-
-    /// `{root}/materials/{task_id}/{material_id}`
-    pub fn material_dir(&self, task_id: &str, material_id: &str) -> PathBuf {
-        self.task_materials_dir(task_id).join(material_id)
-    }
-
-    /// `{root}/materials/{task_id}/{material_id}/material.json`
-    pub fn material_record_file(&self, task_id: &str, material_id: &str) -> PathBuf {
-        self.material_dir(task_id, material_id)
-            .join(MATERIAL_RECORD_FILE)
-    }
-
-    /// `{root}/materials/{task_id}/{material_id}/blobs/{sha256}`
-    pub fn material_blob_file(&self, task_id: &str, material_id: &str, sha256: &str) -> PathBuf {
-        self.material_dir(task_id, material_id)
-            .join(MATERIAL_BLOBS_DIR)
-            .join(sha256)
-    }
-
-    /// `{root}/observers`: only for the startup warning about stored
-    /// observers.
-    pub fn observers_dir(&self) -> PathBuf {
-        self.root.join(OBSERVERS_DIR)
-    }
-
-    /// `{root}/observer-queues/automations`
-    pub fn automation_states_dir(&self) -> PathBuf {
-        self.observer_queues_dir().join(AUTOMATION_STATES_DIR)
-    }
-
-    /// `{root}/observer-queues/automations/{queue}`
-    pub fn automation_queue_dir(&self, queue: &str) -> PathBuf {
-        self.automation_states_dir().join(queue)
-    }
-
-    /// `{root}/observer-queues/automations/{queue}/{automation}`
-    pub fn automation_state_dir(&self, queue: &str, automation: &str) -> PathBuf {
-        self.automation_queue_dir(queue).join(automation)
-    }
-
-    /// `{root}/observer-queues/automations/{queue}/{automation}/state.json`
-    pub fn automation_state_file(&self, queue: &str, automation: &str) -> PathBuf {
-        self.automation_state_dir(queue, automation)
-            .join(AUTOMATION_STATE_FILE)
-    }
-
-    /// `{root}/observer-queues/automations/{queue}/{automation}/state.lock`
-    pub fn automation_state_lock_file(&self, queue: &str, automation: &str) -> PathBuf {
-        self.automation_state_dir(queue, automation)
-            .join(AUTOMATION_STATE_LOCK_FILE)
-    }
-
-    /// `{root}/observer-queues/automations/{queue}/{automation}/errors`
-    pub fn automation_errors_dir(&self, queue: &str, automation: &str) -> PathBuf {
-        self.automation_state_dir(queue, automation)
-            .join(AUTOMATION_ERRORS_DIR)
-    }
-
-    /// `{root}/observer-queues/automations/{queue}/{automation}/errors/{sequence:08}.json`
-    pub fn automation_error_file(&self, queue: &str, automation: &str, sequence: u64) -> PathBuf {
-        self.automation_errors_dir(queue, automation)
-            .join(event_file_name(sequence))
-    }
-
-    /// `{root}/observer-queues`
-    pub fn observer_queues_dir(&self) -> PathBuf {
-        self.root.join(OBSERVER_QUEUES_DIR)
-    }
-
-    /// `{root}/observer-queues/entries`
-    pub fn queue_entries_dir(&self) -> PathBuf {
-        self.observer_queues_dir().join(OBSERVER_QUEUE_ENTRIES_DIR)
-    }
-
-    /// `{root}/observer-queues/entries/{entry_id}.json`
-    pub fn queue_entry_file(&self, entry_id: &str) -> PathBuf {
-        self.queue_entries_dir().join(format!("{entry_id}.json"))
-    }
-
-    /// `{root}/observer-queues/entries.lock`
-    pub fn queue_entries_lock_file(&self) -> PathBuf {
-        self.observer_queues_dir()
-            .join(OBSERVER_QUEUE_ENTRIES_LOCK_FILE)
-    }
-
-    /// `{root}/orchestration/controllers`
-    pub fn orchestration_controllers_dir(&self) -> PathBuf {
-        self.orchestration_dir().join(ORCHESTRATION_CONTROLLERS_DIR)
-    }
-
-    /// `{root}/orchestration/controllers/{controller_id}/controller.json`
-    pub fn controller_record_file(&self, controller_id: &str) -> PathBuf {
-        self.orchestration_controllers_dir()
-            .join(controller_id)
-            .join(CONTROLLER_RECORD_FILE)
-    }
-
-    /// `{root}/orchestration/controllers/{controller_id}/controller.lock`
-    pub fn controller_lock_file(&self, controller_id: &str) -> PathBuf {
-        self.orchestration_controllers_dir()
-            .join(controller_id)
-            .join(CONTROLLER_LOCK_FILE)
-    }
-
-    /// `{root}/orchestration/enrollments`
-    pub fn orchestration_enrollments_dir(&self) -> PathBuf {
-        self.orchestration_dir().join(ORCHESTRATION_ENROLLMENTS_DIR)
-    }
-
-    /// `{root}/orchestration/enrollments/{enrollment_id}.json`
-    pub fn enrollment_file(&self, enrollment_id: &str) -> PathBuf {
-        self.orchestration_enrollments_dir()
-            .join(format!("{enrollment_id}.json"))
-    }
-
-    /// `{root}/orchestration/enrollments/enroll.lock`
-    pub fn enrollments_lock_file(&self) -> PathBuf {
-        self.orchestration_enrollments_dir()
-            .join(ENROLLMENTS_LOCK_FILE)
     }
 
     /// `{state}/executions/{id}/checkpoint.{name}.bundle`: the checkpoint of
@@ -738,6 +449,302 @@ impl AsRef<Path> for StatePaths {
 impl Default for StatePaths {
     fn default() -> Self {
         Self::new(DEFAULT_ROOT)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The server's own state
+// ---------------------------------------------------------------------------
+
+/// Resolves every path of `narsor-server`'s own state:
+/// `{state}/narsor-server/` below the state root (`server.state`).
+///
+/// Constructed from the *root*, to which it appends only its own directory
+/// name ([`SERVER_STATE_DIR`]): the type yields no path in another binary's
+/// directory and keeps no raw root to join one out of. Control-plane task
+/// records, leases, controller identities, materials, observer queues, the
+/// installation owner and the daemon's instance lock live here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerStatePaths {
+    dir: PathBuf,
+}
+
+impl ServerStatePaths {
+    /// The server's state below the state root `state_root`.
+    pub fn new(state_root: impl AsRef<Path>) -> Self {
+        Self {
+            dir: state_root.as_ref().join(SERVER_STATE_DIR),
+        }
+    }
+
+    /// `{state}/narsor-server`: the server's own directory.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// `{state}/narsor-server/daemon.instance.lock`: held by the running daemon for its
+    /// whole life, so a second daemon cannot start beside it.
+    pub fn daemon_instance_lock_file(&self) -> PathBuf {
+        self.dir.join(DAEMON_INSTANCE_LOCK_FILE)
+    }
+
+    /// `{state}/narsor-server/auth`
+    pub fn auth_dir(&self) -> PathBuf {
+        self.dir.join(AUTH_DIR)
+    }
+
+    /// `{state}/narsor-server/auth/owner.json`
+    pub fn owner_file(&self) -> PathBuf {
+        self.auth_dir().join(OWNER_FILE)
+    }
+
+    /// `{state}/narsor-server/auth/claim.json`
+    pub fn claim_file(&self) -> PathBuf {
+        self.auth_dir().join(CLAIM_FILE)
+    }
+
+    /// `{state}/narsor-server/auth/claim-code`
+    pub fn claim_code_file(&self) -> PathBuf {
+        self.auth_dir().join(CLAIM_CODE_FILE)
+    }
+
+    /// `{state}/narsor-server/agent-harness.json`
+    pub fn agent_harness_selection_file(&self) -> PathBuf {
+        self.dir.join(AGENT_HARNESS_SELECTION_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration`
+    pub fn orchestration_dir(&self) -> PathBuf {
+        self.dir.join(ORCHESTRATION_DIR)
+    }
+
+    /// `{state}/narsor-server/orchestration/tasks`
+    pub fn orchestration_tasks_dir(&self) -> PathBuf {
+        self.orchestration_dir().join(ORCHESTRATION_TASKS_DIR)
+    }
+
+    /// `{state}/narsor-server/orchestration/tasks/create.lock`
+    pub fn orchestration_create_lock_file(&self) -> PathBuf {
+        self.orchestration_tasks_dir().join(TASKS_CREATE_LOCK_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration/tasks/{task_id}`
+    pub fn orchestration_task_dir(&self, task_id: &str) -> PathBuf {
+        self.orchestration_tasks_dir().join(task_id)
+    }
+
+    /// `{state}/narsor-server/orchestration/tasks/{task_id}/task.json`
+    pub fn orchestration_task_file(&self, task_id: &str) -> PathBuf {
+        self.orchestration_task_dir(task_id).join(TASK_RECORD_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration/tasks/{task_id}/task.lock`
+    pub fn orchestration_task_lock_file(&self, task_id: &str) -> PathBuf {
+        self.orchestration_task_dir(task_id).join(TASK_LOCK_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration/tasks/{task_id}/events`
+    pub fn orchestration_task_events_dir(&self, task_id: &str) -> PathBuf {
+        self.orchestration_task_dir(task_id).join(EVENTS_DIR)
+    }
+
+    /// `{state}/narsor-server/orchestration/tasks/{task_id}/events/{sequence:08}.json`
+    pub fn orchestration_task_event_file(&self, task_id: &str, sequence: u64) -> PathBuf {
+        self.orchestration_task_events_dir(task_id)
+            .join(event_file_name(sequence))
+    }
+
+    /// `{state}/narsor-server/orchestration/backends`
+    pub fn orchestration_backends_dir(&self) -> PathBuf {
+        self.orchestration_dir().join(ORCHESTRATION_BACKENDS_DIR)
+    }
+
+    /// `{state}/narsor-server/orchestration/backends/{backend_id}`
+    pub fn orchestration_backend_dir(&self, backend_id: &str) -> PathBuf {
+        self.orchestration_backends_dir().join(backend_id)
+    }
+
+    /// `{state}/narsor-server/orchestration/backends/{backend_id}/lease.json`
+    pub fn backend_lease_file(&self, backend_id: &str) -> PathBuf {
+        self.orchestration_backend_dir(backend_id)
+            .join(BACKEND_LEASE_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration/backends/{backend_id}/lease.lock`
+    pub fn backend_lease_lock_file(&self, backend_id: &str) -> PathBuf {
+        self.orchestration_backend_dir(backend_id)
+            .join(BACKEND_LEASE_LOCK_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration/backends/{backend_id}/schedule.lock`
+    pub fn backend_schedule_lock_file(&self, backend_id: &str) -> PathBuf {
+        self.orchestration_backend_dir(backend_id)
+            .join(BACKEND_SCHEDULE_LOCK_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration/default-backend.json`
+    pub fn default_backend_file(&self) -> PathBuf {
+        self.orchestration_dir().join(DEFAULT_BACKEND_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration/default-backend.lock`
+    pub fn default_backend_lock_file(&self) -> PathBuf {
+        self.orchestration_dir().join(DEFAULT_BACKEND_LOCK_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration/global-schedule.lock`
+    pub fn global_schedule_lock_file(&self) -> PathBuf {
+        self.orchestration_dir().join(GLOBAL_SCHEDULE_LOCK_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration/tasks/{task_id}/runner-session.json`
+    pub fn runner_session_file(&self, task_id: &str) -> PathBuf {
+        self.orchestration_task_dir(task_id)
+            .join(RUNNER_SESSION_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration/tasks/{task_id}/reader-session.json`: the
+    /// credential of the task's read-only runner, apart from the session of
+    /// the runner that works, so neither replaces the other.
+    pub fn reader_session_file(&self, task_id: &str) -> PathBuf {
+        self.orchestration_task_dir(task_id)
+            .join(READER_SESSION_FILE)
+    }
+
+    /// `{state}/narsor-server/materials`
+    pub fn materials_dir(&self) -> PathBuf {
+        self.dir.join(MATERIALS_DIR)
+    }
+
+    /// `{state}/narsor-server/materials/.staging`
+    pub fn materials_staging_dir(&self) -> PathBuf {
+        self.materials_dir().join(MATERIALS_STAGING_DIR)
+    }
+
+    /// `{state}/narsor-server/materials/.locks/{task_id}.lock`
+    pub fn task_materials_lock_file(&self, task_id: &str) -> PathBuf {
+        self.materials_dir()
+            .join(MATERIALS_LOCKS_DIR)
+            .join(format!("{task_id}.lock"))
+    }
+
+    /// `{state}/narsor-server/materials/{task_id}`
+    pub fn task_materials_dir(&self, task_id: &str) -> PathBuf {
+        self.materials_dir().join(task_id)
+    }
+
+    /// `{state}/narsor-server/materials/{task_id}/{material_id}`
+    pub fn material_dir(&self, task_id: &str, material_id: &str) -> PathBuf {
+        self.task_materials_dir(task_id).join(material_id)
+    }
+
+    /// `{state}/narsor-server/materials/{task_id}/{material_id}/material.json`
+    pub fn material_record_file(&self, task_id: &str, material_id: &str) -> PathBuf {
+        self.material_dir(task_id, material_id)
+            .join(MATERIAL_RECORD_FILE)
+    }
+
+    /// `{state}/narsor-server/materials/{task_id}/{material_id}/blobs/{sha256}`
+    pub fn material_blob_file(&self, task_id: &str, material_id: &str, sha256: &str) -> PathBuf {
+        self.material_dir(task_id, material_id)
+            .join(MATERIAL_BLOBS_DIR)
+            .join(sha256)
+    }
+
+    /// `{state}/narsor-server/observer-queues/automations`
+    pub fn automation_states_dir(&self) -> PathBuf {
+        self.observer_queues_dir().join(AUTOMATION_STATES_DIR)
+    }
+
+    /// `{state}/narsor-server/observer-queues/automations/{queue}`
+    pub fn automation_queue_dir(&self, queue: &str) -> PathBuf {
+        self.automation_states_dir().join(queue)
+    }
+
+    /// `{state}/narsor-server/observer-queues/automations/{queue}/{automation}`
+    pub fn automation_state_dir(&self, queue: &str, automation: &str) -> PathBuf {
+        self.automation_queue_dir(queue).join(automation)
+    }
+
+    /// `{state}/narsor-server/observer-queues/automations/{queue}/{automation}/state.json`
+    pub fn automation_state_file(&self, queue: &str, automation: &str) -> PathBuf {
+        self.automation_state_dir(queue, automation)
+            .join(AUTOMATION_STATE_FILE)
+    }
+
+    /// `{state}/narsor-server/observer-queues/automations/{queue}/{automation}/state.lock`
+    pub fn automation_state_lock_file(&self, queue: &str, automation: &str) -> PathBuf {
+        self.automation_state_dir(queue, automation)
+            .join(AUTOMATION_STATE_LOCK_FILE)
+    }
+
+    /// `{state}/narsor-server/observer-queues/automations/{queue}/{automation}/errors`
+    pub fn automation_errors_dir(&self, queue: &str, automation: &str) -> PathBuf {
+        self.automation_state_dir(queue, automation)
+            .join(AUTOMATION_ERRORS_DIR)
+    }
+
+    /// `{state}/narsor-server/observer-queues/automations/{queue}/{automation}/errors/{sequence:08}.json`
+    pub fn automation_error_file(&self, queue: &str, automation: &str, sequence: u64) -> PathBuf {
+        self.automation_errors_dir(queue, automation)
+            .join(event_file_name(sequence))
+    }
+
+    /// `{state}/narsor-server/observer-queues`
+    pub fn observer_queues_dir(&self) -> PathBuf {
+        self.dir.join(OBSERVER_QUEUES_DIR)
+    }
+
+    /// `{state}/narsor-server/observer-queues/entries`
+    pub fn queue_entries_dir(&self) -> PathBuf {
+        self.observer_queues_dir().join(OBSERVER_QUEUE_ENTRIES_DIR)
+    }
+
+    /// `{state}/narsor-server/observer-queues/entries/{entry_id}.json`
+    pub fn queue_entry_file(&self, entry_id: &str) -> PathBuf {
+        self.queue_entries_dir().join(format!("{entry_id}.json"))
+    }
+
+    /// `{state}/narsor-server/observer-queues/entries.lock`
+    pub fn queue_entries_lock_file(&self) -> PathBuf {
+        self.observer_queues_dir()
+            .join(OBSERVER_QUEUE_ENTRIES_LOCK_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration/controllers`
+    pub fn orchestration_controllers_dir(&self) -> PathBuf {
+        self.orchestration_dir().join(ORCHESTRATION_CONTROLLERS_DIR)
+    }
+
+    /// `{state}/narsor-server/orchestration/controllers/{controller_id}/controller.json`
+    pub fn controller_record_file(&self, controller_id: &str) -> PathBuf {
+        self.orchestration_controllers_dir()
+            .join(controller_id)
+            .join(CONTROLLER_RECORD_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration/controllers/{controller_id}/controller.lock`
+    pub fn controller_lock_file(&self, controller_id: &str) -> PathBuf {
+        self.orchestration_controllers_dir()
+            .join(controller_id)
+            .join(CONTROLLER_LOCK_FILE)
+    }
+
+    /// `{state}/narsor-server/orchestration/enrollments`
+    pub fn orchestration_enrollments_dir(&self) -> PathBuf {
+        self.orchestration_dir().join(ORCHESTRATION_ENROLLMENTS_DIR)
+    }
+
+    /// `{state}/narsor-server/orchestration/enrollments/{enrollment_id}.json`
+    pub fn enrollment_file(&self, enrollment_id: &str) -> PathBuf {
+        self.orchestration_enrollments_dir()
+            .join(format!("{enrollment_id}.json"))
+    }
+
+    /// `{state}/narsor-server/orchestration/enrollments/enroll.lock`
+    pub fn enrollments_lock_file(&self) -> PathBuf {
+        self.orchestration_enrollments_dir()
+            .join(ENROLLMENTS_LOCK_FILE)
     }
 }
 

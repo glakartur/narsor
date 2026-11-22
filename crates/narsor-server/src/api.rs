@@ -1,25 +1,9 @@
 //! The daemon-owned local HTTP API.
 //!
-//! TUI, CLI and web clients use this API to create and control tasks, to
-//! read the executions their runners keep, and for the default-agent-harness
-//! setting. The daemon drives no execution itself: every task runs in a
-//! `narsor-runner` under a controller. The historical rationale below
-//! predates the daemon migration.
-//!
-//! # Why an API at all, when the TUI already has the store on disk
-//!
-//! Every reader before this unit — the TUI, the CLI — has opened
-//! [`narsor_engine::persistence::ExecutionStore`] directly, in-process, against the
-//! local filesystem. That stops working the moment a task view wants to read
-//! a *step timeline* or a *conversation*: those are computed
-//! ([`narsor_engine::engine::build_timeline`]) or transparently decompressed
-//! ([`narsor_engine::persistence::ConversationStore::read`]), not just deserialized,
-//! and M2's distributed narsor (`docs/brainstorms/2026-09-25-…`) wants that
-//! same computed view available to a caller that is *not* the process
-//! holding the filesystem. An HTTP boundary drawn now, even inside the TUI's
-//! own process, is the boundary that later moves to a standalone `narsor
-//! serve` (M2) without the TUI or CLI changing how they ask for a timeline or
-//! a conversation — only where the answer comes from changes.
+//! TUI, CLI and web clients use this API to create, control and read tasks,
+//! and for the default-agent-harness setting. The daemon drives no execution
+//! itself: every task runs in a `narsor-runner` under a controller. The
+//! historical rationale below predates the daemon migration.
 //!
 //! # Historical embedded-server rationale
 //!
@@ -34,7 +18,7 @@
 //!
 //! # Why loopback-only and why a random token
 //!
-//! The conversation store this API exposes can contain secrets from tool
+//! The conversations this API relays can contain secrets from tool
 //! results (the plan's plan-local scope: "we do not filter secrets from tool
 //! results"). `127.0.0.1` keeps the socket off any network interface, but a
 //! loopback port is still visible to every other local user on a shared
@@ -43,21 +27,14 @@
 //! process never writes the token to disk, and nothing to guess since it is
 //! a random UUID valid only for this process's lifetime.
 //!
-//! # Historical read-only rationale
+//! # Reads go through the runner
 //!
-//! `docs/plans/2026-09-26-001-fix-tui-background-engine-runs-plan.md`
-//! established that anything which *drives* an execution — runs it, resumes
-//! it, delivers input to it — must go through `spawn_background` and check
-//! `Engine::is_active` first, because two independent drivers racing to
-//! advance the same execution is exactly the bug that plan fixed. This
-//! server does not drive anything: every handler here only reads
-//! `ExecutionStore` and `ConversationStore`, both already safe for
-//! concurrent read access from multiple processes (that is the whole point
-//! of a plain-file, append-only, atomic-rename store). The "list executions,
-//! run/input/transition, live event stream over the API" surface — the one
-//! that *would* need that check — is explicitly out of scope until M2 (REST
-//! and SSE, D37/D38); this unit only moves read paths the TUI already has
-//! onto HTTP.
+//! The server never reads a task's storage. A task's execution — its events,
+//! its conversation — is read through the control plane from the task's
+//! runner, or from a read-only runner the controller starts for a stopped
+//! task (D63); its list, status and timeline come from the task records the
+//! runners report to (U8). A local task is read like a task of any other
+//! backend.
 //!
 //! # Bind address and startup failure
 //!
@@ -215,14 +192,13 @@ impl ApiHandle {
 
 /// Starts the local API server on a random loopback port.
 ///
-/// `catalog_dir`/`work_dir` are the daemon's own catalogue and work roots
-/// (U3): `POST /tasks` needs them to resolve a workflow reference and
-/// provision a workspace exactly as `narsor run` does, now server-side.
+/// `catalog_dir` is the daemon's own catalogue: `POST /tasks` resolves a
+/// workflow reference in it.
 ///
 /// The returned [`ApiHandle`] carries the bound address and the token every
 /// request must present as `Authorization: Bearer <token>`.
-pub async fn start(catalog_dir: PathBuf, work_dir: PathBuf) -> Result<ApiHandle, ApiStartError> {
-    start_with_harness_selector(catalog_dir, work_dir, None).await
+pub async fn start(catalog_dir: PathBuf) -> Result<ApiHandle, ApiStartError> {
+    start_with_harness_selector(catalog_dir, None).await
 }
 
 /// Starts the API server with the daemon's shared default-harness selector.
@@ -232,12 +208,10 @@ pub async fn start(catalog_dir: PathBuf, work_dir: PathBuf) -> Result<ApiHandle,
 /// function so the settings resource and executor observe the same `Arc`.
 pub async fn start_with_harness_selector(
     catalog_dir: PathBuf,
-    work_dir: PathBuf,
     harness_selector: Option<Arc<DefaultHarnessSelector>>,
 ) -> Result<ApiHandle, ApiStartError> {
     start_with_services(
         catalog_dir,
-        work_dir,
         ApiServices {
             harness_selector,
             control: None,
@@ -290,16 +264,9 @@ impl fmt::Debug for ApiServices {
 /// trusted mode on a random loopback port.
 pub async fn start_with_services(
     catalog_dir: PathBuf,
-    work_dir: PathBuf,
     services: ApiServices,
 ) -> Result<ApiHandle, ApiStartError> {
-    serve(
-        catalog_dir,
-        work_dir,
-        services,
-        ServerSecurity::trusted_loopback(),
-    )
-    .await
+    serve(catalog_dir, services, ServerSecurity::trusted_loopback()).await
 }
 
 /// How the server is exposed and who may call it.
@@ -350,7 +317,6 @@ impl ServerSecurity {
 /// Starts the API server in the given security mode.
 pub async fn serve(
     catalog_dir: PathBuf,
-    work_dir: PathBuf,
     services: ApiServices,
     security: ServerSecurity,
 ) -> Result<ApiHandle, ApiStartError> {
@@ -380,7 +346,7 @@ pub async fn serve(
     let listener = TcpListener::bind(bind).await.map_err(ApiStartError)?;
     let addr = listener.local_addr().map_err(ApiStartError)?;
 
-    let mut app = routes::router(auth, catalog_dir, work_dir, services);
+    let mut app = routes::router(auth, catalog_dir, services);
     if let Some(cors) = gate::cors_layer(&cors) {
         app = app.layer(cors);
     }

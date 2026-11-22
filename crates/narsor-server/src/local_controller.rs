@@ -9,9 +9,9 @@
 //!
 //! # Starting
 //!
-//! The daemon creates a one-time enrollment code in process when the
-//! credential does not exist yet, notes the `epoch` of the backend's
-//! current lease, starts the child and waits — up to [`READY_TIMEOUT`] —
+//! The daemon creates a short-lived one-time enrollment code in process for
+//! every start of the child, notes the `epoch` of the backend's current
+//! lease, starts the child and waits — up to [`READY_TIMEOUT`] —
 //! for a lease of a larger epoch. Only a lease of the new incarnation
 //! proves the child works: after a `kill -9` of the previous daemon its
 //! lease is still valid (R7). A child that ends first, a missing binary or
@@ -19,7 +19,10 @@
 //!
 //! # What the child gets
 //!
-//! Its connection and storage as flags, and its configuration the way the
+//! Its connection and the state and work roots (`--state-root`,
+//! `--work-root`) as flags — the controller appends its own directory name
+//! to each, so the daemon never constructs the controller's paths or looks
+//! at its files (KTD7) — and its configuration the way the
 //! daemon got it (R21): `--config <file>` naming the file that won the
 //! daemon's cascade, or `--no-config` when none won, so the child cannot
 //! find a file that appeared later. The child reads its own `controller`
@@ -27,8 +30,10 @@
 //! again. Of the daemon's `NARSOR_*` variables only those of the
 //! controller's sections (`NARSOR_GLOBAL__*`, `NARSOR_CONTROLLER__*`) reach
 //! it; the others are removed from its environment (R6). The enrollment
-//! code is the one other `NARSOR_*` variable it gets, and only when there
-//! is one — never as an argument (R12). The daemon checks the controller's
+//! code is the one other `NARSOR_*` variable it gets — never as an argument
+//! (R12). The child uses it only when its own credential does not exist,
+//! so a controller whose state was wiped enrolls again; an unused code
+//! simply expires. The daemon checks the controller's
 //! configuration before it binds its API
 //! ([`crate::settings::configure`]). `RUST_LOG` follows the daemon's log
 //! level; the child's stderr is copied, line by line and prefixed, to the
@@ -44,8 +49,8 @@
 //! that ends after the start is started again after [`Supervision`]'s pause,
 //! doubled on each further failure up to
 //! [`child_process::MAX_RESTART_DELAY`] and reset once one ran for
-//! [`child_process::RESTART_RESET_AFTER`] (R9). A restart enrolls nothing:
-//! the credential is there. [`child_process`] holds what this supervision
+//! [`child_process::RESTART_RESET_AFTER`] (R9). A restart gets a fresh code
+//! too. [`child_process`] holds what this supervision
 //! shares with the observer worker's.
 //!
 //! # Stopping
@@ -64,6 +69,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use narsor_controller_runtime::{ControllerConfig, Supervision, ENROLLMENT_CODE_ENV};
+use narsor_engine::config::local_controller;
 use narsor_engine::controller_protocol::ProtocolService;
 use narsor_engine::domain::BackendId;
 use narsor_engine::environment::BackendRecord;
@@ -81,6 +87,11 @@ const READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the child waits for a predecessor holding its credential lock.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(7);
 
+/// How long the enrollment code of one start stays valid: enough for the
+/// child's wait on its lock and its first request, short enough that an
+/// unused code is worth nothing soon after.
+const ENROLLMENT_TTL: Duration = Duration::from_secs(120);
+
 /// How many of the child's last stderr lines a start failure quotes.
 const STDERR_TAIL: usize = 20;
 
@@ -94,10 +105,10 @@ pub struct LocalControllerSettings {
     pub program: PathBuf,
     /// The API's URL, for the controller and for its runners.
     pub control_plane: String,
-    /// The controller's credential.
-    pub credential_file: PathBuf,
-    /// The backend's storage: task storages and runner records.
-    pub storage: PathBuf,
+    /// The state root (`server.state`), handed on as `--state-root`.
+    pub state_root: PathBuf,
+    /// The work root (`server.work`), handed on as `--work-root`.
+    pub work_root: PathBuf,
     /// The arguments naming the child's configuration file:
     /// `--config <file>` or `--no-config`.
     pub config_args: Vec<OsString>,
@@ -166,7 +177,8 @@ pub struct LocalController {
 }
 
 impl LocalController {
-    /// Enrolls when needed, starts the child and waits for its lease.
+    /// Starts the child with a fresh enrollment code and waits for its
+    /// lease.
     pub async fn start(
         settings: LocalControllerSettings,
         control: Arc<ProtocolService>,
@@ -180,16 +192,9 @@ impl LocalController {
                 .map_err(|error| format!("cannot read the local backend's lease: {error}"))
         };
         let before = epoch(&control)?;
-        let code = if settings.credential_file.exists() {
-            None
-        } else {
-            Some(
-                control
-                    .create_builtin_local_enrollment()
-                    .map_err(|error| format!("could not enroll the local controller: {error}"))?
-                    .enrollment_code,
-            )
-        };
+        // The first code is made here, so a control plane that cannot make
+        // one fails the start at once rather than in the supervising thread.
+        let code = enrollment_code(&control)?;
 
         let shared = Arc::new(Shared {
             phase: Mutex::new(Phase::Starting),
@@ -198,9 +203,10 @@ impl LocalController {
         let (stop, stopped) = mpsc::channel();
         let thread = {
             let shared = Arc::clone(&shared);
+            let control_for_thread = Arc::clone(&control);
             std::thread::Builder::new()
                 .name("local-controller".into())
-                .spawn(move || supervise(&settings, code, &shared, &stopped))
+                .spawn(move || supervise(&settings, &control_for_thread, code, &shared, &stopped))
                 .map_err(|error| {
                     format!("cannot start the local controller's supervisor: {error}")
                 })?
@@ -260,19 +266,38 @@ impl LocalController {
     }
 }
 
+/// A short-lived one-time code enrolling the child of one start, used by
+/// the child only when it has no credential.
+fn enrollment_code(control: &ProtocolService) -> Result<String, String> {
+    control
+        .create_builtin_local_enrollment(ENROLLMENT_TTL)
+        .map(|response| response.enrollment_code)
+        .map_err(|error| {
+            format!("could not create the local controller's enrollment code: {error}")
+        })
+}
+
 /// The supervising thread: starts the child, restarts it after the start,
-/// stops it on request.
+/// stops it on request. Every start but the first gets a fresh code.
 fn supervise(
     settings: &LocalControllerSettings,
-    mut code: Option<String>,
+    control: &ProtocolService,
+    first_code: String,
     shared: &Arc<Shared>,
     stopped: &mpsc::Receiver<()>,
 ) {
     let policy = Supervision::default();
     let mut delays = RestartDelay::new(policy.restart_after);
+    let mut code = Some(first_code);
     loop {
         let started = Instant::now();
-        let outcome = match spawn(settings, code.take(), shared) {
+        let start_code = match code.take() {
+            Some(code) => Some(code),
+            None => enrollment_code(control)
+                .inspect_err(|error| tracing::warn!(%error, "daemon: starting the local controller without one"))
+                .ok(),
+        };
+        let outcome = match spawn(settings, start_code, shared) {
             Ok((mut child, stderr)) => {
                 let outcome = child_process::watch(
                     &mut child,
@@ -324,10 +349,10 @@ fn spawn(
         .arg("local")
         .arg("--control-plane")
         .arg(&settings.control_plane)
-        .arg("--credential-file")
-        .arg(&settings.credential_file)
-        .arg("--storage")
-        .arg(&settings.storage)
+        .args(local_controller::root_args(
+            &settings.state_root,
+            Some(&settings.work_root),
+        ))
         .arg("--lease-ttl-secs")
         .arg(
             ControllerConfig::new(String::new())

@@ -3,7 +3,7 @@
 use crate::controller_protocol::credentials::RunnerIdentity;
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::{
-    ConductorRelay, EventsRelay, PageRelay, ProtocolService,
+    ConductorRelay, DetailsRelay, EventsRelay, PageRelay, ProtocolService,
 };
 use crate::controller_protocol::wire::*;
 
@@ -46,7 +46,8 @@ impl ProtocolService {
             || self
                 .lock_conductor_reads()
                 .take(request_id, task_id)
-                .is_some();
+                .is_some()
+            || self.lock_detail_reads().take(request_id, task_id).is_some();
         Ok(ConversationPageAccepted { delivered: failed })
     }
 
@@ -58,6 +59,12 @@ impl ProtocolService {
 
     pub(crate) fn lock_conductor_reads(&self) -> std::sync::MutexGuard<'_, ConductorRelay> {
         self.conductor_reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn lock_detail_reads(&self) -> std::sync::MutexGuard<'_, DetailsRelay> {
+        self.detail_reads
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }

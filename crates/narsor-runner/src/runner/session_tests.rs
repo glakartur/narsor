@@ -312,7 +312,7 @@ fn offline_config(root: &TempRoot, storage: &Path, incarnation: &str) -> RunnerC
     RunnerConfig {
         task_id: TaskId::parse("task-1").unwrap(),
         storage: storage.to_path_buf(),
-        launch_spec: None,
+        launch_digest: None,
         control_plane: "http://control-plane.invalid".to_string(),
         credential_file: root.0.join("no-credential"),
         secrets_dir: None,
@@ -1316,10 +1316,8 @@ async fn a_base_image_without_git_fails_before_any_work() {
     let root = TempRoot::new();
     let storage = root.dir("storage");
     let spec = spec(ONE_STEP, "claude-code");
-    let spec_file = root.0.join("spec.json");
-    fs::write(&spec_file, serde_json::to_string(&spec).unwrap()).unwrap();
-    let mut config = offline_config(&root, &storage, "pod-1");
-    config.launch_spec = Some(spec_file);
+    let plane = SpecPlane::serving(Some(serde_json::to_value(&spec).unwrap()));
+    let mut config = pinned_config(&root, &storage, &spec.digest);
     // Every basic tool but git, as empty programs: none of them is run.
     config.contract.path = Some(
         harness_path(
@@ -1329,9 +1327,7 @@ async fn a_base_image_without_git_fails_before_any_work() {
         .into_os_string(),
     );
 
-    let exit = run(config, |_| panic!("no environment is applied"))
-        .await
-        .expect("the runner ends");
+    let exit = run_on(&plane, config).await;
 
     let RunnerExit::Problem(problem) = exit else {
         panic!("a problem: {exit:?}");
@@ -1354,6 +1350,167 @@ async fn a_base_image_without_git_fails_before_any_work() {
         "nothing was initialized"
     );
     assert!(storage.store().list_execution_ids().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The launch spec, fetched on the first start (R5, KTD3)
+// ---------------------------------------------------------------------------
+
+/// A control plane that serves one launch spec to the runner (or, with
+/// `None`, is unreachable) and counts the fetches.
+struct SpecPlane {
+    spec: Option<Value>,
+    fetches: std::sync::atomic::AtomicUsize,
+}
+
+impl SpecPlane {
+    fn serving(spec: Option<Value>) -> Arc<Self> {
+        Arc::new(Self {
+            spec,
+            fetches: Default::default(),
+        })
+    }
+
+    fn fetches(&self) -> usize {
+        self.fetches.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A runner link that fetches the spec from this control plane.
+    fn link(self: &Arc<Self>, config: &RunnerConfig) -> Link {
+        Link {
+            spec_source: Some(Arc::clone(self) as Arc<dyn LaunchSpecSource>),
+            ..Link::new(config)
+        }
+    }
+}
+
+impl LaunchSpecSource for SpecPlane {
+    fn launch_spec(&self) -> LaunchSpecFetch {
+        self.fetches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let answer = self
+            .spec
+            .clone()
+            .ok_or_else(|| ClientError::Unavailable("connection refused".into()));
+        Box::pin(async move { answer })
+    }
+}
+
+/// A runner configuration whose controller passed `digest`.
+fn pinned_config(root: &TempRoot, storage: &Path, digest: &str) -> RunnerConfig {
+    RunnerConfig {
+        launch_digest: Some(digest.to_string()),
+        ..offline_config(root, storage, "pod-1")
+    }
+}
+
+/// [`run`] of a working runner whose launch spec `plane` serves.
+async fn run_on(plane: &Arc<SpecPlane>, config: RunnerConfig) -> RunnerExit {
+    let link = plane.link(&config);
+    work(config, link, |_| panic!("no environment is applied"))
+        .await
+        .expect("the runner ends")
+}
+
+/// A served spec is taken only when it recomputes to the digest the
+/// controller passed; its own `digest` field proves nothing.
+#[tokio::test]
+async fn a_fetched_spec_is_accepted_only_with_the_pinned_digest() {
+    let honest = spec(ONE_STEP, "claude-code");
+    let mut tampered = honest.clone();
+    tampered.inputs = json!({"injected": true});
+    let other = spec(ONE_STEP, "codex");
+    let cases = [
+        ("the pinned spec", &honest, true),
+        (
+            "a body changed under the same digest field",
+            &tampered,
+            false,
+        ),
+        ("another task's spec", &other, false),
+    ];
+    for (name, served, accepted) in cases {
+        let root = TempRoot::new();
+        let storage = TaskStorage::new(root.dir("storage"));
+        let plane = SpecPlane::serving(Some(serde_json::to_value(served).unwrap()));
+        let config = pinned_config(&root, storage.root(), &honest.digest);
+
+        let loaded = load_spec(&config, &storage, &mut plane.link(&config)).await;
+
+        match loaded {
+            Ok(spec) => assert!(accepted && spec == honest, "{name}"),
+            Err(RunnerError::LaunchSpec(problem)) => {
+                assert!(!accepted, "{name}: {problem}");
+                assert!(problem.contains(&honest.digest), "{name}: {problem}");
+            }
+            Err(error) => panic!("{name}: {error}"),
+        }
+        assert_eq!(plane.fetches(), 1, "{name}");
+    }
+}
+
+/// A spec the runner refuses stops it with a problem before anything is
+/// initialized: no copy on the storage, no marker, no clone.
+#[tokio::test]
+async fn a_spec_with_another_digest_is_reported_and_initializes_nothing() {
+    let root = TempRoot::new();
+    let storage = root.dir("storage");
+    let served = spec(ONE_STEP, "codex");
+    let plane = SpecPlane::serving(Some(serde_json::to_value(&served).unwrap()));
+    let pinned = spec(ONE_STEP, "claude-code").digest;
+    let config = pinned_config(&root, &storage, &pinned);
+
+    let exit = run_on(&plane, config).await;
+
+    let RunnerExit::Problem(problem) = exit else {
+        panic!("a problem: {exit:?}");
+    };
+    assert_eq!(problem.code, PROBLEM_LAUNCH_SPEC);
+    let storage = TaskStorage::new(&storage);
+    assert!(storage.marker().unwrap().is_none());
+    assert!(storage
+        .store()
+        .load_task_launch_spec(&TaskId::parse("task-1").unwrap())
+        .unwrap()
+        .is_none());
+}
+
+/// A restarted runner works from the storage's copy: the control plane is
+/// not asked again.
+#[tokio::test]
+async fn a_restart_on_initialized_storage_fetches_nothing() {
+    let root = TempRoot::new();
+    let spec = spec(ONE_STEP, "claude-code");
+    let fixture = Fixture::start(&root, &spec, Agent::new(vec![], Reply::Hang));
+    let storage = fixture.session.storage.clone();
+    let plane = SpecPlane::serving(Some(serde_json::to_value(&spec).unwrap()));
+    let config = pinned_config(&root, storage.root(), &spec.digest);
+
+    let loaded = load_spec(&config, &storage, &mut plane.link(&config))
+        .await
+        .expect("the storage's copy");
+
+    assert_eq!(loaded, spec);
+    assert_eq!(plane.fetches(), 0);
+}
+
+/// A control plane that does not answer is asked again with backoff until
+/// the problem deadline; then the runner ends with a problem, not a crash.
+#[tokio::test]
+async fn an_unreachable_control_plane_is_retried_then_reported() {
+    let root = TempRoot::new();
+    let storage = root.dir("storage");
+    let plane = SpecPlane::serving(None);
+    let mut config = pinned_config(&root, &storage, "sha256:pinned");
+    config.timing.problem_report_deadline = Duration::from_millis(200);
+
+    let exit = run_on(&plane, config).await;
+
+    let RunnerExit::Problem(problem) = exit else {
+        panic!("a problem: {exit:?}");
+    };
+    assert_eq!(problem.code, PROBLEM_LAUNCH_SPEC);
+    assert!(plane.fetches() > 1, "retried: {}", plane.fetches());
 }
 
 /// What a runner that cannot work reports waits for the owner as a problem

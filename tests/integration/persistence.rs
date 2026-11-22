@@ -769,7 +769,16 @@ fn the_three_roots_on_one_directory_reproduce_the_previous_layout() {
         state.artifacts_dir("exec-1"),
         Path::new("/srv/narsor/executions/exec-1/artifacts")
     );
-    assert_eq!(state.log_file(), Path::new("/srv/narsor/narsor.log"));
+    // The server's own state is a directory of its own below the root.
+    let server = narsor_engine::persistence::ServerStatePaths::new("/srv/narsor");
+    assert_eq!(
+        server.orchestration_task_file("task-1"),
+        Path::new("/srv/narsor/narsor-server/orchestration/tasks/task-1/task.json")
+    );
+    assert_eq!(
+        server.daemon_instance_lock_file(),
+        Path::new("/srv/narsor/narsor-server/daemon.instance.lock")
+    );
 
     assert_eq!(catalog.workflows_dir(), Path::new("/srv/narsor/workflows"));
     assert_eq!(
@@ -895,4 +904,128 @@ fn launch_specs_are_not_executions_and_their_temp_files_are_swept() {
     assert_eq!(removed, vec![orphan.clone()]);
     assert!(!orphan.exists());
     assert!(store.load_task_launch_spec(&task_id).unwrap().is_some());
+}
+
+/// KTD7: the daemon hands its local controller the state and work roots and
+/// a fresh enrollment code on every start, and never looks at the
+/// controller's credential. The controller uses the code only without a
+/// credential, so a controller whose state was wiped enrolls again.
+#[test]
+#[ignore = "starts the built narsor-server and narsor-controller binaries"]
+fn a_controller_whose_credential_was_deleted_enrolls_again_at_the_next_start() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_narsor-cli"));
+    let server = cli.with_file_name("narsor-server");
+    assert!(
+        server.is_file() && cli.with_file_name("narsor-controller").is_file(),
+        "build the workspace binaries first"
+    );
+    let root = std::env::temp_dir().join(format!("narsor-reenroll-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let config = root.join("config.yaml");
+    fs::write(&config, format!("global:\n  root: {}\n", root.display())).unwrap();
+    let daemon_file = root.join("state/run/daemon.json");
+    let credential = root.join("state/narsor-controller-local/credential");
+
+    let mut credentials = Vec::new();
+    for _ in 0..2 {
+        let mut daemon = Command::new(&server)
+            .arg("--config")
+            .arg(&config)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start narsor-server");
+        // The discovery file appears once the controller holds its lease.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !daemon_file.is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let read = fs::read_to_string(&credential);
+        // SAFETY: signalling the daemon this test started.
+        unsafe {
+            libc::kill(daemon.id() as libc::pid_t, libc::SIGTERM);
+        }
+        daemon.wait().expect("wait for narsor-server");
+        credentials.push(read.expect("the controller enrolled and wrote its credential"));
+        fs::remove_file(&credential).unwrap();
+        let _ = fs::remove_file(&daemon_file);
+    }
+    let _ = fs::remove_dir_all(&root);
+
+    assert_ne!(credentials[0], credentials[1], "a new identity each time");
+}
+
+/// R7: a client finds and starts the daemon only through `state/run/`
+/// (0700). A daemon that refuses its configuration is reported with the end
+/// of its log there, at once.
+#[test]
+#[ignore = "starts the built narsor-cli, narsor-server and narsor-controller binaries"]
+fn a_client_starts_the_daemon_through_the_rendezvous_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Output};
+    use std::time::{Duration, Instant};
+
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_narsor-cli"));
+    let server = cli.with_file_name("narsor-server");
+    assert!(
+        server.is_file() && cli.with_file_name("narsor-controller").is_file(),
+        "build the workspace binaries first"
+    );
+    let root = std::env::temp_dir().join(format!("narsor-rendezvous-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let config = root.join("config.yaml");
+    let run_dir = root.join("state/run");
+    let run = |binary: &Path, args: &[&str]| -> Output {
+        Command::new(binary)
+            .arg("--config")
+            .arg(&config)
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &root)
+            .output()
+            .expect("run a narsor binary")
+    };
+
+    fs::write(&config, format!("global:\n  root: {}\n", root.display())).unwrap();
+    let listed = run(&cli, &["list"]);
+    let mode = fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
+    let discovered = run_dir.join("daemon.json").is_file();
+    let stopped = run(&server, &["stop"]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while run_dir.join("daemon.json").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    fs::write(
+        &config,
+        format!(
+            "global:\n  root: {}\nserver:\n  mode: netwrk\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let refused = run(&cli, &["list"]);
+    let _ = fs::remove_dir_all(&root);
+
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert_eq!(mode, 0o700);
+    assert!(discovered, "daemon.json is written in state/run/");
+    assert!(stopped.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success());
+    assert!(
+        message.contains("server.mode") && message.contains("narsor-server.log"),
+        "{message}"
+    );
 }

@@ -31,6 +31,7 @@ pub mod file;
 pub mod harness_home;
 pub mod legacy;
 pub mod local_controller;
+pub mod old_layout;
 pub mod resolve;
 pub mod scope;
 pub(crate) mod security_validation;
@@ -38,7 +39,6 @@ pub mod settings;
 
 pub use cascade::{CascadeError, ConfigCascade, Resolution};
 pub use check::{CheckReport, Problem, CHECK_CONFIG_FLAG};
-pub use client_paths::ClientPaths;
 pub use file::{FileError, FileValues, ParsedFile};
 pub use harness_home::{
     HarnessHome, HomeMode, API_KEY_ENVS, CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV,

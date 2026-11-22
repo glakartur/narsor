@@ -290,7 +290,7 @@ mod tests {
     };
     use narsor_engine::observers::AutomationKey;
     use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef};
-    use narsor_engine::persistence::StatePaths;
+    use narsor_engine::persistence::ServerStatePaths;
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
@@ -427,7 +427,7 @@ mod tests {
             claim_wait: StdDuration,
         ) -> Service {
             Arc::new(ProtocolService::with_config(
-                ControlPlane::with_clock(StatePaths::new(root.join("state")), clock.clone()),
+                ControlPlane::with_clock(ServerStatePaths::new(root.join("state")), clock.clone()),
                 Arc::new(NoLaunches {
                     catalog: root.join("catalog"),
                 }),

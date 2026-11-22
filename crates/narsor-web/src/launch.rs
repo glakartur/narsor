@@ -3,7 +3,7 @@
 //! The address of the interface carries the session token in its fragment,
 //! so it is a credential. It is never an argument of the opener (every user
 //! of the machine can read the arguments of a process): the opener gets the
-//! path of a page in the state directory, readable by the operator only, and
+//! path of a page in its own state directory, readable by the operator only, and
 //! that page sends the browser on to the address.
 
 use std::io::Write as _;
@@ -11,18 +11,18 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::paths::WebStatePaths;
+
 /// The program that opens an address in the operator's browser.
 pub const OPENER: &str = "xdg-open";
-
-/// The name of the launch page in the state directory.
-const LAUNCH_PAGE: &str = "web-open.html";
 
 /// Writes the page that sends a browser on to `url`, for the operator only.
 ///
 /// The file is made afresh each time, so its mode is always the one set
 /// here and a leftover from an earlier run never stays readable by others.
-pub fn write_launch_page(state: &Path, url: &str) -> std::io::Result<PathBuf> {
-    let path = state.join(LAUNCH_PAGE);
+pub fn write_launch_page(paths: &WebStatePaths, url: &str) -> std::io::Result<PathBuf> {
+    paths.create()?;
+    let path = paths.launch_page();
     match std::fs::remove_file(&path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
         _ => {}
@@ -69,10 +69,11 @@ mod tests {
     #[test]
     fn the_launch_page_is_private_and_replaces_an_older_one() {
         let state = std::env::temp_dir().join(format!("narsor-web-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&state).unwrap();
-        std::fs::write(state.join(LAUNCH_PAGE), "old").unwrap();
+        let paths = WebStatePaths::new(&state);
+        paths.create().unwrap();
+        std::fs::write(paths.launch_page(), "old").unwrap();
 
-        let page = write_launch_page(&state, "http://127.0.0.1:1/ui/#token=abc").unwrap();
+        let page = write_launch_page(&paths, "http://127.0.0.1:1/ui/#token=abc").unwrap();
 
         let mode = std::fs::metadata(&page).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);

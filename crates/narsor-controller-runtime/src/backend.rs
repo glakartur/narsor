@@ -1,9 +1,11 @@
 //! Platform-neutral contract shared by execution backends and the reconciler.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use std::fmt;
 
+use crate::launch_specs::LaunchSpecs;
 use narsor_protocol::identifier::TaskId;
 use narsor_protocol::launch::{unsupported_launch_spec_version, LaunchSpecEnvelope};
 use serde::{Deserialize, Serialize};
@@ -154,12 +156,27 @@ pub struct WorkloadLaunch {
     /// created it; an adapter may also refuse to act over a workload a newer
     /// lease holder created.
     pub lease_epoch: u64,
-    /// The immutable launch input, mounted read-only.
+    /// The immutable launch input the controller verified. A backend checks
+    /// and plans with it; the runner gets only its digest
+    /// ([`Self::launch_digest`]) and fetches the spec itself (R5).
     pub launch_spec: Value,
     /// Base URL the runner reaches the control plane at.
     pub control_plane_url: String,
     /// The incarnation's credential, mounted read-only outside storage.
     pub credential: RunnerCredential,
+}
+
+impl WorkloadLaunch {
+    /// The content digest of the launch spec, recomputed: the value the
+    /// runner is passed (`--launch-digest`) and checks the spec it fetches
+    /// against (KTD3). The controller checked it equals its command's.
+    pub fn launch_digest(&self) -> BackendResult<String> {
+        serde_json::from_value::<narsor_model::domain::TaskLaunchSpec>(self.launch_spec.clone())
+            .map(|spec| spec.compute_digest())
+            .map_err(|error| {
+                BackendError::rejected(format!("the launch spec is malformed: {error}"))
+            })
+    }
 }
 
 /// Validates the versioned top-level launch contract without importing the
@@ -380,6 +397,89 @@ pub trait ExecutionBackend: Send + Sync + 'static {
         &self,
         task: &TaskResources,
     ) -> impl Future<Output = BackendResult<Removal>> + Send;
+
+    /// The launch-spec cache of a backend that needs a task's spec after
+    /// [`Self::provision`] or [`Self::resume`] returned (KTD4). The
+    /// controller fills it with every spec it verified, and fetches the ones
+    /// the backend asks for ([`LaunchSpecs::get_or_request`]) when it next
+    /// observes their task. `None` (the default): the launch is enough.
+    fn launch_specs(&self) -> Option<LaunchSpecs> {
+        None
+    }
+
+    /// Resolves when the backend saw a change worth observing again since
+    /// it last resolved: a runner process exited, a container or a Pod
+    /// changed (R4, KTD5). The controller only wakes on it and runs its next
+    /// step early; the step observes, checks its lease and reports as
+    /// always, so an event never confirms a loss by itself. A change seen
+    /// while nobody waits is kept for the next wait. Must be cancel-safe:
+    /// the controller drops it whenever the long-poll or a sleep ends first.
+    ///
+    /// Never resolves by default: the controller then observes at its
+    /// periodic pace alone. An adapter with a native event source holds a
+    /// [`WakeSignal`], hands its clones to whatever follows the platform's
+    /// events, and answers here with its [`WakeListener::woken`].
+    fn changed(&self) -> impl Future<Output = ()> + Send {
+        std::future::pending()
+    }
+}
+
+/// The producer side of a backend's wake (see
+/// [`ExecutionBackend::changed`]): whatever follows the platform's events
+/// (a signal handler, an event stream) calls [`Self::wake`]. Cloning shares
+/// it; every [`WakeListener`] subscribed to it sees every wake.
+#[derive(Debug, Clone)]
+pub struct WakeSignal(Arc<tokio::sync::watch::Sender<u64>>);
+
+impl Default for WakeSignal {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(0)))
+    }
+}
+
+impl WakeSignal {
+    /// A signal nobody listens to yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Tells every listener the backend saw a change.
+    pub fn wake(&self) {
+        self.0.send_modify(|wakes| *wakes = wakes.wrapping_add(1));
+    }
+
+    /// A listener that sees the wakes from now on.
+    pub fn listen(&self) -> WakeListener {
+        WakeListener(tokio::sync::Mutex::new(self.0.subscribe()))
+    }
+
+    /// Whether no listener is left: an event follower can stop.
+    pub fn unheard(&self) -> bool {
+        self.0.receiver_count() == 0
+    }
+
+    /// Resolves once no listener is left: an event follower waiting on a
+    /// quiet stream can stop without waiting for its next event.
+    pub async fn deserted(&self) {
+        self.0.closed().await;
+    }
+}
+
+/// The consumer side of a [`WakeSignal`]: what a backend's
+/// [`ExecutionBackend::changed`] waits on.
+#[derive(Debug)]
+pub struct WakeListener(tokio::sync::Mutex<tokio::sync::watch::Receiver<u64>>);
+
+impl WakeListener {
+    /// Resolves at the first wake this listener has not seen yet; a wake
+    /// that came while nobody waited resolves it at once. Cancel-safe.
+    pub async fn woken(&self) {
+        let mut receiver = self.0.lock().await;
+        if receiver.changed().await.is_err() {
+            // Every signal is gone: nothing will ever wake it.
+            std::future::pending::<()>().await;
+        }
+    }
 }
 /// What platform a backend runs task workloads on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

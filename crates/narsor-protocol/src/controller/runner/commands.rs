@@ -2,19 +2,25 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use crate::api::ExecutionStatusDto;
 use crate::chat::is_false;
 use crate::controller::{Observation, ObservedSummary, ResourceIdentity, RunnerState};
 use crate::identifier::TaskId;
 
+/// `GET /controller/v1/commands`: a read of the backend's desired state.
+///
+/// Without `since` the read is full: every task, at once. With `since` —
+/// the [`CommandsResponse::cursor`] of the last response the controller
+/// applied — it is incremental: only the tasks whose desired state changed
+/// since that response, waiting up to `wait_secs` for one to change. A
+/// cursor the control plane no longer knows (it restarted, the lease
+/// changed) is answered with a full read.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandsQuery {
     #[serde(default)]
     pub wait_secs: Option<u64>,
     #[serde(default)]
-    pub all: bool,
+    pub since: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,22 +75,27 @@ pub enum DesiredAction {
     KeepPaused,
     Hold,
     Archive,
+    /// The task left the backend's desired state (archived, or no longer
+    /// admitted): the controller drops what it holds about it. Sent once,
+    /// in an incremental read only; a full read just leaves the task out.
+    Forget,
 }
 
-/// Runner progress visible to an environment controller.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// The runner progress an environment controller acts on. Nothing that
+/// moves with every runner snapshot (event cursors, timestamps) belongs
+/// here: a change of a command wakes the controller (KTD1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerProgress {
     pub incarnation: String,
     pub launch_generation: u64,
-    pub execution_status: ExecutionStatusDto,
-    pub event_cursor: u64,
     pub safe_point_acknowledged: bool,
-    pub received_at: DateTime<Utc>,
 }
 
-/// Desired state sent to a backend controller. The sealed launch spec is
-/// carried as JSON so the wire contract does not import the engine model.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Desired state sent to a backend controller. It carries no launch spec:
+/// the controller fetches one only to create a workload or start a reader
+/// ([`LaunchSpecQuery`]), and accepts it only when its recomputed content
+/// digest equals [`Self::launch_digest`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesiredCommand {
     pub task_id: TaskId,
     pub generation: u64,
@@ -92,7 +103,9 @@ pub struct DesiredCommand {
     pub runner_state: RunnerState,
     pub action: DesiredAction,
     pub resource_key: String,
-    pub launch_spec: Value,
+    /// Digest of the task's sealed launch spec: what a fetched spec must
+    /// hash to.
+    pub launch_digest: String,
     pub runner: Option<RunnerProgress>,
     /// Whether the control plane wants a read-only runner for the task
     /// alongside (D63): an owner is reading a stopped or interrupted task and
@@ -103,9 +116,24 @@ pub struct DesiredCommand {
     pub reader_needed: bool,
 }
 
+/// `GET /controller/v1/tasks/:task_id/launch-spec`: the task's sealed
+/// launch spec for this desired generation. Refused with `stale_generation`
+/// when the task moved on, and to a controller not holding the lease.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchSpecQuery {
+    pub generation: u64,
+}
+
 /// Controller command response.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandsResponse {
     pub lease_epoch: u64,
+    /// What to send as [`CommandsQuery::since`] once this response is
+    /// applied.
+    pub cursor: u64,
+    /// True when `commands` is the whole desired state: a task the
+    /// controller holds that is not in it is no longer wanted. False when it
+    /// holds only the tasks that changed (and a `Forget` for each that left).
+    pub full: bool,
     pub commands: Vec<DesiredCommand>,
 }

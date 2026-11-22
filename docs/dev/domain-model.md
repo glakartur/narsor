@@ -21,8 +21,8 @@ The main entities of the system and their responsibilities are presented below:
 | `Decision` | The result of choosing a transition based on an action result | Entry in `events/` |
 | `AgentSession` | A communication session with an external AI harness | Metadata in `state.json` + logs |
 | `Automation` | Scripts (`check`, optional `in` and `out`) that create tasks or serve decision gates | `{catalog}/automations/{name}/` |
-| `Queue` | The automations that serve a queue of gates or create tasks, with their mode and schedule | `{catalog}/queues/{name}.yaml`; runtime state per (queue, automation) in `{state}/observer-queues/automations/` |
-| `QueueEntry` | One wait episode of a `decision` gate with `watch`, on a queue | `{state}/observer-queues/entries/` in the control plane |
+| `Queue` | The automations that serve a queue of gates or create tasks, with their mode and schedule | `{catalog}/queues/{name}.yaml`; runtime state per (queue, automation) in `{state}/narsor-server/observer-queues/automations/` |
+| `QueueEntry` | One wait episode of a `decision` gate with `watch`, on a queue | `{state}/narsor-server/observer-queues/entries/` in the control plane |
 
 ---
 
@@ -343,9 +343,9 @@ control plane reads them at every load and keeps no copy; it schedules each
 **Storage:**
 - `{catalog}/automations/{name}/`, `{catalog}/queues/{name}.yaml`: the
   definitions.
-- `{state}/observer-queues/automations/{queue}/{automation}/state.json`,
+- `{state}/narsor-server/observer-queues/automations/{queue}/{automation}/state.json`,
   `errors/{seq}.json`: the runtime state of a pair.
-- `{state}/observer-queues/entries/{entry}.json`: one file per entry, created
+- `{state}/narsor-server/observer-queues/entries/{entry}.json`: one file per entry, created
   once and never changed.
 
 ---

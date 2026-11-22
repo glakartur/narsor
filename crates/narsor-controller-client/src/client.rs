@@ -401,19 +401,20 @@ impl ControllerClient {
             .await
     }
 
-    /// `GET /controller/v1/commands` — waits up to `wait_secs` for something
-    /// new; `all` asks for a full resync.
+    /// `GET /controller/v1/commands` — without `since` the whole desired
+    /// state at once; with the cursor of the last response applied, what
+    /// changed since, waiting up to `wait_secs` for a change.
     pub async fn commands(
         &self,
         wait_secs: u64,
-        all: bool,
+        since: Option<u64>,
     ) -> Result<CommandsResponse, ClientError> {
         self.transport
             .get(
                 "/controller/v1/commands",
                 &CommandsQuery {
                     wait_secs: Some(wait_secs),
-                    all,
+                    since,
                 },
                 Duration::from_secs(wait_secs),
             )
@@ -458,6 +459,22 @@ impl ControllerClient {
             .post(
                 &format!("/controller/v1/tasks/{task_id}/reader-credentials"),
                 request,
+            )
+            .await
+    }
+
+    /// `GET /controller/v1/tasks/:task_id/launch-spec`: the task's sealed
+    /// launch spec for `generation`, as JSON. The caller checks its digest.
+    pub async fn fetch_launch_spec(
+        &self,
+        task_id: &str,
+        generation: u64,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.transport
+            .get(
+                &format!("/controller/v1/tasks/{task_id}/launch-spec"),
+                &LaunchSpecQuery { generation },
+                Duration::ZERO,
             )
             .await
     }
@@ -519,6 +536,14 @@ impl RunnerClient {
         self.transport.get("/runner/v1/poll", query, wait).await
     }
 
+    /// `GET /runner/v1/launch-spec`: the task's sealed launch spec, for a
+    /// working runner's first start. The caller checks its digest.
+    pub async fn launch_spec(&self) -> Result<serde_json::Value, ClientError> {
+        self.transport
+            .get("/runner/v1/launch-spec", &(), Duration::ZERO)
+            .await
+    }
+
     /// `POST /runner/v1/renew`.
     pub async fn renew(&self) -> Result<RunnerRenewResponse, ClientError> {
         self.transport
@@ -553,6 +578,20 @@ impl RunnerClient {
     ) -> Result<ConversationPageAccepted, ClientError> {
         self.transport
             .post(&format!("/runner/v1/execution-events/{request_id}"), page)
+            .await
+    }
+
+    /// `POST /runner/v1/execution-details/:request_id`.
+    pub async fn upload_execution_details(
+        &self,
+        request_id: &str,
+        details: &ExecutionDetails,
+    ) -> Result<ConversationPageAccepted, ClientError> {
+        self.transport
+            .post(
+                &format!("/runner/v1/execution-details/{request_id}"),
+                details,
+            )
             .await
     }
 

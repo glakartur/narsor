@@ -110,16 +110,23 @@ ID                                     STATUS     STATE                  WORKFLO
 4f1c8f0e-...-9b21                      paused     approve                cli-greet
 ```
 
-### `show <EXECUTION_ID>`
+### `show <EXECUTION_ID> [--details]`
 
-The status, the current state, the workspace and the context variables; plus the
-question and its form fields, when the execution is waiting on a human. When the
-conductor has something to add, `show` prints it too: the problem a `failed`
-execution is stopped on (the conductor's diagnosis, or the raw error) with the
-failure's key and the `narsor-cli task restart-step` command to answer it, the
-conductor's summary and recommendation of the `human` gate the execution waits
-on, and what the conductor is working on right now. `run` and `input` print the
-same when they return.
+The status, the current state and the start and end times, as the execution's
+task record holds them; plus the question and its form fields, when the
+execution is waiting on a human. `show` reads only the task record: it is fast
+and never starts a runner.
+
+`--details` also prints what only the task's storage holds, read through the
+task's runner: the context variables, the problem a `failed` execution is
+stopped on (the conductor's diagnosis, or the raw error) with the failure's key
+and the `narsor-cli task restart-step` command to answer it, the conductor's
+summary and recommendation of the `human` gate the execution waits on, and what
+the conductor is working on right now. For a stopped task, the control plane
+starts a read-only runner for the read, and `show --details` waits for it (up
+to 30 seconds), like `events` and `conversation`. When the details cannot be
+read, `show --details` prints the task record's part and one line that tells
+why.
 
 Every execution runs in a runner process under its task. To restart a failed
 step, talk to the conductor or change the task, use the `narsor-cli task …`
@@ -129,14 +136,24 @@ commands ([Remote backends](remote.md)).
 $ narsor-cli show 4f1c8f0e-...-9b21
 Execution:     4f1c8f0e-...-9b21
 Workflow:      cli-greet (version 1)
-Status:        paused
-Current state: approve
+Status:        failed
+Current state: greet
 Started:       2026-09-23T19:43:49.018665031+00:00
-Workspace:     /tmp/data/tasks/4f1c8f0e-...-9b21/code/workspace
+Finished:      2026-09-23T19:44:02.101354212+00:00
+
+$ narsor-cli show 4f1c8f0e-...-9b21 --details
+Execution:     4f1c8f0e-...-9b21
+Workflow:      cli-greet (version 1)
+Status:        failed
+Current state: greet
+Started:       2026-09-23T19:43:49.018665031+00:00
+Finished:      2026-09-23T19:44:02.101354212+00:00
 Context variables:
   announced = "Good morning"
   greeting = "Good morning"
-  is_experimental = true
+Problem (failure): the greeting script exited with status 1
+  Failure: 7d2e...-a41c
+  Restart with: narsor-cli task restart-step <TASK> --failure-key 7d2e...-a41c [--note TEXT]
 ```
 
 ### `events <EXECUTION_ID> [--follow]`

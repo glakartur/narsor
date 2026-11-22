@@ -532,7 +532,9 @@ async fn the_harness_is_taken_from_the_selector_at_every_invocation() {
     fixture.opencode.answers(&opencode_answer(CHOOSE_DONE));
     let selector = Arc::new(
         DefaultHarnessSelector::load(
-            fixture.harness.store().paths().clone(),
+            narsor_engine::persistence::ServerStatePaths::new(
+                fixture.harness.store().paths().root(),
+            ),
             vec![
                 "claude-code".to_string(),
                 "codex".to_string(),

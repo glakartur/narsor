@@ -27,6 +27,7 @@ use narsor_controller::local::container::docker_fake::FakeDocker;
 use narsor_controller::local::container::image::{BuildSettings, TaskImageBuilds};
 use narsor_controller::local::container::secrets::SecretStore;
 use narsor_controller::local::container::{ContainerMode, DEFAULT_START_WINDOW, TASK_LABEL};
+use narsor_controller::local::paths::{ControllerStatePaths, ControllerWorkPaths};
 use narsor_controller_runtime::backend::{ExecutionBackend, TaskResources};
 use narsor_engine::domain::{
     ImageSpec, ResolvedEnvironment, ResourceProfile, TaskId, TaskImage, TaskLaunchSpec,
@@ -37,9 +38,8 @@ use narsor_engine::domain::{
 pub struct LocalDockerTarget {
     /// The daemon every adapter instance of the target talks to.
     pub docker: Arc<FakeDocker>,
-    root: PathBuf,
+    scratch: PathBuf,
     program: PathBuf,
-    controller_dir: PathBuf,
 }
 
 impl LocalDockerTarget {
@@ -57,15 +57,12 @@ impl ContractTarget for LocalDockerTarget {
 
     fn setup(scratch: &Path) -> Option<Self> {
         let program = stub_runner::install(&scratch.join("bin"));
-        let controller_dir = scratch.join("controller");
-        fs::create_dir_all(&controller_dir).expect("the controller directory");
         let docker = Arc::new(FakeDocker::new());
         docker.run_programs();
         Some(Self {
             docker,
-            root: scratch.join("local"),
+            scratch: scratch.to_path_buf(),
             program,
-            controller_dir,
         })
     }
 
@@ -74,12 +71,18 @@ impl ContractTarget for LocalDockerTarget {
         // directory: exactly a restarted controller.
         let user = current_user();
         let transport: Arc<dyn DockerTransport> = self.docker.clone();
-        let mut config = LocalBackendConfig::with_program(&self.root, &self.program);
+        let state_root = self.scratch.join("state");
+        let state = ControllerStatePaths::new(&state_root);
+        let mut config = LocalBackendConfig::with_program(
+            state.clone(),
+            ControllerWorkPaths::new(self.scratch.join("work")),
+            &self.program,
+        );
         config.docker = Some(transport.clone());
         config.container_mode = Some(ContainerMode {
             builds: TaskImageBuilds::new(
                 transport,
-                &self.controller_dir,
+                &state,
                 BuildSettings {
                     update_interval: None,
                     version_timeout: Duration::from_secs(5),
@@ -88,7 +91,8 @@ impl ContractTarget for LocalDockerTarget {
                     retry_delay: Duration::from_millis(100),
                 },
             ),
-            secrets: SecretStore::beside_credential(&self.controller_dir.join("credential")),
+            secrets: SecretStore::of(&state),
+            state_root,
             user,
             host_home: None,
             config_file: None,
@@ -142,7 +146,8 @@ impl ContractTarget for LocalDockerTarget {
     fn cleanup(&self, backend: &LocalBackend) {
         self.docker.kill_all_processes();
         // Readers are host processes in this mode too.
-        let Ok(entries) = fs::read_dir(self.root.join("readers")) else {
+        let readers = ControllerWorkPaths::new(self.scratch.join("work")).readers_dir();
+        let Ok(entries) = fs::read_dir(readers) else {
             return;
         };
         for entry in entries.flatten() {

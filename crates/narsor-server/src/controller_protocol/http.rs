@@ -158,12 +158,18 @@ where
             get(get_concurrency_limit).put(put_concurrency_limit),
         )
         .route("/control/v1/usage", get(get_usage))
+        .route("/control/v1/executions", get(list_executions))
+        .route("/control/v1/executions/{execution_id}", get(get_execution))
         .route("/control/v1/tasks/{task_id}/timeline", get(get_timeline))
         .route(
             "/control/v1/tasks/{task_id}/execution-events",
             get(get_execution_events),
         )
         .route("/control/v1/tasks/{task_id}/conductor", get(get_conductor))
+        .route(
+            "/control/v1/tasks/{task_id}/execution-details",
+            get(get_execution_details),
+        )
         .route(
             "/control/v1/tasks/{task_id}/conversation",
             get(get_conversation),
@@ -230,6 +236,10 @@ where
             "/controller/v1/tasks/{task_id}/reader-credentials",
             post(post_reader_credential),
         )
+        .route(
+            "/controller/v1/tasks/{task_id}/launch-spec",
+            get(get_launch_spec),
+        )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&service),
             require_controller,
@@ -248,6 +258,7 @@ where
     Router::new()
         .route("/runner/v1/snapshots", post(post_snapshot))
         .route("/runner/v1/poll", get(get_poll))
+        .route("/runner/v1/launch-spec", get(get_runner_launch_spec))
         .route(
             "/runner/v1/usage",
             post(post_usage).layer(usage_body_limit()),
@@ -268,6 +279,10 @@ where
         .route(
             "/runner/v1/conductor-reads/{request_id}",
             post(post_conductor_read),
+        )
+        .route(
+            "/runner/v1/execution-details/{request_id}",
+            post(post_execution_details),
         )
         .route(
             "/runner/v1/relay-failures/{request_id}",
@@ -486,6 +501,27 @@ async fn get_usage(
     Json(service.harness_usage())
 }
 
+/// The execution of every task of the owner, from the task records.
+async fn list_executions(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+) -> ProtocolResult<Json<narsor_protocol::api::ExecutionListResponse>> {
+    Ok(Json(
+        blocking(&service, move |s| s.executions(&owner)).await?,
+    ))
+}
+
+/// One execution of the owner and the task that runs it.
+async fn get_execution(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(execution_id): Path<String>,
+) -> ProtocolResult<Json<narsor_protocol::api::ExecutionLookupResponse>> {
+    Ok(Json(
+        blocking(&service, move |s| s.execution(&owner, &execution_id)).await?,
+    ))
+}
+
 async fn get_timeline(
     State(service): State<Service>,
     Extension(owner): Extension<OwnerRef>,
@@ -514,6 +550,14 @@ async fn get_conductor(
     Query(query): Query<ConductorReadQuery>,
 ) -> ProtocolResult<Json<ConductorReadResponse>> {
     Ok(Json(service.conductor(&owner, &task_id, query).await?))
+}
+
+async fn get_execution_details(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(task_id): Path<String>,
+) -> ProtocolResult<Json<ExecutionDetailsResponse>> {
+    Ok(Json(service.execution_details(&owner, &task_id).await?))
 }
 
 async fn get_conversation(
@@ -860,9 +904,36 @@ async fn post_reader_credential(
     Ok((StatusCode::CREATED, Json(response)))
 }
 
+/// The task's sealed launch spec, to the lease holder, for the task's
+/// current generation (R2). Its body is never logged.
+async fn get_launch_spec(
+    State(service): State<Service>,
+    Extension(identity): Extension<ControllerIdentity>,
+    Path(task_id): Path<String>,
+    Query(query): Query<LaunchSpecQuery>,
+) -> ProtocolResult<Json<narsor_engine::domain::TaskLaunchSpec>> {
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.launch_spec(&identity, &task_id, query.generation)
+        })
+        .await?,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Runner handlers
 // ---------------------------------------------------------------------------
+
+/// The task's sealed launch spec, to its working runner (R5); a reader is
+/// refused. Its body is never logged.
+async fn get_runner_launch_spec(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+) -> ProtocolResult<Json<narsor_engine::domain::TaskLaunchSpec>> {
+    Ok(Json(
+        blocking(&service, move |s| s.runner_launch_spec(&identity)).await?,
+    ))
+}
 
 async fn post_snapshot(
     State(service): State<Service>,
@@ -965,6 +1036,20 @@ async fn post_relay_failure(
     Ok(Json(
         blocking(&service, move |s| {
             s.runner_relay_failure(&identity, &request_id, &failure.reason)
+        })
+        .await?,
+    ))
+}
+
+async fn post_execution_details(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Path(request_id): Path<String>,
+    Json(details): Json<ExecutionDetails>,
+) -> ProtocolResult<Json<ConversationPageAccepted>> {
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.runner_execution_details(&identity, &request_id, details)
         })
         .await?,
     ))

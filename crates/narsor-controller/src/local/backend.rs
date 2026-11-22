@@ -27,22 +27,32 @@
 //!   never the configured mode: a controller restarted in the other mode
 //!   still observes and removes what the previous one left.
 //! - The read-only runner (D63) is a host process in both modes.
+//!
+//! # Waking the controller
+//!
+//! The controller waits on [`ExecutionBackend::changed`] between steps
+//! (R4). The first wait starts what wakes it: a `SIGCHLD` listener for the
+//! runners this instance starts, and in the Docker mode a follower of the
+//! managed containers' events. Both only wake; the next observation tells
+//! what changed.
 
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use narsor_controller_runtime::backend::{
     ArchiveProgress, BackendCapabilities, BackendError, BackendKind, BackendResult,
     ExecutionBackend, Provisioned, ReaderStart, Removal, StorageState, TaskObservation,
-    TaskResources, WorkloadLaunch, WorkloadState,
+    TaskResources, WakeListener, WakeSignal, WorkloadLaunch, WorkloadState,
 };
+use narsor_controller_runtime::LaunchSpecs;
 use narsor_model::domain::{TaskId, TaskLaunchSpec};
 
 use super::container::docker::DockerTransport;
 use super::container::{ContainerMode, ContainerRunners};
+use super::paths::{ControllerStatePaths, ControllerWorkPaths};
 use super::process::ProcessRunners;
 use super::workload::{io_error, Look, Role, WorkloadKind, WorkloadRecord, WorkloadStore};
 
@@ -73,8 +83,10 @@ impl std::fmt::Debug for LaunchCheck {
 /// Configuration of a [`LocalBackend`].
 #[derive(Debug, Clone)]
 pub struct LocalBackendConfig {
-    /// Directory holding task storages and workload records.
-    pub root: PathBuf,
+    /// The controller's state directory: per-task records.
+    pub state: ControllerStatePaths,
+    /// The controller's work directory: task storages and workloads.
+    pub work: ControllerWorkPaths,
     /// The standalone `narsor-runner` executable.
     pub program: PathBuf,
     /// Extra arguments appended to every `narsor-runner` process invocation
@@ -105,7 +117,7 @@ pub struct LocalBackendConfig {
 impl LocalBackendConfig {
     /// Runners started from the `narsor-runner` sibling of the current
     /// executable. The server and runner binaries are installed together.
-    pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
+    pub fn new(state: ControllerStatePaths, work: ControllerWorkPaths) -> io::Result<Self> {
         let current_exe = std::env::current_exe()?;
         let runner_name = if cfg!(windows) {
             "narsor-runner.exe"
@@ -115,13 +127,18 @@ impl LocalBackendConfig {
         let parent = current_exe.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "current executable has no parent")
         })?;
-        Ok(Self::with_program(root, parent.join(runner_name)))
+        Ok(Self::with_program(state, work, parent.join(runner_name)))
     }
 
     /// Runners started from the explicit executable `program`.
-    pub fn with_program(root: impl Into<PathBuf>, program: impl Into<PathBuf>) -> Self {
+    pub fn with_program(
+        state: ControllerStatePaths,
+        work: ControllerWorkPaths,
+        program: impl Into<PathBuf>,
+    ) -> Self {
         Self {
-            root: absolute_root(root.into()),
+            state,
+            work,
             program: program.into(),
             runner_args: Vec::new(),
             env: Vec::new(),
@@ -131,16 +148,6 @@ impl LocalBackendConfig {
             container_mode: None,
         }
     }
-}
-
-/// `root` made absolute against the current directory, once: container
-/// mounts and workdirs need absolute host paths. An absolute root, or one
-/// the current directory cannot resolve, stays as it is.
-fn absolute_root(root: PathBuf) -> PathBuf {
-    if root.is_absolute() {
-        return root;
-    }
-    std::path::absolute(&root).unwrap_or(root)
 }
 
 /// The local adapter. Cloning shares the process table.
@@ -153,16 +160,30 @@ pub struct LocalBackend {
     pub(super) process: ProcessRunners,
     /// Container runners: the working runners of the Docker mode.
     containers: ContainerRunners,
+    /// The launch specs a container waiting for its image starts from,
+    /// shared with the controller (KTD4).
+    launch_specs: LaunchSpecs,
+    /// What a runner exit or a container event wakes (R4).
+    wake: WakeSignal,
+    listener: Arc<WakeListener>,
+    /// Starts what wakes it, once, at the first wait.
+    following: Arc<Once>,
 }
 
 impl LocalBackend {
-    /// An adapter over `config.root`.
+    /// An adapter over the controller's state and work directories.
     pub fn new(config: LocalBackendConfig) -> Self {
         let config = Arc::new(config);
-        let store = WorkloadStore::new(config.root.clone());
+        let store = WorkloadStore::new(config.state.clone(), config.work.clone());
+        let launch_specs = LaunchSpecs::default();
+        let wake = WakeSignal::new();
         Self {
+            listener: Arc::new(wake.listen()),
+            wake,
+            following: Arc::new(Once::new()),
             process: ProcessRunners::new(config.clone(), store.clone()),
-            containers: ContainerRunners::new(config.clone(), store.clone()),
+            containers: ContainerRunners::new(config.clone(), store.clone(), launch_specs.clone()),
+            launch_specs,
             store,
             config,
         }
@@ -430,6 +451,18 @@ impl ExecutionBackend for LocalBackend {
         }
     }
 
+    fn launch_specs(&self) -> Option<LaunchSpecs> {
+        Some(self.launch_specs.clone())
+    }
+
+    async fn changed(&self) {
+        self.following.call_once(|| {
+            self.process.follow_exits(self.wake.clone());
+            self.containers.follow_events(self.wake.clone());
+        });
+        self.listener.woken().await;
+    }
+
     fn resources(&self, task_id: &TaskId, resource_key: &str) -> BackendResult<TaskResources> {
         // A task id is one safe path component; nothing else is accepted.
         let key = TaskId::parse(resource_key)
@@ -576,8 +609,10 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(!scratch
-            .root
-            .join("local/readers")
+            .backend
+            .config
+            .work
+            .readers_dir()
             .join(&task.reader)
             .exists());
     }
@@ -588,7 +623,7 @@ mod tests {
         let task = scratch.task();
         assert_ne!(task.reader, task.workload);
         let reader_dir = scratch.backend.store.workload_dir(&task, Role::Read);
-        assert!(reader_dir.starts_with(scratch.root.join("local/readers")));
+        assert!(reader_dir.starts_with(scratch.backend.config.work.readers_dir()));
         assert_ne!(
             reader_dir,
             scratch.backend.store.workload_dir(&task, Role::Work)
@@ -602,6 +637,7 @@ mod tests {
                 .backend
                 .process
                 .runner_args(role, &launch, &dir, &storage)
+                .unwrap()
         };
         assert!(args(Role::Read).iter().any(|arg| arg == "--read-only"));
         assert!(!args(Role::Work).iter().any(|arg| arg == "--read-only"));

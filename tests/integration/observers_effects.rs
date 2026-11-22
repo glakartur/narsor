@@ -17,7 +17,7 @@ use narsor_engine::domain::TaskId;
 use narsor_engine::environment::EnvironmentCatalog;
 use narsor_engine::observers::{AutomationKey, AutomationRecord, AutomationState, RunStatus};
 use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef, TaskEventKind};
-use narsor_engine::persistence::StatePaths;
+use narsor_engine::persistence::ServerStatePaths;
 use narsor_protocol::controller::{
     ObserverCreateTaskRequest, ObserverEffectOutcome, ObserverEffectResponse, OwnerCommand,
     OwnerCommandRequest,
@@ -108,7 +108,7 @@ impl Fixture {
             Utc.with_ymd_and_hms(2026, 11, 13, 12, 0, 0).unwrap(),
         )));
         let service = ProtocolService::new(
-            ControlPlane::with_clock(StatePaths::new(&root), clock.clone()),
+            ControlPlane::with_clock(ServerStatePaths::new(&root), clock.clone()),
             resolver,
         )
         .with_installation_owner(Arc::new(move || owner.clone()));

@@ -199,19 +199,16 @@ impl Resolved {
         self.root_of(SettingKey::CatalogDir)
     }
 
-    /// Where executions are kept.
+    /// The state root (`server.state`): every binary keeps its state in a
+    /// directory of its own below it.
     pub fn state_dir(&self) -> &Path {
         self.root_of(SettingKey::StateDir)
     }
 
-    /// Where task workspaces are created.
+    /// The work root (`server.work`): every binary keeps its work in a
+    /// directory of its own below it.
     pub fn work_dir(&self) -> &Path {
         self.root_of(SettingKey::WorkDir)
-    }
-
-    /// The client's narrow filesystem paths for logging and daemon discovery.
-    pub fn client_paths(&self) -> crate::config::client_paths::ClientPaths {
-        crate::config::client_paths::ClientPaths::new(self.state_dir())
     }
 
     /// One of the directory settings, which are all paths.
@@ -439,8 +436,8 @@ pub fn resolve_with(
 /// Joins every relative server directory of the scope to `global.root`.
 ///
 /// An absolute directory is used as it is. `.` components of the relative
-/// value are dropped, so the built-in `.` is the root itself (`./.narsor`,
-/// not `./.narsor/.`).
+/// value are dropped, so the built-in `.` of the catalogue is the root
+/// itself (`./.narsor`, not `./.narsor/.`).
 fn join_directories_to_root(values: &mut BTreeMap<SettingKey, (SettingValue, Source)>) {
     let Some(root) = values
         .get(&SettingKey::GlobalRoot)

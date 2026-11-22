@@ -155,11 +155,22 @@ pub enum Command {
     /// Lists the executions stored in the data directory.
     List,
 
-    /// Shows the current state, the status and the context variables of one execution.
+    /// Shows the current state, the status and what waits on the owner of
+    /// one execution, as its task record holds them.
+    ///
+    /// With `--details`, also the context variables, the conductor's summary
+    /// and activity, and the problem a failed step leaves: these are read
+    /// from the task's storage through its runner — for a stopped task, a
+    /// read-only runner started on demand, which can take a while.
     Show {
         /// The execution identifier.
         #[arg(value_name = "EXECUTION_ID")]
         execution_id: String,
+
+        /// Also reads the context variables, the conductor's summary and
+        /// activity, and a failed step's problem from the task's runner.
+        #[arg(long)]
+        details: bool,
     },
 
     /// Prints the event history of an execution.
@@ -594,7 +605,10 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             commands::run(&config, &flags, &workflow, &inputs).await
         }
         Command::List => commands::list(&state, &flags).await,
-        Command::Show { execution_id } => commands::show(&state, &flags, &execution_id).await,
+        Command::Show {
+            execution_id,
+            details,
+        } => commands::show(&state, &flags, &execution_id, details).await,
         Command::Events {
             execution_id,
             follow,

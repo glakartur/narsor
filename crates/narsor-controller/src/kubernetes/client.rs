@@ -6,10 +6,12 @@
 //! whole generated API surface (and minutes of compile time) for that. The
 //! existing `reqwest` (rustls) client speaks to the API server directly;
 //! requests and answers are plain JSON, read through the minimal types in
-//! [`super::objects`]. What is lost — watches, kubeconfig contexts, auth
+//! [`super::objects`]. What is lost — informers, kubeconfig contexts, auth
 //! plugins — the controller does not need: it observes by name, and it runs
 //! either in-cluster (service-account token) or with an explicit API server,
-//! token and CA bundle.
+//! token and CA bundle. Its one watch (the managed Pods, only to wake the
+//! controller, R4) is a plain streaming GET read line by line
+//! ([`KubeTransport::watch`], [`WatchEvent`]).
 //!
 //! # Authentication
 //!
@@ -35,6 +37,10 @@ pub const SERVICE_ACCOUNT_DIR: &str = "/var/run/secrets/kubernetes.io/serviceacc
 /// Longest a single API request may take before it counts as a transient
 /// failure.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest a connection to the API server may take to open; a watch has no
+/// other bound than its own (see [`KubeTransport::watch`]).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where a bearer token comes from.
 #[derive(Clone, PartialEq, Eq)]
@@ -141,6 +147,101 @@ pub enum Created {
 /// A boxed future, so [`KubeTransport`] stays object-safe.
 pub type TransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// One open watch: the event objects the API server sends, one JSON object
+/// per line, as they come.
+pub trait WatchStream: Send {
+    /// The next event object; `None` once the server ended the stream (its
+    /// `timeoutSeconds` passed, the connection closed). `Err` is a stream
+    /// cut off or unreadable.
+    fn next_event(&mut self) -> TransportFuture<'_, BackendResult<Option<Value>>>;
+}
+
+/// The API server's answer to a watch request.
+pub enum WatchAnswer<'a> {
+    /// The watch is open.
+    Events(Box<dyn WatchStream + 'a>),
+    /// The server refused it: the status and its body.
+    Refused(StatusCode, Value),
+}
+
+impl fmt::Debug for WatchAnswer<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Events(_) => f.write_str("Events(..)"),
+            Self::Refused(status, body) => {
+                f.debug_tuple("Refused").field(status).field(body).finish()
+            }
+        }
+    }
+}
+
+/// One event of a watch, as the adapter reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WatchEvent {
+    /// `ADDED`, `MODIFIED` or `DELETED`: the object as it now is (as it
+    /// last was, for `DELETED`).
+    Changed {
+        /// The object's `resourceVersion`: where to resume from.
+        resource_version: Option<String>,
+        /// The object.
+        object: Value,
+    },
+    /// `BOOKMARK`: nothing changed, the watch is current up to this
+    /// `resourceVersion`.
+    Bookmark(Option<String>),
+    /// An `ERROR` with code 410 Gone: the version the watch started from is
+    /// too old, list again.
+    Expired,
+    /// Any other `ERROR`, or an event the adapter does not know.
+    Failed(String),
+}
+
+impl WatchEvent {
+    /// Reads one event object as the API server sends it,
+    /// `{"type": …, "object": …}`.
+    pub fn read(event: Value) -> Self {
+        let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+        let version = |object: &Value| {
+            object
+                .pointer("/metadata/resourceVersion")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        match kind {
+            "ADDED" | "MODIFIED" | "DELETED" => {
+                let object = event.get("object").cloned().unwrap_or(Value::Null);
+                Self::Changed {
+                    resource_version: version(&object),
+                    object,
+                }
+            }
+            "BOOKMARK" => Self::Bookmark(event.get("object").and_then(version)),
+            "ERROR" => {
+                let status = event.get("object").cloned().unwrap_or(Value::Null);
+                if status.get("code").and_then(Value::as_u64) == Some(410) {
+                    Self::Expired
+                } else {
+                    let message = status
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("no message");
+                    Self::Failed(format!("the watch failed: {message}"))
+                }
+            }
+            other => Self::Failed(format!("unknown watch event type '{other}'")),
+        }
+    }
+}
+
+/// What a [`KubeClient::watch`] opened.
+pub enum Watched<'a> {
+    /// The events, as the server sends them; read each with
+    /// [`WatchEvent::read`].
+    Events(Box<dyn WatchStream + 'a>),
+    /// The version to start from is too old (HTTP 410 Gone): list again.
+    Expired,
+}
+
 /// One HTTP exchange with the API server: the boundary with the
 /// infrastructure. Everything above it — paths, bodies, status and error
 /// categorization — is the adapter's own and runs in tests unchanged;
@@ -154,12 +255,26 @@ pub trait KubeTransport: fmt::Debug + Send + Sync {
         path: &'a str,
         body: Option<&'a Value>,
     ) -> TransportFuture<'a, BackendResult<(StatusCode, Value)>>;
+
+    /// Opens a watch: a GET of `path` (whose query asks for `watch=true`
+    /// and a `timeoutSeconds`) whose answer streams on. `timeout` bounds the
+    /// whole exchange — the server's `timeoutSeconds` plus a margin — since
+    /// a watch outlives any ordinary request. `Err` is a failure to get any
+    /// answer.
+    fn watch<'a>(
+        &'a self,
+        path: &'a str,
+        timeout: Duration,
+    ) -> TransportFuture<'a, BackendResult<WatchAnswer<'a>>>;
 }
 
 /// The reqwest transport to a real API server.
 #[derive(Debug)]
 struct HttpTransport {
     http: reqwest::Client,
+    /// For watches: no total timeout of its own, and a connection pool
+    /// apart from the ordinary requests'.
+    watch_http: reqwest::Client,
     base: String,
     token: TokenSource,
 }
@@ -192,6 +307,30 @@ impl HttpTransport {
         Ok((status, body))
     }
 
+    async fn open_watch(&self, path: &str, timeout: Duration) -> BackendResult<WatchAnswer<'_>> {
+        let mut request = self
+            .watch_http
+            .get(format!("{}{path}", self.base))
+            .header("Accept", "application/json")
+            .timeout(timeout);
+        if let Some(token) = self.token()? {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|error| {
+            BackendError::transient(format!("the Kubernetes API is unreachable: {error}"))
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let bytes = response.bytes().await.unwrap_or_default();
+            let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            return Ok(WatchAnswer::Refused(status, body));
+        }
+        Ok(WatchAnswer::Events(Box::new(HttpWatch {
+            response,
+            lines: WatchLines::default(),
+        })))
+    }
+
     fn token(&self) -> BackendResult<Option<String>> {
         match &self.token {
             TokenSource::None => Ok(None),
@@ -217,6 +356,82 @@ impl KubeTransport for HttpTransport {
     ) -> TransportFuture<'a, BackendResult<(StatusCode, Value)>> {
         Box::pin(self.exchange(method, path, body))
     }
+
+    fn watch<'a>(
+        &'a self,
+        path: &'a str,
+        timeout: Duration,
+    ) -> TransportFuture<'a, BackendResult<WatchAnswer<'a>>> {
+        Box::pin(self.open_watch(path, timeout))
+    }
+}
+
+/// A watch over HTTP: the response body, read chunk by chunk.
+struct HttpWatch {
+    response: reqwest::Response,
+    lines: WatchLines,
+}
+
+impl HttpWatch {
+    async fn next(&mut self) -> BackendResult<Option<Value>> {
+        loop {
+            if let Some(event) = self.lines.next_event()? {
+                return Ok(Some(event));
+            }
+            let chunk = self.response.chunk().await.map_err(|error| {
+                BackendError::transient(format!("the Pod watch was cut off: {error}"))
+            })?;
+            match chunk {
+                Some(chunk) => self.lines.push(&chunk),
+                None => return self.lines.finish(),
+            }
+        }
+    }
+}
+
+impl WatchStream for HttpWatch {
+    fn next_event(&mut self) -> TransportFuture<'_, BackendResult<Option<Value>>> {
+        Box::pin(self.next())
+    }
+}
+
+/// Splits a watch body into its event objects: one JSON object per line,
+/// whatever the chunks it arrives in.
+#[derive(Debug, Default)]
+struct WatchLines {
+    pending: Vec<u8>,
+}
+
+impl WatchLines {
+    fn push(&mut self, chunk: &[u8]) {
+        self.pending.extend_from_slice(chunk);
+    }
+
+    /// The next complete line's object, skipping blank lines.
+    fn next_event(&mut self) -> BackendResult<Option<Value>> {
+        while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=end).collect();
+            if let Some(event) = parse_line(&line)? {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The stream ended: what is left is a last line without its newline.
+    fn finish(&mut self) -> BackendResult<Option<Value>> {
+        let rest = std::mem::take(&mut self.pending);
+        parse_line(&rest)
+    }
+}
+
+fn parse_line(line: &[u8]) -> BackendResult<Option<Value>> {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    serde_json::from_slice(line)
+        .map(Some)
+        .map_err(|error| BackendError::transient(format!("unreadable watch event: {error}")))
 }
 
 /// The client. Cheap to clone.
@@ -229,22 +444,14 @@ pub struct KubeClient {
 impl KubeClient {
     /// A client for `access`.
     pub fn new(access: &ClusterAccess) -> Result<Self, String> {
-        let mut builder = reqwest::Client::builder().timeout(REQUEST_TIMEOUT);
-        if let Some(pem) = &access.ca_pem {
-            let certificates = reqwest::Certificate::from_pem_bundle(pem)
-                .map_err(|error| format!("invalid CA bundle: {error}"))?;
-            if certificates.is_empty() {
-                return Err("the CA bundle holds no certificate".to_string());
-            }
-            // Only the cluster's CA: a public CA must not be able to stand
-            // in for the API server.
-            builder = builder.tls_certs_only(certificates);
-        }
-        let http = builder
-            .build()
-            .map_err(|error| format!("cannot build the HTTP client: {error}"))?;
+        let http = http_client(access, reqwest::Client::builder().timeout(REQUEST_TIMEOUT))?;
+        let watch_http = http_client(
+            access,
+            reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT),
+        )?;
         let transport = HttpTransport {
             http,
+            watch_http,
             base: access.api_server.trim_end_matches('/').to_string(),
             token: access.token.clone(),
         };
@@ -334,6 +541,30 @@ impl KubeClient {
         }
     }
 
+    /// GET a collection (`path` with its query).
+    pub async fn list(&self, path: &str) -> BackendResult<Value> {
+        let (status, body) = self.send(Method::GET, path, None).await?;
+        if status.is_success() {
+            Ok(body)
+        } else {
+            Err(failure("list", path, status, &body))
+        }
+    }
+
+    /// Opens a watch of `path` (with its query, `timeoutSeconds` included),
+    /// bounded by `timeout`.
+    pub async fn watch<'a>(
+        &'a self,
+        path: &'a str,
+        timeout: Duration,
+    ) -> BackendResult<Watched<'a>> {
+        match self.transport.watch(path, timeout).await? {
+            WatchAnswer::Events(events) => Ok(Watched::Events(events)),
+            WatchAnswer::Refused(StatusCode::GONE, _) => Ok(Watched::Expired),
+            WatchAnswer::Refused(status, body) => Err(failure("watch", path, status, &body)),
+        }
+    }
+
     async fn send(
         &self,
         method: Method,
@@ -342,6 +573,26 @@ impl KubeClient {
     ) -> BackendResult<(StatusCode, Value)> {
         self.transport.send(method, path, body).await
     }
+}
+
+/// A reqwest client trusting only the cluster's CA bundle, when it has one.
+fn http_client(
+    access: &ClusterAccess,
+    mut builder: reqwest::ClientBuilder,
+) -> Result<reqwest::Client, String> {
+    if let Some(pem) = &access.ca_pem {
+        let certificates = reqwest::Certificate::from_pem_bundle(pem)
+            .map_err(|error| format!("invalid CA bundle: {error}"))?;
+        if certificates.is_empty() {
+            return Err("the CA bundle holds no certificate".to_string());
+        }
+        // Only the cluster's CA: a public CA must not be able to stand in
+        // for the API server.
+        builder = builder.tls_certs_only(certificates);
+    }
+    builder
+        .build()
+        .map_err(|error| format!("cannot build the HTTP client: {error}"))
 }
 
 /// The `reason` of a Kubernetes `Status` answer.
@@ -394,6 +645,49 @@ mod tests {
         assert_eq!(overridden.namespace, "other");
         assert!(ClusterAccess::in_cluster_from(&dir, None, |_| None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The watch body is read line by line whatever its chunks: events split
+    /// across chunks or sharing one, a last line without its newline; a
+    /// 410 ERROR asks for a new list, a bookmark only moves the version.
+    #[test]
+    fn a_watch_body_is_read_into_events_whatever_its_chunks() {
+        let body = concat!(
+            r#"{"type":"ADDED","object":{"metadata":{"name":"a","resourceVersion":"5"}}}"#,
+            "\n\n",
+            r#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"7"}}}"#,
+            "\n",
+            r#"{"type":"ERROR","object":{"kind":"Status","code":410,"reason":"Expired"}}"#,
+        )
+        .as_bytes();
+        let mut lines = WatchLines::default();
+        let mut events = Vec::new();
+        for chunk in body.chunks(13) {
+            lines.push(chunk);
+            while let Some(event) = lines.next_event().unwrap() {
+                events.push(WatchEvent::read(event));
+            }
+        }
+        events.extend(lines.finish().unwrap().map(WatchEvent::read));
+
+        assert_eq!(
+            events,
+            vec![
+                WatchEvent::Changed {
+                    resource_version: Some("5".into()),
+                    object: serde_json::json!({"metadata":{"name":"a","resourceVersion":"5"}}),
+                },
+                WatchEvent::Bookmark(Some("7".into())),
+                WatchEvent::Expired,
+            ]
+        );
+        let mut garbled = WatchLines::default();
+        garbled.push(b"{not json\n");
+        assert!(garbled.next_event().is_err());
+        assert!(matches!(
+            WatchEvent::read(serde_json::json!({"type":"ERROR","object":{"code":500}})),
+            WatchEvent::Failed(_)
+        ));
     }
 
     #[test]

@@ -56,7 +56,7 @@ use crate::persistence::atomic::{
     write_json_atomic, write_json_atomic_exclusive,
 };
 use crate::persistence::lock::{FileLock, FileLockError};
-use crate::persistence::paths::{is_temp_file, parse_event_file_name, StatePaths};
+use crate::persistence::paths::{is_temp_file, parse_event_file_name, ServerStatePaths};
 use crate::persistence::PersistenceError;
 use chrono::{DateTime, Utc};
 use narsor_protocol::controller::OwnerRef;
@@ -123,17 +123,17 @@ pub struct EntryScan {
 /// of handles in any number of threads are safe.
 #[derive(Debug, Clone)]
 pub struct ObserverStore {
-    paths: StatePaths,
+    paths: ServerStatePaths,
 }
 
 impl ObserverStore {
     /// A store below the state root of `paths`.
-    pub fn new(paths: StatePaths) -> Self {
+    pub fn new(paths: ServerStatePaths) -> Self {
         Self { paths }
     }
 
     /// The path layout.
-    pub fn paths(&self) -> &StatePaths {
+    pub fn paths(&self) -> &ServerStatePaths {
         &self.paths
     }
 

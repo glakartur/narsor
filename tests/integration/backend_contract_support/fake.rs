@@ -25,6 +25,10 @@
 //! `narsor-controller-runtime::testkit::Probed` does both for any adapter, so
 //! every adapter — this one, the local one, U5's Kubernetes one — runs the
 //! same contract suite with the same faults.
+//!
+//! Every phase change on the platform — a runner ending, a workload lost —
+//! wakes the controllers of every instance at once
+//! ([`ExecutionBackend::changed`]), as a platform's event stream would.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -35,8 +39,8 @@ use tokio::task::JoinHandle;
 
 use narsor_controller_runtime::backend::{
     ArchiveProgress, BackendError, BackendResult, ExecutionBackend, Provisioned, ReaderStart,
-    Removal, StorageState, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase,
-    WorkloadState,
+    Removal, StorageState, TaskObservation, TaskResources, WakeListener, WakeSignal,
+    WorkloadLaunch, WorkloadPhase, WorkloadState,
 };
 use narsor_engine::api::ClientError;
 use narsor_engine::controller_protocol::{RunnerClient, RunnerDirective, RunnerPollQuery};
@@ -52,11 +56,23 @@ const RUNNER_RETRY: Duration = Duration::from_millis(50);
 const RUNNER_POLL_SECS: u64 = 1;
 
 /// The in-memory platform. Cloning shares it: two clones are two
-/// controllers' views of one backend.
-#[derive(Debug, Clone)]
+/// controllers' views of one backend, each woken by its changes.
+#[derive(Debug)]
 pub struct FakeBackend {
     platform: Arc<Mutex<Platform>>,
     simulate_runners: bool,
+    /// This instance's view of the platform's wake.
+    listener: Arc<WakeListener>,
+}
+
+impl Clone for FakeBackend {
+    fn clone(&self) -> Self {
+        Self {
+            platform: Arc::clone(&self.platform),
+            simulate_runners: self.simulate_runners,
+            listener: Arc::new(self.lock().wake.listen()),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -66,6 +82,8 @@ struct Platform {
     /// Read-only runners (D63), by their own names.
     readers: HashMap<String, FakeWorkload>,
     next_uid: u64,
+    /// Woken at every phase change.
+    wake: WakeSignal,
 }
 
 #[derive(Debug, Default)]
@@ -80,6 +98,8 @@ struct FakeStorage {
 struct FakeWorkload {
     state: WorkloadState,
     runner: Option<JoinHandle<()>>,
+    /// The runner credential it was launched with.
+    credential: String,
 }
 
 impl Drop for Platform {
@@ -101,8 +121,10 @@ impl Default for FakeBackend {
 impl FakeBackend {
     /// An empty platform whose workloads run simulated runners.
     pub fn new() -> Self {
+        let platform = Platform::default();
         Self {
-            platform: Arc::new(Mutex::new(Platform::default())),
+            listener: Arc::new(platform.wake.listen()),
+            platform: Arc::new(Mutex::new(platform)),
             simulate_runners: true,
         }
     }
@@ -132,6 +154,7 @@ impl FakeBackend {
         }
         workload.state.phase = WorkloadPhase::Exited { code: None };
         workload.state.resource_generation += 1;
+        platform.wake.wake();
         true
     }
 
@@ -150,7 +173,20 @@ impl FakeBackend {
         }
         reader.state.phase = WorkloadPhase::Exited { code: None };
         reader.state.resource_generation += 1;
+        platform.wake.wake();
         true
+    }
+
+    /// The credential the task's workload (`reader`: its reader) was
+    /// launched with, while it exists: what a test presents as that runner.
+    pub fn credential_of(&self, task: &TaskResources, reader: bool) -> Option<String> {
+        let platform = self.lock();
+        let found = if reader {
+            platform.readers.get(&task.reader)
+        } else {
+            platform.workloads.get(&task.workload)
+        };
+        found.map(|workload| workload.credential.clone())
     }
 
     fn lock(&self) -> MutexGuard<'_, Platform> {
@@ -205,6 +241,7 @@ impl FakeBackend {
             FakeWorkload {
                 state: state.clone(),
                 runner,
+                credential: launch.credential.expose().to_string(),
             },
         );
         Ok(Provisioned {
@@ -230,6 +267,10 @@ impl FakeBackend {
 impl ExecutionBackend for FakeBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Fake
+    }
+
+    async fn changed(&self) {
+        self.listener.woken().await;
     }
 
     fn capabilities(&self) -> BackendCapabilities {
@@ -345,6 +386,7 @@ impl ExecutionBackend for FakeBackend {
             FakeWorkload {
                 state: state.clone(),
                 runner,
+                credential: launch.credential.expose().to_string(),
             },
         );
         Ok(ReaderStart {
@@ -406,6 +448,7 @@ fn update_reader(
             if !reader.state.phase.is_alive() {
                 reader.runner = None;
             }
+            platform.wake.wake();
         }
     }
 }
@@ -462,6 +505,7 @@ impl FakeWorkloadHandle {
                 if !workload.state.phase.is_alive() {
                     workload.runner = None;
                 }
+                platform.wake.wake();
             }
         }
     }

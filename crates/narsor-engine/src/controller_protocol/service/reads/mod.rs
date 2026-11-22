@@ -3,6 +3,7 @@
 mod blocker;
 mod conductor;
 mod conversation;
+mod details;
 mod events;
 mod reader;
 mod relay;

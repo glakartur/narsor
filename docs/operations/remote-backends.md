@@ -69,9 +69,12 @@ Rules that follow from this split:
 The daemon serves the control plane and runs no workflow itself. The `local` backend has a controller like every
 other backend: `narsor-controller local`, a separate process that enrolls and
 talks `/controller/v1` over HTTP. In trusted mode the daemon starts it as its
-child, enrolls it on the first start and supervises it:
+child with the state and work roots (`--state-root`, `--work-root`) and
+supervises it. At every start it passes a short-lived enrollment code, which
+the controller uses only when it has no credential of its own (a first start,
+or a wiped controller state):
 
-* the daemon becomes discoverable (`daemon.json`) only after this controller
+* the daemon becomes discoverable (`{state}/run/daemon.json`) only after this controller
   holds a lease of its own — a newer `epoch` than the one before its start;
   it gives up after 10 s, and the start fails with the last lines the
   controller wrote;
@@ -103,7 +106,7 @@ every problem.
 | --- | --- | --- |
 | For | one person on one machine | a shared, reachable control plane |
 | Listens on | loopback only; a wildcard, IPv4-mapped or non-loopback bind is refused | any address, behind a TLS-terminating proxy |
-| Users prove | the random per-process token in the `0600` discovery file `{state}/daemon.json` | an OIDC access token of the configured issuer and audience |
+| Users prove | the random per-process token in the `0600` discovery file `{state}/run/daemon.json` | an OIDC access token of the configured issuer and audience |
 | Owner | the local token holder | one OIDC identity `(issuer, subject)` |
 
 ### Trusted mode
@@ -144,7 +147,7 @@ audience, an asymmetric algorithm allow list (no `none`, no HMAC), signature,
 
 **Owner.** Either set `server.owner_subject` (the owner is bound at startup), or
 leave it empty: the daemon then prints a one-time **claim code** and stores it
-`0600` at `{state}/auth/claim-code`. The first user who presents a valid
+`0600` at `{state}/narsor-server/auth/claim-code`. The first user who presents a valid
 token together with the code owns the installation:
 
 ```bash
@@ -400,8 +403,15 @@ kubectl apply -f deploy/kubernetes/controller.yaml             # backend config,
 ```
 
 The admission parameter ConfigMap must exist before the bindings reference
-it, and the controller must start only once the policies are enforced. An
-operator who is only a Rancher Project Owner needs the cluster administrator
+it, and the controller must start only once the policies are enforced.
+
+The controller's Role grants `list` and `watch` on pods: the controller
+watches its own Pods so that a Pod change wakes it at once. When you
+upgrade a controller, apply `controller-rbac.yaml` again. With an older
+Role the controller logs a warning ("cannot watch the managed Pods") and
+notices Pod changes only at its periodic observation.
+
+An operator who is only a Rancher Project Owner needs the cluster administrator
 to create the shared policies, the per-user admission bindings and the
 StorageClass read binding.
 
@@ -948,7 +958,7 @@ empty components, backslashes, colons, control characters or `.git`
 components, at most 1024 bytes and 32 levels, and no two paths that differ
 only in letter case.
 
-Where the bytes live: at the control plane under `{state}/materials/` (one
+Where the bytes live: at the control plane under `{state}/narsor-server/materials/` (one
 directory per task and material, blobs named by their SHA-256), outside task
 records, event logs and the SSE stream — events say only
 `material <id> uploaded|delivered|published|deleted|expired` with a file
@@ -969,6 +979,18 @@ API (owner, behind the owner gate; another owner's task is a `404`):
 Runner (behind the runner credential, its own task only):
 `GET /runner/v1/materials/:material`, `GET …/blobs/:sha256`,
 `POST …/ack`, and `POST /runner/v1/materials` to publish.
+
+**Launch spec.** No launch spec is mounted into a workload: the launch
+Secret on Kubernetes and the local workload directory hold only the runner
+credential. The controller passes the spec's content digest in the runner's
+arguments (`--launch-digest`). On its first start the working runner fetches
+the spec with its credential (`GET /runner/v1/launch-spec`; refused to a
+reader credential and to the credential of a launch a later start or resume
+superseded), recomputes the content digest and starts only when it equals
+`--launch-digest`; otherwise it reports the problem `launch_spec_invalid` and
+initializes nothing. Later starts and the reader use the copy on task
+storage. A runner that cannot reach the control plane on its first start
+retries, then reports the problem.
 
 ## 12. Smoke tests
 
@@ -1066,13 +1088,18 @@ operation](installation.md) for role selection and the generated setup.
    ```bash
    NARSOR_ENROLLMENT_CODE=<code> narsor-controller local \
      --control-plane https://narsor.example \
-     --storage ~/narsor-laptop
+     --work-root ~/narsor-laptop
    ```
 
-   The credential is kept `0600` in
-   `$XDG_STATE_HOME/narsor/workstation-controller/credential` (or
-   `--credential-file`). At start the controller prints the server's address,
-   the backend it serves and a warning.
+   The controller keeps its files in a directory of its own below two
+   roots: task storages and runner directories in
+   `<work root>/narsor-controller-local/` (`--work-root`, required), its
+   credential (`0600`) and records in
+   `<state root>/narsor-controller-local/` (`--state-root`, by default
+   `$XDG_STATE_HOME/narsor`). The former `--storage` and `--credential-file`
+   are refused with the flag that replaces them; a controller whose
+   credential is gone needs a new enrollment code. At start the controller
+   prints the server's address, the backend it serves and a warning.
 
 **Transport.** Beyond loopback (a loopback IP address or exactly
 `localhost`; no DNS) the controller accepts only `https://`, checks the
@@ -1102,7 +1129,8 @@ task is created:
   `GLAB_TOKEN`, `GLAB_CONFIG_DIR`, `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `GIT_ASKPASS`,
   `GIT_SSH`, `GIT_SSH_COMMAND`, `XDG_CONFIG_HOME` and no `GIT_CONFIG*`
   variable;
-* a local workspace directory must lie inside `--storage`;
+* a local workspace directory must lie inside the controller's work
+  directory, `<work root>/narsor-controller-local/`;
 * a Git workspace is cloned over `https://` only — never a path, a
   `file://`, `ssh://` or `git@host:` remote, nor a host on this computer or
   a private network (`localhost`, a loopback, private, link-local or

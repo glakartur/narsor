@@ -2,23 +2,35 @@
 //! `narsor-runner` process per task, on this machine (R5).
 //!
 //! ```text
-//! narsor-controller local --control-plane <url> --credential-file <file> \
-//!                   --storage <dir> [--home private|host] [--codex-home <dir>] …
+//! narsor-controller local --control-plane <url> [--state-root <dir>] \
+//!                   --work-root <dir> [--home private|host] [--codex-home <dir>] …
 //! ```
 //!
 //! The daemon of a trusted installation starts it as its child, with every
-//! setting resolved and passed as a flag (R6); it is the same controller
-//! loop over the same [`LocalBackend`] the daemon used to run in its own
-//! process, so task storage and the controller's identity stay where they
-//! were (R10).
+//! setting resolved and passed as a flag (R6).
+//!
+//! # Its directories
+//!
+//! The controller is given the state and work *roots* (`--state-root`,
+//! by default `$XDG_STATE_HOME/narsor`; `--work-root`) and appends its own
+//! directory name to each ([`paths`]): its credential, token store, image
+//! cache and per-task records in `<state-root>/narsor-controller-local`,
+//! task storages and workloads in `<work-root>/narsor-controller-local`.
+//! Nobody else constructs these paths (KTD7). The former `--credential-file`
+//! and `--storage` are refused with the flag that replaces them.
+//!
+//! # Enrollment
+//!
+//! An enrollment code (`NARSOR_ENROLLMENT_CODE` or `--enrollment-code-file`)
+//! is used only when the credential does not exist: the daemon passes a
+//! fresh one on every start, so a controller whose state was wiped enrolls
+//! again.
 //!
 //! # One controller per credential
 //!
 //! Two controllers on one credential would fight over the lease and over
 //! the runners. At start the controller takes an exclusive `flock` on
-//! `<credential file>.lock` beside the credential file and writes its PID
-//! into it — one lock per credential, so controllers whose credentials share
-//! a directory do not wait for each other;
+//! `credential.lock` beside its credential and writes its PID into it;
 //! while another process holds it, it waits up to `--lock-timeout-secs`,
 //! naming the holder. The kernel releases the lock with the process, even
 //! after `SIGKILL` (R8).
@@ -75,6 +87,7 @@ use untrusted::UntrustedServer;
 
 pub mod backend;
 pub mod container;
+pub mod paths;
 mod process;
 #[cfg(test)]
 mod test_support;
@@ -88,9 +101,7 @@ use narsor_controller_client::{ClientOptions, ControllerClient};
 use narsor_controller_runtime::{Controller, ControllerConfig};
 use narsor_shared::config::local_controller::{self, LocalMode};
 use narsor_shared::config::{Flags, HarnessHome, HomeMode, Resolved, SettingKey, Source};
-
-/// What the lock file's name adds to the credential file's.
-const LOCK_SUFFIX: &str = ".lock";
+use paths::{ControllerStatePaths, ControllerWorkPaths};
 
 /// Bound of the lease release on the way out: well inside the daemon's
 /// stop timeout (10 s), so a release against a dead control plane cannot
@@ -110,9 +121,24 @@ pub struct LocalArgs {
     #[command(flatten)]
     pub connection: ConnectionArgs,
 
-    /// Directory holding task storages and runner records.
+    /// The state root: the controller keeps its credential, token store
+    /// and records in its own directory below it. Defaults to
+    /// `$XDG_STATE_HOME/narsor`.
     #[arg(long, value_name = "DIRECTORY")]
-    pub storage: PathBuf,
+    pub state_root: Option<PathBuf>,
+
+    /// The work root: the controller keeps task storages and runner
+    /// directories in its own directory below it. Required.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub work_root: Option<PathBuf>,
+
+    /// Refused: replaced by `--work-root`.
+    #[arg(long, hide = true, value_name = "DIRECTORY")]
+    pub storage: Option<PathBuf>,
+
+    /// Refused: replaced by `--state-root`.
+    #[arg(long, hide = true, value_name = "FILE")]
+    pub credential_file: Option<PathBuf>,
 
     /// Where HOME points for the tools of a task.
     #[arg(long, value_enum, value_name = "MODE")]
@@ -209,10 +235,13 @@ pub enum ImageCommand {
 /// Arguments of `narsor-controller local image refresh`.
 #[derive(Debug, Clone, Args)]
 pub struct ImageRefreshArgs {
-    /// The credential file of the controller whose images these are; the
-    /// marker is in the `images` directory beside it. Defaults to the
-    /// credential of a controller started by hand.
-    #[arg(long, env = "NARSOR_CONTROLLER_CREDENTIAL_FILE", value_name = "FILE")]
+    /// The state root of the controller whose images these are. Defaults
+    /// to that of a controller started by hand.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub state_root: Option<PathBuf>,
+
+    /// Refused: replaced by `--state-root`.
+    #[arg(long, hide = true, value_name = "FILE")]
     pub credential_file: Option<PathBuf>,
 }
 
@@ -231,25 +260,37 @@ pub struct SecretSetArgs {
     #[arg(value_name = "NAME")]
     pub name: String,
 
-    /// The credential file of the controller whose store this is; the store
-    /// is the `secrets` directory beside it. Defaults to the credential of
-    /// a controller started by hand.
-    #[arg(long, env = "NARSOR_CONTROLLER_CREDENTIAL_FILE", value_name = "FILE")]
+    /// The state root of the controller whose store this is. Defaults to
+    /// that of a controller started by hand.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub state_root: Option<PathBuf>,
+
+    /// Refused: replaced by `--state-root`.
+    #[arg(long, hide = true, value_name = "FILE")]
     pub credential_file: Option<PathBuf>,
 }
 
 /// Runs a hidden helper command of `narsor-controller local`.
 pub fn local_helper_command(command: LocalCommand) -> i32 {
+    exit_code(run_local_helper(command, &mut std::io::stdin().lock()))
+}
+
+/// Runs a hidden helper command of `narsor-controller local`, reading what
+/// it reads (the value of `secret set`) from `input`.
+pub fn run_local_helper(
+    command: LocalCommand,
+    input: &mut impl std::io::Read,
+) -> Result<(), ControllerError> {
     match command {
         LocalCommand::Secret {
             command: SecretCommand::Set(args),
-        } => exit_code(secret_set(&args, &mut std::io::stdin().lock())),
+        } => secret_set(&args, input),
         LocalCommand::Image {
             command: ImageCommand::Refresh(args),
-        } => exit_code(image_refresh(&args)),
+        } => image_refresh(&args),
         LocalCommand::Docker {
             command: DockerCommand::Check,
-        } => exit_code(docker_check(&DockerCli::default())),
+        } => docker_check(&DockerCli::default()),
     }
 }
 
@@ -263,27 +304,42 @@ fn docker_check(docker: &dyn DockerTransport) -> Result<(), ControllerError> {
     Ok(())
 }
 
-/// The credential file a helper command names, else the default one.
-fn helper_credential_file(given: Option<&Path>) -> Result<PathBuf, ControllerError> {
+/// The state root a command names, else the default one, refusing the
+/// former `--credential-file`.
+fn state_root(
+    given: Option<&Path>,
+    credential_file: Option<&Path>,
+) -> Result<PathBuf, ControllerError> {
+    if credential_file.is_some() {
+        return Err(replaced_flag(
+            "--credential-file",
+            "--state-root <DIRECTORY>",
+        ));
+    }
     given
         .map(Path::to_path_buf)
-        .or_else(default_credential_file)
+        .or_else(default_state_root)
         .ok_or_else(|| {
-            crate::controller::missing_argument(
-                "--credential-file <FILE>",
-                "NARSOR_CONTROLLER_CREDENTIAL_FILE",
+            ControllerError::usage(
+                "error: --state-root <DIRECTORY> was not given and neither XDG_STATE_HOME nor \
+                 HOME is set",
             )
         })
 }
 
-/// `local image refresh`: writes the refresh marker beside the credential.
+/// The usage error for a flag that `replacement` replaced.
+fn replaced_flag(flag: &str, replacement: &str) -> ControllerError {
+    ControllerError::usage(format!(
+        "{flag} is no longer accepted: use {replacement}. The controller keeps its files in a \
+         directory of its own below the state and work roots"
+    ))
+}
+
+/// `local image refresh`: writes the refresh marker in the controller's
+/// state.
 fn image_refresh(args: &ImageRefreshArgs) -> Result<(), ControllerError> {
-    let credential_file = helper_credential_file(args.credential_file.as_deref())?;
-    let controller_dir = credential_file
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let marker = image::request_refresh(controller_dir).map_err(|error| {
+    let root = state_root(args.state_root.as_deref(), args.credential_file.as_deref())?;
+    let marker = image::request_refresh(&ControllerStatePaths::new(root)).map_err(|error| {
         ControllerError::failure(format!("cannot write the image refresh marker: {error}"))
     })?;
     eprintln!(
@@ -293,14 +349,15 @@ fn image_refresh(args: &ImageRefreshArgs) -> Result<(), ControllerError> {
     Ok(())
 }
 
-/// `local secret set`: the value from `input`, stored beside the credential.
+/// `local secret set`: the value from `input`, stored in the controller's
+/// token store.
 fn secret_set(args: &SecretSetArgs, input: &mut impl std::io::Read) -> Result<(), ControllerError> {
-    let credential_file = helper_credential_file(args.credential_file.as_deref())?;
+    let root = state_root(args.state_root.as_deref(), args.credential_file.as_deref())?;
     let mut text = String::new();
     input.read_to_string(&mut text).map_err(|error| {
         ControllerError::failure(format!("cannot read the value from stdin: {error}"))
     })?;
-    let store = secrets::SecretStore::beside_credential(&credential_file);
+    let store = secrets::SecretStore::of(&ControllerStatePaths::new(root));
     store
         .set(&args.name, secrets::value_from_input(&text))
         .map_err(|error| match error {
@@ -514,10 +571,47 @@ pub async fn local_command(args: LocalArgs) -> i32 {
     exit_code(run(args).await)
 }
 
+/// Where a controller keeps its files, from its arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDirectories {
+    /// The state root it was given: protected from container mounts as a
+    /// whole.
+    pub state_root: PathBuf,
+    /// Its own state directory below the state root.
+    pub state: ControllerStatePaths,
+    /// Its own work directory below the work root.
+    pub work: ControllerWorkPaths,
+}
+
+impl LocalArgs {
+    /// The controller's directories below the roots it was given, refusing
+    /// the flags the roots replaced.
+    pub fn directories(&self) -> Result<LocalDirectories, ControllerError> {
+        if self.storage.is_some() {
+            return Err(replaced_flag("--storage", "--work-root <DIRECTORY>"));
+        }
+        let state_root = state_root(self.state_root.as_deref(), self.credential_file.as_deref())?;
+        let work_root = self.work_root.as_deref().ok_or_else(|| {
+            ControllerError::usage(
+                "error: the following required argument was not provided: --work-root \
+                 <DIRECTORY>",
+            )
+        })?;
+        Ok(LocalDirectories {
+            state: ControllerStatePaths::new(&state_root),
+            work: ControllerWorkPaths::new(work_root),
+            state_root,
+        })
+    }
+}
+
 async fn run(args: LocalArgs) -> Result<(), ControllerError> {
-    let connection = args
-        .connection
-        .resolve_with_default_credential(default_credential_file())?;
+    let LocalDirectories {
+        state_root,
+        state,
+        work,
+    } = args.directories()?;
+    let connection = args.connection.resolve(Some(state.credential_file()))?;
     let place = check_transport(
         "--control-plane",
         &connection.control_plane,
@@ -539,22 +633,23 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
     if place == ControlPlanePlace::Remote {
         warn_untrusted(&connection.control_plane, &home);
     }
-    let lock_path = lock_path(&connection.credential_file);
     let timeout = Duration::from_secs(args.lock_timeout_secs);
+    let lock_path = state.credential_lock_file();
     let _lock = tokio::task::spawn_blocking(move || ControllerLock::acquire(&lock_path, timeout))
         .await
         .map_err(|error| ControllerError::failure(error.to_string()))??;
 
-    let mut backend_config = LocalBackendConfig::new(&args.storage).map_err(|error| {
-        ControllerError::failure(format!("cannot configure the local backend: {error}"))
-    })?;
+    let mut backend_config =
+        LocalBackendConfig::new(state.clone(), work.clone()).map_err(|error| {
+            ControllerError::failure(format!("cannot configure the local backend: {error}"))
+        })?;
     backend_config.runner_args = home.runner_args();
     if let Some(path) = config.file().path().map(Path::to_path_buf) {
         backend_config.runner_args.push("--config".into());
         backend_config.runner_args.push(path.as_os_str().into());
     }
     if place == ControlPlanePlace::Remote {
-        backend_config.launch_check = Some(untrusted_check(&args)?);
+        backend_config.launch_check = Some(untrusted_check(&args, &work)?);
         if home.mode == HomeMode::Private {
             backend_config
                 .runner_args
@@ -569,7 +664,8 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
     if setup.mode == LocalMode::Docker {
         backend_config.container_mode = Some(container_mode(
             docker,
-            &connection.credential_file,
+            &state,
+            state_root,
             setup.docker_update_interval,
             config.file().path().map(Path::to_path_buf),
         ));
@@ -604,7 +700,8 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
     let mut config = ControllerConfig::new(connection.runner_control_plane);
     config.lease_ttl = connection.lease_ttl;
     tracing::info!(
-        storage = %args.storage.display(),
+        state = %state.dir().display(),
+        work = %work.dir().display(),
         remote = place == ControlPlanePlace::Remote,
         mode = setup.mode.as_str(),
         "controller: driving the local backend"
@@ -624,22 +721,21 @@ async fn run(args: LocalArgs) -> Result<(), ControllerError> {
 }
 
 /// What the Docker work mode needs: the image build jobs and the token
-/// store of the controller keeping `credential_file`, and the host user.
+/// store of the controller whose state is `state`, the state root no
+/// mount may overlap, and the host user.
 fn container_mode(
     docker: Arc<dyn DockerTransport>,
-    credential_file: &Path,
+    state: &ControllerStatePaths,
+    state_root: PathBuf,
     update_interval: Option<Duration>,
     config_file: Option<PathBuf>,
 ) -> ContainerMode {
-    let controller_dir = credential_file
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
     let settings = image::BuildSettings::new(update_interval);
     let user = settings.user;
     ContainerMode {
-        builds: image::TaskImageBuilds::new(docker, controller_dir, settings),
-        secrets: secrets::SecretStore::beside_credential(credential_file),
+        builds: image::TaskImageBuilds::new(docker, state, settings),
+        secrets: secrets::SecretStore::of(state),
+        state_root,
         user,
         host_home: std::env::var_os("HOME")
             .filter(|home| !home.is_empty())
@@ -651,11 +747,14 @@ fn container_mode(
 }
 
 /// The checks of every launch spec from a control plane beyond this
-/// machine, over the controller's storage (R17).
-fn untrusted_check(args: &LocalArgs) -> Result<LaunchCheck, ControllerError> {
-    create_private_dir(&args.storage)?;
-    let checks = UntrustedServer::new(&args.storage, &args.allow_env).map_err(|error| {
-        ControllerError::failure(format!("cannot use {}: {error}", args.storage.display()))
+/// machine, over the controller's work directory (R17).
+fn untrusted_check(
+    args: &LocalArgs,
+    work: &ControllerWorkPaths,
+) -> Result<LaunchCheck, ControllerError> {
+    create_private_dir(work.dir())?;
+    let checks = UntrustedServer::new(work.dir(), &args.allow_env).map_err(|error| {
+        ControllerError::failure(format!("cannot use {}: {error}", work.dir().display()))
     })?;
     Ok(LaunchCheck::new(move |spec| checks.check(spec)))
 }
@@ -732,10 +831,9 @@ pub fn check_transport(
     }
 }
 
-/// The credential file of a controller started by hand:
-/// `$XDG_STATE_HOME/narsor/workstation-controller/credential`, else under
-/// `~/.local/state`.
-fn default_credential_file() -> Option<PathBuf> {
+/// The state root of a controller started by hand: `$XDG_STATE_HOME/narsor`,
+/// else `~/.local/state/narsor`.
+fn default_state_root() -> Option<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
@@ -744,15 +842,7 @@ fn default_credential_file() -> Option<PathBuf> {
                 .filter(|dir| !dir.is_empty())
                 .map(|home| PathBuf::from(home).join(".local/state"))
         })?;
-    Some(state.join("narsor/workstation-controller/credential"))
-}
-
-/// The lock file of the controller keeping `credential_file`:
-/// `<credential_file>.lock`.
-fn lock_path(credential_file: &Path) -> PathBuf {
-    let mut path = credential_file.as_os_str().to_owned();
-    path.push(LOCK_SUFFIX);
-    PathBuf::from(path)
+    Some(state.join("narsor"))
 }
 
 /// Resolves when `parent` is set and this process is no longer its child;
@@ -857,7 +947,10 @@ mod tests {
     fn args() -> LocalArgs {
         LocalArgs {
             connection: ConnectionArgs::default(),
-            storage: PathBuf::from("/storage"),
+            state_root: Some(PathBuf::from("/state")),
+            work_root: Some(PathBuf::from("/work")),
+            storage: None,
+            credential_file: None,
             home: None,
             codex_home: None,
             claude_config_dir: None,

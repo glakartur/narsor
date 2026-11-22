@@ -1422,7 +1422,7 @@ fn print_server_commands(backend: &WorkstationBackend, config_path: &Path) -> Re
         backend.id
     );
     println!(
-        "Start its separate outbound controller process (replace the placeholders):\n  NARSOR_ENROLLMENT_CODE='<code>' narsor-controller local --control-plane 'https://<corporate-server>' --storage {}",
+        "Start its separate outbound controller process (replace the placeholders):\n  NARSOR_ENROLLMENT_CODE='<code>' narsor-controller local --control-plane 'https://<corporate-server>' --work-root {}",
         shell_quote(
             &backend
                 .catalog_dir

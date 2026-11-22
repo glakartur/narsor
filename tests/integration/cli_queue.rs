@@ -29,7 +29,7 @@ use narsor_engine::automations::HookPhase;
 use narsor_engine::controller_protocol::{ProtocolError, ProtocolService};
 use narsor_engine::observers::{AutomationKey, AutomationState, RunId};
 use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef};
-use narsor_engine::persistence::StatePaths;
+use narsor_engine::persistence::ServerStatePaths;
 use narsor_observer_worker::worker::{
     ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, Worker, WorkerApi, WorkerOptions,
 };
@@ -90,7 +90,7 @@ impl Fixture {
         fs::write(state.join("workflows").join("triage.yaml"), triage_yaml()).unwrap();
         let clock = Arc::new(ManualClock(Mutex::new(Utc::now())));
         let service = Arc::new(ProtocolService::new(
-            ControlPlane::with_clock(StatePaths::new(&state), clock.clone()),
+            ControlPlane::with_clock(ServerStatePaths::new(&state), clock.clone()),
             resolver,
         ));
         Self {

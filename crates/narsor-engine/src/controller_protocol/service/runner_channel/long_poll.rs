@@ -25,22 +25,44 @@ impl ProtocolService {
         only: Option<&TaskId>,
         mut check: impl FnMut() -> ProtocolResult<Option<T>>,
     ) -> ProtocolResult<Option<T>> {
+        self.wait_for_or_until(wait, only, || {
+            Ok(match check()? {
+                Some(found) => Checked::Found(found),
+                None => Checked::NotYet { recheck_at: None },
+            })
+        })
+        .await
+    }
+
+    /// [`Self::wait_for`] for a check that can also tell when what it looks
+    /// at changes without a notification (a lease running out): it is run
+    /// again then, too.
+    pub(super) async fn wait_for_or_until<T>(
+        &self,
+        wait: std::time::Duration,
+        only: Option<&TaskId>,
+        mut check: impl FnMut() -> ProtocolResult<Checked<T>>,
+    ) -> ProtocolResult<Option<T>> {
         let mut changes = self.changes.subscribe();
         // The installation's default harness, which every task sees (U7):
         // a runner hears of a change now rather than when its long-poll
         // runs out.
         let mut harness_changes = self.launch.default_harness_changes();
         let deadline = tokio::time::Instant::now() + wait;
+        let mut recheck_at = None;
         let mut relevant = true;
         loop {
             if relevant {
-                if let Some(found) = check()? {
-                    return Ok(Some(found));
+                match check()? {
+                    Checked::Found(found) => return Ok(Some(found)),
+                    Checked::NotYet { recheck_at: at } => recheck_at = at,
                 }
             }
+            let wake_at = recheck_at.map_or(deadline, |at: tokio::time::Instant| at.min(deadline));
             relevant = tokio::select! {
-                received = tokio::time::timeout_at(deadline, changes.recv()) => match received {
-                    Err(_elapsed) => return Ok(None),
+                received = tokio::time::timeout_at(wake_at, changes.recv()) => match received {
+                    Err(_elapsed) if wake_at >= deadline => return Ok(None),
+                    Err(_elapsed) => true,
                     Ok(Ok(changed)) => only.is_none_or(|task_id| *task_id == changed),
                     // Some notifications were missed: any of them may matter.
                     Ok(Err(RecvError::Lagged(_))) => true,
@@ -50,6 +72,17 @@ impl ProtocolService {
             };
         }
     }
+}
+
+/// What one check of a long-poll found.
+pub(super) enum Checked<T> {
+    /// Something to answer with.
+    Found(T),
+    /// Nothing yet; look again at the next notification, or at `recheck_at`
+    /// if that comes first.
+    NotYet {
+        recheck_at: Option<tokio::time::Instant>,
+    },
 }
 
 /// Resolves when the default harness `changes` watches changes; never

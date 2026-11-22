@@ -35,7 +35,7 @@ use narsor_engine::engine::{
 };
 use narsor_engine::persistence::{
     ConversationEntry, ConversationSource, ConversationStore, DefaultHarnessSelector,
-    ExecutionStore, StatePaths,
+    ExecutionStore, ServerStatePaths,
 };
 use narsor_engine::workflow::{load_from_file, TemplateScope};
 use narsor_protocol::chat::{
@@ -3116,7 +3116,7 @@ async fn the_reprompt_runs_on_the_harness_of_the_rejected_attempt() {
         .answers_on_call(2, &envelope(r#"{"choice":"implemented"}"#));
     let selector = Arc::new(
         DefaultHarnessSelector::load(
-            StatePaths::new(fixture.root.path()),
+            ServerStatePaths::new(fixture.root.path()),
             vec!["claude-code".into(), "opencode".into()],
             "claude-code",
         )
@@ -3213,7 +3213,7 @@ async fn engine_with_live_default(
 ) -> (Engine, Arc<DefaultHarnessSelector>) {
     let selector = Arc::new(
         DefaultHarnessSelector::load(
-            StatePaths::new(fixture.root.path()),
+            ServerStatePaths::new(fixture.root.path()),
             vec!["claude-code".into(), "opencode".into(), "codex".into()],
             "claude-code",
         )
@@ -4771,7 +4771,7 @@ async fn an_explicit_harness_wins_over_the_live_default_selector() {
     fixture.fake.answers(&envelope("{\"choice\": \"done\"}"));
     let selector = Arc::new(
         DefaultHarnessSelector::load(
-            StatePaths::new(fixture.root.path()),
+            ServerStatePaths::new(fixture.root.path()),
             vec!["claude-code".into(), "opencode".into()],
             "opencode",
         )

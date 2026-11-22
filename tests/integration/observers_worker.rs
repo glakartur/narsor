@@ -29,7 +29,7 @@ use narsor_engine::observers::{
     MAX_SCRIPT_OUTPUT_BYTES,
 };
 use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef};
-use narsor_engine::persistence::StatePaths;
+use narsor_engine::persistence::ServerStatePaths;
 use narsor_observer_worker::worker::{
     check_secrets_dir, current_uid, inheritable_environment, kill_all_processes_of, processes_of,
     Masker, ProcessRunner, ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, ScriptUser, Worker,
@@ -81,7 +81,7 @@ impl Fixture {
         fs::create_dir_all(root.join("work")).unwrap();
         let clock = Arc::new(ManualClock(Mutex::new(Utc::now())));
         let service = Arc::new(ProtocolService::new(
-            ControlPlane::with_clock(StatePaths::new(root.join("state")), clock),
+            ControlPlane::with_clock(ServerStatePaths::new(root.join("state")), clock),
             crate::environment_support::seeded_resolver(&root.join("state")),
         ));
         Self { root, service }

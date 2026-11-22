@@ -1,4 +1,5 @@
-//! The daemon discovery file (`{state}/daemon.json`).
+//! The daemon discovery file (`{state}/run/daemon.json`, see
+//! `narsor_shared::run_paths::RunPaths`).
 //!
 //! A running daemon writes one of these so that clients can find it without a
 //! registry: PID, bound address, a bearer token minted for this run, and when
@@ -71,7 +72,7 @@ impl DaemonInfo {
 ///
 /// Shared between [`DaemonInfo::is_alive`] (is the daemon named by
 /// `daemon.json` still around) and the spawn-lock staleness check in
-/// `src/api/discovery.rs` (is the process that acquired `daemon.lock` still
+/// `narsor-api-client`'s `discovery.rs` (is the process that acquired `daemon.lock` still
 /// around, or did it die — killed, OOM, `SIGKILL` from a closing terminal —
 /// after winning the lock but before releasing it, which would otherwise
 /// wedge every future caller against a lock nothing will ever remove).

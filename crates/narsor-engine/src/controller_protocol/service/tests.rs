@@ -192,7 +192,7 @@ fn record_of(yaml: Option<&str>, runner_state: RunnerState) -> TaskRecord {
     if let Some(yaml) = yaml {
         spec = spec.with_definition(&load_from_str(yaml).unwrap()).unwrap();
     }
-    let control = ControlPlane::new(crate::persistence::StatePaths::new(&root));
+    let control = ControlPlane::new(crate::persistence::ServerStatePaths::new(&root));
     let mut record = control
         .create_task(NewTask::new(
             TaskId::parse("task-1").unwrap(),

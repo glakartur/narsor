@@ -16,7 +16,7 @@ use narsor_engine::observers::{
 };
 use narsor_engine::orchestration::OwnerRef;
 use narsor_engine::persistence::paths::temp_path_for;
-use narsor_engine::persistence::StatePaths;
+use narsor_engine::persistence::ServerStatePaths;
 use narsor_protocol::controller::{GateWatch, GateWatchChoice, GateWatchVariable};
 use serde_json::json;
 use std::fs;
@@ -35,11 +35,11 @@ impl TempRoot {
     }
 
     fn store(&self) -> ObserverStore {
-        ObserverStore::new(StatePaths::new(&self.path))
+        ObserverStore::new(ServerStatePaths::new(&self.path))
     }
 
-    fn paths(&self) -> StatePaths {
-        StatePaths::new(&self.path)
+    fn paths(&self) -> ServerStatePaths {
+        ServerStatePaths::new(&self.path)
     }
 }
 
@@ -359,11 +359,11 @@ fn records_errors_and_entries_survive_a_restart_and_stray_writes_are_swept() {
 fn stored_observers_of_an_older_version_are_only_reported() {
     // R22: no migration; the record is never read, the server warns once.
     let root = TempRoot::new();
-    let old = root.paths().observers_dir().join("obs-1");
+    let old = root.path.join("observers").join("obs-1");
     fs::create_dir_all(&old).unwrap();
     fs::write(old.join("observer.json"), br#"{"record_version": 2}"#).unwrap();
 
-    let warning = stored_observers_warning(&root.paths()).expect("a warning");
+    let warning = stored_observers_warning(&root.path).expect("a warning");
     assert!(warning.contains("ignored"), "{warning}");
     assert!(root.store().list_readable().unwrap().is_empty());
 }

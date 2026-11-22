@@ -12,7 +12,7 @@
 //! its API, and refuse to start on its errors, without starting it.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::cascade::ConfigCascade;
 use super::check::Problem;
@@ -66,12 +66,17 @@ pub fn config_args(file: Option<&Path>) -> Vec<OsString> {
     }
 }
 
-/// The credential file of the local controller of a server whose state
-/// directory (`server.state`) is `state_dir`. Its directory also holds the
-/// controller's token store, which `narsor-cli secret set` reaches through
-/// it.
-pub fn credential_file(state_dir: &Path) -> PathBuf {
-    state_dir.join("local-controller").join("credential")
+/// The `narsor-controller local` arguments naming the state and work
+/// roots (`server.state`, `server.work`). The controller appends its own
+/// directory name to each (KTD7): whoever starts it never constructs its
+/// paths.
+pub fn root_args(state_root: &Path, work_root: Option<&Path>) -> Vec<OsString> {
+    let mut args = vec!["--state-root".into(), state_root.as_os_str().to_owned()];
+    if let Some(work_root) = work_root {
+        args.push("--work-root".into());
+        args.push(work_root.as_os_str().to_owned());
+    }
+    args
 }
 
 /// The controller's configuration from `file` (none: no file at all) and

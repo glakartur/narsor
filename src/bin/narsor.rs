@@ -1,11 +1,10 @@
-use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use clap::Parser;
 use narsor::cli::{self, EXIT_FAILURE, EXIT_USAGE};
-use narsor::config::ClientPaths;
 use narsor::config::{self, Flags};
+use narsor::tui::paths::TuiStatePaths;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[derive(Debug, Parser)]
@@ -82,7 +81,8 @@ async fn main() {
         });
     }
     if let Some(directive) = resolved.log_directive() {
-        if let Some(file) = open_log_file(&resolved.client_paths()) {
+        // The terminal interface's own log, never the server's (KTD6).
+        if let Ok(file) = TuiStatePaths::new(resolved.state_dir()).open_log() {
             let subscriber = FmtSubscriber::builder()
                 .with_env_filter(EnvFilter::builder().parse_lossy(directive))
                 .with_writer(Mutex::new(file))
@@ -100,13 +100,4 @@ async fn main() {
         eprintln!("{}", error.message);
         std::process::exit(error.exit_code);
     }
-}
-
-fn open_log_file(paths: &ClientPaths) -> Option<File> {
-    std::fs::create_dir_all(paths.root()).ok()?;
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.log_file())
-        .ok()
 }

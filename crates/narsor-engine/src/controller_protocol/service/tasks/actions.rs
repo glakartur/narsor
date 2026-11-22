@@ -1564,7 +1564,7 @@ mod tests {
         let spec = spec
             .with_definition(&crate::workflow::load_from_str(STEPS).unwrap())
             .unwrap();
-        let control = ControlPlane::new(crate::persistence::StatePaths::new(root));
+        let control = ControlPlane::new(crate::persistence::ServerStatePaths::new(root));
         let mut record = control
             .create_task(NewTask::new(
                 TaskId::parse("task-1").unwrap(),

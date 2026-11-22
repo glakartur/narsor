@@ -33,14 +33,31 @@ impl ProtocolService {
         self.issue_enrollment(backend_id, request)
     }
 
-    /// A one-time code for the controller a trusted daemon starts for its
-    /// built-in `local` backend. Not reachable over HTTP: the daemon calls
-    /// it in process, for a controller it starts itself (KTD11).
-    pub fn create_builtin_local_enrollment(&self) -> ProtocolResult<EnrollmentResponse> {
-        self.issue_enrollment(
-            crate::environment::BackendRecord::LOCAL_ID,
-            CreateEnrollmentRequest::default(),
-        )
+    /// A one-time code, valid for `ttl`, for the controller a trusted
+    /// daemon starts for its built-in `local` backend. Not reachable over
+    /// HTTP: the daemon calls it in process, for a controller it starts
+    /// itself (KTD11), on every start (KTD7).
+    pub fn create_builtin_local_enrollment(
+        &self,
+        ttl: std::time::Duration,
+    ) -> ProtocolResult<EnrollmentResponse> {
+        let backend_id = BackendId::parse(crate::environment::BackendRecord::LOCAL_ID)
+            .expect("a valid backend id");
+        let ttl = bounded_ttl(
+            Some(ttl.as_secs()),
+            self.config.default_enrollment_ttl,
+            self.config.max_enrollment_ttl,
+        );
+        // Every start of the daemon makes one: the earlier ones that
+        // expired unused go with it.
+        let (record, code) = self
+            .credentials
+            .create_enrollment_replacing_expired(&backend_id, ttl)?;
+        Ok(EnrollmentResponse {
+            enrollment_code: code.expose().to_string(),
+            backend_id: record.backend_id.to_string(),
+            expires_at: record.expires_at,
+        })
     }
 
     fn issue_enrollment(

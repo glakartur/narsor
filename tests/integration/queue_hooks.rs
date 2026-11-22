@@ -30,7 +30,7 @@ use narsor_engine::orchestration::{
     Clock, CommandRequest, ControlPlane, GateAutomationPhase, OperatorCommand,
     OperatorCommandRequest, OwnerCommand, OwnerRef, TaskEventKind,
 };
-use narsor_engine::persistence::StatePaths;
+use narsor_engine::persistence::ServerStatePaths;
 use narsor_protocol::api::HumanInputDeliveryDto;
 use narsor_protocol::controller::ObserverDecideRequest;
 use serde_json::{json, Value};
@@ -130,7 +130,7 @@ impl Fixture {
 
     fn service_over(root: &PathBuf, clock: &Arc<ManualClock>) -> Arc<ProtocolService> {
         Arc::new(ProtocolService::new(
-            ControlPlane::with_clock(StatePaths::new(root), clock.clone()),
+            ControlPlane::with_clock(ServerStatePaths::new(root), clock.clone()),
             crate::environment_support::seeded_resolver(root),
         ))
     }

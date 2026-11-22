@@ -3,7 +3,7 @@
 #
 # Instalacja:    install.sh [wersja] [--role local|frontend|server] [--bin-dir KATALOG]
 #                           [--with-frontend] [--update-bashrc] [--non-interactive]
-#                           [--stop-running] [--progress]
+#                           [--stop-running] [--migrate] [--progress]
 #                           [opcje narsor-cli init, np. --data-dir, --config-file]
 # Odinstalowanie: install.sh --uninstall [--purge] [--bin-dir KATALOG]
 #                           [--data-dir KATALOG] [--config-file PLIK] [--non-interactive]
@@ -16,16 +16,27 @@
 # directory (~/.narsor by default), writes it as global.root and writes
 # server.catalog, server.state and server.work relative to it. It does not touch an
 # existing configuration: it writes config.yaml.new next to it.
+# server.state and server.work are roots: every program keeps its own directory
+# below them (state/run/, state/narsor-server/, state/narsor-controller-local/,
+# state/narsor-web/, state/narsor/, work/narsor-controller-local/). --purge runs
+# `narsor-cli purge`, which removes the whole data directory with all of them and
+# lists, but keeps, directories the configuration names outside it.
 # For the local role it also asks for the work mode of local tasks (process or
 # docker); `--local-mode process|docker` answers that question and is passed
 # to `narsor-cli init` like the other init options.
+# For the local and server roles it then runs `narsor-migrate`, which moves the
+# data of an older version to the per-binary layout once, after a backup in
+# <global.root>/backups/. The Narsor processes must be stopped for that; when
+# they keep running, the migration is skipped and the command is printed.
+# Interactive: narsor-migrate shows its plan and asks. --non-interactive: it
+# migrates (with --yes) only with --migrate; otherwise it prints the command.
 set -euo pipefail
 
 repository="glakartur/narsor"
 target="x86_64-unknown-linux-gnu"
 archive="narsor-linux-x86_64-gnu.tar.gz"
 version="${NARSOR_VERSION:-latest}"
-all_binaries=(narsor narsor-cli narsor-web narsor-server narsor-controller narsor-runner narsor-observer-worker)
+all_binaries=(narsor narsor-cli narsor-web narsor-server narsor-controller narsor-runner narsor-observer-worker narsor-migrate)
 bashrc_marker="# narsor-installer"
 
 fail() {
@@ -53,9 +64,11 @@ usage() {
 Instalacja:
   install.sh [wersja] [--role local|frontend|server] [--bin-dir KATALOG]
              [--with-frontend] [--update-bashrc] [--non-interactive]
-             [--stop-running] [--progress]
+             [--stop-running] [--migrate] [--progress]
              [opcje narsor-cli init, np. --data-dir, --config-file]
              (init options include --local-mode process|docker for the local role)
+             (--migrate: with --non-interactive, move the data of an older
+              version with narsor-migrate --yes; see docs/operations/updates.md)
 Odinstalowanie:
   install.sh --uninstall [--purge] [--bin-dir KATALOG]
              [--data-dir KATALOG] [--config-file PLIK] [--non-interactive]
@@ -142,7 +155,7 @@ binaries_for_role() {
             if ((with_frontend)); then
                 printf '%s\n' "${all_binaries[@]}"
             else
-                printf '%s\n' narsor-server narsor-controller narsor-runner narsor-observer-worker
+                printf '%s\n' narsor-server narsor-controller narsor-runner narsor-observer-worker narsor-migrate
             fi
             ;;
     esac
@@ -251,7 +264,84 @@ handle_running_processes() {
         stop_processes "${pids[@]}"
         printf 'Stopped %d process(es).\n' "${#pids[@]}"
     else
+        narsor_running=1
         printf 'They keep running the previous version until you restart them.\n'
+    fi
+}
+
+# Loud: a step the operator must not miss.
+warn_loudly() {
+    if [[ -t 1 ]]; then
+        printf '\033[1;33m!!! %s\033[0m\n' "$*"
+    else
+        printf '!!! %s\n' "$*"
+    fi
+}
+
+# The configuration narsor-server reads: an explicit --config/--config-file
+# given to the installer, else the one the cascade finds (no flag).
+migrate_scope_args() {
+    local -a args=() given=("${passthrough[@]}")
+    local index=0
+    while ((index < ${#given[@]})); do
+        case "${given[index]}" in
+            --config|--config-file)
+                ((index + 1 < ${#given[@]})) && args=(--config "${given[index + 1]}")
+                index=$((index + 2))
+                continue
+                ;;
+            --config=*|--config-file=*) args=(--config "${given[index]#*=}") ;;
+        esac
+        index=$((index + 1))
+    done
+    if ((${#args[@]})); then
+        printf '%s\n' "${args[@]}"
+    fi
+}
+
+# Moves the data of an older version to the per-binary layout with
+# narsor-migrate (backup first). Only for roles that keep server or local
+# controller data; a no-op when there is nothing to migrate.
+run_migration() {
+    local migrate="$bin_dir/narsor-migrate" output status=0 command arg
+    local -a scope
+    case "$role" in local|server) ;; *) return 0 ;; esac
+    [[ -x "$migrate" ]] || return 0
+    step "Data migration"
+    mapfile -t scope < <(migrate_scope_args)
+    command="$(shell_quote "$migrate")"
+    for arg in ${scope[@]+"${scope[@]}"}; do
+        command+=" $(shell_quote "$arg")"
+    done
+    output="$("$migrate" ${scope[@]+"${scope[@]}"} --dry-run 2>&1)" || status=$?
+    if ((status == 0)) && [[ "$output" == "Nothing to migrate." ]]; then
+        printf 'No data of an older version to migrate.\n'
+        return 0
+    fi
+    if ((status == 2)); then
+        printf '%s\n' "$output" >&2
+        warn_loudly "narsor-migrate cannot read the configuration; correct it, then run: $command"
+        return 0
+    fi
+    if ((narsor_running)); then
+        printf '%s\n' "$output"
+        warn_loudly "The data of an older version was NOT migrated: Narsor is still running."
+        warn_loudly "The new narsor-server refuses to start until it is. Stop every Narsor process (narsor-server stop), then run: $command"
+        return 0
+    fi
+    status=0
+    if ((interactive)); then
+        "$migrate" ${scope[@]+"${scope[@]}"} </dev/tty || status=$?
+    elif ((run_migrate)); then
+        "$migrate" ${scope[@]+"${scope[@]}"} --yes || status=$?
+    else
+        printf '%s\n' "$output"
+        warn_loudly "The data of an older version was NOT migrated (no --migrate). The new narsor-server refuses to start until it is. Run: $command --yes"
+        return 0
+    fi
+    if ((status != 0)); then
+        warn_loudly "narsor-migrate stopped (exit status $status); the new narsor-server refuses to start until the data is migrated. See the message above, then run: $command"
+        ((interactive)) || fail "the data migration did not complete"
     fi
 }
 
@@ -335,7 +425,7 @@ install() {
 
     while IFS= read -r entry; do
         case "$entry" in
-            manifest.json|narsor|narsor-cli|narsor-web|narsor-server|narsor-controller|narsor-runner|narsor-observer-worker) ;;
+            manifest.json|narsor|narsor-cli|narsor-web|narsor-server|narsor-controller|narsor-runner|narsor-observer-worker|narsor-migrate) ;;
             *) fail "unexpected path in release archive: $entry" ;;
         esac
     done < <(tar -tzf "$work_dir/$archive")
@@ -394,6 +484,7 @@ install() {
     handle_running_processes
     install_binaries "$work_dir" "$bin_dir" "${binaries[@]}"
     printf 'Installed: %s\n' "${binaries[*]}"
+    run_migration
 
     if ! path_contains "$bin_dir"; then
         step "PATH"
@@ -416,7 +507,7 @@ install() {
 
 main() {
     local role= bin_dir= with_frontend=0 update_bashrc=0 non_interactive=0 stop_running=0 show_progress=0
-    local uninstall_mode=0 purge=0 interactive=0
+    local uninstall_mode=0 purge=0 interactive=0 run_migrate=0 narsor_running=0
     local -a passthrough=()
 
     if [[ "${1:-}" == "latest" || "${1:-}" == v* ]]; then
@@ -435,6 +526,7 @@ main() {
             --with-frontend) with_frontend=1; shift ;;
             --update-bashrc) update_bashrc=1; shift ;;
             --stop-running) stop_running=1; shift ;;
+            --migrate) run_migrate=1; shift ;;
             --progress) show_progress=1; shift ;;
             --non-interactive) non_interactive=1; shift ;;
             --uninstall) uninstall_mode=1; shift ;;

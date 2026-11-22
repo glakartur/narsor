@@ -8,7 +8,9 @@
 //! ([`super::fake::run_simulated_runner`]): it runs no
 //! workflow step, reports `Running` until an owner's `Transition` moves the
 //! work to a terminal state, pauses at once at a safe point and leaves when
-//! told. Its event cursor and workflow state live in `stub-runner/` on the
+//! told. Like the runner, it fetches its launch spec from the control plane
+//! with its credential and takes it only with the `--launch-digest` it was
+//! given. Its event cursor and workflow state live in `stub-runner/` on the
 //! task storage it is given, so a resumed stub continues there; a read-only
 //! stub (`--read-only`) writes nothing.
 //!
@@ -27,6 +29,7 @@ use std::time::Duration;
 
 use super::fake::{run_simulated_reader, run_simulated_runner, SimulatedStorage};
 use narsor_engine::controller_protocol::RunnerClient;
+use narsor_engine::domain::TaskLaunchSpec;
 
 /// The variable that carries the runner's arguments, one per line.
 const ARGS_ENV: &str = "NARSOR_STUB_RUNNER_ARGS";
@@ -101,11 +104,39 @@ fn run(args: &[String]) -> i32 {
     if args.iter().any(|arg| arg == "--read-only") {
         return runtime.block_on(run_simulated_reader(&client, || {}));
     }
-    let launch_spec: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(value("--launch-spec")).expect("the launch spec"))
-            .expect("a launch spec");
     let storage = StubStorage(PathBuf::from(value("--task-storage")).join("stub-runner"));
+    let launch_spec = match runtime.block_on(fetch_launch_spec(&client, &value("--launch-digest")))
+    {
+        Ok(spec) => spec,
+        Err(problem) => {
+            eprintln!("stub runner: {problem}");
+            return 3;
+        }
+    };
     runtime.block_on(run_simulated_runner(&client, &launch_spec, &storage, || {}))
+}
+
+/// Fetches the launch spec as the runner does on its first start (R5):
+/// with the runner credential, accepted only when its recomputed content
+/// digest is the one the controller passed.
+async fn fetch_launch_spec(
+    client: &RunnerClient,
+    pinned: &str,
+) -> Result<serde_json::Value, String> {
+    let mut last = String::new();
+    for _ in 0..100 {
+        match client.launch_spec().await {
+            Ok(spec) => {
+                let typed: TaskLaunchSpec =
+                    serde_json::from_value(spec.clone()).map_err(|error| error.to_string())?;
+                typed.check_pinned_digest(pinned)?;
+                return Ok(spec);
+            }
+            Err(error) => last = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(format!("the launch spec was not served: {last}"))
 }
 
 /// The stub's work on the task storage: one file per value.

@@ -25,6 +25,7 @@ use std::io;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -112,6 +113,21 @@ pub struct ImageInfo {
     pub id: String,
     pub labels: BTreeMap<String, String>,
 }
+
+/// One container event of [`DockerTransport::follow_container_events`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerEvent {
+    /// What happened (`start`, `die`, `destroy`, ...).
+    pub action: String,
+    /// The container's name.
+    pub name: String,
+    /// The container's labels, and what else Docker says of it.
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// The container events [`DockerCli`] follows: the ones that change what an
+/// observation sees.
+const FOLLOWED_EVENTS: [&str; 4] = ["start", "die", "destroy", "oom"];
 
 /// One `docker build`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +219,19 @@ pub trait DockerTransport: fmt::Debug + Send + Sync {
     /// The last `tail` lines the container's process wrote, its standard
     /// output and error together.
     fn container_logs(&self, name: &str, tail: usize) -> DockerResult<String>;
+
+    /// Follows the daemon's events of the containers carrying `label`
+    /// (`key=value`) and hands each to `on_event`, until the stream ends
+    /// (`Ok`) or `on_event` returns false. Blocks for as long as the stream
+    /// lasts, which is meant to be forever: run it on a thread of its own.
+    ///
+    /// `on_event` may also get `None` while no event comes, just to tell
+    /// whether it still wants them.
+    fn follow_container_events(
+        &self,
+        label: &str,
+        on_event: &mut dyn FnMut(Option<ContainerEvent>) -> bool,
+    ) -> DockerResult<()>;
 }
 
 /// The transport that runs the `docker` CLI.
@@ -324,6 +353,51 @@ impl DockerTransport for DockerCli {
         }
     }
 
+    fn follow_container_events(
+        &self,
+        label: &str,
+        on_event: &mut dyn FnMut(Option<ContainerEvent>) -> bool,
+    ) -> DockerResult<()> {
+        let args = container_events_args(label);
+        let mut child = Command::new(&self.program)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| spawn_failure(&error, &args))?;
+        let stderr = read_all(child.stderr.take().expect("stderr is piped"));
+        let lines = read_lines(child.stdout.take().expect("stdout is piped"));
+        let early = match pump_events(&lines, EVENTS_IDLE_TICK, on_event) {
+            PumpEnd::Ended => None,
+            PumpEnd::Unwanted => Some(Ok(())),
+            PumpEnd::Failed(message) => Some(Err(DockerError::Failed {
+                command: command_line(&args),
+                message: format!("cannot read the docker events: {message}"),
+            })),
+        };
+        if let Some(outcome) = early {
+            // Still running: nobody reads it any more.
+            let _ = child.kill();
+            let _ = child.wait();
+            return outcome;
+        }
+        let status = child.wait().map_err(|error| DockerError::Failed {
+            command: command_line(&args),
+            message: format!("cannot wait for docker: {error}"),
+        })?;
+        let stderr = stderr.join().unwrap_or_default();
+        docker_output(
+            CallOutput {
+                status,
+                stdout: Vec::new(),
+                stderr,
+            },
+            &args,
+        )
+        .map(drop)
+    }
+
     fn container_logs(&self, name: &str, tail: usize) -> DockerResult<String> {
         let args = container_logs_args(name, tail);
         // `docker logs` replays the container's standard error on its own
@@ -336,6 +410,107 @@ impl DockerTransport for DockerCli {
         }
         Err(classify_failure(&command_line(&args), &tail_text(&stderr)))
     }
+}
+
+/// How long the event follower waits for a line before it asks its
+/// callback (with `None`) whether events are still wanted: a quiet stream
+/// still stops soon after its follower is no longer heard.
+const EVENTS_IDLE_TICK: Duration = Duration::from_secs(1);
+
+/// How [`pump_events`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum PumpEnd {
+    /// The callback wanted no more events.
+    Unwanted,
+    /// The stream ended.
+    Ended,
+    /// Reading the stream failed.
+    Failed(String),
+}
+
+/// The lines of `pipe`, read on a thread of their own until it ends, fails
+/// or nobody receives them any more.
+fn read_lines(pipe: impl io::Read + Send + 'static) -> mpsc::Receiver<io::Result<String>> {
+    use std::io::BufRead as _;
+
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in io::BufReader::new(pipe).lines() {
+            let failed = line.is_err();
+            if sender.send(line).is_err() || failed {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
+/// Hands every container event of `lines` to `on_event`, and `None` after
+/// each `idle` without one, until the callback returns false, the stream
+/// ends or a read fails.
+fn pump_events(
+    lines: &mpsc::Receiver<io::Result<String>>,
+    idle: Duration,
+    on_event: &mut dyn FnMut(Option<ContainerEvent>) -> bool,
+) -> PumpEnd {
+    loop {
+        let wanted = match lines.recv_timeout(idle) {
+            Ok(Ok(line)) => match parse_container_event(&line) {
+                Some(event) => on_event(Some(event)),
+                None => {
+                    tracing::debug!(%line, "docker events: an event that cannot be read");
+                    continue;
+                }
+            },
+            Ok(Err(error)) => return PumpEnd::Failed(error.to_string()),
+            Err(mpsc::RecvTimeoutError::Timeout) => on_event(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return PumpEnd::Ended,
+        };
+        if !wanted {
+            return PumpEnd::Unwanted;
+        }
+    }
+}
+
+pub(crate) fn container_events_args(label: &str) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "events".into(),
+        "--format".into(),
+        "{{json .}}".into(),
+        "--filter".into(),
+        "type=container".into(),
+        "--filter".into(),
+        format!("label={label}").into(),
+    ];
+    for event in FOLLOWED_EVENTS {
+        args.push("--filter".into());
+        args.push(format!("event={event}").into());
+    }
+    args
+}
+
+/// One line of `docker events --format '{{json .}}'`; `None` when it is no
+/// container event.
+pub(crate) fn parse_container_event(line: &str) -> Option<ContainerEvent> {
+    let event: Value = serde_json::from_str(line).ok()?;
+    if event["Type"] != "container" {
+        return None;
+    }
+    let actor = &event["Actor"];
+    let attributes: BTreeMap<String, String> = actor["Attributes"]
+        .as_object()
+        .map(|attributes| {
+            attributes
+                .iter()
+                .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(ContainerEvent {
+        action: event["Action"].as_str()?.to_string(),
+        name: attributes.get("name").cloned().unwrap_or_default(),
+        attributes,
+    })
 }
 
 fn list_images_args(labels: &[String]) -> Vec<OsString> {
@@ -792,6 +967,47 @@ mod tests {
         for forbidden in ["--privileged", "--pid", "--ipc", "--userns", "--cap-add"] {
             assert!(!args.iter().any(|arg| arg.starts_with(forbidden)));
         }
+    }
+
+    #[test]
+    fn a_docker_events_line_reads_as_the_containers_event() {
+        let args = strings(container_events_args("io.narsor.managed=true"));
+        assert!(args.starts_with(&["events".into(), "--format".into(), "{{json .}}".into()]));
+        assert!(args.contains(&"label=io.narsor.managed=true".to_string()));
+        assert!(args.contains(&"event=die".to_string()));
+
+        let line = r#"{"status":"die","id":"abc","from":"narsor-task:1","Type":"container","Action":"die","Actor":{"ID":"abc","Attributes":{"exitCode":"137","io.narsor.managed":"true","name":"narsor-local-1"}},"scope":"local","time":1}"#;
+        let event = parse_container_event(line).expect("a container event");
+        assert_eq!(event.action, "die");
+        assert_eq!(event.name, "narsor-local-1");
+        assert_eq!(event.attributes["io.narsor.managed"], "true");
+
+        let network = r#"{"Type":"network","Action":"connect","Actor":{"ID":"n","Attributes":{}}}"#;
+        assert_eq!(parse_container_event(network), None);
+        assert_eq!(parse_container_event("not json"), None);
+    }
+
+    /// A quiet stream that stays open still asks whether events are wanted,
+    /// so its follower stops; a stream that cannot be read stops too.
+    #[test]
+    fn the_event_pump_stops_on_a_quiet_open_stream_and_on_a_read_error() {
+        let event =
+            r#"{"Type":"container","Action":"die","Actor":{"ID":"a","Attributes":{"name":"n"}}}"#;
+        let (sender, lines) = mpsc::channel();
+        sender.send(Ok(event.to_string())).unwrap();
+        let mut seen = Vec::new();
+        let end = pump_events(&lines, Duration::from_millis(10), &mut |event| {
+            seen.push(event.map(|event| event.action));
+            seen.len() < 2
+        });
+        assert_eq!(end, PumpEnd::Unwanted);
+        assert_eq!(seen, [Some("die".to_string()), None]);
+        drop(sender);
+
+        let (sender, lines) = mpsc::channel();
+        sender.send(Err(io::Error::other("broken pipe"))).unwrap();
+        let end = pump_events(&lines, Duration::from_millis(10), &mut |_| true);
+        assert_eq!(end, PumpEnd::Failed("broken pipe".into()));
     }
 
     #[test]
