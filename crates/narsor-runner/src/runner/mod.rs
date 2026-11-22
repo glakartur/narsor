@@ -353,8 +353,8 @@ async fn work(
     let _lock = storage.lock()?;
     let store = storage.store();
 
-    let spec = match load_spec(&config, &storage, &mut link).await {
-        Ok(spec) => spec,
+    let LoadedSpec { spec, replacement } = match load_spec(&config, &storage, &mut link).await {
+        Ok(loaded) => loaded,
         Err(error) => {
             return Ok(report_problem(
                 &storage,
@@ -430,7 +430,15 @@ async fn work(
     } else {
         GitAccess::User
     };
-    if let Err(error) = initialize(&storage, &store, &config.task_id, &spec, &secrets, &git) {
+    if let Err(error) = initialize(
+        &storage,
+        &store,
+        &config.task_id,
+        &spec,
+        replacement.as_ref(),
+        &secrets,
+        &git,
+    ) {
         return Ok(report_problem(
             &storage,
             &mut link,
@@ -590,24 +598,66 @@ fn starting_harness(storage: &TaskStorage, spec: &TaskLaunchSpec) -> String {
     applied.unwrap_or_else(|| spec.environment.harness.clone())
 }
 
+/// The launch spec a working runner goes on with, and whether it replaces
+/// the storage's copy.
+#[derive(Debug)]
+struct LoadedSpec {
+    spec: TaskLaunchSpec,
+    replacement: Option<AcceptedReplacement>,
+}
+
+/// Proof that [`load_spec`] accepted a served spec as an environment-only
+/// refresh of the storage's copy: it recomputes to the pinned digest, its
+/// digest field and environment identity match its content, and everything
+/// the task was created with equals the copy. Only [`load_spec`] makes one,
+/// and only with one does [`initialize`] replace the copy and the marker's
+/// digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedReplacement {
+    /// Digest of the storage's copy the spec replaces.
+    replaced_digest: String,
+}
+
 /// The task's launch spec: the storage's copy once it holds one, else the
 /// one the control plane serves (R5, KTD3). Either must recompute to the
 /// digest the controller passed; the spec's own `digest` field is never
 /// trusted alone. Nothing is written here: [`initialize`] copies a fetched
 /// spec onto the storage.
+///
+/// A storage copy that misses the pin is the one exception: the task's
+/// environment may have been refreshed since the storage was initialized.
+/// The served spec is then accepted as an [`AcceptedReplacement`] when it
+/// differs from the copy in its environment only; any other difference
+/// refuses the copy as before.
 async fn load_spec(
     config: &RunnerConfig,
     storage: &TaskStorage,
     link: &mut Link,
-) -> Result<TaskLaunchSpec, RunnerError> {
+) -> Result<LoadedSpec, RunnerError> {
     let pinned = config.launch_digest.as_deref();
-    if let Some(spec) = storage.store().load_task_launch_spec(&config.task_id)? {
-        if let Some(pinned) = pinned {
-            spec.check_pinned_digest(pinned).map_err(|problem| {
-                RunnerError::LaunchSpec(format!("the storage's copy: {problem}"))
-            })?;
+    if let Some(stored) = storage.store().load_task_launch_spec(&config.task_id)? {
+        let unchanged = |spec| LoadedSpec {
+            spec,
+            replacement: None,
+        };
+        let Some(pinned) = pinned else {
+            return Ok(unchanged(stored));
+        };
+        let Err(problem) = stored.check_pinned_digest(pinned) else {
+            return Ok(unchanged(stored));
+        };
+        let served = fetch_pinned_spec(link, &config.timing, pinned).await?;
+        if !same_task_launch(&stored, &served) {
+            return Err(RunnerError::LaunchSpec(format!(
+                "the storage's copy: {problem}"
+            )));
         }
-        return Ok(spec);
+        return Ok(LoadedSpec {
+            spec: served,
+            replacement: Some(AcceptedReplacement {
+                replaced_digest: stored.digest,
+            }),
+        });
     }
     let pinned = pinned.ok_or_else(|| {
         RunnerError::LaunchSpec(
@@ -616,7 +666,36 @@ async fn load_spec(
                 .to_string(),
         )
     })?;
-    let fetched = fetch_launch_spec(link, &config.timing).await?;
+    let spec = fetch_pinned_spec(link, &config.timing, pinned).await?;
+    Ok(LoadedSpec {
+        spec,
+        replacement: None,
+    })
+}
+
+/// Whether `served` launches the same task as `stored`: everything but the
+/// environment (and the schema version and digest that follow the reseal)
+/// is equal. A refresh re-resolves the environment and nothing else.
+fn same_task_launch(stored: &TaskLaunchSpec, served: &TaskLaunchSpec) -> bool {
+    stored.workflow_id == served.workflow_id
+        && stored.workflow_version == served.workflow_version
+        && stored.definition == served.definition
+        && stored.inputs == served.inputs
+        && stored.workspace == served.workspace
+        && stored.resources == served.resources
+        && stored.ticket == served.ticket
+        && stored.title == served.title
+}
+
+/// The spec the control plane serves, accepted only when it recomputes to
+/// `pinned` and its digest field and environment identity match its
+/// content.
+async fn fetch_pinned_spec(
+    link: &mut Link,
+    timing: &RunnerTiming,
+    pinned: &str,
+) -> Result<TaskLaunchSpec, RunnerError> {
+    let fetched = fetch_launch_spec(link, timing).await?;
     let spec: TaskLaunchSpec = serde_json::from_value(fetched).map_err(|error| {
         RunnerError::LaunchSpec(format!(
             "the control plane served a malformed spec: {error}"

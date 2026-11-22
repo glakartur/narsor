@@ -363,6 +363,7 @@ impl Fixture {
             &storage.store(),
             &config.task_id,
             spec,
+            None,
             &MountedSecrets::new(None),
             &crate::workspace::GitAccess::User,
         )
@@ -1438,7 +1439,7 @@ async fn a_fetched_spec_is_accepted_only_with_the_pinned_digest() {
         let loaded = load_spec(&config, &storage, &mut plane.link(&config)).await;
 
         match loaded {
-            Ok(spec) => assert!(accepted && spec == honest, "{name}"),
+            Ok(loaded) => assert!(accepted && loaded.spec == honest, "{name}"),
             Err(RunnerError::LaunchSpec(problem)) => {
                 assert!(!accepted, "{name}: {problem}");
                 assert!(problem.contains(&honest.digest), "{name}: {problem}");
@@ -1490,8 +1491,216 @@ async fn a_restart_on_initialized_storage_fetches_nothing() {
         .await
         .expect("the storage's copy");
 
-    assert_eq!(loaded, spec);
+    assert_eq!(loaded.spec, spec);
     assert_eq!(plane.fetches(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// A refreshed environment on initialized storage
+// ---------------------------------------------------------------------------
+
+/// A storage a first start initialized for `spec`.
+fn initialized(root: &TempRoot, spec: &TaskLaunchSpec) -> TaskStorage {
+    let storage = TaskStorage::new(root.dir("storage"));
+    storage.prepare().expect("prepare the storage");
+    initialize(
+        &storage,
+        &storage.store(),
+        &TaskId::parse("task-1").unwrap(),
+        spec,
+        None,
+        &MountedSecrets::new(None),
+        &crate::workspace::GitAccess::User,
+    )
+    .expect("initialize the storage");
+    storage
+}
+
+/// The spec of [`ONE_STEP`] on another harness — an environment-only
+/// refresh of `spec(ONE_STEP, "claude-code")` — with `change` applied and
+/// the digest recomputed.
+fn refreshed(change: impl FnOnce(&mut TaskLaunchSpec)) -> TaskLaunchSpec {
+    let mut spec = spec(ONE_STEP, "codex");
+    change(&mut spec);
+    spec.digest = spec.compute_digest();
+    spec
+}
+
+/// Loads the spec `plane` serves under `pinned` and initializes the storage
+/// with it, as a working runner does.
+async fn load_and_initialize(
+    root: &TempRoot,
+    storage: &TaskStorage,
+    plane: &Arc<SpecPlane>,
+    pinned: &str,
+) -> Result<(TaskLaunchSpec, Initialization), RunnerError> {
+    let config = pinned_config(root, storage.root(), pinned);
+    let loaded = load_spec(&config, storage, &mut plane.link(&config)).await?;
+    let initialization = initialize(
+        storage,
+        &storage.store(),
+        &config.task_id,
+        &loaded.spec,
+        loaded.replacement.as_ref(),
+        &MountedSecrets::new(None),
+        &crate::workspace::GitAccess::User,
+    )?;
+    Ok((loaded.spec, initialization))
+}
+
+fn stored_copy(storage: &TaskStorage) -> TaskLaunchSpec {
+    storage
+        .store()
+        .load_task_launch_spec(&TaskId::parse("task-1").unwrap())
+        .unwrap()
+        .expect("the storage's copy")
+}
+
+/// A spec whose only change is the environment replaces the storage's copy
+/// and the marker's digest; the next start under the new pin works from the
+/// storage again without asking the control plane.
+#[tokio::test]
+async fn a_refreshed_environment_replaces_the_storage_copy_once() {
+    let root = TempRoot::new();
+    let old = spec(ONE_STEP, "claude-code");
+    let storage = initialized(&root, &old);
+    let before = storage.marker().unwrap().expect("the marker");
+    let new = refreshed(|_| {});
+    let plane = SpecPlane::serving(Some(serde_json::to_value(&new).unwrap()));
+
+    let (loaded, initialization) = load_and_initialize(&root, &storage, &plane, &new.digest)
+        .await
+        .expect("the refreshed spec is accepted");
+
+    assert_eq!(loaded, new);
+    assert_eq!(initialization, Initialization::Resumed);
+    assert_eq!(stored_copy(&storage), new);
+    let marker = storage.marker().unwrap().expect("the marker");
+    assert_eq!(marker.launch_digest, new.digest);
+    assert_eq!(marker.task_id, before.task_id);
+    assert_eq!(marker.workspace_commit, before.workspace_commit);
+
+    let config = pinned_config(&root, storage.root(), &new.digest);
+    let again = load_spec(&config, &storage, &mut plane.link(&config))
+        .await
+        .expect("the storage's copy");
+    assert_eq!(again.spec, new);
+    assert!(again.replacement.is_none());
+    assert_eq!(plane.fetches(), 1, "the restart did not fetch again");
+}
+
+/// The marker is written before the copy: a runner that died between the
+/// two leaves the new digest beside the old copy, and the next start
+/// replaces the copy and goes on.
+#[tokio::test]
+async fn a_replacement_interrupted_after_the_marker_is_finished_by_the_next_start() {
+    let root = TempRoot::new();
+    let old = spec(ONE_STEP, "claude-code");
+    let storage = initialized(&root, &old);
+    let new = refreshed(|_| {});
+    let marker = storage.marker().unwrap().expect("the marker");
+    storage
+        .write_marker(&marker.for_launch(&new.digest))
+        .unwrap();
+    let plane = SpecPlane::serving(Some(serde_json::to_value(&new).unwrap()));
+
+    let (loaded, _) = load_and_initialize(&root, &storage, &plane, &new.digest)
+        .await
+        .expect("the replacement is finished");
+
+    assert_eq!(loaded, new);
+    assert_eq!(stored_copy(&storage), new);
+    assert_eq!(storage.marker().unwrap().unwrap().launch_digest, new.digest);
+}
+
+/// Only an environment change replaces the copy: a served spec that misses
+/// the pin, carries a forged environment identity or changes anything the
+/// task was created with is refused, and the storage keeps its copy and
+/// marker.
+#[tokio::test]
+async fn a_served_spec_that_is_not_an_environment_refresh_leaves_the_storage_alone() {
+    let mut forged = refreshed(|_| {});
+    forged.environment.harness = "claude-code".to_string();
+    forged.digest = forged.compute_digest();
+    let immutable_changes: Vec<(&str, TaskLaunchSpec)> = vec![
+        (
+            "workflow version",
+            refreshed(|spec| spec.workflow_version += 1),
+        ),
+        (
+            "definition",
+            refreshed(|spec| spec.definition = Some(json!({"changed": true}))),
+        ),
+        (
+            "inputs",
+            refreshed(|spec| spec.inputs = json!({"injected": true})),
+        ),
+        (
+            "workspace",
+            refreshed(|spec| {
+                spec.workspace = TaskWorkspace::single(TaskRepository::new(
+                    "demo",
+                    TaskRepositorySource::Local {
+                        path: "/elsewhere".to_string(),
+                    },
+                ))
+            }),
+        ),
+        (
+            "resources",
+            refreshed(|spec| spec.resources = ResourceProfile::new(2000, 2048)),
+        ),
+        (
+            "title",
+            refreshed(|spec| spec.title = Some("Another task".to_string())),
+        ),
+        (
+            "ticket",
+            refreshed(|spec| spec.ticket = Some("NAR-1".to_string())),
+        ),
+    ];
+    let mut cases: Vec<(&str, TaskLaunchSpec, String, &str)> = vec![
+        (
+            "not the pinned spec",
+            refreshed(|_| {}),
+            spec(ONE_STEP, "gemini").digest,
+            "the control plane served",
+        ),
+        (
+            "a forged environment identity",
+            forged.clone(),
+            forged.digest.clone(),
+            "environment identity",
+        ),
+    ];
+    for (name, served) in immutable_changes {
+        let pinned = served.digest.clone();
+        cases.push((name, served, pinned, "the storage's copy"));
+    }
+    for (name, served, pinned, words) in cases {
+        let root = TempRoot::new();
+        let old = spec(ONE_STEP, "claude-code");
+        let storage = initialized(&root, &old);
+        let plane = SpecPlane::serving(Some(serde_json::to_value(&served).unwrap()));
+
+        let exit = run_on(&plane, pinned_config(&root, storage.root(), &pinned)).await;
+
+        let RunnerExit::Problem(problem) = exit else {
+            panic!("{name}: a problem: {exit:?}");
+        };
+        assert_eq!(problem.code, PROBLEM_LAUNCH_SPEC, "{name}");
+        assert!(
+            problem.message.contains(words),
+            "{name}: {}",
+            problem.message
+        );
+        assert_eq!(stored_copy(&storage), old, "{name}");
+        assert_eq!(
+            storage.marker().unwrap().unwrap().launch_digest,
+            old.digest,
+            "{name}"
+        );
+    }
 }
 
 /// A control plane that does not answer is asked again with backoff until
