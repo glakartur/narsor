@@ -9,8 +9,10 @@ listed here need no special order. The update notes of the remote backends
 ## Update to a directory per program (state ownership)
 
 This update gives every program a directory of its own below the state
-root and the work root, and moves an existing installation there once, at
-the first start of the new `narsor-server`. The move is one way.
+root and the work root. The installer of the new version moves an existing
+installation there once with `narsor-migrate`, after a backup. The programs
+themselves move nothing: the new `narsor-server` refuses to start while the
+old layout is not moved. The move is one way.
 
 ### What changes
 
@@ -30,46 +32,86 @@ keeps its value: the files move below the same root. With the built-in
 values the old files are in `global.root` and move below
 `global.root/state` and `global.root/work`. The catalogue does not move.
 
-### What the migration does
+### The installer runs the migration
 
-At start, before it reads any of its files, the new server:
+For the `local` and `server` roles the installer runs `narsor-migrate`
+after it installed the binaries and stopped the running Narsor processes
+(see [Installation](installation.md#install-a-role)):
 
-1. Takes the old `{old state}/daemon.instance.lock` without waiting. When
-   an old daemon holds it, the server stops and names the file. Nothing is
-   moved.
-2. Reads the old workload records of the local controller
-   (`{old work}/local-controller/workloads/` and `readers/`). When a runner
-   process (pid and start time) or a runner container still runs, the
-   server stops with "Stop all tasks first" and the recovery steps below.
-   Nothing is moved.
-3. Moves its own files, deletes the stale discovery and autostart files,
-   and writes the marker `{state}/narsor-server/layout-migrated`.
-4. Starts the local controller with `--legacy-dir <old state>/local-controller`
-   and `--legacy-work-dir <old work>/local-controller`. The controller takes
-   the old `credential.lock`, records its `controller-id` from the old
-   directory (so the Docker images it built earlier stay its own), moves its
-   entries, renames the Claude Code sessions of the tasks (see below),
-   changes the workspace paths in the stored execution of each task to the
-   new storage path (so a stopped task resumes in its moved workspace) and
-   writes the marker `{state}/narsor-controller-local/layout-migrated`.
-   It removes the old `local-controller/` directories when they are empty.
+- **Interactive:** `narsor-migrate` prints its plan, runs its checks and
+  asks `Back up and migrate now? [y/N]`.
+- **`--non-interactive --migrate`:** it migrates without a question
+  (`--yes`). A refusal or a failure makes the installation fail.
+- **`--non-interactive` without `--migrate`:** the installer prints the plan
+  and the command to run; nothing is moved.
+- **Narsor still running** (you answered no to stopping it): the installer
+  skips the migration with a highlighted message and the command to run.
+
+Until the migration is done, the new `narsor-server` stops at start with a
+message that lists the old entries it found and the exact `narsor-migrate`
+command. A fresh installation has no old entries and starts normally.
+
+### What `narsor-migrate` does
+
+`narsor-migrate` reads the configuration as `narsor-server` does (`--config
+<file>`, `--root <dir>`, the `NARSOR_*` variables and the configuration file
+it finds) and works out the old roots from it. One run:
+
+1. **Finds what is left of the old layout.** With nothing there, or with the
+   marker `{state}/narsor-server/layout-migrated`, it prints
+   `Nothing to migrate.` and exits 0.
+2. **Prints the plan:** every entry that moves and its new place, the stale
+   files it deletes, the old entries it leaves, what the backup holds, the
+   estimated backup size and the free space where it goes.
+3. **Checks, before it changes anything,** and refuses (exit 3) when:
+   - an old daemon holds `{old state}/daemon.instance.lock`, a new server
+     holds `{state}/narsor-server/daemon.instance.lock`, or an old or new
+     local controller holds its `credential.lock`;
+   - a runner of the old local controller still lives: a process (pid and
+     start time in `{old work}/local-controller/workloads/` and `readers/`)
+     or a container that `docker` reports as running;
+   - a workload record names a container and `docker` cannot answer (no
+     `docker`, no daemon, no permission). Check with
+     `docker ps --filter label=io.narsor.workload` yourself, remove what
+     runs, and run again with `--assume-containers-stopped`;
+   - an entry to move is a symbolic link;
+   - the backup needs more than the free space on its filesystem (the
+     estimate plus 10 %). Choose another place with `--backup-dir`.
+4. **Asks for confirmation** on a terminal. Without a terminal it refuses
+   (exit 4) unless you pass `--yes`.
+5. **Writes the backup** (see below).
+6. **Moves the files.** It moves the server's entries by allowlist, splits
+   the old `local-controller/` into the controller's state and work
+   directories, records the controller's `controller-id` from the old
+   directory (so the Docker images it built earlier stay its own), renames
+   the Claude Code sessions of the tasks (see below), changes the workspace
+   paths in the stored execution of each task to the new storage path (so a
+   stopped task resumes in its moved workspace), deletes the stale discovery,
+   autostart, instance lock and web session files, and writes the markers
+   `{state}/narsor-controller-local/layout-migrated` and, last,
+   `{state}/narsor-server/layout-migrated`. It removes the old
+   `local-controller/` directories when they are empty.
+7. **Prints a summary:** the backup, what moved, what was deleted and what
+   is left for you to delete.
 
 Within one filesystem each entry is renamed. Across filesystems it is
-copied, compared with the source, given its original modes again
-(`0600` files, `0700` directories), and then the source is deleted. A
-source that is a symbolic link is refused. A failed move stops the program
-and names the file; correct the cause and start again. A start after a
-crash finishes the move. A program that finds its marker does not migrate
-again.
+copied, compared with the source (entries, bytes, links, modes and
+modification times), given its original modes and times again (`0600` files,
+`0700` directories), and then the source is deleted. Sockets and FIFOs are
+not copied; a warning names each one. A read-only directory of a task (for
+example a module cache) is made writable for its owner when the copied
+source must be deleted. A failed move stops the run (exit 1) and names the
+file; correct the cause and run `narsor-migrate` again. A run after a crash
+finishes the move.
 
-A copy across filesystems can take long. The server waits up to 30 minutes
-for its controller while it can migrate, and logs that it waits. A client
-started in that time can stop waiting before; start it again when the server
-log says that the local controller holds its lease.
+`secrets/` and `images/` that a newer `narsor-cli secret set` or
+`narsor-cli image refresh` created before the migration are merged: the new
+entries stay, the old ones are added, and an old entry with the same name
+as a new one stays in the old `local-controller/` directory with a warning.
 
 **Claude Code sessions.** The workspace of every task moves with its
 storage, and Claude Code finds a session by its working directory. In
-each task's private HOME on storage, the controller renames
+each task's private HOME on storage, the migration renames
 `home/.claude/projects/<key of the old path>` to the key of the new path,
 so a stopped task resumes its session. Not covered:
 
@@ -77,74 +119,145 @@ so a stopped task resumes its session. Not covered:
   `CLAUDE_CONFIG_DIR` outside its storage: its sessions are in your own
   `~/.claude/projects/` under the old path, and the task cannot resume them;
 - a path longer than 200 characters, which Claude Code shortens with a
-  hash: the controller logs a warning and leaves that session.
+  hash: a warning names that session and it is left.
 
 A task in the Docker work mode sees its storage at the same path inside
 its container, so its sessions are renamed the same way.
 
+### Exit status of `narsor-migrate`
+
+| Status | Meaning |
+|---|---|
+| 0 | Migrated, nothing to migrate, or a dry run with nothing to refuse |
+| 1 | The migration started and stopped; the message names the file. Run it again to finish |
+| 2 | Wrong command line or a configuration that does not hold up |
+| 3 | Refused before anything changed |
+| 4 | Not confirmed; nothing changed |
+
+### The backup
+
+The backup is a zstd-compressed tar archive, written before anything moves:
+`<global.root>/backups/layout-migration-<UTC time>.tar.zst` (for example
+`~/.narsor/backups/layout-migration-20261122T101500Z.tar.zst`). The
+directory is created `0700`, the archive `0600`. `--backup-dir <dir>` puts it
+elsewhere; `--no-backup` skips it.
+
+It holds the old-layout entries only, not the whole root: with the built-in
+values the old state root is `global.root`, which also holds the catalogue
+and the new directories. These entries go in, from the old state root:
+`auth/`, `orchestration/`, `materials/`, `observer-queues/`,
+`agent-harness.json`, `narsor.log`, `local-controller/`, the daemon files
+(`daemon.json`, `daemon.lock`, `daemon.lock.guard`, `daemon.instance.lock`),
+the web session files, and the old `executions/`, `launch-specs/` and
+`observers/`; from the old work root (when it is another directory) its
+`local-controller/`. Modes, times and symbolic links (as links) are kept;
+sockets and FIFOs are left out. Each entry is stored under its absolute path
+without the leading `/`. After writing, the archive is read back and its
+entries counted.
+
+`narsor-cli purge` and `install.sh --uninstall --purge` delete the data
+directory with its `backups/`. Copy a backup elsewhere if you want to keep
+it.
+
+### Restore the backup
+
+1. Stop every Narsor process (`narsor-server stop`).
+2. Remove what the migration made: `{state}/narsor-server/`,
+   `{state}/narsor-controller-local/` and `{work}/narsor-controller-local/`
+   (with the built-in values: `~/.narsor/state/narsor-server/` and so on).
+   Anything the new version wrote there is lost.
+3. Extract the archive at `/`; it puts every entry back at its old path:
+
+   ```bash
+   tar --zstd -xpf ~/.narsor/backups/layout-migration-20261122T101500Z.tar.zst -C /
+   ```
+
+   Without `tar --zstd` (GNU tar older than 1.31):
+   `zstd -dc <archive> | tar -xpf - -C /`.
+4. Install the older binaries (see "Rollback").
+
+### Run it by hand
+
+```bash
+narsor-migrate --dry-run                    # plan and checks only
+narsor-migrate                              # asks before it changes anything
+narsor-migrate --config /etc/narsor/config.yaml --yes
+narsor-migrate --root /srv/narsor --backup-dir /mnt/backup
+```
+
+`--root` and `--config` mean what they mean for `narsor-server`. Run it with
+the same environment as the server, so that `NARSOR_*` variables give the
+same roots.
+
 ### Before the update
 
-1. **Back up the state root and the work root** (with the built-in values:
-   the whole `global.root`). The migration is one way: the backup is the
-   only rollback.
-2. **Stop all tasks and the server** (`narsor-server stop`). Make sure no
-   runner outlived it (see "Runners that still run").
+1. Stop all tasks and the server (`narsor-server stop`), or let the
+   installer stop them. Make sure no runner outlived them (see "Runners that
+   still run").
+2. Make sure the backup fits: `narsor-migrate --dry-run` of the new version
+   prints its estimated size and the free space. A separate backup of the
+   state and work roots is still a good idea.
 
 ### Update order
 
-1. Update all binaries together (`narsor-server`, `narsor-controller`,
-   `narsor-runner`, `narsor-cli`, `narsor`, `narsor-web`,
-   `narsor-observer-worker`): they must sit next to each other and be of
-   the same version.
+1. Update all binaries together with the installer (`narsor-server`,
+   `narsor-controller`, `narsor-runner`, `narsor-cli`, `narsor`,
+   `narsor-web`, `narsor-observer-worker`, `narsor-migrate`): they must sit
+   next to each other and be of the same version. The installer runs the
+   migration.
 2. Kubernetes: apply the new `controller-rbac.yaml` before you deploy the
    new controller image (see
    [Remote execution backends](remote-backends.md)).
-3. Start the server. The migration runs and the server logs what it moved.
-   Start the server before you use `narsor-cli secret set` or
-   `narsor-cli image refresh`: when you use them first, the migration keeps
-   the new `secrets/` and `images/` entries, adds the old entries with other
-   names, and leaves each old entry of the same name in the old
-   `local-controller/` directory with a warning in the log.
-4. Then start the controllers on other machines.
+3. Start the server.
+4. Then migrate and start the controllers on other machines (see
+   "Controllers started by hand").
 
 ### Runners that still run
 
-When the server refuses with "Stop all tasks first", a runner of the old
-installation is still alive. To recover by hand:
+When `narsor-migrate` refuses with "Stop all tasks first", a runner of the
+old installation is still alive. To recover by hand:
 
 1. Kill the runner processes. Each one has the variable
    `NARSOR_LOCAL_WORKLOAD_UID` in its environment, for example:
    `grep -l NARSOR_LOCAL_WORKLOAD_UID /proc/[0-9]*/environ`.
 2. Remove the runner containers:
    `docker rm -f $(docker ps -q --filter label=io.narsor.workload)`.
-3. Start the server again. After the migration the controller does not
+3. Run `narsor-migrate` again. After the migration the controller does not
    find these runners, reports them lost, and the control plane resumes
    the tasks (D58).
 
 ### Controllers started by hand
 
-A controller started by hand (`narsor-controller local`) now takes
-`--state-root` (by default `$XDG_STATE_HOME/narsor`) and `--work-root` in
-place of `--credential-file` and `--storage`. Its credential is no longer
-found at the old place (`$XDG_STATE_HOME/narsor/workstation-controller/`),
-so it must enroll again with a new enrollment code. To keep the old
-credential and the task storages, stop the old controller and its runners,
-and start the new one once with the old directories:
+A controller started by hand (`narsor-controller local`) on another machine
+now takes `--state-root` (by default `$XDG_STATE_HOME/narsor`) and
+`--work-root` in place of `--credential-file` and `--storage`. Its credential
+is no longer found at the old place
+(`$XDG_STATE_HOME/narsor/workstation-controller/`). Either:
 
-```bash
-narsor-controller local --control-plane https://narsor.example \
-  --work-root ~/narsor-laptop \
-  --legacy-dir "$XDG_STATE_HOME/narsor/workstation-controller" \
-  --legacy-work-dir ~/narsor-laptop
-```
+- **Migrate it.** Install the new version on that machine, stop the old
+  controller and its runners, and run `narsor-migrate controller` there with
+  the old directories and the new roots. It makes the same checks, a backup
+  in `<state root>/backups/` and the same moves as for an installation:
 
-The controller does not check for live runners itself: only start it this
-way when no runner of the old controller runs.
+  ```bash
+  narsor-migrate controller \
+    --legacy-dir "$XDG_STATE_HOME/narsor/workstation-controller" \
+    --legacy-work-dir ~/narsor-laptop \
+    --work-root ~/narsor-laptop
+  narsor-controller local --control-plane https://narsor.example \
+    --work-root ~/narsor-laptop
+  ```
+
+  `--legacy-dir` is the old credential directory, `--legacy-work-dir` the old
+  `--storage` (default: `--legacy-dir`), `--state-root` the new state root
+  (default `$XDG_STATE_HOME/narsor`). Its backup holds the entries that move.
+- **Enroll it again** with a new enrollment code. Its old task storages are
+  not used.
 
 ### After the update
 
 These old entries are left in place for you to delete by hand when you
-no longer need them:
+no longer need them (they are in the backup):
 
 - `{old state}/executions/` and `{old state}/launch-specs/`: records of
   the former in-process execution;
@@ -155,7 +268,7 @@ no longer need them:
 
 There is no rollback by downgrade: an older server does not find the
 moved files and starts as a new installation. To go back, stop the new
-server, restore the backup of the state and work roots, and install the
+server, restore the backup (see "Restore the backup"), and install the
 older binaries.
 
 ## Update to archive only at a terminal state (D80)

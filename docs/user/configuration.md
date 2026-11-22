@@ -442,6 +442,7 @@ repository registry and the other catalogue files. With the built-in values
 
 ```text
 {root}/                              # the catalogue (server.catalog)
+├── backups/                         # 0700: backups of narsor-migrate (layout-migration-*.tar.zst)
 ├── state/                           # the state root (server.state)
 │   ├── run/                         # 0700: the meeting place of the server and its clients
 │   │   ├── daemon.json              # discovery: address, token, pid (0600)
@@ -454,7 +455,7 @@ repository registry and the other catalogue files. With the built-in values
 │   │   ├── observer-queues/         # queue entries, automation state
 │   │   ├── agent-harness.json       # the default harness selection
 │   │   ├── daemon.instance.lock     # held by the running server
-│   │   └── layout-migrated          # marker of the one-time layout migration
+│   │   └── layout-migrated          # marker of the one-time layout migration (narsor-migrate)
 │   ├── narsor-controller-local/     # the local controller (narsor-controller local)
 │   │   ├── credential(.lock)        # its identity, written at enrollment
 │   │   ├── controller-id            # label of the Docker images it builds
