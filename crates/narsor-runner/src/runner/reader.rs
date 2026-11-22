@@ -13,7 +13,7 @@
 //!    mount too;
 //! 2. finds the initialization marker and the launch spec on the storage;
 //! 3. long-polls with `read_only` set and answers only page, event,
-//!    conductor and details reads, until the directive is anything but `continue` or the
+//!    conductor, details and state reads, until the directive is anything but `continue` or the
 //!    control plane refuses its credential.
 //!
 //! It skips every step of a working start that writes: no directory
@@ -35,7 +35,8 @@ use std::time::Duration;
 use crate::api::ClientError;
 use crate::controller_client::{
     ConductorReadRequest, ConversationPageRequest, ExecutionDetailsRequest, ExecutionEventsPage,
-    ExecutionEventsRequest, RelayFailure, RunnerDirective, RunnerPollQuery, RunnerPollResponse,
+    ExecutionEventsRequest, ExecutionStateRequest, RelayFailure, RunnerDirective, RunnerPollQuery,
+    RunnerPollResponse, STATE_TOO_LARGE,
 };
 use crate::persistence::ExecutionStore;
 use narsor_protocol::controller::RunnerProblem;
@@ -182,6 +183,12 @@ fn waiting_request_ids(response: RunnerPollResponse) -> Vec<String> {
                 .into_iter()
                 .map(|request| request.request_id),
         )
+        .chain(
+            response
+                .execution_states
+                .into_iter()
+                .map(|request| request.request_id),
+        )
         .collect()
 }
 
@@ -256,6 +263,9 @@ async fn answer(
     }
     for request in response.execution_details {
         serve_details(link, timing, store, execution_id, request).await;
+    }
+    for request in response.execution_states {
+        serve_state(link, timing, store, execution_id, request).await;
     }
     None
 }
@@ -362,6 +372,51 @@ pub(super) async fn serve_details(
         .await
     {
         link.failed(&error, timing);
+    }
+}
+
+/// Uploads the complete state of the execution an owner waits for: its
+/// context, the local values of each step, the conductor's state. A state
+/// the control plane refuses as too large fails the read: sending it again
+/// on every poll could not succeed and would only slow the link.
+pub(super) async fn serve_state(
+    link: &mut Link,
+    timing: &RunnerTiming,
+    store: &ExecutionStore,
+    execution_id: &str,
+    request: ExecutionStateRequest,
+) {
+    let Some(client) = link.client() else {
+        return;
+    };
+    let state = match crate::api::execution_state(store, execution_id) {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(%error, "cannot read the execution's state");
+            fail_read(link, timing, &request.request_id, &error.to_string()).await;
+            return;
+        }
+    };
+    match client
+        .upload_execution_state(&request.request_id, &state)
+        .await
+    {
+        Ok(_) => {}
+        Err(error) => match refused_state_reason(&error) {
+            Some(reason) => fail_read(link, timing, &request.request_id, reason).await,
+            None => link.failed(&error, timing),
+        },
+    }
+}
+
+/// Why the control plane will never take a state upload it refused, or
+/// `None` when the refusal is the link's and sending again may work.
+fn refused_state_reason(error: &ClientError) -> Option<&'static str> {
+    match error {
+        ClientError::Request { code, .. } if code == STATE_TOO_LARGE => {
+            Some("state too large to send")
+        }
+        _ => None,
     }
 }
 
@@ -635,5 +690,68 @@ mod tests {
         assert!(!view.available);
         assert_eq!(view.unavailable_reason.as_deref(), Some(NO_CONDUCTOR));
         assert!(view.chat.is_empty());
+    }
+
+    /// A poll answer an older control plane sends has no state reads, and
+    /// one with them hands their ids out beside the other kinds: a reader
+    /// without an execution fails each of them.
+    #[test]
+    fn a_reader_without_an_execution_fails_state_reads_like_the_other_kinds() {
+        let response = |extra: serde_json::Value| -> RunnerPollResponse {
+            let mut answer = serde_json::json!({
+                "directive": "continue",
+                "generation": 1,
+                "runner_state": "running",
+                "inputs": [],
+                "credential_expires_at": "2026-11-22T00:00:00Z",
+                "launch": { "incarnation": "reader-1", "launch_generation": 1 },
+                "execution_details": [{ "request_id": "details-1" }],
+            });
+            answer
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(answer).unwrap()
+        };
+
+        assert_eq!(
+            waiting_request_ids(response(serde_json::json!({}))),
+            vec!["details-1"]
+        );
+        assert_eq!(
+            waiting_request_ids(response(serde_json::json!({
+                "execution_states": [{ "request_id": "state-1" }],
+            }))),
+            vec!["details-1", "state-1"]
+        );
+    }
+
+    /// Only a state the control plane refuses as too large ends the read;
+    /// any other failure is the link's, and the upload is tried again.
+    #[test]
+    fn only_a_state_refused_as_too_large_ends_the_read() {
+        let cases = [
+            (
+                ClientError::Request {
+                    code: STATE_TOO_LARGE.to_string(),
+                    message: "too large".to_string(),
+                },
+                Some("state too large to send"),
+            ),
+            (
+                ClientError::Unavailable("connection reset".to_string()),
+                None,
+            ),
+            (
+                ClientError::Degraded {
+                    code: "busy".to_string(),
+                    message: "later".to_string(),
+                },
+                None,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(refused_state_reason(&error), expected, "{error}");
+        }
     }
 }
