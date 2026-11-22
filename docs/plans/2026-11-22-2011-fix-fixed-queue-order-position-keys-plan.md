@@ -352,7 +352,7 @@ flowchart TB
 - Q1 (DECIDED by the owner: option 1). Product Contract, R1 (which tasks are out of the order). Does a task in `Archiving` (archive asked for, not yet confirmed) leave the order now, or only when it is `Archived`?
   - Option 1 (recommended): Only `Archived` leaves the order. An `Archiving` task still holds a slot and still shows in the list, and it leaves the order when the archive completes.
   - Option 2: `Archiving` and `Archived` both leave the order. Positions change when the owner asks for the archive, not when it completes.
-- Q2. Product Contract, R13 and A5 (position shown for an archived task). What does `rank` show for an archived task, which has no position?
+- Q2 (DECIDED by the owner: option 1, no client changes; `rank` is 0 for an archived task). Product Contract, R13 and A5 (position shown for an archived task). What does `rank` show for an archived task, which has no position?
   - Option 1 (recommended): `rank` is 0 and no client changes. The CLI shows `#0` for archived tasks in `task list --archived`. This keeps the scope rule that clients do not change.
   - Option 2: `rank` is 0, and the CLI list line shows `#-` instead of `#0`. One small change in `src/cli/task_text.rs`.
   - Option 3: An archived task keeps the last position it had before the archive. This needs a stored field.
