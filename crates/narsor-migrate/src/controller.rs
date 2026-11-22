@@ -3,42 +3,38 @@
 //!
 //! The old controller kept everything in one `local-controller/` directory
 //! of the old state root (credential side) and of the old work root
-//! (storage side), one directory with the defaults. `narsor-server` checks
-//! that no old daemon and no old runner lives, moves its own files and then
-//! starts this controller with `--legacy-dir` (and `--legacy-work-dir`).
-//! Before it takes its own credential lock, [`migrate`]:
+//! (storage side), one directory with the defaults; a controller started by
+//! hand had a credential directory and a storage directory of its own.
+//! After the refusal checks ([`crate::refusal`]), [`migrate`]:
 //!
 //! 1. does nothing when its marker is in its state directory;
-//! 2. takes the old `credential.lock` (an old controller still stopping is
-//!    waited for);
-//! 3. records the `controller-id` from the old directory (KTD8), before
+//! 2. records the `controller-id` from the old directory (KTD8), before
 //!    anything moves, so the images built earlier stay this controller's;
-//! 4. moves its entries ([`STATE_ENTRIES`], [`WORK_ENTRIES`]), splitting
+//! 3. moves its entries ([`STATE_ENTRIES`], [`WORK_ENTRIES`]), splitting
 //!    them between its state and work directories;
 //!    `secrets/` and `images/` merge into a target a newer `narsor-cli`
 //!    already created ([`MERGED_ENTRIES`]);
-//! 5. renames the Claude Code session directories of every task, keyed by
+//! 4. renames the Claude Code session directories of every task, keyed by
 //!    the old workspace path, to the key of the new one ([`claude_project_key`]),
 //!    and rewrites the workspace paths each stored execution recorded below
 //!    the old storage directory ([`rebase_workspace_paths`]);
-//! 6. writes its marker, then removes the old directories when empty.
+//! 5. writes its marker, then removes the old directories when empty.
 //!
 //! A repeat finishes what a crash left: every move and rename is done per
 //! entry and skipped when done.
 
 use std::fs;
 use std::io;
-use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
+use narsor_controller::local::paths::{ControllerStatePaths, ControllerWorkPaths};
 use narsor_model::domain::WorkflowExecution;
-use narsor_shared::layout_move::{self, Mover};
 use narsor_store::paths::EXECUTIONS_DIR;
 use narsor_store::ExecutionStore;
+use sha2::{Digest as _, Sha256};
 
-use super::container::image;
-use super::paths::{ControllerStatePaths, ControllerWorkPaths};
+use crate::mover::{self, Moved, Mover};
 
 /// The old entries of the credential side that go to the state directory.
 pub const STATE_ENTRIES: [&str; 3] = ["credential", "secrets", "images"];
@@ -58,7 +54,7 @@ pub const WORK_ENTRIES: [(&str, bool); 4] = [
 pub const MERGED_ENTRIES: [&str; 2] = ["secrets", "images"];
 
 /// The old credential lock: moved last.
-const CREDENTIAL_LOCK: &str = "credential.lock";
+pub const CREDENTIAL_LOCK: &str = "credential.lock";
 
 /// Where Claude Code keeps its sessions, inside a task's private HOME on
 /// its storage.
@@ -72,10 +68,7 @@ const TASK_STATE_DIR: &str = "state";
 /// a hash this migration cannot reproduce.
 const CLAUDE_KEY_LIMIT: usize = 200;
 
-/// How long the old credential lock is waited for between tries.
-const LOCK_RETRY: Duration = Duration::from_millis(100);
-
-/// The controller's old directories (`--legacy-dir`, `--legacy-work-dir`).
+/// The controller's old directories.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyDirs {
     /// The old `{state}/local-controller`: credential, secrets, images.
@@ -88,7 +81,7 @@ pub struct LegacyDirs {
 /// What [`migrate`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// The marker was there: an earlier start migrated.
+    /// The marker was there: an earlier run migrated.
     AlreadyMigrated,
     /// Migrated now: the entries that moved, the Claude session
     /// directories renamed and the stored executions whose workspace paths
@@ -106,14 +99,12 @@ pub fn migrate(
     state: &ControllerStatePaths,
     work: &ControllerWorkPaths,
     mover: Mover,
-    lock_timeout: Duration,
 ) -> Result<Outcome, String> {
-    if layout_move::marker_present(state.dir()) {
+    if mover::marker_present(state.dir()) {
         return Ok(Outcome::AlreadyMigrated);
     }
-    let lock = lock_old_credential(&legacy.state.join(CREDENTIAL_LOCK), lock_timeout)?;
     if legacy.state.exists() {
-        image::seed_controller_id(state, &legacy.state).map_err(|error| {
+        seed_controller_id(state, &legacy.state).map_err(|error| {
             format!(
                 "cannot record the controller id in {}: {error}",
                 state.controller_id_file().display()
@@ -138,7 +129,7 @@ pub fn migrate(
             mover.move_entry(&from.join(name), &to.join(name))
         };
         match outcome {
-            Ok(layout_move::Moved::Moved) => {
+            Ok(Moved::Moved) => {
                 moved.push(name.to_string());
                 Ok(())
             }
@@ -157,26 +148,15 @@ pub fn migrate(
 
     let sessions = rename_claude_sessions(&old_storage, &work.storage_dir());
     let executions = rebase_workspace_paths(&old_storage, &work.storage_dir());
-    layout_move::write_marker(state.dir()).map_err(|error| {
+    mover::write_marker(state.dir()).map_err(|error| {
         format!(
             "cannot write the migration marker in {}: {error}",
             state.dir().display()
         )
     })?;
-    drop(lock);
     // Only empty ones go; anything left stays for the operator.
     let _ = fs::remove_dir(&legacy.state);
     let _ = fs::remove_dir(&legacy.work);
-    if !moved.is_empty() {
-        tracing::info!(
-            state = %state.dir().display(),
-            work = %work.dir().display(),
-            entries = %moved.join(", "),
-            sessions,
-            executions,
-            "migration: moved the controller's files to the new layout"
-        );
-    }
     Ok(Outcome::Migrated {
         moved,
         sessions,
@@ -188,12 +168,8 @@ pub fn migrate(
 /// one by one, so a repeat finishes what a crash left. An entry whose name
 /// `to` already holds was written after the update and is newer: it stays,
 /// and the old one is left beside the old directory with a warning.
-fn merge_dir(
-    mover: Mover,
-    from: &Path,
-    to: &Path,
-) -> Result<layout_move::Moved, layout_move::MoveError> {
-    let fail = |reason: String| layout_move::MoveError {
+fn merge_dir(mover: Mover, from: &Path, to: &Path) -> Result<Moved, mover::MoveError> {
+    let fail = |reason: String| mover::MoveError {
         source: from.to_path_buf(),
         target: to.to_path_buf(),
         reason,
@@ -208,14 +184,14 @@ fn merge_dir(
     for name in &mut names {
         if let Some(original) = name
             .to_str()
-            .and_then(|name| name.strip_suffix(layout_move::MOVED_SUFFIX))
+            .and_then(|name| name.strip_suffix(mover::MOVED_SUFFIX))
         {
             *name = original.into();
         }
     }
     names.sort();
     names.dedup();
-    let mut outcome = layout_move::Moved::AlreadyThere;
+    let mut outcome = Moved::AlreadyThere;
     for name in names {
         let (source, target) = (from.join(&name), to.join(&name));
         let kept = fs::symlink_metadata(&source).is_ok() && fs::symlink_metadata(&target).is_ok();
@@ -223,8 +199,8 @@ fn merge_dir(
             tracing::warn!(old = %source.display(), kept = %target.display(), "migration: a newer entry of the same name is already in the new layout; keeping it and leaving the old one");
             continue;
         }
-        if mover.move_entry(&source, &target)? == layout_move::Moved::Moved {
-            outcome = layout_move::Moved::Moved;
+        if mover.move_entry(&source, &target)? == Moved::Moved {
+            outcome = Moved::Moved;
         }
     }
     // Only an empty one goes; a kept conflict stays for the operator.
@@ -477,57 +453,52 @@ fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Takes the old credential lock, waiting up to `timeout` for an old
-/// controller to stop; `None` when there is no such file.
-fn lock_old_credential(path: &Path, timeout: Duration) -> Result<Option<fs::File>, String> {
-    let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("cannot open {}: {error}", path.display())),
-    };
-    let deadline = Instant::now() + timeout;
-    loop {
-        // SAFETY: flock on a descriptor this function owns.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(Some(file));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::WouldBlock {
-            return Err(format!("cannot lock {}: {error}", path.display()));
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "an old narsor-controller holds {}; stop it, then start again: nothing was moved",
-                path.display()
-            ));
-        }
-        std::thread::sleep(LOCK_RETRY);
+/// Records, before anything moves, the id of the controller whose old
+/// directory was `old_dir` as the `controller-id` of `paths` (KTD8): the
+/// first 16 hex digits of the sha256 of the canonical old path, the value
+/// the controller used as its image label, so the images it built keep
+/// matching. An id already recorded stays.
+pub fn seed_controller_id(paths: &ControllerStatePaths, old_dir: &Path) -> io::Result<()> {
+    let file = paths.controller_id_file();
+    if fs::read_to_string(&file).is_ok_and(|text| !text.trim().is_empty()) {
+        return Ok(());
     }
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(paths.dir())?;
+    let temporary = mover::with_suffix(&file, ".tmp");
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    io::Write::write_all(
+        &mut out,
+        format!("{}\n", id_of_directory(old_dir)).as_bytes(),
+    )?;
+    out.sync_all()?;
+    fs::rename(&temporary, &file)
+}
+
+/// The first 16 hex digits of the sha256 of the canonical path of `dir`.
+fn id_of_directory(dir: &Path) -> String {
+    let canonical = fs::canonicalize(dir)
+        .or_else(|_| std::path::absolute(dir))
+        .unwrap_or_else(|_| dir.to_path_buf());
+    Sha256::digest(canonical.as_os_str().as_encoded_bytes())
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Temp;
     use std::os::unix::fs::PermissionsExt as _;
-
-    struct Temp(PathBuf);
-
-    impl Temp {
-        fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "narsor-controller-migration-{}",
-                uuid::Uuid::new_v4()
-            ));
-            fs::create_dir_all(&dir).unwrap();
-            Self(fs::canonicalize(&dir).unwrap())
-        }
-    }
-
-    impl Drop for Temp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 
     #[test]
     fn a_claude_key_replaces_every_other_character_with_a_dash() {
@@ -553,58 +524,6 @@ mod tests {
             state: dir.to_path_buf(),
             work: dir.to_path_buf(),
         }
-    }
-
-    #[test]
-    fn splits_the_old_directory_and_records_the_old_controller_id() {
-        let temp = Temp::new();
-        let legacy = old_controller(&temp.0.join("local-controller"));
-        let old_id = {
-            let old_paths = ControllerStatePaths::new(temp.0.join("scratch"));
-            image::seed_controller_id(&old_paths, &legacy.state).unwrap();
-            fs::read_to_string(old_paths.controller_id_file()).unwrap()
-        };
-        let state = ControllerStatePaths::new(temp.0.join("state"));
-        let work = ControllerWorkPaths::new(temp.0.join("work"));
-
-        let outcome = migrate(&legacy, &state, &work, Mover::new(), Duration::ZERO).unwrap();
-
-        assert!(matches!(outcome, Outcome::Migrated { .. }), "{outcome:?}");
-        assert_eq!(
-            fs::read_to_string(state.credential_file()).unwrap(),
-            "token"
-        );
-        assert!(state.secrets_dir().is_dir());
-        assert!(state.tasks_dir().join("task-1.json").is_file());
-        assert!(state.credential_lock_file().is_file());
-        assert!(work.storage_dir().join("task-1/workspace").is_dir());
-        assert!(!legacy.state.exists(), "the emptied old directory goes");
-        assert_eq!(
-            image::controller_id(&state),
-            old_id.trim(),
-            "images built before the move stay this controller's"
-        );
-        assert_eq!(
-            migrate(&legacy, &state, &work, Mover::new(), Duration::ZERO).unwrap(),
-            Outcome::AlreadyMigrated
-        );
-    }
-
-    #[test]
-    fn a_held_old_credential_lock_refuses_before_anything_moves() {
-        let temp = Temp::new();
-        let legacy = old_controller(&temp.0.join("local-controller"));
-        let _old = lock_old_credential(&legacy.state.join(CREDENTIAL_LOCK), Duration::ZERO)
-            .unwrap()
-            .unwrap();
-        let state = ControllerStatePaths::new(temp.0.join("state"));
-        let work = ControllerWorkPaths::new(temp.0.join("work"));
-
-        let error = migrate(&legacy, &state, &work, Mover::new(), Duration::ZERO).unwrap_err();
-
-        assert!(error.contains("credential.lock"), "{error}");
-        assert!(legacy.state.join("credential").is_file());
-        assert!(!state.controller_id_file().exists());
     }
 
     fn paused_execution(workspace_dir: &Path, elsewhere: &str) -> WorkflowExecution {
@@ -663,7 +582,7 @@ mod tests {
         let state = ControllerStatePaths::new(temp.0.join("state"));
         let work = ControllerWorkPaths::new(temp.0.join("work"));
 
-        let outcome = migrate(&legacy, &state, &work, Mover::new(), Duration::ZERO).unwrap();
+        let outcome = migrate(&legacy, &state, &work, Mover::new()).unwrap();
 
         assert!(
             matches!(outcome, Outcome::Migrated { executions: 1, .. }),
@@ -768,7 +687,7 @@ mod tests {
         fs::write(state.secrets_dir().join("token"), "new").unwrap();
         let work = ControllerWorkPaths::new(temp.0.join("work"));
 
-        migrate(&legacy, &state, &work, Mover::copying(), Duration::ZERO).unwrap();
+        migrate(&legacy, &state, &work, Mover::copying()).unwrap();
 
         assert_eq!(
             fs::read_to_string(state.secrets_dir().join("token")).unwrap(),
@@ -778,7 +697,7 @@ mod tests {
             fs::read_to_string(state.secrets_dir().join("key")).unwrap(),
             "old key"
         );
-        assert!(layout_move::marker_present(state.dir()));
+        assert!(mover::marker_present(state.dir()));
         assert!(
             legacy.state.join("secrets/token").is_file(),
             "the older value stays for the operator"
@@ -808,7 +727,7 @@ mod tests {
         let state = ControllerStatePaths::new(temp.0.join("link/state"));
         let work = ControllerWorkPaths::new(temp.0.join("link/work"));
 
-        migrate(&legacy, &state, &work, Mover::new(), Duration::ZERO).unwrap();
+        migrate(&legacy, &state, &work, Mover::new()).unwrap();
 
         let storage = work.storage_dir().join("task-1");
         let projects = storage.join(CLAUDE_PROJECTS);

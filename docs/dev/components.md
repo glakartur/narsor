@@ -10,19 +10,20 @@ decisions behind this structure, see `architecture.md`.
 |---|---|
 | `narsor` (root, `src/`) | The `narsor` (TUI) and `narsor-cli` binaries and the client library they share. `TuiStatePaths` (`src/tui/paths.rs`): the TUI log in `state/narsor/`. |
 | `narsor-protocol` | Wire types shared by clients and services: REST API, events, controller protocol, panel forms. |
-| `narsor-shared` | Small contracts shared by the processes: API errors, configuration, `RunPaths` (`run_paths.rs`: the rendezvous directory `state/run/`, created `0700` by `RunPaths::prepare`) and `config/old_layout.rs` (the pre-D82 locations, read only by the one-time migration). |
+| `narsor-shared` | Small contracts shared by the processes: API errors, configuration, `RunPaths` (`run_paths.rs`: the rendezvous directory `state/run/`, created `0700` by `RunPaths::prepare`) and `config/old_layout.rs` (the pre-D82 locations: moved by `narsor-migrate`, looked at by `narsor-server` to refuse a start on them). |
 | `narsor-api-client` | HTTP/SSE client transport; discovers a running `narsor-server` in `state/run/` or launches one. |
 | `narsor-controller-runtime` | Lifecycle helpers shared by the local controller and the `narsor-controller` process; `WakeSignal`/`WakeListener`, which carry a backend event to the controller loop. |
 | `narsor-controller-client` | The client side of the controller protocol: `ControllerClient`, `RunnerClient`, the wire types, proof-of-possession signing, and the adapter to `narsor-controller-runtime`. |
 | `narsor-model` | The model layer: domain types, workflow definitions (schema, loading, templates, validation) and shared configuration. No I/O beyond reading workflow files. |
-| `narsor-store` | File-backed storage primitives: `ServerStatePaths` (`state/narsor-server/`; engine stores take it as a parameter, only `narsor-server` constructs it), the task-storage `StatePaths` (execution entries only), atomic writes, file locks, the execution store, event logs and conversation records. |
+| `narsor-store` | File-backed storage primitives: `ServerStatePaths` (`state/narsor-server/`; engine stores take it as a parameter, only `narsor-server` and `narsor-migrate` construct it), the task-storage `StatePaths` (execution entries only), atomic writes, file locks, the execution store, event logs and conversation records. |
 | `narsor-exec` | The execution layer: the Engine that runs a workflow, the conductor, task workspaces, the repository registry, task definitions and their sources, and the API projections of an execution. |
 | `narsor-engine` | The control plane: orchestration, controller protocol service, auth, observers, materials, environment configuration and launch resolution. Re-exports `narsor-exec`, `narsor-model`, `narsor-store` (as `persistence`) and `narsor-controller-client` under its old module paths. |
-| `narsor-server` | The daemon (control plane): the API server, its lifecycle and the child processes it supervises. It passes the state and work roots to the local controller and migrates its own files once at start (`layout_migration.rs`, D82). |
+| `narsor-server` | The daemon (control plane): the API server, its lifecycle and the child processes it supervises. It passes the state and work roots to the local controller and refuses to start on an installation of the old layout that `narsor-migrate` has not moved (`layout_guard.rs`, D82). |
 | `narsor-runner` | The isolated task runner: the Engine run against one portable task storage. |
-| `narsor-controller` | The environment controller process: `narsor-controller local` and `narsor-controller kubernetes`. Local: `ControllerStatePaths`/`ControllerWorkPaths` (`local/paths.rs`, `narsor-controller-local/` below the roots it is given), its part of the one-time migration (`local/layout_migration.rs`), and the wake sources (SIGCHLD of its runners, `docker events`). Kubernetes: the watch of its managed Pods. |
+| `narsor-controller` | The environment controller process: `narsor-controller local` and `narsor-controller kubernetes`. Local: `ControllerStatePaths`/`ControllerWorkPaths` (`local/paths.rs`, `narsor-controller-local/` below the roots it is given) and the wake sources (SIGCHLD of its runners, `docker events`). Kubernetes: the watch of its managed Pods. |
 | `narsor-observer-worker` | The observer worker: claims the due runs of the catalogue's automations (`in`, `check`, `out`) and executes their scripts. |
 | `narsor-web` | The browser interface: serves the single-page application and proxies `/control/v1` to a `narsor-server`. `WebStatePaths` (`paths.rs`): the session files in `state/narsor-web/`. |
+| `narsor-migrate` | The one-time move of an older installation to the per-binary layout (D82), run by the installer: refusal checks, a `tar.zst` backup, then the server's and the local controller's moves (`mover.rs`, `server.rs`, `controller.rs`). The one program that knows both layouts; it builds `ServerStatePaths`, `ControllerStatePaths` and `ControllerWorkPaths`. |
 
 ## Build-time dependencies
 
@@ -43,7 +44,10 @@ graph TD
   ctrl[narsor-controller] --> cc
   ctrl --> cr
   ctrl --> model
-  ctrl --> store
+  migrate[narsor-migrate] --> ctrl
+  migrate --> store
+  migrate --> model
+  migrate --> shared
   engine --> exec
   engine --> cc
   engine --> cr
@@ -70,7 +74,8 @@ graph TD
 | `narsor-observer-worker` | api-client, protocol |
 | `narsor-server` | api-client, engine, controller-runtime, protocol, shared |
 | `narsor-runner` | exec, controller-client, protocol |
-| `narsor-controller` | model, store, controller-client, controller-runtime, protocol, shared |
+| `narsor-controller` | model, controller-client, controller-runtime, protocol, shared |
+| `narsor-migrate` | controller, store, model, protocol, shared |
 | `narsor-engine` | exec, model, store, controller-client, controller-runtime, protocol, shared |
 | `narsor-exec` | model, store, protocol, shared |
 | `narsor-controller-client` | model, controller-runtime, protocol, shared |
@@ -89,8 +94,11 @@ Rules this graph keeps:
   `narsor-runner` links only the execution layer (`narsor-exec`) and the
   protocol client (`narsor-controller-client`). `narsor-controller` links
   neither: it needs only the domain types (`narsor-model`), configuration
-  and Git rules (`narsor-shared`), the controller crates and, for the
-  one-time layout migration of the stored executions, `narsor-store`.
+  and Git rules (`narsor-shared`) and the controller crates.
+- `narsor-migrate` is a tool, not a service: it links `narsor-controller`
+  only for its path types and `narsor-store` for the server's path type and
+  the stored executions whose workspace paths it rewrites. No service
+  depends on it.
 - `narsor-protocol` has no workspace dependencies.
 
 The root package lists every crate under `[dev-dependencies]`. Only the

@@ -26,6 +26,7 @@ members = [
     "crates/narsor-controller-runtime",
     "crates/narsor-engine",
     "crates/narsor-exec",
+    "crates/narsor-migrate",
     "crates/narsor-model",
     "crates/narsor-store",
     "crates/narsor-protocol",
@@ -100,6 +101,7 @@ narsor-controller-runtime = { path = "crates/narsor-controller-runtime" }
 narsor-engine = { path = "crates/narsor-engine" }
 narsor-exec = { path = "crates/narsor-exec" }
 narsor-model = { path = "crates/narsor-model" }
+narsor-migrate = { path = "crates/narsor-migrate" }
 narsor-store = { path = "crates/narsor-store" }
 # The runner's reading of a Pod's arguments (tests/kubernetes_adapter.rs).
 narsor-runner = { path = "crates/narsor-runner" }
@@ -111,5 +113,8 @@ narsor-observer-worker = { path = "crates/narsor-observer-worker" }
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 rand = "0.10"
+# Reading the backup archive of narsor-migrate (tests/integration/layout_migration.rs).
+tar = "0.4"
+zstd = "0.14"
 # EdDSA test keys exported as PKCS#8, the form jsonwebtoken signs with.
 ed25519-dalek = { version = "3", features = ["alloc", "rand_core", "pkcs8"] }

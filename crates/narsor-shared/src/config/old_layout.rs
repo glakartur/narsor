@@ -9,8 +9,9 @@
 //! explicitly (flag, environment, file), and `global.root` when it took the
 //! built-in value.
 //!
-//! Only the one-time layout migration of `narsor-server`, and the deletion
-//! of the old web session files by `narsor-web`, use these roots.
+//! The one-time layout migration (`narsor-migrate`) moves what it finds
+//! there; `narsor-server` only looks whether anything is left to move
+//! ([`OldRoots::unmigrated_entries`]) and refuses to start until it is moved.
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +30,22 @@ pub struct OldRoots {
 
 /// The old directory of the local controller below an old root.
 pub const OLD_LOCAL_CONTROLLER_DIR: &str = "local-controller";
+
+/// The server's entries of the old state root; each keeps its name in
+/// `state/narsor-server/`. `narsor.log` is the old log: kept, nobody
+/// writes it any more.
+pub const OLD_SERVER_ENTRIES: [&str; 6] = [
+    "auth",
+    "orchestration",
+    "materials",
+    "observer-queues",
+    "agent-harness.json",
+    "narsor.log",
+];
+
+/// The file the migration writes, last, into a binary's new state directory
+/// once that binary's files are moved.
+pub const LAYOUT_MARKER_FILE: &str = "layout-migrated";
 
 /// The old state root of the installation `config` resolves; needs only
 /// `server.state` in the scope (the web interface has no `server.work`).
@@ -64,6 +81,23 @@ impl OldRoots {
     /// configured apart.
     pub fn local_controller_work(&self) -> PathBuf {
         self.work.join(OLD_LOCAL_CONTROLLER_DIR)
+    }
+
+    /// The entries of the old layout still at the old roots: the server's
+    /// ([`OLD_SERVER_ENTRIES`]) and the local controller's old directories.
+    /// Empty for a fresh installation and for one already moved.
+    pub fn unmigrated_entries(&self) -> Vec<PathBuf> {
+        OLD_SERVER_ENTRIES
+            .iter()
+            .map(|name| self.state.join(name))
+            .chain([self.local_controller_state(), self.local_controller_work()])
+            .filter(|path| path.symlink_metadata().is_ok())
+            .fold(Vec::new(), |mut found, path| {
+                if !found.contains(&path) {
+                    found.push(path);
+                }
+                found
+            })
     }
 }
 

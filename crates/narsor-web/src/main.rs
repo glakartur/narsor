@@ -88,7 +88,6 @@ async fn run(cli: Cli) -> Result<(), String> {
     // (`run/`), and this binary's own files are in its own directory there.
     let state = resolved.state_dir().to_path_buf();
     let paths = WebStatePaths::new(&state);
-    remove_old_session_files(&config::old_layout::old_state_root(&resolved));
 
     let upstream = upstream(&settings, &cli, &state, &flags).await?;
     let listener = TcpListener::bind(settings.bind)
@@ -210,22 +209,6 @@ fn token_source(cli: &Cli) -> Option<TokenSource> {
 }
 
 /// A new session token, also written for the operator only.
-/// Deletes the session files of the layout before `narsor-web/` (KTD10):
-/// a new session is written at every start, so nothing is migrated. One
-/// that cannot be deleted is only reported.
-fn remove_old_session_files(old_state_root: &std::path::Path) {
-    for name in ["web-session", "web-open.html"] {
-        let path = old_state_root.join(name);
-        match std::fs::remove_file(&path) {
-            Ok(()) => tracing::info!(path = %path.display(), "removed an old web session file"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "cannot remove an old web session file")
-            }
-        }
-    }
-}
-
 fn new_session(paths: &WebStatePaths) -> Result<String, String> {
     let session = uuid::Uuid::new_v4().simple().to_string();
     paths

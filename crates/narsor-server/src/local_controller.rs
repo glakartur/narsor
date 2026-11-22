@@ -84,13 +84,6 @@ const CONTROLLER_PROGRAM: &str = "narsor-controller";
 /// wait on a predecessor's lock ([`LOCK_TIMEOUT`]).
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Longest wait for the child's lease when it may first move its files to
-/// the new layout (`--legacy-dir`, KTD10): a copy of the task storage across
-/// filesystems can take long, and a child killed on the way would start the
-/// copy again at every start. Clients stop waiting long before; they find
-/// the daemon once the move is done.
-const MIGRATION_READY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-
 /// How long the child waits for a predecessor holding its credential lock.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(7);
 
@@ -116,10 +109,6 @@ pub struct LocalControllerSettings {
     pub state_root: PathBuf,
     /// The work root (`server.work`), handed on as `--work-root`.
     pub work_root: PathBuf,
-    /// The controller's old directories (state side, work side) while they
-    /// exist, handed on as `--legacy-dir` / `--legacy-work-dir` so the
-    /// controller moves its own files (KTD10).
-    pub legacy_dirs: Option<(PathBuf, PathBuf)>,
     /// The arguments naming the child's configuration file:
     /// `--config <file>` or `--no-config`.
     pub config_args: Vec<OsString>,
@@ -203,16 +192,9 @@ impl LocalController {
                 .map_err(|error| format!("cannot read the local backend's lease: {error}"))
         };
         let before = epoch(&control)?;
-        let timing = StartTiming::of(&settings);
-        if settings.legacy_dirs.is_some() {
-            tracing::info!(
-                wait_mins = timing.ready.as_secs() / 60,
-                "daemon: the local controller may first move its files to the new layout; waiting for it"
-            );
-        }
         // The first code is made here, so a control plane that cannot make
         // one fails the start at once rather than in the supervising thread.
-        let code = enrollment_code(&control, timing.enrollment_ttl)?;
+        let code = enrollment_code(&control)?;
 
         let shared = Arc::new(Shared {
             phase: Mutex::new(Phase::Starting),
@@ -231,7 +213,7 @@ impl LocalController {
         };
         let controller = Self { stop, thread };
 
-        let deadline = Instant::now() + timing.ready;
+        let deadline = Instant::now() + READY_TIMEOUT;
         let failure = loop {
             // Judged under the lock the thread takes when the child ends, so
             // an end is either a failed start or a restart, never neither.
@@ -263,7 +245,7 @@ impl LocalController {
             if Instant::now() >= deadline {
                 break format!(
                     "the local controller did not take the local backend's lease within {} s{}",
-                    timing.ready.as_secs(),
+                    READY_TIMEOUT.as_secs(),
                     shared.stderr_tail()
                 );
             }
@@ -284,37 +266,11 @@ impl LocalController {
     }
 }
 
-/// How long the first start of the child may take.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StartTiming {
-    /// The longest wait for the child's lease.
-    ready: Duration,
-    /// How long the first enrollment code stays valid: past the wait, as
-    /// the child uses it only after its migration and its lock.
-    enrollment_ttl: Duration,
-}
-
-impl StartTiming {
-    fn of(settings: &LocalControllerSettings) -> Self {
-        if settings.legacy_dirs.is_some() {
-            Self {
-                ready: MIGRATION_READY_TIMEOUT,
-                enrollment_ttl: MIGRATION_READY_TIMEOUT + ENROLLMENT_TTL,
-            }
-        } else {
-            Self {
-                ready: READY_TIMEOUT,
-                enrollment_ttl: ENROLLMENT_TTL,
-            }
-        }
-    }
-}
-
 /// A short-lived one-time code enrolling the child of one start, used by
 /// the child only when it has no credential.
-fn enrollment_code(control: &ProtocolService, ttl: Duration) -> Result<String, String> {
+fn enrollment_code(control: &ProtocolService) -> Result<String, String> {
     control
-        .create_builtin_local_enrollment(ttl)
+        .create_builtin_local_enrollment(ENROLLMENT_TTL)
         .map(|response| response.enrollment_code)
         .map_err(|error| {
             format!("could not create the local controller's enrollment code: {error}")
@@ -337,7 +293,7 @@ fn supervise(
         let started = Instant::now();
         let start_code = match code.take() {
             Some(code) => Some(code),
-            None => enrollment_code(control, ENROLLMENT_TTL)
+            None => enrollment_code(control)
                 .inspect_err(|error| tracing::warn!(%error, "daemon: starting the local controller without one"))
                 .ok(),
         };
@@ -397,13 +353,6 @@ fn spawn(
             &settings.state_root,
             Some(&settings.work_root),
         ))
-        .args(
-            settings
-                .legacy_dirs
-                .as_ref()
-                .map(|(state, work)| local_controller::legacy_args(state, work))
-                .unwrap_or_default(),
-        )
         .arg("--lease-ttl-secs")
         .arg(
             ControllerConfig::new(String::new())
@@ -435,35 +384,6 @@ fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A start that may migrate waits much longer than the clients, and its
-    /// code outlives the wait either way.
-    #[test]
-    fn a_start_that_may_migrate_waits_long_for_the_lease() {
-        for (legacy_dirs, ready) in [
-            (None, READY_TIMEOUT),
-            (
-                Some((PathBuf::from("/old/state"), PathBuf::from("/old/work"))),
-                MIGRATION_READY_TIMEOUT,
-            ),
-        ] {
-            let settings = LocalControllerSettings {
-                program: PathBuf::from("narsor-controller"),
-                control_plane: "http://127.0.0.1:1".into(),
-                state_root: PathBuf::from("/state"),
-                work_root: PathBuf::from("/work"),
-                legacy_dirs,
-                config_args: Vec::new(),
-                forwarded_env_prefixes: Vec::new(),
-                log_directive: None,
-            };
-
-            let timing = StartTiming::of(&settings);
-
-            assert_eq!(timing.ready, ready);
-            assert!(timing.enrollment_ttl > timing.ready, "{timing:?}");
-        }
-    }
 
     #[test]
     fn a_start_failure_quotes_the_last_twenty_lines() {

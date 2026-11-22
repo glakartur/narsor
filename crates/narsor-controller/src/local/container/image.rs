@@ -759,9 +759,9 @@ fn is_network_failure(text: &str) -> bool {
 /// of the canonical path of the controller's state directory — the value
 /// the label had when it was computed from the controller's directory at
 /// every start, so a controller keeps recognising the images it built for
-/// as long as its directory does not move. A controller whose files are
-/// moved to a new directory has its id written beforehand, from the old
-/// directory, so its earlier images stay its own. When the file cannot be
+/// as long as its directory does not move. `narsor-migrate`, which moves an
+/// old controller's files, writes this file beforehand from the old
+/// directory with the same formula, so the earlier images stay its own. When the file cannot be
 /// written, the computed value is used for this run.
 pub fn controller_id(paths: &ControllerStatePaths) -> String {
     let file = paths.controller_id_file();
@@ -780,19 +780,6 @@ pub fn controller_id(paths: &ControllerStatePaths) -> String {
         tracing::warn!(file = %file.display(), %error, "images: cannot record the controller id");
     }
     id
-}
-
-/// Records, before a migration moves anything, the id of the controller
-/// whose old directory was `old_dir` as the `controller-id` of `paths`
-/// (KTD8): the images it built keep matching. An id already recorded
-/// stays.
-pub fn seed_controller_id(paths: &ControllerStatePaths, old_dir: &Path) -> io::Result<()> {
-    let file = paths.controller_id_file();
-    if fs::read_to_string(&file).is_ok_and(|text| !text.trim().is_empty()) {
-        return Ok(());
-    }
-    create_private_dir(paths.dir())?;
-    write_private_file(&file, format!("{}\n", id_of_directory(old_dir)).as_bytes())
 }
 
 /// The first 16 hex digits of the sha256 of the canonical path of `dir`.

@@ -30,6 +30,5 @@ pub mod cli_error {
 pub mod api_error;
 pub mod config;
 pub mod git;
-pub mod layout_move;
 pub mod process_liveness;
 pub mod run_paths;

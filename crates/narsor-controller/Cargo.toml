@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 narsor-model = { path = "../narsor-model" }
 narsor-shared = { path = "../narsor-shared" }
-narsor-store = { path = "../narsor-store" }
 narsor-controller-client = { path = "../narsor-controller-client" }
 narsor-protocol = { path = "../narsor-protocol" }
 narsor-controller-runtime = { path = "../narsor-controller-runtime" }

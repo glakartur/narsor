@@ -27,9 +27,18 @@ const CONSTRUCTORS: &[(&str, &[&str])] = &[
     // TUI and the web UI reach it only through `narsor-api-client`.
     ("RunPaths", &["narsor-server", "narsor-api-client"]),
     // Engine stores take it as a parameter; only the server builds it.
-    ("ServerStatePaths", &["narsor-server"]),
-    ("ControllerStatePaths", &["narsor-controller"]),
-    ("ControllerWorkPaths", &["narsor-controller"]),
+    // `narsor-migrate` moves an old installation into the server's and the
+    // local controller's directories once, so it builds their path types
+    // (D82, KTD10); it is the one program that knows both layouts.
+    ("ServerStatePaths", &["narsor-server", "narsor-migrate"]),
+    (
+        "ControllerStatePaths",
+        &["narsor-controller", "narsor-migrate"],
+    ),
+    (
+        "ControllerWorkPaths",
+        &["narsor-controller", "narsor-migrate"],
+    ),
     ("WebStatePaths", &["narsor-web"]),
     ("TuiStatePaths", &["narsor"]),
 ];
@@ -50,12 +59,20 @@ const RAW_ROOT_USES: &[RawRootUse] = &[
     RawRootUse {
         file: "crates/narsor-shared/src/config/old_layout.rs",
         call: "config.state_dir()",
-        reason: "the one-time migration computes the old layout from the roots (R6 c)",
+        reason: "the old layout is computed from the roots, for narsor-migrate and the \
+                 server's refusal to start on it (R6 c)",
     },
     RawRootUse {
         file: "crates/narsor-shared/src/config/old_layout.rs",
         call: "config.work_dir()",
-        reason: "the one-time migration computes the old layout from the roots (R6 c)",
+        reason: "the old layout is computed from the roots, for narsor-migrate and the \
+                 server's refusal to start on it (R6 c)",
+    },
+    RawRootUse {
+        file: "crates/narsor-migrate/src/lib.rs",
+        call: "(config.state_dir(), config.work_dir())",
+        reason: "narsor-migrate builds the server's and the local controller's path types \
+                 from the roots to move an old installation into them (KTD10)",
     },
     RawRootUse {
         file: "crates/narsor-server/src/runtime.rs",

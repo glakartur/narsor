@@ -1,18 +1,19 @@
 //! Moving one entry of an installation to its new place, safely and so that
 //! a repeat finishes what a crash left (KTD10).
 //!
-//! The one-time layout migrations of `narsor-server` and
-//! `narsor-controller local` move their files entry by entry with
-//! [`Mover::move_entry`]:
-//!
 //! - Within one filesystem an entry is renamed, which is atomic.
 //! - Across filesystems it is copied to a staging name beside the target
 //!   (`<target>.narsor-moving`), the copy is compared with the source, the
-//!   original modes are applied again (a `0600` credential stays `0600`), the
-//!   source is renamed aside (`<source>.narsor-moved`), the copy takes the
-//!   target name and the source is deleted last.
+//!   original modes and times are applied again (a `0600` credential stays
+//!   `0600`), the source is renamed aside (`<source>.narsor-moved`), the copy
+//!   takes the target name and the source is deleted last.
 //! - A source that is a symbolic link is refused: the migration moves the
 //!   installation's own files, never what a link points at.
+//! - A socket, a FIFO or a device inside a copied tree is not copied: a
+//!   warning names it. Nothing listens on it once the old programs stopped.
+//! - A directory without owner write permission (a read-only checkout, a
+//!   Go module cache) is made writable for its owner when the copied source
+//!   or an incomplete copy must be deleted.
 //!
 //! Every step leaves a state a repeat recognises: source gone and target
 //! present is done; the source renamed aside means the copy was complete;
@@ -21,20 +22,23 @@
 //! settle by guessing, so it is refused.
 //!
 //! The migration of each binary ends with its marker ([`write_marker`]):
-//! a binary that finds its marker does not migrate again.
+//! the tool does not migrate again what a marker says is done.
 
 use std::fmt;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{
+    DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _,
+    PermissionsExt as _,
+};
 use std::path::{Path, PathBuf};
 
-/// The file each binary writes, last, into its new state directory once its
-/// migration is complete.
-pub const MARKER_FILE: &str = "layout-migrated";
+use filetime::FileTime;
+
+pub use narsor_shared::config::old_layout::LAYOUT_MARKER_FILE as MARKER_FILE;
 
 /// Suffix of the copy being made across filesystems, beside the target.
-const STAGING_SUFFIX: &str = ".narsor-moving";
+pub const STAGING_SUFFIX: &str = ".narsor-moving";
 
 /// Suffix of a source whose copy is complete, until it is deleted.
 pub const MOVED_SUFFIX: &str = ".narsor-moved";
@@ -46,7 +50,7 @@ pub struct MoveError {
     pub source: PathBuf,
     /// Where it was to go.
     pub target: PathBuf,
-    /// What went wrong.
+    /// What went wrong, naming the file it went wrong on.
     pub reason: String,
 }
 
@@ -105,8 +109,8 @@ impl Mover {
         let staging = with_suffix(target, STAGING_SUFFIX);
 
         // A copy that was complete when its source was renamed aside.
-        if exists(&aside).map_err(|error| fail(error.to_string()))? {
-            if !exists(target).map_err(|error| fail(error.to_string()))? {
+        if exists(&aside).map_err(&fail)? {
+            if !exists(target).map_err(&fail)? {
                 fs::rename(&staging, target).map_err(|error| {
                     fail(format!(
                         "cannot finish the copy {}: {error}",
@@ -114,36 +118,30 @@ impl Mover {
                     ))
                 })?;
             }
-            remove_any(&aside).map_err(|error| {
-                fail(format!(
-                    "cannot delete the copied source {}: {error}",
-                    aside.display()
-                ))
-            })?;
+            remove_tree(&aside)
+                .map_err(|error| fail(format!("cannot delete the copied source: {error}")))?;
             return Ok(Moved::Moved);
         }
 
         let metadata = match fs::symlink_metadata(source) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(
-                    if exists(target).map_err(|error| fail(error.to_string()))? {
-                        Moved::AlreadyThere
-                    } else {
-                        Moved::Absent
-                    },
-                );
+                return Ok(if exists(target).map_err(&fail)? {
+                    Moved::AlreadyThere
+                } else {
+                    Moved::Absent
+                });
             }
-            Err(error) => return Err(fail(error.to_string())),
+            Err(error) => return Err(fail(at(source, error))),
         };
         if metadata.file_type().is_symlink() {
             return Err(fail(
-                "it is a symbolic link; move what it points at by hand and start again".into(),
+                "it is a symbolic link; move what it points at by hand and run again".into(),
             ));
         }
-        if exists(target).map_err(|error| fail(error.to_string()))? {
+        if exists(target).map_err(&fail)? {
             return Err(fail(
-                "the target exists too; keep the one you want, remove the other and start again"
+                "the target exists too; keep the one you want, remove the other and run again"
                     .into(),
             ));
         }
@@ -152,16 +150,12 @@ impl Mover {
                 .recursive(true)
                 .mode(0o700)
                 .create(parent)
-                .map_err(|error| fail(format!("cannot create {}: {error}", parent.display())))?;
+                .map_err(|error| fail(at(parent, error)))?;
         }
         // A copy beside a source still in place never completed.
-        if exists(&staging).map_err(|error| fail(error.to_string()))? {
-            remove_any(&staging).map_err(|error| {
-                fail(format!(
-                    "cannot delete the incomplete copy {}: {error}",
-                    staging.display()
-                ))
-            })?;
+        if exists(&staging).map_err(&fail)? {
+            remove_tree(&staging)
+                .map_err(|error| fail(format!("cannot delete the incomplete copy: {error}")))?;
         }
         if !self.always_copy {
             match fs::rename(source, target) {
@@ -174,14 +168,10 @@ impl Mover {
         copy_tree(source, &staging).map_err(|error| fail(format!("copy failed: {error}")))?;
         same_tree(source, &staging)
             .map_err(|error| fail(format!("the copy differs from the source: {error}")))?;
-        fs::rename(source, &aside).map_err(|error| fail(error.to_string()))?;
-        fs::rename(&staging, target).map_err(|error| fail(error.to_string()))?;
-        remove_any(&aside).map_err(|error| {
-            fail(format!(
-                "cannot delete the copied source {}: {error}",
-                aside.display()
-            ))
-        })?;
+        fs::rename(source, &aside).map_err(|error| fail(at(source, error)))?;
+        fs::rename(&staging, target).map_err(|error| fail(at(&staging, error)))?;
+        remove_tree(&aside)
+            .map_err(|error| fail(format!("cannot delete the copied source: {error}")))?;
         Ok(Moved::Moved)
     }
 }
@@ -212,77 +202,143 @@ pub fn write_marker(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+/// `path` with `suffix` appended to its last component.
+pub fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
     PathBuf::from(name)
 }
 
 /// Whether anything (a link included) is at `path`.
-fn exists(path: &Path) -> io::Result<bool> {
+fn exists(path: &Path) -> Result<bool, String> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
+        Err(error) => Err(at(path, error)),
     }
 }
 
-fn remove_any(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
-        Ok(_) => fs::remove_file(path),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+/// An error message naming the file it happened on.
+fn at(path: &Path, error: io::Error) -> String {
+    format!("{}: {error}", path.display())
+}
+
+/// Whether `file_type` is a socket, a FIFO or a device: nothing the copy
+/// can carry over.
+pub fn is_special(file_type: &fs::FileType) -> bool {
+    file_type.is_socket()
+        || file_type.is_fifo()
+        || file_type.is_char_device()
+        || file_type.is_block_device()
+}
+
+/// Deletes `path` and everything below it. A directory that refuses
+/// (`EACCES`/`EPERM`) is given owner read, write and search permission and
+/// the step is tried again; a final failure names the file.
+pub fn remove_tree(path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(at(path, error)),
+    };
+    let parent = path.parent().unwrap_or(Path::new("/"));
+    if !metadata.is_dir() {
+        return retry_writable(parent, path, || fs::remove_file(path));
     }
+    let entries = retry_writable(path, path, || {
+        fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()
+    })?;
+    for entry in entries {
+        remove_tree(&entry.path())?;
+    }
+    retry_writable(parent, path, || fs::remove_dir(path))
+}
+
+/// Runs `step` on `path`; when it is refused for permissions, gives the
+/// owner of the directory `dir` full access and runs it once more.
+fn retry_writable<T>(
+    dir: &Path,
+    path: &Path,
+    step: impl Fn() -> io::Result<T>,
+) -> Result<T, String> {
+    match step() {
+        Ok(value) => Ok(value),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let mode = fs::symlink_metadata(dir)
+                .map_err(|error| at(dir, error))?
+                .permissions()
+                .mode();
+            fs::set_permissions(dir, fs::Permissions::from_mode((mode & 0o7777) | 0o700))
+                .map_err(|error| at(dir, error))?;
+            step().map_err(|error| at(path, error))
+        }
+        Err(error) => Err(at(path, error)),
+    }
+}
+
+/// The times of `metadata` as `filetime` takes them.
+fn times(metadata: &fs::Metadata) -> (FileTime, FileTime) {
+    (
+        FileTime::from_last_access_time(metadata),
+        FileTime::from_last_modification_time(metadata),
+    )
 }
 
 /// Copies `source` to `target`: files with their contents, links as links,
-/// directories recursively, then every original mode applied again (a
-/// directory's last, so a read-only one can still be filled).
-fn copy_tree(source: &Path, target: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(source)?;
+/// directories recursively, then every original mode and access and
+/// modification time applied again (a directory's last, so a read-only one
+/// can still be filled and its time is not changed by the filling). A
+/// socket, a FIFO or a device is skipped with a warning. An error names the
+/// file.
+fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source).map_err(|error| at(source, error))?;
     let file_type = metadata.file_type();
     let mode = metadata.permissions().mode() & 0o7777;
+    let (atime, mtime) = times(&metadata);
     if file_type.is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(source)?, target)
-    } else if file_type.is_dir() {
-        fs::DirBuilder::new().mode(0o700).create(target)?;
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
+        let link = fs::read_link(source).map_err(|error| at(source, error))?;
+        std::os::unix::fs::symlink(link, target).map_err(|error| at(target, error))?;
+        return filetime::set_symlink_file_times(target, atime, mtime)
+            .map_err(|error| at(target, error));
+    }
+    if file_type.is_dir() {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(target)
+            .map_err(|error| at(target, error))?;
+        for entry in fs::read_dir(source).map_err(|error| at(source, error))? {
+            let entry = entry.map_err(|error| at(source, error))?;
             copy_tree(&entry.path(), &target.join(entry.file_name()))?;
         }
-        fs::set_permissions(target, fs::Permissions::from_mode(mode))
     } else if file_type.is_file() {
-        let mut from = fs::File::open(source)?;
+        let mut from = fs::File::open(source).map_err(|error| at(source, error))?;
         let mut to = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(target)?;
-        io::copy(&mut from, &mut to)?;
-        to.sync_all()?;
-        fs::set_permissions(target, fs::Permissions::from_mode(mode))
+            .open(target)
+            .map_err(|error| at(target, error))?;
+        io::copy(&mut from, &mut to).map_err(|error| at(source, error))?;
+        to.sync_all().map_err(|error| at(target, error))?;
     } else {
-        Err(io::Error::other(format!(
-            "{} is neither a file, a directory nor a link",
-            source.display()
-        )))
+        tracing::warn!(path = %source.display(), "migration: not copying a socket, FIFO or device");
+        return Ok(());
     }
+    fs::set_permissions(target, fs::Permissions::from_mode(mode))
+        .map_err(|error| at(target, error))?;
+    filetime::set_file_times(target, atime, mtime).map_err(|error| at(target, error))
 }
 
-/// Checks that `copy` holds what `source` holds: the same entries, the
-/// same bytes, the same links and the same modes.
+/// Checks that `copy` holds what `source` holds: the same entries (sockets,
+/// FIFOs and devices left out), the same bytes, the same links, the same
+/// modes and the same modification times (to the second, which every
+/// filesystem keeps).
 fn same_tree(source: &Path, copy: &Path) -> Result<(), String> {
     let differs = |what: &str| format!("{} ({what})", copy.display());
-    let left = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
-    let right = fs::symlink_metadata(copy).map_err(|error| error.to_string())?;
+    let left = fs::symlink_metadata(source).map_err(|error| at(source, error))?;
+    let right = fs::symlink_metadata(copy).map_err(|error| at(copy, error))?;
     if left.file_type() != right.file_type() {
         return Err(differs("type"));
-    }
-    if !left.file_type().is_symlink()
-        && left.permissions().mode() & 0o7777 != right.permissions().mode() & 0o7777
-    {
-        return Err(differs("mode"));
     }
     if left.file_type().is_symlink() {
         let targets = (fs::read_link(source), fs::read_link(copy));
@@ -291,13 +347,21 @@ fn same_tree(source: &Path, copy: &Path) -> Result<(), String> {
             _ => Err(differs("link")),
         };
     }
+    if left.permissions().mode() & 0o7777 != right.permissions().mode() & 0o7777 {
+        return Err(differs("mode"));
+    }
     if left.is_dir() {
         let names = |dir: &Path| -> Result<Vec<std::ffi::OsString>, String> {
-            let mut names = fs::read_dir(dir)
-                .map_err(|error| error.to_string())?
-                .map(|entry| entry.map(|entry| entry.file_name()))
-                .collect::<io::Result<Vec<_>>>()
-                .map_err(|error| error.to_string())?;
+            let mut names = Vec::new();
+            for entry in fs::read_dir(dir).map_err(|error| at(dir, error))? {
+                let entry = entry.map_err(|error| at(dir, error))?;
+                let kind = entry
+                    .file_type()
+                    .map_err(|error| at(&entry.path(), error))?;
+                if !is_special(&kind) {
+                    names.push(entry.file_name());
+                }
+            }
             names.sort();
             Ok(names)
         };
@@ -308,10 +372,16 @@ fn same_tree(source: &Path, copy: &Path) -> Result<(), String> {
         for name in entries {
             same_tree(&source.join(&name), &copy.join(&name))?;
         }
-        return Ok(());
+    } else {
+        let same = left.len() == right.len()
+            && same_bytes(source, copy).map_err(|error| at(copy, error))?;
+        if !same {
+            return Err(differs("contents"));
+        }
     }
-    if left.len() != right.len() || !same_bytes(source, copy).map_err(|e| e.to_string())? {
-        return Err(differs("contents"));
+    // Last, after the entries were read: reading does not change it.
+    if left.mtime() != right.mtime() {
+        return Err(differs("modification time"));
     }
     Ok(())
 }
@@ -341,37 +411,7 @@ fn same_bytes(left: &Path, right: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt as _;
-
-    struct Temp(PathBuf);
-
-    impl Temp {
-        fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "narsor-layout-move-{}-{}",
-                std::process::id(),
-                uuid_like()
-            ));
-            fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-    }
-
-    impl Drop for Temp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn uuid_like() -> u128 {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        now + u128::from(NEXT.fetch_add(1, Ordering::Relaxed))
-    }
+    use crate::test_support::Temp;
 
     fn private_tree(root: &Path) -> PathBuf {
         let source = root.join("old").join("secrets");
@@ -384,12 +424,15 @@ mod tests {
         source
     }
 
-    /// Both ways keep contents, links and the private modes.
+    /// Both ways keep contents, links, the private modes and the times.
     #[test]
-    fn a_tree_keeps_its_contents_and_modes_by_rename_and_by_copy() {
+    fn a_tree_keeps_its_contents_modes_and_times_by_rename_and_by_copy() {
         for mover in [Mover::new(), Mover::copying()] {
             let temp = Temp::new();
             let source = private_tree(&temp.0);
+            let old_time = FileTime::from_unix_time(1_600_000_000, 0);
+            filetime::set_file_times(source.join("nested/data"), old_time, old_time).unwrap();
+            filetime::set_file_times(source.join("nested"), old_time, old_time).unwrap();
             let target = temp.0.join("new").join("secrets");
 
             assert_eq!(mover.move_entry(&source, &target).unwrap(), Moved::Moved);
@@ -410,12 +453,82 @@ mod tests {
             let mode = |path: &Path| fs::metadata(path).unwrap().mode() & 0o777;
             assert_eq!(mode(&target.join("credential")), 0o600, "{mover:?}");
             assert_eq!(mode(&target), 0o700, "{mover:?}");
+            for path in [target.join("nested/data"), target.join("nested")] {
+                assert_eq!(
+                    fs::metadata(&path).unwrap().mtime(),
+                    1_600_000_000,
+                    "{mover:?} {}",
+                    path.display()
+                );
+            }
             assert!(!with_suffix(&target, STAGING_SUFFIX).exists());
             assert!(!with_suffix(&source, MOVED_SUFFIX).exists());
             assert_eq!(
                 mover.move_entry(&source, &target).unwrap(),
                 Moved::AlreadyThere
             );
+        }
+    }
+
+    /// The copy path leaves out what cannot be copied and deletes what its
+    /// owner made read-only.
+    #[test]
+    fn the_copy_skips_sockets_and_fifos_and_deletes_read_only_directories() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores the permissions this test relies on
+        }
+        type Plant = fn(&Path);
+        let cases: [(&str, Plant); 3] = [
+            ("socket", |dir| {
+                std::os::unix::net::UnixListener::bind(dir.join("socket")).unwrap();
+            }),
+            ("fifo", |dir| {
+                let path =
+                    std::ffi::CString::new(dir.join("fifo").into_os_string().into_encoded_bytes())
+                        .unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            }),
+            ("read-only", |dir| {
+                let locked = dir.join("read-only");
+                fs::create_dir(&locked).unwrap();
+                fs::write(locked.join("file"), "kept").unwrap();
+                fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+            }),
+        ];
+        for (name, plant) in cases {
+            let temp = Temp::new();
+            let source = private_tree(&temp.0);
+            plant(&source);
+            let target = temp.0.join("new").join("secrets");
+
+            let moved = Mover::copying().move_entry(&source, &target);
+
+            assert_eq!(moved.unwrap(), Moved::Moved, "{name}");
+            assert!(!source.exists(), "{name}: the source is deleted");
+            assert!(
+                !with_suffix(&source, MOVED_SUFFIX).exists(),
+                "{name}: nothing left aside"
+            );
+            assert_eq!(
+                fs::read_to_string(target.join("credential")).unwrap(),
+                "token"
+            );
+            match name {
+                "read-only" => {
+                    assert_eq!(
+                        fs::read_to_string(target.join("read-only/file")).unwrap(),
+                        "kept"
+                    );
+                    let mode = fs::metadata(target.join("read-only")).unwrap().mode() & 0o777;
+                    assert_eq!(mode, 0o500, "the copy keeps the mode");
+                    fs::set_permissions(
+                        target.join("read-only"),
+                        fs::Permissions::from_mode(0o700),
+                    )
+                    .unwrap();
+                }
+                _ => assert!(!target.join(name).exists(), "{name} is not copied"),
+            }
         }
     }
 

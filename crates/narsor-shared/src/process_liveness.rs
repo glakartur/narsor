@@ -1,8 +1,8 @@
 //! Whether a recorded process still runs: its pid together with its start
 //! time, so a reused pid is never taken for the recorded process.
 //!
-//! The local controller records both for every runner it starts; the
-//! server's one-time layout migration reads the same records to refuse a
+//! The local controller records both for every runner it starts;
+//! `narsor-migrate` reads the same records to refuse the one-time layout
 //! move while a runner lives (KTD10).
 
 use std::fs;

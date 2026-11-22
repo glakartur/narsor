@@ -2129,6 +2129,7 @@ dependencies = [
  "narsor-controller-runtime",
  "narsor-engine",
  "narsor-exec",
+ "narsor-migrate",
  "narsor-model",
  "narsor-observer-worker",
  "narsor-protocol",
@@ -2145,10 +2146,12 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.11.1",
+ "tar",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -2185,7 +2188,6 @@ dependencies = [
  "narsor-model",
  "narsor-protocol",
  "narsor-shared",
- "narsor-store",
  "reqwest",
  "serde",
  "serde_json",
@@ -2287,6 +2289,29 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "narsor-migrate"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "filetime",
+ "libc",
+ "narsor-controller",
+ "narsor-model",
+ "narsor-protocol",
+ "narsor-shared",
+ "narsor-store",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tar",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zstd",
 ]
 
 [[package]]
