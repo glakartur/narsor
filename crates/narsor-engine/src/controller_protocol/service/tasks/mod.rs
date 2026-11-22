@@ -9,6 +9,7 @@ mod history;
 mod lookup;
 mod materials;
 mod panel;
+mod refresh;
 mod summary;
 mod view;
 

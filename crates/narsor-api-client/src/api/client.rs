@@ -67,7 +67,8 @@ use narsor_protocol::api::{
 };
 use narsor_protocol::controller::{
     ControlEventEnvelope, ConversationResponse as RemoteConversationResponse, MoveTaskRequest,
-    OwnerCommandResponse, SubmitCommentRequest, SubmitCommentResponse, SubmitInputResponse,
+    OwnerCommandResponse, RefreshEnvironmentRequest, RefreshEnvironmentResponse,
+    SubmitCommentRequest, SubmitCommentResponse, SubmitInputResponse,
     SubmitOperatorCommandResponse, TaskEvent, TaskListResponse, TaskSummary, TimelineResponse,
 };
 
@@ -473,6 +474,14 @@ impl ApiClient {
         self.get_json(&url).await
     }
 
+    /// One remote task's summary with how its stored environment stands
+    /// against the current catalogue. It makes the server read the
+    /// catalogue, so pollers use [`Self::control_task`].
+    pub async fn control_task_with_drift(&self, task_id: &str) -> Result<TaskSummary, ClientError> {
+        let url = format!("{}/control/v1/tasks/{task_id}?drift=true", self.base_url);
+        self.get_json(&url).await
+    }
+
     /// An owner command (pause, resume, start, archive) on a remote task.
     pub async fn control_command(
         &self,
@@ -491,6 +500,20 @@ impl ApiClient {
         request: &MoveTaskRequest,
     ) -> Result<TaskSummary, ClientError> {
         let url = format!("{}/control/v1/tasks/{task_id}/move", self.base_url);
+        self.post_json(&url, request).await
+    }
+
+    /// Re-resolves a stopped remote task's environment from the current
+    /// catalogue; says whether anything changed.
+    pub async fn control_refresh_environment(
+        &self,
+        task_id: &str,
+        request: &RefreshEnvironmentRequest,
+    ) -> Result<RefreshEnvironmentResponse, ClientError> {
+        let url = format!(
+            "{}/control/v1/tasks/{task_id}/refresh-environment",
+            self.base_url
+        );
         self.post_json(&url, request).await
     }
 

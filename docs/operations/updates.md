@@ -6,6 +6,66 @@ listed here need no special order. The update notes of the remote backends
 (automatic resume, the read-only runner) are in
 [Remote execution backends](remote-backends.md).
 
+## Update to the environment refresh
+
+This update lets the owner refresh the environment of a stopped task
+(`narsor-cli task refresh-env <task>`, the action *Odśwież środowisko* in
+the TUI and the web): the control plane resolves the environment from the
+current catalogue again and stores it in the task's launch spec under a new
+generation. The workflow, its version, the inputs, the workspace, the
+resources, the title and the ticket do not change. The stored data needs no
+migration, and a task that you do not refresh works as before.
+
+### What changes
+
+| Area | Before | After |
+|---|---|---|
+| Environment of a task | Sealed at creation; a change in the catalogue reaches only new tasks. | Sealed at creation; a refresh seals it again from the current catalogue. |
+| Runner on existing task storage | Refuses a launch spec whose digest differs from its storage copy (foreign storage). | Accepts a newer spec of the same task when only the environment differs and the spec verifies; refuses all other differences as before. |
+| Docker mode, task without a task image | The refusal says to create the task again. | The refusal names `narsor-cli task refresh-env <task>`. |
+| Task history | — | A refresh records an `EnvironmentRefreshed` event with the owner, the old and new environment identity and the difference. |
+
+### Update order
+
+1. Update the control plane (`narsor-server`).
+2. Update the controllers and the runners (`narsor-controller`,
+   `narsor-runner`). On the local backend the runner sits next to the
+   controller, so update both binaries together.
+3. Update the clients (`narsor-cli`, `narsor`, `narsor-web`). An older client
+   does not offer the refresh and shows the new event as an unknown event.
+
+Refresh a task only after its runner is updated. A runner of an older
+version does not know the refresh: it finds a launch spec with a new digest
+on task storage that holds the old one and refuses it as foreign storage.
+The task then fails to start; it starts again after you update the runner.
+
+### Kubernetes: publish the runner in the runtime bundle first
+
+On Kubernetes the runner of a task comes from the runtime bundle sealed in
+the task's environment (`runtime.yaml` → `bundle`), not from the
+controller's machine. A refresh seals the bundle that `runtime.yaml` names
+at that moment. So before you refresh any Kubernetes task:
+
+1. Publish a runtime bundle image that contains the new runner.
+2. Set it as `bundle` in `runtime.yaml` (by digest).
+3. Then refresh the tasks.
+
+When you refresh with an older bundle in `runtime.yaml`, the refreshed task
+gets an older runner, which refuses its storage as above. Set the new bundle
+and refresh again.
+
+**Known risk.** A refresh can give a task a newer runtime bundle than the
+one that started its execution. There is no documented compatibility rule
+for a newer runner that resumes an older execution, so a resume can fail.
+This risk is accepted: fix the catalogue (for example, set the bundle back)
+and refresh the task again.
+
+### Rollback
+
+An older runner refuses the storage of a task that you refreshed (foreign
+storage), so do not roll back the runners while refreshed tasks must run.
+Tasks that you did not refresh are not affected.
+
 ## Update to a directory per program (state ownership)
 
 This update gives every program a directory of its own below the state

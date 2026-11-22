@@ -27,10 +27,10 @@ use narsor_protocol::display::{loss_state, LossState};
 use super::view::at_workflow_terminal_state;
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::service::ProtocolService;
-use crate::orchestration::{lifecycle, OwnerCommand, TaskRecord};
+use crate::orchestration::{environment_refresh_refusal, lifecycle, OwnerCommand, TaskRecord};
 
 /// Every action of the offer, in the order a client lists them.
-const OFFERED: [TaskActionId; 13] = [
+const OFFERED: [TaskActionId; 14] = [
     TaskActionId::Comment,
     TaskActionId::Answer,
     TaskActionId::Approve,
@@ -43,6 +43,7 @@ const OFFERED: [TaskActionId; 13] = [
     TaskActionId::Transition,
     TaskActionId::SelectStep,
     TaskActionId::Restart,
+    TaskActionId::RefreshEnvironment,
     TaskActionId::Archive,
 ];
 
@@ -141,6 +142,14 @@ fn describe(task: &TaskSummary, id: TaskActionId) -> TaskActionOffer {
              storage."
                 .to_string(),
             TaskActionSend::owner(OwnerCommand::Start),
+        ),
+        TaskActionId::RefreshEnvironment => leaf(
+            "Odśwież środowisko",
+            "Odczytuje środowisko zadania z bieżącego katalogu: obrazy, profil, sekrety i \
+             narzędzia. Zadanie dostaje je przy następnym uruchomieniu. Storage zostaje. Gdy nic się \
+             nie zmieniło, zadanie zostaje bez zmian."
+                .to_string(),
+            TaskActionSend::RefreshEnvironment,
         ),
         TaskActionId::Archive => {
             let mut offer = leaf(
@@ -380,6 +389,10 @@ pub(super) fn unavailable_reason(task: &TaskSummary, id: TaskActionId) -> Option
             Some("zadanie jest archiwizowane".to_string())
         }
         TaskActionId::Archive => None,
+        // The command's own rule, so the offer and the send agree.
+        TaskActionId::RefreshEnvironment => {
+            environment_refresh_refusal(task.runner_state, task.state, task.holds_slot)
+        }
         TaskActionId::Unrecognized => Some("serwer nie zna tej akcji".to_string()),
     }
 }
@@ -1200,6 +1213,30 @@ mod tests {
     }
 
     #[test]
+    fn the_environment_refresh_is_offered_only_where_no_workload_runs() {
+        // Covers AE2: a running task is told to pause first.
+        let stopped = summary("stopped", "paused", false);
+        let refresh = offered(&stopped, TaskActionId::RefreshEnvironment).expect("offered");
+        assert_eq!(refresh.label.as_deref(), Some("Odśwież środowisko"));
+        assert_eq!(refresh.send, Some(TaskActionSend::RefreshEnvironment));
+
+        for (runner_state, state, holds_slot, refused_with) in [
+            ("running", "running", true, "wstrzymaj"),
+            ("pause_requested", "paused", true, "poczekaj"),
+            ("queued", "queued", true, "zaraz ruszy"),
+            ("stopped", "finished", false, "zakończone"),
+        ] {
+            let task = summary(runner_state, state, holds_slot);
+            assert!(
+                offered(&task, TaskActionId::RefreshEnvironment).is_none(),
+                "{runner_state}"
+            );
+            let reason = reason(&task, TaskActionId::RefreshEnvironment).expect("a reason");
+            assert!(reason.contains(refused_with), "{runner_state}: {reason}");
+        }
+    }
+
+    #[test]
     fn a_stopped_task_holds_no_slot_to_release() {
         let task = summary("stopped", "paused", false);
         assert!(offered(&task, TaskActionId::ReleaseSlot).is_none());
@@ -1496,6 +1533,16 @@ mod tests {
         ) -> Result<crate::environment::ResolvedLaunch, crate::environment::LaunchError> {
             Err(crate::environment::LaunchError::UnknownBackend(
                 "k8s".to_string(),
+            ))
+        }
+
+        fn resolve_environment(
+            &self,
+            backend: &crate::domain::BackendId,
+            _spec: &crate::domain::TaskLaunchSpec,
+        ) -> Result<crate::domain::ResolvedEnvironment, crate::environment::LaunchError> {
+            Err(crate::environment::LaunchError::UnknownBackend(
+                backend.to_string(),
             ))
         }
 

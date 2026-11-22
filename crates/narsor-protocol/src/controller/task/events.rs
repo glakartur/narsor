@@ -195,8 +195,128 @@ pub enum TaskEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         gate_phase: Option<GateAutomationPhase>,
     },
+    /// The owner refreshed the catalogue-derived part of the task's
+    /// environment: the launch spec now carries `new_identity` under a new
+    /// generation. A client from before the refresh reads it as
+    /// [`TaskEventKind::Unrecognized`].
+    EnvironmentRefreshed {
+        /// The owner who asked for the refresh, as the server authenticated
+        /// them.
+        requested_by: OwnerRef,
+        /// The environment identity before the refresh.
+        old_identity: String,
+        /// The environment identity after the refresh.
+        new_identity: String,
+        /// What changed, part by part. Boxed: it is the largest payload
+        /// of any event.
+        #[serde(default)]
+        diff: Box<EnvironmentDiff>,
+    },
     #[serde(other)]
     Unrecognized,
+}
+
+/// What an environment refresh changed, part by part (R9). Every part is
+/// left out of the serialized form when it did not change, and a part this
+/// version does not know is ignored by an older reader.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentDiff {
+    /// The base image of the task image, as configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_image_base: Option<ValueChange>,
+    /// The components of the task image, by name.
+    #[serde(default, skip_serializing_if = "NamedChanges::is_empty")]
+    pub task_image_components: NamedChanges,
+    /// The image-level secrets of the task image, by token store name.
+    #[serde(default, skip_serializing_if = "NamedChanges::is_empty")]
+    pub task_image_secrets: NamedChanges,
+    /// The secret references the controller injects, by name.
+    #[serde(default, skip_serializing_if = "NamedChanges::is_empty")]
+    pub secrets: NamedChanges,
+    /// The base image of the main container, pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_image: Option<ValueChange>,
+    /// The per-state image overrides, by state id.
+    #[serde(default, skip_serializing_if = "NamedChanges::is_empty")]
+    pub step_images: NamedChanges,
+    /// The Narsor runtime bundle, pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_bundle: Option<ValueChange>,
+    /// The tool packages, by tool name.
+    #[serde(default, skip_serializing_if = "NamedChanges::is_empty")]
+    pub tools: NamedChanges,
+    /// The user profile, as `{id} v{version}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ValueChange>,
+}
+
+impl EnvironmentDiff {
+    /// How many single changes the diff holds: one per changed value and
+    /// one per added, removed or changed name.
+    pub fn change_count(&self) -> usize {
+        let values = [
+            &self.task_image_base,
+            &self.base_image,
+            &self.runtime_bundle,
+            &self.profile,
+        ]
+        .into_iter()
+        .filter(|change| change.is_some())
+        .count();
+        let names: usize = [
+            &self.task_image_components,
+            &self.task_image_secrets,
+            &self.secrets,
+            &self.step_images,
+            &self.tools,
+        ]
+        .into_iter()
+        .map(NamedChanges::len)
+        .sum();
+        values + names
+    }
+
+    /// Whether nothing changed.
+    pub fn is_empty(&self) -> bool {
+        self.change_count() == 0
+    }
+}
+
+/// Entries of a named collection that were added, removed or changed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamedChanges {
+    /// Names only the new environment has.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added: Vec<String>,
+    /// Names only the old environment had.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<String>,
+    /// Names both have, with different content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<String>,
+}
+
+impl NamedChanges {
+    /// How many names changed in any way.
+    pub fn len(&self) -> usize {
+        self.added.len() + self.removed.len() + self.changed.len()
+    }
+
+    /// Whether no name changed.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// One value before and after a change; `None` where it was or is absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValueChange {
+    /// The value before.
+    #[serde(default)]
+    pub before: Option<String>,
+    /// The value after.
+    #[serde(default)]
+    pub after: Option<String>,
 }
 
 /// Where the automations of a watched gate's queue stand in one wait

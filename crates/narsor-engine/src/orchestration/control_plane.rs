@@ -21,18 +21,19 @@ use super::lifecycle::{command_effect, observation_effect, CommandEffect, Observ
 use super::model::{
     slot_release_extension_threshold, ArchiveTombstone, ArchivedRun, BackendLease, CommandActor,
     CommandOutcome, CommandReceipt, CommandRequest, ControllerReport, LeaseToken, MaterialChange,
-    NewTask, Observation, ObservedState, OwnerCommand, ReaderLease, ReportOutcome, ResumeState,
-    RunnerState, SlotReleaseClass, SlotReleaseReason, TaskAssignment, TaskEvent, TaskEventKind,
-    TaskRecord, WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
+    NewTask, Observation, ObservedState, OwnerCommand, OwnerRef, ReaderLease, ReportOutcome,
+    ResumeState, RunnerState, SlotReleaseClass, SlotReleaseReason, TaskAssignment, TaskEvent,
+    TaskEventKind, TaskRecord, WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
 };
 use super::resume::{
     auto_resume_key, count_loss, loss_from_history, owner_slot_release_key, slot_release_key,
     ResumePolicy,
 };
 use super::store::OrchestrationStore;
-use crate::domain::{BackendId, TaskId};
+use crate::domain::{BackendId, ResolvedEnvironment, TaskId};
 use crate::persistence::{ExecutionStore, ServerStatePaths};
 use chrono::{DateTime, Duration, Utc};
+use narsor_protocol::controller::EnvironmentRefreshResult;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -505,6 +506,67 @@ impl ControlPlane {
             )
             .expecting_generation(generation),
         )
+    }
+
+    /// Stores `environment` in the task's launch spec: the environment
+    /// refresh, the one change a sealed spec allows (R4, R5, R8, R9).
+    ///
+    /// `environment` is the sealed result of the environment-only resolve;
+    /// one whose identity does not match its content is refused with
+    /// `InvalidLaunchSpec`. The workflow, inputs, workspace, resources and
+    /// labels of the spec are kept and the spec is resealed. Refused as
+    /// [`TaskRecord::check_environment_refresh`] says (`StaleGeneration`,
+    /// `EnvironmentRefreshRefused`), checked under the task lock, so a
+    /// command that raced in wins and the record is left as it was.
+    ///
+    /// An environment with the stored identity writes and announces nothing
+    /// ([`EnvironmentRefreshResult::Unchanged`]). Otherwise the generation
+    /// moves on and the runner state, resume counters and reservation stay:
+    /// the controller fetches and verifies the new spec by the new
+    /// generation, and a policy command issued for the old one (an
+    /// automatic resume, a slot release) is refused as stale. The event
+    /// names `requested_by`, the server-side owner reference, never a value
+    /// from the request.
+    pub fn refresh_environment(
+        &self,
+        task_id: &TaskId,
+        environment: ResolvedEnvironment,
+        requested_by: OwnerRef,
+        expected_generation: Option<u64>,
+    ) -> Result<(TaskRecord, EnvironmentRefreshResult)> {
+        if !environment.identity_is_valid() {
+            return Err(OrchestrationError::InvalidLaunchSpec(task_id.clone()));
+        }
+        self.mutate(task_id, |record, _now| {
+            record.check_environment_refresh(expected_generation)?;
+            let spec = &mut record.launch_spec;
+            if environment.identity == spec.environment.identity {
+                return Ok(Mutation::Unchanged(EnvironmentRefreshResult::Unchanged {
+                    identity: environment.identity,
+                }));
+            }
+            let diff = Box::new(spec.environment.diff(&environment));
+            let old_identity = std::mem::replace(&mut spec.environment, environment).identity;
+            spec.digest = spec.compute_digest();
+            let new_identity = spec.environment.identity.clone();
+            record.generation += 1;
+            let result = EnvironmentRefreshResult::Refreshed {
+                old_identity: old_identity.clone(),
+                new_identity: new_identity.clone(),
+                generation: record.generation,
+                change_count: diff.change_count(),
+                diff: diff.clone(),
+            };
+            Ok(Mutation::Changed(
+                TaskEventKind::EnvironmentRefreshed {
+                    requested_by,
+                    old_identity,
+                    new_identity,
+                    diff,
+                },
+                result,
+            ))
+        })
     }
 
     /// Ends the slot hold of a `Stopped` task whose deadline passed: the

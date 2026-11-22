@@ -78,6 +78,16 @@ use crate::api::ApiClient;
 use style::Styles;
 use task_app::{detail, layout, EventFeed, TaskApp};
 
+/// The Polish form of a noun after `count`: one, a few, many (for example
+/// `["zadanie", "zadania", "zadań"]`).
+pub(crate) fn plural(count: usize, forms: [&'static str; 3]) -> &'static str {
+    match (count, count % 10, count % 100) {
+        (1, _, _) => forms[0],
+        (_, 2..=4, tens) if !(12..=14).contains(&tens) => forms[1],
+        _ => forms[2],
+    }
+}
+
 /// The terminal this interface draws on.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 

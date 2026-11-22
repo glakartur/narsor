@@ -24,8 +24,8 @@ use serde_json::{Map, Value};
 use super::task_text::{
     age, awaiting_input, command_outcome, conversation_lines, conversation_origin,
     default_backend_line, default_harness_line, detail_lines, event_line, list_line, next_waiting,
-    record_unreadable_detail, safe_json, status_badge, task_state_name, waiting_summary,
-    PAGE_BYTE_BUDGET,
+    record_unreadable_detail, refresh_outcome_lines, safe_json, status_badge, task_state_name,
+    waiting_summary, PAGE_BYTE_BUDGET,
 };
 use crate::api::{
     ApiClient, ClientError, ConversationResponse as PageResponse, HumanInputDeliveryDto,
@@ -43,7 +43,8 @@ use crate::domain::without_unsafe_chars;
 use crate::materials::{snapshot_paths, write_files, MaterialLimits, WriteMode};
 use narsor_protocol::api::MaterialOrigin;
 use narsor_protocol::controller::{
-    MoveTaskTarget, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskEvent,
+    MoveTaskTarget, OperatorCommand, OperatorCommandStatus, OwnerCommand,
+    RefreshEnvironmentRequest, TaskEvent,
 };
 use narsor_protocol::harness::{display_name, CLAUDE_CODE};
 use narsor_protocol::identifier::TaskId;
@@ -321,6 +322,11 @@ pub enum TaskCommand {
         /// Print the task summary as JSON instead.
         #[arg(long)]
         json: bool,
+        /// With `--json`, also compare the task's environment with the
+        /// catalogue (`environment_drift`); the server reads the catalogue
+        /// for it. The human-readable view always shows it.
+        #[arg(long, requires = "json")]
+        drift: bool,
     },
     /// Brings a running task to a safe point and releases its compute.
     Pause(CommandArgs),
@@ -348,6 +354,14 @@ pub enum TaskCommand {
         /// Put it last.
         #[arg(long, group = "target")]
         bottom: bool,
+    },
+    /// Re-resolves a stopped task's environment (task image, secrets, tools,
+    /// profile) from the current catalogue; the workflow stays as it is.
+    /// Refused while the task has a live workload: pause it first.
+    RefreshEnv {
+        /// The task id.
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
     },
     /// Cuts short the step the task's runner is working on; the execution
     /// is left recoverable (see `restart-step`).
@@ -830,6 +844,16 @@ pub(super) fn print_created(task: &TaskSummary) {
     print_status(task);
 }
 
+/// The task's current generation, for a request that must not apply to a
+/// task that moved on meanwhile.
+async fn current_generation(client: &ApiClient, task_id: &str) -> Result<u64> {
+    let task = client
+        .control_task(task_id)
+        .await
+        .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
+    Ok(task.generation)
+}
+
 /// Refuses unless the control plane is a trusted local daemon: the only one
 /// that reads workflow files of its own disk for its owner. Any other
 /// server is refused with the reason it gives.
@@ -1076,11 +1100,20 @@ pub async fn task(
             }
             Ok(())
         }
-        TaskCommand::Show { task_id, json } => {
-            let task = client
-                .control_task(&task_id)
-                .await
-                .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
+        TaskCommand::Show {
+            task_id,
+            json,
+            drift,
+        } => {
+            // The comparison with the catalogue makes the server read it, so
+            // JSON asks for it only with `--drift`; the human-readable view
+            // shows it and always asks.
+            let task = if json && !drift {
+                client.control_task(&task_id).await
+            } else {
+                client.control_task_with_drift(&task_id).await
+            }
+            .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
             if json {
                 println!("{}", json_output(&task)?);
                 return Ok(());
@@ -1113,16 +1146,13 @@ pub async fn task(
             bottom,
         } => {
             let target = move_target(before, after, top, bottom)?;
-            let current = client
-                .control_task(&task_id)
-                .await
-                .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
+            let generation = current_generation(&client, &task_id).await?;
             let task = client
                 .control_move_task(
                     &task_id,
                     &MoveTaskRequest {
                         target,
-                        expected_generation: Some(current.generation),
+                        expected_generation: Some(generation),
                     },
                 )
                 .await
@@ -1131,6 +1161,22 @@ pub async fn task(
                 "{} is now #{} in its backend's queue.",
                 task.task_id, task.rank
             );
+            Ok(())
+        }
+        TaskCommand::RefreshEnv { task_id } => {
+            let generation = current_generation(&client, &task_id).await?;
+            let response = client
+                .control_refresh_environment(
+                    &task_id,
+                    &RefreshEnvironmentRequest {
+                        expected_generation: Some(generation),
+                    },
+                )
+                .await
+                .map_err(|error| failure("Environment not refreshed", error))?;
+            for line in refresh_outcome_lines(&task_id, &response.outcome) {
+                println!("{line}");
+            }
             Ok(())
         }
         TaskCommand::Interrupt(args) => {

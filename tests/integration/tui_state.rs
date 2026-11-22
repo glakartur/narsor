@@ -3154,7 +3154,12 @@ mod task_app_detail {
             press(&mut app, KeyCode::Char(']'));
             press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.detail().tab(), DetailTab::Info);
-            let lines = info::lines(app.list().selected().unwrap(), &Styles::new(false), false);
+            let lines = info::lines(
+                app.list().selected().unwrap(),
+                None,
+                &Styles::new(false),
+                false,
+            );
             assert!(!lines.is_empty());
 
             // The next good read clears the message.
@@ -3664,7 +3669,7 @@ mod task_app_detail {
                 Some("jeszcze nie wystartowało, #2 w kolejce")
             );
 
-            let text = flatten(&info::lines(&task, &Styles::new(false), false));
+            let text = flatten(&info::lines(&task, None, &Styles::new(false), false));
             for expected in [
                 "Zapieczętowane wejścia",
                 "launch digest",
@@ -3736,6 +3741,58 @@ mod task_app_detail {
             });
             assert_eq!(queue_text(&offline, Some(1)), "kontroler offline 4m");
             assert_eq!(queue_text(&queued("c", 3), Some(3)), "#3 · w kolejce");
+        }
+
+        /// *Info* compares the environment with the catalogue when it opens
+        /// and again for a new generation; no marker while the read runs.
+        #[tokio::test]
+        async fn info_reads_the_catalogue_comparison_on_opening_and_for_a_new_generation() {
+            use narsor::tui::task_app::tabs::info::drift_text;
+            use narsor_protocol::controller::EnvironmentDrift;
+            let row = |app: &TaskApp| {
+                let task = app.list().selected().unwrap();
+                let drift = app
+                    .detail()
+                    .view("a")
+                    .and_then(|view| view.info().drift(task.generation));
+                drift_text(drift).map(|(text, _)| text)
+            };
+            let mut app = app();
+            app.load(listing(vec![task("a", "local", "stopped", 1)], "c"));
+            app.sync_detail().await;
+            assert!(app
+                .detail()
+                .view("a")
+                .is_none_or(|view| view.info().needs_drift_read(1)));
+
+            app.detail_mut().set_tab(DetailTab::Info);
+            app.sync_detail().await;
+            assert_eq!(
+                row(&app).as_deref(),
+                Some("nie udało się sprawdzić zgodności z katalogiem"),
+                "the server cannot be reached"
+            );
+
+            let mut differs = task("a", "local", "stopped", 1);
+            differs.environment_drift = Some(EnvironmentDrift::Differs {
+                catalogue_identity: "env-2".to_string(),
+            });
+            app.on_drift_read("a", 1, Ok(differs));
+            assert_eq!(
+                row(&app).as_deref(),
+                Some("różni się od katalogu — użyj akcji „Odśwież środowisko”")
+            );
+
+            let mut refreshed = task("a", "local", "stopped", 1);
+            refreshed.generation = 2;
+            refreshed.revision = 2;
+            app.load(listing(vec![refreshed], "c2"));
+            assert_eq!(
+                row(&app),
+                None,
+                "no marker until the new generation is read"
+            );
+            assert!(app.detail().view("a").unwrap().info().needs_drift_read(2));
         }
     }
 
@@ -7074,8 +7131,9 @@ mod task_app_actions {
     use narsor::tui::keymap::{self, Action, Context};
     use narsor::tui::stepped::Stage;
     use narsor::tui::task_app::actions::{
-        availability, refusal_reason, verb, ActionPanel, ActionRequest, ActionSend, Availability,
-        Overlay, PanelContent, TaskAction, NOTHING_TEXT, NOT_OFFERED, NO_DATA_TEXT, NO_OFFER,
+        availability, environment_refresh_notice, refusal_reason, verb, ActionPanel, ActionRequest,
+        ActionSend, Availability, Overlay, PanelContent, TaskAction, NOTHING_TEXT, NOT_OFFERED,
+        NO_DATA_TEXT, NO_OFFER,
     };
     use narsor::tui::task_app::notify::Severity;
     use narsor::tui::task_app::{Request, TaskApp};
@@ -7667,6 +7725,51 @@ mod task_app_actions {
             assert!(chooser.items()[1].irreversible, "stop cannot be undone");
             assert!(chooser.items()[0].description.contains("skończy krok"));
             assert_eq!(app.key_context().base, Context::Menu);
+        }
+
+        #[test]
+        fn a_stopped_task_refreshes_its_environment_at_the_generation_the_operator_saw() {
+            let mut stopped = runner_state("stopped");
+            stopped.generation = 4;
+            let mut app = loaded(stopped);
+            let request = act(choose(&mut app, "Odśwież środowisko"));
+            assert_eq!(request.send, ActionSend::RefreshEnvironment);
+            assert_eq!(request.generation, 4);
+            assert!(
+                !panel_of(running("a", 1)).contains(&"Odśwież środowisko".to_string()),
+                "a running task is paused first"
+            );
+        }
+
+        #[test]
+        fn the_bar_says_what_the_environment_refresh_found() {
+            use narsor_protocol::controller::{EnvironmentDiff, EnvironmentRefreshResult};
+            let refreshed = |diff: serde_json::Value| {
+                let diff = Box::new(serde_json::from_value::<EnvironmentDiff>(diff).unwrap());
+                EnvironmentRefreshResult::Refreshed {
+                    old_identity: "a".to_string(),
+                    new_identity: "b".to_string(),
+                    generation: 2,
+                    change_count: diff.change_count(),
+                    diff,
+                }
+            };
+            let two = refreshed(serde_json::json!({
+                "profile": {"before": "small", "after": "large"},
+                "tools": {"added": ["glab"], "removed": []}
+            }));
+            for (outcome, said) in [
+                (two, "środowisko odświeżone — 2 zmiany"),
+                (
+                    EnvironmentRefreshResult::Unchanged {
+                        identity: "a".to_string(),
+                    },
+                    "środowisko bez zmian",
+                ),
+            ] {
+                let text = environment_refresh_notice(&outcome);
+                assert!(text.starts_with(said), "{text}");
+            }
         }
 
         #[test]

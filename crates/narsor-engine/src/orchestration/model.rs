@@ -140,6 +140,46 @@ pub fn derive_task_state(
     }
 }
 
+/// Why the owner cannot refresh the environment of a task now; `None` when
+/// they can (R4, R5). The one rule the control plane's mutation and the
+/// action offer both ask, so what a client is offered and what the control
+/// plane accepts cannot disagree.
+///
+/// Only a task without a live workload is refreshed: `Stopped`,
+/// `Interrupted` (its workload is gone, whether or not the resume policy
+/// still tries) and `Queued` without a reservation. A task whose work ended
+/// (`Finished`), or that is archived or being archived, is refused whatever
+/// its runner state. `holds_slot` is [`TaskRecord::holds_capacity`]: for a
+/// `Queued` task, whether the scheduler admitted it. The reasons are for the
+/// owner, in Polish like the rest of the offer.
+pub fn environment_refresh_refusal(
+    runner_state: RunnerState,
+    task_state: TaskState,
+    holds_slot: bool,
+) -> Option<String> {
+    let reason = match runner_state {
+        RunnerState::Archiving | RunnerState::Archived => "zadanie jest archiwizowane",
+        _ if task_state == TaskState::Finished => "zadanie jest zakończone",
+        RunnerState::Stopped | RunnerState::Interrupted => return None,
+        RunnerState::Queued if !holds_slot => return None,
+        RunnerState::Queued => {
+            "zadanie zostało dopuszczone i zaraz ruszy — gdy ruszy, wstrzymaj je, a potem \
+             odśwież środowisko"
+        }
+        RunnerState::Provisioning | RunnerState::Running => {
+            "zadanie działa — wstrzymaj je, a potem odśwież środowisko"
+        }
+        RunnerState::PauseRequested => {
+            "zadanie jest wstrzymywane — poczekaj, aż się zatrzyma, a potem odśwież środowisko"
+        }
+        RunnerState::Unknown => {
+            "nie wiadomo, czy zadanie jeszcze działa — poczekaj, aż kontroler to ustali, \
+             a potem odśwież środowisko"
+        }
+    };
+    Some(reason.to_string())
+}
+
 /// Current schema version of [`BackendLease`].
 pub const BACKEND_LEASE_VERSION: u32 = 1;
 
@@ -688,6 +728,36 @@ impl TaskRecord {
             .as_ref()
             .and_then(|runner| runner.snapshot.pending_input.as_ref())
             .map(|pending| pending.id.as_str())
+    }
+
+    /// Why the owner cannot refresh the task's environment now; see
+    /// [`environment_refresh_refusal`].
+    pub fn environment_refresh_refusal(&self) -> Option<String> {
+        environment_refresh_refusal(self.runner_state, self.task_state(), self.holds_capacity())
+    }
+
+    /// Refuses an environment refresh of this task: with `StaleGeneration`
+    /// when it moved past `expected_generation`, then with
+    /// `EnvironmentRefreshRefused` when [`Self::environment_refresh_refusal`]
+    /// names a reason. The one guard the protocol service (before reading
+    /// the catalogue) and the control plane's mutation (under the task lock)
+    /// both run.
+    pub fn check_environment_refresh(
+        &self,
+        expected_generation: Option<u64>,
+    ) -> super::error::Result<()> {
+        if let Some(expected) = expected_generation {
+            self.check_generation(expected)?;
+        }
+        match self.environment_refresh_refusal() {
+            Some(reason) => Err(
+                super::error::OrchestrationError::EnvironmentRefreshRefused {
+                    task_id: self.task_id.clone(),
+                    reason,
+                },
+            ),
+            None => Ok(()),
+        }
     }
 
     /// Whether the task can take no more answers: finished, archived (or

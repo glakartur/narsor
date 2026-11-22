@@ -120,6 +120,7 @@ impl ProtocolService {
                     since: entry.created_at,
                 }),
             gate_automation: gate_automation(record),
+            environment_drift: None,
             as_of: now,
         };
         // Last: the offer reads the rest of the summary.
@@ -138,6 +139,30 @@ impl ProtocolService {
         // After the actions: the panel reads the same summary and the offer.
         summary.panel = super::panel::offer_forms(&summary);
         Ok(summary)
+    }
+
+    /// How the record's stored environment stands against the current
+    /// catalogue (R10, R11). It resolves the environment from the catalogue,
+    /// so only the single-task fetch asks for it, never a list.
+    pub(super) fn environment_drift(&self, record: &TaskRecord) -> EnvironmentDrift {
+        if record.has_ended() {
+            return EnvironmentDrift::NotApplicable;
+        }
+        match self
+            .launch
+            .resolve_environment(&record.assignment.backend_id, &record.launch_spec)
+        {
+            Ok(environment) if environment.identity == record.launch_spec.environment.identity => {
+                EnvironmentDrift::Current
+            }
+            Ok(environment) => EnvironmentDrift::Differs {
+                catalogue_identity: environment.identity,
+            },
+            Err(error) => EnvironmentDrift::CatalogueProblem {
+                code: error.code().to_string(),
+                reason: error.to_string(),
+            },
+        }
     }
 
     /// Live only while the task expects a runner, the runner's launch is

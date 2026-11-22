@@ -126,6 +126,26 @@ impl ExecutionStore {
         }
     }
 
+    /// Replaces the task's launch specification with `spec`, atomically.
+    ///
+    /// The one exception to [`Self::initialize_task_launch_spec`]'s "once":
+    /// a refreshed environment of the same task. The caller (the runner)
+    /// has already checked that `spec` is that refresh; here only a spec
+    /// whose digest does not match its content is refused, with
+    /// [`PersistenceError::LaunchSpecConflict`], leaving the stored copy as
+    /// it was. A reader sees either the old copy or the new one, never a
+    /// partial file.
+    pub fn replace_task_launch_spec(&self, task_id: &TaskId, spec: &TaskLaunchSpec) -> Result<()> {
+        let path = self.paths.task_launch_spec_file(task_id.as_str());
+        if !spec.digest_is_valid() {
+            return Err(PersistenceError::LaunchSpecConflict {
+                task_id: task_id.to_string(),
+                path,
+            });
+        }
+        write_json_atomic(&path, spec)
+    }
+
     /// Reads the pinned launch specification of a task, or `None` when this
     /// task storage was never initialized.
     pub fn load_task_launch_spec(&self, task_id: &TaskId) -> Result<Option<TaskLaunchSpec>> {
@@ -515,5 +535,42 @@ mod tests {
             error,
             PersistenceError::UnsupportedVersion { found: 2, .. }
         ));
+    }
+
+    fn launch_spec(harness: &str) -> TaskLaunchSpec {
+        use narsor_model::domain::{ResolvedEnvironment, ResourceProfile, TaskWorkspace};
+        TaskLaunchSpec::new(
+            "flow",
+            1,
+            serde_json::json!({}),
+            TaskWorkspace::none(),
+            ResolvedEnvironment::harness_only(harness),
+            ResourceProfile::new(1000, 2048),
+        )
+    }
+
+    /// A refreshed spec replaces the copy that `initialize` would refuse to
+    /// overwrite; a spec whose digest does not match its content is refused
+    /// and the copy stays as it was.
+    #[test]
+    fn a_launch_spec_is_replaced_only_by_a_spec_with_a_valid_digest() {
+        let root = TempRoot::new();
+        let store = ExecutionStore::new(&root.path);
+        let task = TaskId::parse("task-1").unwrap();
+        let old = launch_spec("claude-code");
+        let new = launch_spec("codex");
+        store.initialize_task_launch_spec(&task, &old).unwrap();
+        let mut forged = new.clone();
+        forged.inputs = serde_json::json!({"injected": true});
+
+        let refused = store.replace_task_launch_spec(&task, &forged).unwrap_err();
+        assert!(matches!(
+            refused,
+            PersistenceError::LaunchSpecConflict { .. }
+        ));
+        assert_eq!(store.load_task_launch_spec(&task).unwrap(), Some(old));
+
+        store.replace_task_launch_spec(&task, &new).unwrap();
+        assert_eq!(store.load_task_launch_spec(&task).unwrap(), Some(new));
     }
 }

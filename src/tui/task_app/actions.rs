@@ -31,7 +31,9 @@
 //! The server names the command: an owner command (`POST …/commands`, the
 //! answer is the new runner state), a command for the runner
 //! (`POST …/operator-commands`, the answer only says "queued" and the verdict
-//! comes as `OperatorCommandResolved`, [`CommandResolved`]) or a comment.
+//! comes as `OperatorCommandResolved`, [`CommandResolved`]), a comment or an
+//! environment refresh (`POST …/refresh-environment`, the bar tells what it
+//! found: [`environment_refresh_notice`]).
 //! What was typed goes into it where the server put the field's placeholder
 //! ([`TaskActionSend::resolve`]).
 //!
@@ -48,7 +50,8 @@ use ratatui::Frame;
 
 use crate::api::ClientError;
 use crate::controller_protocol::{
-    OwnerCommandRequest, SubmitCommentRequest, SubmitOperatorCommandRequest, TaskSummary,
+    EnvironmentRefreshResult, OwnerCommandRequest, RefreshEnvironmentRequest, SubmitCommentRequest,
+    SubmitOperatorCommandRequest, TaskSummary,
 };
 use crate::domain::display::safe_link_url;
 use narsor_protocol::controller::{
@@ -218,6 +221,8 @@ pub enum ActionSend {
     Operator(OperatorCommand),
     /// A comment to the agent: what it does, the server decides.
     Comment(String),
+    /// The environment of a stopped task, read again from the catalogue.
+    RefreshEnvironment,
 }
 
 impl From<ResolvedActionSend> for ActionSend {
@@ -226,6 +231,7 @@ impl From<ResolvedActionSend> for ActionSend {
             ResolvedActionSend::Owner(command) => Self::Owner(command),
             ResolvedActionSend::Operator(command) => Self::Operator(command),
             ResolvedActionSend::Comment(text) => Self::Comment(text),
+            ResolvedActionSend::RefreshEnvironment => Self::RefreshEnvironment,
         }
     }
 }
@@ -729,7 +735,7 @@ fn link_list(task: &TaskSummary) -> LinkList {
 fn accepted_summary(label: &str, send: &ActionSend) -> String {
     let label = one_line(label);
     match send {
-        ActionSend::Owner(_) => format!("„{label}” zlecone"),
+        ActionSend::Owner(_) | ActionSend::RefreshEnvironment => format!("„{label}” zlecone"),
         ActionSend::Operator(_) => format!("„{label}” wysłane do runnera"),
         ActionSend::Comment(_) => "komentarz wysłany".to_string(),
     }
@@ -1182,7 +1188,7 @@ impl TaskApp {
             generation,
             key,
             verb,
-            summary,
+            mut summary,
             send,
         } = request;
         let signature = key_signature(&task_id, &send);
@@ -1234,6 +1240,20 @@ impl TaskApp {
                     // Work for a task without a slot resumes it, and the
                     // resume waits when the backend is full.
                     (None, response.task.state == TaskState::Queued)
+                }),
+            // The bar tells what the refresh found, not only that it went.
+            ActionSend::RefreshEnvironment => self
+                .client
+                .control_refresh_environment(
+                    &task_id,
+                    &RefreshEnvironmentRequest {
+                        expected_generation: Some(generation),
+                    },
+                )
+                .await
+                .map(|response| {
+                    summary = environment_refresh_notice(&response.outcome);
+                    (None, false)
                 }),
         };
         match result {
@@ -1333,6 +1353,24 @@ impl TaskApp {
     }
 }
 
+/// What the bar says of the outcome of an environment refresh.
+pub fn environment_refresh_notice(outcome: &EnvironmentRefreshResult) -> String {
+    match outcome {
+        EnvironmentRefreshResult::Refreshed { change_count, .. } => match *change_count {
+            0 => "środowisko odświeżone".to_string(),
+            count => format!(
+                "środowisko odświeżone — {count} {}; zadanie dostanie je przy następnym \
+                 uruchomieniu",
+                crate::tui::plural(count, ["zmiana", "zmiany", "zmian"])
+            ),
+        },
+        EnvironmentRefreshResult::Unchanged { .. } => {
+            "środowisko bez zmian — katalog daje to samo środowisko".to_string()
+        }
+        EnvironmentRefreshResult::Unrecognized => "odświeżenie środowiska przyjęte".to_string(),
+    }
+}
+
 /// What the bar adds when the task waits for a slot after the command.
 pub(super) const QUEUED_FOR_SLOT: &str = " — w kolejce, czeka na slot";
 
@@ -1358,7 +1396,7 @@ fn conductor_kind(command: &OperatorCommand) -> Option<ConductorSent> {
 fn conductor_command(send: &ActionSend) -> Option<ConductorSent> {
     match send {
         ActionSend::Operator(command) => conductor_kind(command),
-        ActionSend::Owner(_) | ActionSend::Comment(_) => None,
+        ActionSend::Owner(_) | ActionSend::Comment(_) | ActionSend::RefreshEnvironment => None,
     }
 }
 

@@ -114,7 +114,7 @@ function DetailsBody({ store, state, task, now, onBack, onActions, onQueue }) {
   else if (tab === 'progress') content = html`<${Progress} api=${api} task=${task} timeline=${timeline} now=${now} />`;
   else if (tab === 'events') content = html`<${Events} api=${api} task=${task} />`;
   else if (tab === 'conductor') content = html`<${Conductor} store=${store} task=${task} />`;
-  else content = html`<${Info} task=${task} />`;
+  else content = html`<${Info} api=${api} task=${task} />`;
 
   return html`
     <section class="pane details-pane" aria-label="Szczegóły zadania">

@@ -11,7 +11,7 @@ use narsor::api::{ClientError, HarnessSelectionSnapshot};
 use narsor::cli::task_text::{
     activity_age, age, attention_lines, command_outcome, conversation_lines, conversation_origin,
     default_harness_line, detail_lines, event_line, header_lines, list_line, next_waiting,
-    queue_badge, record_unreadable_detail, safe_json, state_hint, Tone,
+    queue_badge, record_unreadable_detail, refresh_outcome_lines, safe_json, state_hint, Tone,
 };
 use narsor_engine::controller_protocol::{
     ConversationResponse, ConversationUnavailableReason, ExecutionEventsSource, QueueView,
@@ -24,6 +24,9 @@ use narsor_engine::orchestration::{
     RunnerState, TaskEvent, TaskEventKind, EXHAUSTION_REASON_PREFIX, UNSPECIFIED_LOSS,
 };
 use narsor_protocol::api::{PositionUsage, TokenCounts};
+use narsor_protocol::controller::{
+    EnvironmentDiff, EnvironmentRefreshResult, NamedChanges, OwnerRef, ValueChange,
+};
 
 use crate::task_app_support;
 use task_app_support::{
@@ -555,6 +558,67 @@ fn an_exhaustion_event_names_the_attempts_and_the_loss_once() {
     );
 }
 
+fn refresh_diff() -> Box<EnvironmentDiff> {
+    Box::new(EnvironmentDiff {
+        task_image_components: NamedChanges {
+            added: vec!["cargo".into(), "jq".into()],
+            removed: vec!["node".into()],
+            changed: vec![],
+        },
+        profile: Some(ValueChange {
+            before: Some("default v1".into()),
+            after: Some("default v2".into()),
+        }),
+        ..EnvironmentDiff::default()
+    })
+}
+
+#[test]
+fn a_refresh_shows_what_changed_and_both_identities() {
+    let lines = refresh_outcome_lines(
+        "t-1",
+        &EnvironmentRefreshResult::Refreshed {
+            old_identity: "sha256:aaaa".into(),
+            new_identity: "sha256:bbbb".into(),
+            generation: 8,
+            change_count: 4,
+            diff: refresh_diff(),
+        },
+    );
+    let text = lines.join("\n");
+    assert!(text.contains("4 change(s), now generation 8"), "{text}");
+    assert!(text.contains("sha256:aaaa → sha256:bbbb"), "{text}");
+    assert!(
+        text.contains("task image components: added cargo, jq; removed node"),
+        "{text}"
+    );
+    assert!(text.contains("profile: default v1 → default v2"), "{text}");
+    assert!(!text.contains("tools"), "unchanged parts stay out: {text}");
+
+    let unchanged = refresh_outcome_lines(
+        "t-1",
+        &EnvironmentRefreshResult::Unchanged {
+            identity: "sha256:aaaa".into(),
+        },
+    );
+    assert_eq!(unchanged.len(), 1, "{unchanged:?}");
+    assert!(unchanged[0].contains("nothing changed"), "{unchanged:?}");
+}
+
+#[test]
+fn a_refresh_event_names_who_refreshed_and_the_change_count() {
+    let line = event_line(&resume_event(TaskEventKind::EnvironmentRefreshed {
+        requested_by: OwnerRef("alice".into()),
+        old_identity: format!("sha256:{}", "a".repeat(64)),
+        new_identity: format!("sha256:{}", "b".repeat(64)),
+        diff: refresh_diff(),
+    }));
+    assert!(
+        line.ends_with("environment refreshed by alice: 4 change(s), aaaaaaaaaaaa → bbbbbbbbbbbb"),
+        "{line}"
+    );
+}
+
 #[test]
 fn show_on_an_interrupted_task_tells_what_it_waits_for() {
     let hint = |subject| state_hint(&subject).unwrap();
@@ -907,4 +971,49 @@ fn an_archived_task_without_a_timeline_says_its_storage_was_deleted() {
     assert!(!text
         .iter()
         .any(|line| line.contains("not reported yet") && line.starts_with("Timeline")));
+}
+
+#[test]
+fn show_names_the_refresh_when_the_environment_differs_and_a_catalogue_problem_is_not_drift() {
+    use narsor_protocol::controller::EnvironmentDrift;
+    let shown = |runner_state: &str, drift: EnvironmentDrift| {
+        let mut subject = task("t-1", "local", runner_state, 1);
+        subject.environment_drift = Some(drift);
+        detail_lines(&subject, None, None)
+            .into_iter()
+            .find(|line| line.text.starts_with("Environment"))
+    };
+    let differs = || EnvironmentDrift::Differs {
+        catalogue_identity: "env-2".to_string(),
+    };
+
+    let stopped = shown("stopped", differs()).expect("a drift line");
+    assert_eq!(
+        stopped.text,
+        "Environment differs from the catalogue — run `narsor-cli task refresh-env t-1`"
+    );
+    assert_eq!(stopped.tone, Tone::Warning);
+    let running = shown("running", differs()).expect("a drift line");
+    assert!(
+        running.text.ends_with("once the task is paused"),
+        "{running:?}"
+    );
+
+    let problem = shown(
+        "stopped",
+        EnvironmentDrift::CatalogueProblem {
+            code: "invalid_runtime".to_string(),
+            reason: "runtime.yaml: task_image is broken".to_string(),
+        },
+    )
+    .expect("a catalogue problem line");
+    assert!(
+        problem.text.contains("runtime.yaml: task_image is broken"),
+        "{problem:?}"
+    );
+    assert!(!problem.text.contains("refresh-env"), "{problem:?}");
+
+    for quiet in [EnvironmentDrift::Current, EnvironmentDrift::NotApplicable] {
+        assert_eq!(shown("stopped", quiet.clone()), None, "{quiet:?}");
+    }
 }

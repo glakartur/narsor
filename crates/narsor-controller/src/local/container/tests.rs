@@ -616,7 +616,7 @@ mod containers {
                 Box::new(|fixture| {
                     fixture.launch("task-1", ResolvedEnvironment::harness_only("claude-code"))
                 }),
-                "runtime.yaml",
+                "then run `narsor-cli task refresh-env task-1`",
                 Rejected,
             ),
             (

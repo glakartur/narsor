@@ -281,6 +281,16 @@ pub enum OrchestrationError {
         reason: String,
     },
 
+    /// The task's environment cannot be refreshed in its current state
+    /// (R4, R5).
+    #[error("task '{task_id}' cannot refresh its environment: {reason}")]
+    EnvironmentRefreshRefused {
+        /// The task.
+        task_id: TaskId,
+        /// Why, for the owner.
+        reason: String,
+    },
+
     /// An operator command idempotency key was reused for another command.
     #[error(
         "operator command idempotency key '{key}' of task '{task_id}' was already used for \

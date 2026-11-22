@@ -7,6 +7,7 @@ use super::entry::{
 };
 use super::state::TranscriptState;
 use crate::tui::form::field::clip;
+use crate::tui::plural;
 use crate::tui::scroll::one_line;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -126,15 +127,6 @@ fn subagent_header(name: &str, members: usize, failures: usize, width: usize) ->
     }
     let room = width.saturating_sub(2 + tail.chars().count()).max(1);
     format!("{}{tail}", clip(name, room))
-}
-
-/// The Polish form of a noun after `count`: one, a few, many.
-fn plural(count: usize, forms: [&'static str; 3]) -> &'static str {
-    match (count, count % 10, count % 100) {
-        (1, _, _) => forms[0],
-        (_, 2..=4, tens) if !(12..=14).contains(&tens) => forms[1],
-        _ => forms[2],
-    }
 }
 
 impl TranscriptState {

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  checkEntry, deliver, fieldKind, fieldProblem, fillPlaceholders, panelActions, resolveSend, tagOf,
+  checkEntry, deliver, fieldKind, fieldProblem, fillPlaceholders, panelActions, refreshOutcomeText, resolveSend, tagOf,
 } from '../ui/js/panel.js';
 
 const def = (plan, fields = []) => ({ episode: 'ep-1', entries: [{ label: 'x', plan, fields }] });
@@ -87,6 +87,7 @@ test('resolveSend for the three types', () => {
   );
   assert.deepEqual(resolveSend({ type: 'comment', field: 'tekst' }, { tekst: ' hi ' }), { route: 'comment', body: 'hi' });
   assert.throws(() => resolveSend({ type: 'comment', field: 'tekst' }, { tekst: ' ' }), /wymagane/);
+  assert.deepEqual(resolveSend({ type: 'refresh_environment' }, {}), { route: 'refresh_environment', body: null });
   assert.throws(() => resolveSend({ type: 'teleport' }, {}), /nowszej wersji/);
   assert.equal(fillPlaceholders('a {{b}}', { b: 'x' }), 'a {{b}}');
 });
@@ -100,4 +101,13 @@ test('panel actions: only the panel surface, in order; none from an old server',
     { id: 'd', order: 1 },
   ] });
   assert.deepEqual(actions.map((action) => action.id), ['a', 'b']);
+});
+
+test('the notice of an environment refresh counts the changes, or says nothing changed', () => {
+  const refreshed = refreshOutcomeText({
+    type: 'refreshed', old_identity: 'a', new_identity: 'b', generation: 2, change_count: 3,
+    diff: { profile: { before: 'small', after: 'large' }, tools: { added: ['glab'], removed: ['jq'] } },
+  });
+  assert.match(refreshed, /^środowisko odświeżone — 3 zmiany/);
+  assert.match(refreshOutcomeText({ type: 'unchanged', identity: 'a' }), /^środowisko bez zmian/);
 });

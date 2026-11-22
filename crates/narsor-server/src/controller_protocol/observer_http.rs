@@ -320,6 +320,14 @@ mod tests {
             Err(LaunchError::UnknownBackend("k8s".to_string()))
         }
 
+        fn resolve_environment(
+            &self,
+            backend: &BackendId,
+            _spec: &narsor_engine::domain::TaskLaunchSpec,
+        ) -> Result<narsor_engine::domain::ResolvedEnvironment, LaunchError> {
+            Err(LaunchError::UnknownBackend(backend.to_string()))
+        }
+
         fn check_backend(&self, backend: &BackendId) -> Result<(), LaunchError> {
             Err(LaunchError::UnknownBackend(backend.to_string()))
         }

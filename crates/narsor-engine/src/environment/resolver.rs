@@ -21,8 +21,8 @@ use crate::automations::{
     AutomationCatalogError, AutomationCatalogLoad, AutomationScript, HookPhase,
 };
 use crate::domain::{
-    BackendId, GitIdentityError, ImageError, InvalidIdentifier, ResourceProfile, TaskLaunchSpec,
-    WorkflowDefinition,
+    BackendId, GitIdentityError, ImageError, InvalidIdentifier, ResolvedEnvironment,
+    ResourceProfile, TaskLaunchSpec, WorkflowDefinition,
 };
 use crate::registry::RegistryError;
 
@@ -287,6 +287,20 @@ impl LaunchError {
 pub trait LaunchResolver: Send + Sync {
     /// Resolves and validates `intent`, reading but never writing.
     fn resolve(&self, intent: &LaunchIntent) -> Result<ResolvedLaunch, LaunchError>;
+
+    /// Re-resolves only the catalogue-derived environment of the sealed
+    /// `spec` of an existing task on `backend`, with the rules of creation:
+    /// base and step images, the task image (sealed only on a backend that
+    /// runs no images), the runtime bundle, tools, the profile by its stored
+    /// id and its secret references, and the workspace's git credentials.
+    /// The workspace, inputs, definition, resources, labels and fallback
+    /// harness stay as sealed, so an unchanged catalogue yields the stored
+    /// identity. Refused with the same errors as a create request.
+    fn resolve_environment(
+        &self,
+        backend: &BackendId,
+        spec: &TaskLaunchSpec,
+    ) -> Result<ResolvedEnvironment, LaunchError>;
 
     /// Whether `backend` is registered and usable, read fresh from
     /// configuration on every call.

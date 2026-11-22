@@ -150,6 +150,10 @@ where
         .route("/control/v1/tasks/{task_id}/commands", post(post_command))
         .route("/control/v1/tasks/{task_id}/move", post(post_move))
         .route(
+            "/control/v1/tasks/{task_id}/refresh-environment",
+            post(post_refresh_environment),
+        )
+        .route(
             "/control/v1/default-backend",
             get(get_default_backend).put(put_default_backend),
         )
@@ -430,9 +434,17 @@ async fn get_task(
     State(service): State<Service>,
     Extension(owner): Extension<OwnerRef>,
     Path(task_id): Path<String>,
+    Query(query): Query<TaskQuery>,
 ) -> ProtocolResult<Json<TaskSummary>> {
     Ok(Json(
-        blocking(&service, move |s| s.task(&owner, &task_id)).await?,
+        blocking(&service, move |s| {
+            if query.drift {
+                s.task_with_drift(&owner, &task_id)
+            } else {
+                s.task(&owner, &task_id)
+            }
+        })
+        .await?,
     ))
 }
 
@@ -455,6 +467,20 @@ async fn post_move(
 ) -> ProtocolResult<Json<TaskSummary>> {
     Ok(Json(
         blocking(&service, move |s| s.move_task(&owner, &task_id, request)).await?,
+    ))
+}
+
+async fn post_refresh_environment(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(task_id): Path<String>,
+    Json(request): Json<RefreshEnvironmentRequest>,
+) -> ProtocolResult<Json<RefreshEnvironmentResponse>> {
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.refresh_environment(&owner, &task_id, request)
+        })
+        .await?,
     ))
 }
 

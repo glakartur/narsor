@@ -1,8 +1,13 @@
 // *Info*: the sealed inputs, the workflow, the workspace, the runner and the
-// controller of the task (labels from `src/tui/task_app/tabs/info.rs`).
+// controller of the task (labels from `src/tui/task_app/tabs/info.rs`). The
+// task is read once more, with its environment compared with the catalogue,
+// once per generation (a refresh moves it): reopening the tab for the same
+// generation shows the comparison already read. A failed read is not kept.
 
 import { html } from '../../lib.js';
 import { secondsBetween, shortAge } from '../../model.js';
+import { driftRow } from '../../text.js';
+import { useRead } from '../read.js';
 
 const STATE_NAME = {
   queued: 'w kolejce', running: 'działa', human_needed: 'czeka na Ciebie', paused: 'wstrzymane',
@@ -39,7 +44,20 @@ function Sheet({ title, rows }) {
   </section>`;
 }
 
-export function Info({ task }) {
+/** The task read with its drift, by task id: `{ generation, read }`, the latest generation only. */
+const driftReads = new Map();
+
+async function taskWithDrift(api, task, signal) {
+  const cached = driftReads.get(task.task_id);
+  if (cached?.generation === task.generation) return cached.read;
+  const read = await api.taskWithDrift(task.task_id, signal);
+  driftReads.set(task.task_id, { generation: task.generation, read });
+  return read;
+}
+
+export function Info({ api, task }) {
+  const driftRead = useRead((signal) => taskWithDrift(api, task, signal), `${task.task_id}:${task.generation}`);
+  const drift = driftRow(driftRead);
   const runner = task.runner;
   const observation = task.observation;
   const controller = task.controller;
@@ -50,6 +68,8 @@ export function Info({ task }) {
       ['backend', task.backend_id],
       ['utworzone', `${new Date(task.created_at).toLocaleString('pl-PL')} (${ago(task, task.created_at)})`],
       ['launch digest', task.launch_digest],
+      ['środowisko', task.environment_identity],
+      ['katalog', drift?.text, drift?.role],
       ['ticket', task.ticket],
       ['tytuł', task.title],
       ...(answers.length ? answers : [['odpowiedzi', 'brak', 'done']]),

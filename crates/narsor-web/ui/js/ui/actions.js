@@ -5,7 +5,7 @@
 
 import { html, useEffect, useRef, useState } from '../lib.js';
 import { pullRequest } from '../model.js';
-import { panelActions, resolveSend } from '../panel.js';
+import { panelActions, refreshOutcomeText, resolveSend } from '../panel.js';
 import { Field } from './fields.js';
 
 function kindOfField(field) {
@@ -20,8 +20,12 @@ function send(store, task, action, texts) {
     owner: (api) => api.command(task.task_id, request.body, gen),
     operator: (api) => api.operatorCommand(task.task_id, request.body, gen),
     comment: (api) => api.comment(task.task_id, request.body, gen),
+    refresh_environment: (api) => api.refreshEnvironment(task.task_id, gen),
   }[request.route];
-  return store.mutate(run, { success: `${action.label}: wysłano`, failure: `${action.label}: odrzucone` });
+  const success = request.route === 'refresh_environment'
+    ? (response) => `${action.label}: ${refreshOutcomeText(response?.outcome)}`
+    : `${action.label}: wysłano`;
+  return store.mutate(run, { success, failure: `${action.label}: odrzucone` });
 }
 
 export function ActionPanel({ store, task, onClose, onAnswer }) {

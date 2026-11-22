@@ -73,6 +73,15 @@ impl ProtocolService {
         self.summarize(&record)
     }
 
+    /// One of the owner's tasks, with how its stored environment stands
+    /// against the current catalogue (`GET …/tasks/:id?drift=true`).
+    pub fn task_with_drift(&self, owner: &OwnerRef, task_id: &str) -> ProtocolResult<TaskSummary> {
+        let record = self.owned_task(owner, task_id)?;
+        let mut summary = self.summarize(&record)?;
+        summary.environment_drift = Some(self.environment_drift(&record));
+        Ok(summary)
+    }
+
     /// The owner's task, re-read and summarized.
     pub(super) fn owned_summary(
         &self,

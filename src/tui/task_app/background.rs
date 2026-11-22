@@ -55,6 +55,9 @@ pub(super) enum DetailJob {
     Conductor,
     Events,
     Attempt(String),
+    /// The task once more, with its environment compared with the catalogue
+    /// (*Info*).
+    Drift,
 }
 
 /// What a view that opens reads for.

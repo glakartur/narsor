@@ -1002,7 +1002,20 @@ impl TaskApp {
 
     /// `[` / `]`: the tab `by` places along, on its timeline.
     fn shift_tab(&mut self, by: isize) {
-        self.detail.tab = self.detail.tab.shifted(by);
+        let tab = self.detail.tab.shifted(by);
+        // Opening *Info* compares the selected task's environment with the
+        // catalogue afresh: the catalogue moves without the task knowing.
+        // Other tasks read theirs when they are selected on *Info*.
+        if tab == DetailTab::Info && self.detail.tab != DetailTab::Info {
+            if let Some(view) = self
+                .list
+                .selected_id()
+                .and_then(|id| self.detail.views.get_mut(id))
+            {
+                view.info_mut().invalidate_drift();
+            }
+        }
+        self.detail.set_tab(tab);
         self.back_to_axis();
     }
 
@@ -1533,7 +1546,7 @@ impl TaskApp {
                         resume.title
                     )
                 },
-                |count| format!("wznowiono automatycznie {count} {}", tasks_word(count)),
+                |count| format!("wznowiono automatycznie {count} {}", crate::tui::plural(count, ["zadanie", "zadania", "zadań"])),
                 now,
             ),
             ResumeNoticeKind::Exhausted(detail) => self.notifier.push(
@@ -1644,15 +1657,6 @@ impl TaskApp {
                 self.connection.on_failure(now, None);
             }
         }
-    }
-}
-
-/// "zadanie" in the form that follows the number `count`.
-fn tasks_word(count: usize) -> &'static str {
-    match (count % 10, count % 100) {
-        _ if count == 1 => "zadanie",
-        (2..=4, tens) if !(12..=14).contains(&tens) => "zadania",
-        _ => "zadań",
     }
 }
 

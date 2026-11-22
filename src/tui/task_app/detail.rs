@@ -86,7 +86,7 @@ use super::tabs::conversation::{
     self, transcript_action, AttemptRead, Attempts, Conversation, ReadFailure,
 };
 use super::tabs::events::{self, Events};
-use super::tabs::info::{self, Info};
+use super::tabs::info::{self, DriftOutcome, Info};
 use super::tabs::progress::{self, Progress, StepView};
 use super::workspace_rows::{self, Part, Piece};
 use super::{failure_reason, DetailTab, DetailView, StepFocus, TaskApp};
@@ -155,6 +155,10 @@ impl TaskDetail {
     /// *Info*.
     pub fn info(&self) -> &Info {
         &self.info
+    }
+
+    pub(super) fn info_mut(&mut self) -> &mut Info {
+        &mut self.info
     }
 
     /// *Dyrygent*.
@@ -702,21 +706,24 @@ impl TaskApp {
         let Some(task) = self.list.selected() else {
             return;
         };
-        if requires_explicit_open(task)
+        let id = task.task_id.to_string();
+        let (generation, revision) = (task.generation, task.revision);
+        let unopened = requires_explicit_open(task)
             && !self
                 .detail
                 .views
-                .get(task.task_id.as_str())
-                .is_some_and(|view| view.details_opened)
-        {
-            return;
-        }
-        if readiness(task) != Readiness::Started {
-            return;
-        }
-        let id = task.task_id.to_string();
-        let revision = task.revision;
+                .get(&id)
+                .is_some_and(|view| view.details_opened);
+        let started = readiness(task) == Readiness::Started;
         let tab = self.detail.tab();
+        // Before the runner's reads: the comparison with the catalogue is
+        // the control plane's, and matters most for a task that is stopped.
+        if tab == DetailTab::Info {
+            self.start_drift_read(&id, generation);
+        }
+        if unopened || !started {
+            return;
+        }
 
         // The timeline first: the other reads are made of what it says.
         if self.detail.view_mut(&id).progress.needs_read(revision) {
@@ -773,6 +780,59 @@ impl TaskApp {
                 .selected_id()
                 .is_some_and(|id| self.background.task_running(id)),
         }
+    }
+
+    /// Starts the comparison of the task's environment with the catalogue
+    /// when it is due (*Info*).
+    fn start_drift_read(&mut self, id: &str, generation: u64) {
+        if self
+            .detail
+            .view(id)
+            .is_some_and(|view| !view.info.needs_drift_read(generation))
+        {
+            return;
+        }
+        let client = self.client.clone();
+        let task_id = id.to_string();
+        self.background.start(
+            JobKey::Detail(task_id.clone(), DetailJob::Drift),
+            async move {
+                let result = client.control_task_with_drift(&task_id).await;
+                Outcome::new(move |app: &mut TaskApp| {
+                    app.on_drift_read(&task_id, generation, result);
+                })
+            },
+        );
+    }
+
+    /// Takes the answer of a comparison of `task_id`'s environment with the
+    /// catalogue in, asked for the task at `generation`. A failure shows that
+    /// the comparison is unknown; only an unreachable server counts against
+    /// the connection.
+    pub fn on_drift_read(
+        &mut self,
+        task_id: &str,
+        generation: u64,
+        result: Result<TaskSummary, ClientError>,
+    ) {
+        if !self
+            .list
+            .tasks()
+            .iter()
+            .any(|task| task.task_id.as_str() == task_id)
+        {
+            return;
+        }
+        // Filed under the generation asked for, so a response that is ahead
+        // of the list still settles the read the list is waiting on.
+        let outcome = match self.settle(result) {
+            Ok(task) => DriftOutcome::Known(task.environment_drift),
+            Err(_) => DriftOutcome::Unknown,
+        };
+        self.detail
+            .view_mut(task_id)
+            .info
+            .apply_drift(generation, outcome);
     }
 
     fn start_timeline_read(&mut self, id: &str, revision: u64) {

@@ -4,6 +4,8 @@
 // (`crates/narsor-protocol/src/panel/mod.rs`) and the TUI's field checks
 // (`src/tui/chooser.rs`). Pure functions, tested in Node.
 
+import { pluralPl } from './model.js';
+
 export const MESSAGE_FIELD = 'Wiadomość dla agenta';
 export const COMMENT_TO_AGENT = 'Komentarz dla agenta';
 export const COMMENT_FIELD = 'komentarz';
@@ -213,7 +215,8 @@ export function fillPlaceholders(command, texts) {
 }
 
 /**
- * The request an action sends: `{route: 'owner'|'operator'|'comment', body}`.
+ * The request an action sends:
+ * `{route: 'owner'|'operator'|'comment'|'refresh_environment', body}`.
  * Throws `Error` when it cannot be sent.
  */
 export function resolveSend(send, texts) {
@@ -229,8 +232,25 @@ export function resolveSend(send, texts) {
       if (!text) throw new Error(`Pole '${send.field}' jest wymagane.`);
       return { route: 'comment', body: text };
     }
+    case 'refresh_environment':
+      return { route: 'refresh_environment', body: null };
     default:
       throw new Error('Ta akcja wymaga nowszej wersji klienta.');
+  }
+}
+
+/** What the notice says of an environment refresh (`EnvironmentRefreshResult`), as the TUI's bar. */
+export function refreshOutcomeText(outcome) {
+  switch (outcome?.type) {
+    case 'refreshed': {
+      const count = outcome.change_count ?? 0;
+      if (count === 0) return 'środowisko odświeżone';
+      return `środowisko odświeżone — ${count} ${pluralPl(count, ['zmiana', 'zmiany', 'zmian'])}; zadanie dostanie je przy następnym uruchomieniu`;
+    }
+    case 'unchanged':
+      return 'środowisko bez zmian — katalog daje to samo środowisko';
+    default:
+      return 'odświeżenie środowiska przyjęte';
   }
 }
 

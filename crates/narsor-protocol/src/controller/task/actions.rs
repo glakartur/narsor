@@ -42,6 +42,10 @@ pub enum TaskActionId {
     ReleaseSlot,
     /// Choose any step of the workflow to go on from.
     SelectStep,
+    /// Read the environment of a stopped task again from the current
+    /// catalogue. A client that predates it reads it as
+    /// [`TaskActionId::Unrecognized`].
+    RefreshEnvironment,
     #[serde(other)]
     Unrecognized,
 }
@@ -276,6 +280,10 @@ pub enum TaskActionSend {
     Operator { command: serde_json::Value },
     /// A comment (`POST …/comments`) whose text is the field `field`.
     Comment { field: String },
+    /// An environment refresh (`POST …/refresh-environment`): an
+    /// [`super::RefreshEnvironmentRequest`]. A client that predates it reads
+    /// it as [`TaskActionSend::Unrecognized`] and cannot send it.
+    RefreshEnvironment,
     #[serde(other)]
     Unrecognized,
 }
@@ -286,6 +294,7 @@ pub enum ResolvedActionSend {
     Owner(super::OwnerCommand),
     Operator(super::OperatorCommand),
     Comment(String),
+    RefreshEnvironment,
 }
 
 /// The placeholder of the field `name` in the command of a [`TaskActionSend`].
@@ -330,6 +339,7 @@ impl TaskActionSend {
             Self::Comment { field } => value_of(field)
                 .map(ResolvedActionSend::Comment)
                 .ok_or_else(|| format!("pole „{field}” jest puste")),
+            Self::RefreshEnvironment => Ok(ResolvedActionSend::RefreshEnvironment),
             Self::Unrecognized => Err(NEWER.to_string()),
         }
     }
@@ -536,6 +546,44 @@ mod tests {
             serde_json::from_value(json!({"type": "operator", "command": {"kind": "teleport"}}))
                 .unwrap();
         assert!(read.resolve(&[]).is_err());
+    }
+
+    /// The command kinds a client from before the environment refresh knew.
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    #[allow(dead_code)]
+    enum OlderSend {
+        Owner {
+            command: serde_json::Value,
+        },
+        Operator {
+            command: serde_json::Value,
+        },
+        Comment {
+            field: String,
+        },
+        #[serde(other)]
+        Unrecognized,
+    }
+
+    #[test]
+    fn an_environment_refresh_is_sent_by_a_current_client_and_refused_by_an_older_one() {
+        let send = TaskActionSend::RefreshEnvironment;
+        let wire = serde_json::to_value(&send).unwrap();
+        assert_eq!(wire, json!({"type": "refresh_environment"}));
+        assert_eq!(
+            send.resolve(&[]),
+            Ok(ResolvedActionSend::RefreshEnvironment)
+        );
+
+        // An older client reads the summary, and its panel says the action
+        // needs a newer client (what `resolve` answers for `Unrecognized`).
+        let older: OlderSend = serde_json::from_value(wire).unwrap();
+        assert_eq!(older, OlderSend::Unrecognized);
+        assert_eq!(
+            TaskActionSend::Unrecognized.resolve(&[]),
+            Err("ta akcja wymaga nowszej wersji klienta".to_string())
+        );
     }
 
     #[test]

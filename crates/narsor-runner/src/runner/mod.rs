@@ -353,8 +353,8 @@ async fn work(
     let _lock = storage.lock()?;
     let store = storage.store();
 
-    let spec = match load_spec(&config, &storage, &mut link).await {
-        Ok(spec) => spec,
+    let LoadedSpec { spec, replacement } = match load_spec(&config, &storage, &mut link).await {
+        Ok(loaded) => loaded,
         Err(error) => {
             return Ok(report_problem(
                 &storage,
@@ -430,7 +430,15 @@ async fn work(
     } else {
         GitAccess::User
     };
-    if let Err(error) = initialize(&storage, &store, &config.task_id, &spec, &secrets, &git) {
+    if let Err(error) = initialize(
+        &storage,
+        &store,
+        &config.task_id,
+        &spec,
+        replacement.as_ref(),
+        &secrets,
+        &git,
+    ) {
         return Ok(report_problem(
             &storage,
             &mut link,
@@ -590,24 +598,86 @@ fn starting_harness(storage: &TaskStorage, spec: &TaskLaunchSpec) -> String {
     applied.unwrap_or_else(|| spec.environment.harness.clone())
 }
 
+/// The launch spec a working runner goes on with, and whether it replaces
+/// the storage's copy.
+#[derive(Debug)]
+struct LoadedSpec {
+    spec: TaskLaunchSpec,
+    replacement: Option<AcceptedReplacement>,
+}
+
+/// Proof that a served spec was accepted as an environment-only refresh of
+/// the storage's copy: it recomputes to the pinned digest, its digest field
+/// and environment identity match its content, and everything the task was
+/// created with equals the copy. Only [`AcceptedReplacement::accept`] makes
+/// one, and only with one does [`initialize`] replace the copy and move the
+/// marker to the new launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedReplacement {
+    /// Digest of the storage's copy the spec replaces.
+    pub(crate) replaced_digest: String,
+}
+
+impl AcceptedReplacement {
+    /// Accepts `served`, which the control plane serves under `pinned`, as
+    /// the replacement of `stored`, the storage's copy that misses the pin
+    /// — the check a working runner makes before [`initialize`] replaces
+    /// the copy.
+    pub fn accept(
+        stored: &TaskLaunchSpec,
+        served: &TaskLaunchSpec,
+        pinned: &str,
+    ) -> Result<Self, RunnerError> {
+        check_served_spec(served, pinned)?;
+        if !served.is_environment_refresh_of(stored) {
+            let problem = stored
+                .check_pinned_digest(pinned)
+                .err()
+                .unwrap_or_else(|| format!("it already is the pinned launch {pinned}"));
+            return Err(RunnerError::LaunchSpec(format!(
+                "the storage's copy: {problem}"
+            )));
+        }
+        Ok(Self {
+            replaced_digest: stored.digest.clone(),
+        })
+    }
+}
+
 /// The task's launch spec: the storage's copy once it holds one, else the
 /// one the control plane serves (R5, KTD3). Either must recompute to the
 /// digest the controller passed; the spec's own `digest` field is never
 /// trusted alone. Nothing is written here: [`initialize`] copies a fetched
 /// spec onto the storage.
+///
+/// A storage copy that misses the pin is the one exception: the task's
+/// environment may have been refreshed since the storage was initialized.
+/// The served spec is then accepted as an [`AcceptedReplacement`] when it
+/// differs from the copy in its environment only; any other difference
+/// refuses the copy as before.
 async fn load_spec(
     config: &RunnerConfig,
     storage: &TaskStorage,
     link: &mut Link,
-) -> Result<TaskLaunchSpec, RunnerError> {
+) -> Result<LoadedSpec, RunnerError> {
     let pinned = config.launch_digest.as_deref();
-    if let Some(spec) = storage.store().load_task_launch_spec(&config.task_id)? {
-        if let Some(pinned) = pinned {
-            spec.check_pinned_digest(pinned).map_err(|problem| {
-                RunnerError::LaunchSpec(format!("the storage's copy: {problem}"))
-            })?;
+    if let Some(stored) = storage.store().load_task_launch_spec(&config.task_id)? {
+        let unchanged = |spec| LoadedSpec {
+            spec,
+            replacement: None,
+        };
+        let Some(pinned) = pinned else {
+            return Ok(unchanged(stored));
+        };
+        if stored.check_pinned_digest(pinned).is_ok() {
+            return Ok(unchanged(stored));
         }
-        return Ok(spec);
+        let served = fetch_pinned_spec(link, &config.timing, pinned).await?;
+        let replacement = AcceptedReplacement::accept(&stored, &served, pinned)?;
+        return Ok(LoadedSpec {
+            spec: served,
+            replacement: Some(replacement),
+        });
     }
     let pinned = pinned.ok_or_else(|| {
         RunnerError::LaunchSpec(
@@ -616,12 +686,34 @@ async fn load_spec(
                 .to_string(),
         )
     })?;
-    let fetched = fetch_launch_spec(link, &config.timing).await?;
+    let spec = fetch_pinned_spec(link, &config.timing, pinned).await?;
+    Ok(LoadedSpec {
+        spec,
+        replacement: None,
+    })
+}
+
+/// The spec the control plane serves, accepted only when it recomputes to
+/// `pinned` and its digest field and environment identity match its
+/// content.
+async fn fetch_pinned_spec(
+    link: &mut Link,
+    timing: &RunnerTiming,
+    pinned: &str,
+) -> Result<TaskLaunchSpec, RunnerError> {
+    let fetched = fetch_launch_spec(link, timing).await?;
     let spec: TaskLaunchSpec = serde_json::from_value(fetched).map_err(|error| {
         RunnerError::LaunchSpec(format!(
             "the control plane served a malformed spec: {error}"
         ))
     })?;
+    check_served_spec(&spec, pinned)?;
+    Ok(spec)
+}
+
+/// Whether a spec the control plane served recomputes to `pinned` and its
+/// digest field and environment identity match its content.
+fn check_served_spec(spec: &TaskLaunchSpec, pinned: &str) -> Result<(), RunnerError> {
     spec.check_pinned_digest(pinned).map_err(|problem| {
         RunnerError::LaunchSpec(format!("the control plane served {problem}"))
     })?;
@@ -632,7 +724,7 @@ async fn load_spec(
                 .to_string(),
         ));
     }
-    Ok(spec)
+    Ok(())
 }
 
 /// Fetches the launch spec with the runner's credential, retrying with the

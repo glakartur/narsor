@@ -103,6 +103,60 @@ fn task_summary_state_since_is_optional_on_the_wire() {
 }
 
 #[test]
+fn environment_drift_is_absent_from_an_older_server_and_an_unknown_status_falls_back() {
+    let older = serde_json::json!({
+        "task_id": "task-1",
+        "backend_id": "local",
+        "runner_state": "stopped",
+        "generation": 1,
+        "revision": 1,
+        "rank": 1,
+        "created_at": "2026-10-03T12:00:00Z",
+        "queue_sequence": 1,
+        "workflow_id": "workflow",
+        "workflow_version": 1,
+        "launch_digest": "",
+        "environment_identity": "",
+        "archive": null,
+        "observation": null,
+        "runner": null,
+        "controller": null,
+        "inputs": [],
+        "as_of": "2026-10-03T12:00:00Z"
+    });
+    let summary: super::TaskSummary = serde_json::from_value(older.clone()).unwrap();
+    assert_eq!(summary.environment_drift, None);
+    assert!(serde_json::to_value(&summary)
+        .unwrap()
+        .get("environment_drift")
+        .is_none());
+
+    let mut newer = older;
+    newer["environment_drift"] = serde_json::json!({ "status": "drifting_sideways", "x": 1 });
+    let summary: super::TaskSummary = serde_json::from_value(newer).unwrap();
+    assert_eq!(
+        summary.environment_drift,
+        Some(super::EnvironmentDrift::Unrecognized)
+    );
+
+    let problem: super::EnvironmentDrift = serde_json::from_value(serde_json::json!({
+        "status": "catalogue_problem", "code": "invalid_runtime", "reason": "broken"
+    }))
+    .unwrap();
+    assert_eq!(
+        problem,
+        super::EnvironmentDrift::CatalogueProblem {
+            code: "invalid_runtime".into(),
+            reason: "broken".into()
+        }
+    );
+    assert_eq!(
+        serde_json::from_value::<super::TaskQuery>(serde_json::json!({})).unwrap(),
+        super::TaskQuery { drift: false }
+    );
+}
+
+#[test]
 fn task_event_keeps_the_durable_tagged_wire_shape() {
     let kind = super::TaskEventKind::RunnerReported {
         incarnation: "pod-1".into(),
@@ -163,6 +217,56 @@ fn observer_events_carry_their_provenance_and_unknown_ones_with_fields_are_unrec
         serde_json::from_value::<super::TaskEventKind>(newer).unwrap(),
         super::TaskEventKind::Unrecognized
     );
+}
+
+#[test]
+fn an_environment_refresh_event_decodes_and_an_older_client_reads_it_as_unrecognized() {
+    let raw = serde_json::json!({
+        "type": "environment_refreshed",
+        "requested_by": "oidc:https://issuer|artur",
+        "old_identity": "sha256:old",
+        "new_identity": "sha256:new",
+        "diff": {
+            "task_image_components": { "added": ["glab"] },
+            "base_image": { "before": null, "after": "debian@sha256:abc" },
+            "a_part_from_a_newer_server": { "added": ["x"] }
+        }
+    });
+    let kind: super::TaskEventKind = serde_json::from_value(raw).unwrap();
+    let super::TaskEventKind::EnvironmentRefreshed {
+        requested_by,
+        old_identity,
+        new_identity,
+        diff,
+    } = &kind
+    else {
+        panic!("decoded as {kind:?}");
+    };
+    assert_eq!(requested_by.0, "oidc:https://issuer|artur");
+    assert_eq!(
+        (old_identity.as_str(), new_identity.as_str()),
+        ("sha256:old", "sha256:new")
+    );
+    assert_eq!(diff.task_image_components.added, vec!["glab".to_string()]);
+    assert_eq!(diff.change_count(), 2);
+    // Unchanged parts stay off the wire.
+    let written = serde_json::to_value(&kind).unwrap();
+    assert!(written["diff"].get("tools").is_none());
+    assert_eq!(
+        serde_json::from_value::<super::TaskEventKind>(written).unwrap(),
+        kind
+    );
+
+    // A build from before the refresh: the variant is unknown to it.
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    #[serde(rename_all = "snake_case", tag = "type")]
+    enum OlderKind {
+        Created,
+        #[serde(other)]
+        Unrecognized,
+    }
+    let older: OlderKind = serde_json::from_value(serde_json::to_value(&kind).unwrap()).unwrap();
+    assert_eq!(older, OlderKind::Unrecognized);
 }
 
 #[test]
@@ -979,4 +1083,37 @@ fn a_command_carries_the_launch_digest_and_no_launch_spec() {
     let command = &value["commands"][0];
     assert!(command.get("launch_spec").is_none(), "{command}");
     assert_eq!(command["launch_digest"], "sha256:abc");
+}
+
+#[test]
+fn an_environment_refresh_outcome_decodes_from_raw_json_and_tolerates_newer_kinds() {
+    use super::EnvironmentRefreshResult;
+    let refreshed: EnvironmentRefreshResult = serde_json::from_value(serde_json::json!({
+        "type": "refreshed",
+        "old_identity": "env-old",
+        "new_identity": "env-new",
+        "generation": 4,
+        "change_count": 1,
+        "diff": { "task_image_components": { "added": ["glab"] } },
+    }))
+    .unwrap();
+    let EnvironmentRefreshResult::Refreshed {
+        generation,
+        change_count,
+        diff,
+        ..
+    } = refreshed
+    else {
+        panic!("refreshed: {refreshed:?}");
+    };
+    assert_eq!(
+        (generation, change_count, diff.task_image_components.added),
+        (4, 1, vec!["glab".to_string()])
+    );
+
+    // A client that predates an outcome reads it as `Unrecognized`.
+    let newer: EnvironmentRefreshResult =
+        serde_json::from_value(serde_json::json!({ "type": "deferred", "until": "later" }))
+            .unwrap();
+    assert_eq!(newer, EnvironmentRefreshResult::Unrecognized);
 }

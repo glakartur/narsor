@@ -68,6 +68,7 @@ mod orchestration;
 mod persistence;
 mod profile_step_flow;
 mod queue_hooks;
+mod refresh_environment;
 mod registry;
 mod schema_loading;
 mod secret_store;
