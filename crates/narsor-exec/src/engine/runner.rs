@@ -142,7 +142,8 @@ use transition::*;
 
 pub use failure::engine_error::EngineError;
 pub use failure::handoff::{
-    step_failure, Recovery, StepFailure, METADATA_CONDUCTOR_RETRY_KEY, METADATA_STEP_FAILURE_KEY,
+    step_failure, OwnerMessage, Recovery, StepFailure, METADATA_CONDUCTOR_RETRY_KEY,
+    METADATA_STEP_FAILURE_KEY,
 };
 pub use human_input::manual_transition::record_manual_transition;
 pub use human_input::operations::{

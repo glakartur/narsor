@@ -379,6 +379,7 @@ impl ConductorRegistry {
                         comment: proposal.text.clone(),
                         episode: failure_key,
                         conductor_retry: false,
+                        owner_message: None,
                     },
                 )?;
                 Ok(("Restarted the failed step.".to_string(), Some(pass)))

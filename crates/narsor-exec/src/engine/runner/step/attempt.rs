@@ -191,6 +191,20 @@ impl Engine {
                     && error.error_type.as_deref() == Some(agent::RESUME_SESSION_REJECTED) =>
             {
                 let input = resumed_input.expect("guarded above");
+                if input.restart_if_refused {
+                    // The owner's message of a recovery: the step starts
+                    // again in a new session at once, the message in its
+                    // note, rather than waiting for the owner to confirm.
+                    let note = note_with_message(input.note.as_deref(), &input.answer);
+                    engine_metadata_mut(execution).insert(
+                        METADATA_OPERATOR_RECOVERY_NOTE_KEY.to_string(),
+                        Value::String(note),
+                    );
+                    self.store
+                        .save_execution(execution)
+                        .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
+                    return Ok(AttemptOutcome::SessionRefused(error.message));
+                }
                 Ok(AttemptOutcome::AwaitingAgentInput(HumanInputRequest {
                     action_execution_id: action_execution_id.to_string(),
                     instruction: "The saved agent session could not be resumed. Review the message below, then press Enter to start a new session.".to_string(),

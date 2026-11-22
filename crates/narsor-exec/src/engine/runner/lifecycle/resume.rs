@@ -78,8 +78,31 @@ impl Engine {
             }
             _ => return Err(self.not_runnable(&execution, "recovered")),
         }
+        // Before the failure, rejection and rescue records are cleared: they
+        // may be what names the session.
+        let session = match &recovery.owner_message {
+            Some(_) => {
+                let events = self.store.event_log(execution_id).read_all()?;
+                resumable_agent_session(&self.store, &execution, &events)
+            }
+            None => None,
+        };
         self.recover_step_failure(&mut execution, &recovery)?;
-        let comment = recovery.comment;
+        let mut comment = recovery.comment;
+        if let Some(message) = &recovery.owner_message {
+            let state_id = execution.current_state.clone().unwrap_or_default();
+            let left = leave_owner_message(
+                &mut execution,
+                &state_id,
+                &message.key,
+                &message.text,
+                session.as_ref(),
+                true,
+            );
+            if matches!(left, MessageLeft::AsNote) {
+                comment = Some(note_with_message(comment.as_deref(), &message.text));
+            }
+        }
 
         // A recovery starts the state's action afresh. A rejected output left
         // behind by an interrupted reprompt must not turn it into another one,

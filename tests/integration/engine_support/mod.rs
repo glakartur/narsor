@@ -736,6 +736,8 @@ impl AgentTurn {
 pub struct AgentCall {
     pub prompt: String,
     pub resume_session: Option<String>,
+    /// Whether the run leaves the output contract out of its prompt.
+    pub skips_contract: bool,
     pub action_execution_id: String,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -782,6 +784,7 @@ impl ActionExecutor for ScriptedAgentExecutor {
                 .get("resume_session")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
+            skips_contract: config.harness_step.skip_output_contract,
             action_execution_id: action_execution_id.clone(),
             model: config.harness_step.model.clone(),
             effort: config.harness_step.effort.clone(),

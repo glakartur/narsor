@@ -123,6 +123,19 @@ pub struct Recovery {
     /// The conductor's one retry (R21, KTD14): exactly one attempt, in the
     /// failure's episode. Requires `episode`.
     pub conductor_retry: bool,
+    /// What the owner wrote to the agent: the step goes on in its harness
+    /// session with it when there is one to continue
+    /// ([`resumable_agent_session`]), and starts afresh with it in the note
+    /// otherwise.
+    pub owner_message: Option<OwnerMessage>,
+}
+
+/// A message of the owner's for the agent, left once under its key: a
+/// recovery repeated with the same key leaves nothing again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerMessage {
+    pub key: String,
+    pub text: String,
 }
 
 impl Recovery {
@@ -134,6 +147,7 @@ impl Recovery {
             comment,
             episode,
             conductor_retry: false,
+            owner_message: None,
         }
     }
 

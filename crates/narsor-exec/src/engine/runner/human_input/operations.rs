@@ -20,7 +20,6 @@
 
 use super::*;
 use crate::domain::{Context, DefinitionShape};
-use narsor_protocol::chat::PromptAuthor;
 
 /// Where an execution stands, as a key (KTD9): what a proposal of the
 /// conductor's names, so that a proposal about a moment that has passed is
@@ -278,46 +277,31 @@ impl Engine {
         ) {
             return Err(self.not_runnable(&execution, "commented on"));
         }
-        if engine_metadata_mut(&mut execution)
-            .get(METADATA_RESUME_MESSAGE_KEY)
-            .and_then(Value::as_str)
-            == Some(key)
-        {
-            return Ok(execution);
-        }
-        engine_metadata_mut(&mut execution).insert(
-            METADATA_RESUME_MESSAGE_KEY.to_string(),
-            Value::String(key.to_string()),
-        );
-        let session = match execution.current_state.clone() {
-            Some(state_id) => {
-                let sessions: BTreeMap<String, AgentSessionProvenance> =
-                    read_engine_record(&execution, METADATA_AGENT_SESSIONS_KEY)?
-                        .unwrap_or_default();
-                sessions
-                    .get(&state_id)
-                    .map(|session| (state_id, session.clone()))
-            }
-            None => None,
-        };
-        match session {
-            Some((state_id, session)) => self.store_agent_input(
-                &mut execution,
-                &state_id,
-                text,
-                Some(session.harness.as_str()),
-                Some(session.session_id.as_str()),
-                Vec::new(),
-                PromptAuthor::User,
-            )?,
-            None => {
+        let state_id = execution.current_state.clone().unwrap_or_default();
+        let sessions: BTreeMap<String, AgentSessionProvenance> =
+            read_engine_record(&execution, METADATA_AGENT_SESSIONS_KEY)?.unwrap_or_default();
+        let session = sessions.get(&state_id).map(|session| ResumableSession {
+            harness: session.harness.clone(),
+            harness_session_id: session.session_id.clone(),
+        });
+        match leave_owner_message(
+            &mut execution,
+            &state_id,
+            key,
+            text,
+            session.as_ref(),
+            false,
+        ) {
+            MessageLeft::Before => return Ok(execution),
+            MessageLeft::InSession => {}
+            MessageLeft::AsNote => {
                 engine_metadata_mut(&mut execution).insert(
                     METADATA_OPERATOR_RECOVERY_NOTE_KEY.to_string(),
                     Value::String(text.to_string()),
                 );
-                self.store.save_execution(&execution)?;
             }
         }
+        self.store.save_execution(&execution)?;
         Ok(execution)
     }
 

@@ -550,6 +550,7 @@ impl ConductorRegistry {
                 comment: Some(note.clone()),
                 episode: Some(failure.key().to_string()),
                 conductor_retry: true,
+                owner_message: None,
             };
             match self.engine.try_begin_recover_with(execution_id, recovery) {
                 Err(EngineError::AlreadyRunning { .. })

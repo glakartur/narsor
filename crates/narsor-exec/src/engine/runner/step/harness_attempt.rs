@@ -71,7 +71,7 @@ impl Engine {
         step_memory::add_history(prompt, template, history);
         self.pin_harness(step, pinned_harness);
         self.apply_step_profile(execution, state, step, profile);
-        let input = self.take_agent_input(execution, state)?;
+        let mut input = self.take_agent_input(execution, state)?;
         if let Some(input) = &input {
             if let (Some(harness), Some(session)) =
                 (input.harness.as_deref(), input.session.as_deref())
@@ -87,6 +87,9 @@ impl Engine {
         if let Some(note) = self.take_operator_recovery_note(execution)? {
             prompt.push_str("\n\nOperator recovery note:\n");
             prompt.push_str(&note);
+            if let Some(input) = &mut input {
+                input.note = Some(note);
+            }
         }
         Ok(input)
     }
@@ -380,6 +383,11 @@ impl Engine {
                     .map(|rule| vec![rule.to_string()])
                     .unwrap_or_default(),
             },
+            restart_if_refused: record
+                .get("restart_if_refused")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            note: None,
         });
         if input.is_some() {
             engine.remove(METADATA_AGENT_INPUT_KEY);
