@@ -1,0 +1,147 @@
+{
+  "cases": [
+    {
+      "name": "variables come out sorted by key: scalars raw, array of scalars as one compact row (acceptance example)",
+      "state": {
+        "context": { "status": "available", "value": { "variables": { "branch": "feat/x", "pr": 12, "files": ["a", "b"] } } },
+        "locals": { "status": "available", "value": {} },
+        "conductor": { "status": "absent", "message": "no conductor state" }
+      },
+      "rows": [
+        { "path": "context:variables:branch", "value": "feat/x", "lines": 1 },
+        { "path": "context:variables:files", "value": "[\"a\",\"b\"]", "lines": 1 },
+        { "path": "context:variables:pr", "value": "12", "lines": 1 },
+        { "path": "locals", "value": "{}", "lines": 1 },
+        { "path": "conductor", "value": "(no conductor state)", "lines": 1 }
+      ]
+    },
+    {
+      "name": "nested artifacts and locals are flattened to leaves",
+      "state": {
+        "context": { "status": "available", "value": { "variables": { "A": "x" }, "artifacts": { "report": { "location": "out/report.md", "kind": "file" } } } },
+        "locals": { "status": "available", "value": { "build": { "NAME": "v1", "COUNT": 3 } } },
+        "conductor": { "status": "absent", "message": "none" }
+      },
+      "rows": [
+        { "path": "context:artifacts:report:kind", "value": "file", "lines": 1 },
+        { "path": "context:artifacts:report:location", "value": "out/report.md", "lines": 1 },
+        { "path": "context:variables:A", "value": "x", "lines": 1 },
+        { "path": "locals:build:COUNT", "value": "3", "lines": 1 },
+        { "path": "locals:build:NAME", "value": "v1", "lines": 1 },
+        { "path": "conductor", "value": "(none)", "lines": 1 }
+      ]
+    },
+    {
+      "name": "an array with object items is flattened per index and an array of scalars stays one row",
+      "state": {
+        "context": { "status": "available", "value": { "variables": {} } },
+        "locals": { "status": "available", "value": {} },
+        "conductor": {
+          "status": "available",
+          "value": {
+            "title": "T",
+            "tags": ["x", "y"],
+            "queue": [
+              { "id": "q1", "payload": "line one\nline two" },
+              { "id": "q2", "payload": { "kind": "note", "tags": ["a", "b"] } }
+            ]
+          }
+        }
+      },
+      "rows": [
+        { "path": "context:variables", "value": "{}", "lines": 1 },
+        { "path": "locals", "value": "{}", "lines": 1 },
+        { "path": "conductor:queue:0:id", "value": "q1", "lines": 1 },
+        { "path": "conductor:queue:0:payload", "value": "line one\nline two", "lines": 2 },
+        { "path": "conductor:queue:1:id", "value": "q2", "lines": 1 },
+        { "path": "conductor:queue:1:payload:kind", "value": "note", "lines": 1 },
+        { "path": "conductor:queue:1:payload:tags", "value": "[\"a\",\"b\"]", "lines": 1 },
+        { "path": "conductor:tags", "value": "[\"x\",\"y\"]", "lines": 1 },
+        { "path": "conductor:title", "value": "T", "lines": 1 }
+      ]
+    },
+    {
+      "name": "array indexes sort numerically and scalar items of a mixed array get their own rows",
+      "state": {
+        "context": { "status": "available", "value": { "variables": {} } },
+        "locals": { "status": "available", "value": {} },
+        "conductor": { "status": "available", "value": { "items": [{ "a": 1 }, 1, 2, 3, 4, 5, 6, 7, 8, 9, "ten"] } }
+      },
+      "rows": [
+        { "path": "context:variables", "value": "{}", "lines": 1 },
+        { "path": "locals", "value": "{}", "lines": 1 },
+        { "path": "conductor:items:0:a", "value": "1", "lines": 1 },
+        { "path": "conductor:items:1", "value": "1", "lines": 1 },
+        { "path": "conductor:items:2", "value": "2", "lines": 1 },
+        { "path": "conductor:items:3", "value": "3", "lines": 1 },
+        { "path": "conductor:items:4", "value": "4", "lines": 1 },
+        { "path": "conductor:items:5", "value": "5", "lines": 1 },
+        { "path": "conductor:items:6", "value": "6", "lines": 1 },
+        { "path": "conductor:items:7", "value": "7", "lines": 1 },
+        { "path": "conductor:items:8", "value": "8", "lines": 1 },
+        { "path": "conductor:items:9", "value": "9", "lines": 1 },
+        { "path": "conductor:items:10", "value": "ten", "lines": 1 }
+      ]
+    },
+    {
+      "name": "empty containers, null, bool, quotes and multi-line text; keys sort by code unit",
+      "state": {
+        "context": {
+          "status": "available",
+          "value": {
+            "variables": {
+              "alpha": "2",
+              "Zed": "1",
+              "empty_obj": {},
+              "empty_list": [],
+              "nothing": null,
+              "flag": true,
+              "note": "a\nb\nc",
+              "text": "say \"hi\""
+            }
+          }
+        },
+        "locals": { "status": "available", "value": {} },
+        "conductor": { "status": "absent", "message": "none" }
+      },
+      "rows": [
+        { "path": "context:variables:Zed", "value": "1", "lines": 1 },
+        { "path": "context:variables:alpha", "value": "2", "lines": 1 },
+        { "path": "context:variables:empty_list", "value": "[]", "lines": 1 },
+        { "path": "context:variables:empty_obj", "value": "{}", "lines": 1 },
+        { "path": "context:variables:flag", "value": "true", "lines": 1 },
+        { "path": "context:variables:note", "value": "a\nb\nc", "lines": 3 },
+        { "path": "context:variables:nothing", "value": "null", "lines": 1 },
+        { "path": "context:variables:text", "value": "say \"hi\"", "lines": 1 },
+        { "path": "locals", "value": "{}", "lines": 1 },
+        { "path": "conductor", "value": "(none)", "lines": 1 }
+      ]
+    },
+    {
+      "name": "sections keep the order context, locals, conductor even when a conductor path sorts first",
+      "state": {
+        "context": { "status": "available", "value": { "zzz": 1 } },
+        "locals": { "status": "available", "value": { "mmm": { "k": 1 } } },
+        "conductor": { "status": "available", "value": { "aaa": 1 } }
+      },
+      "rows": [
+        { "path": "context:zzz", "value": "1", "lines": 1 },
+        { "path": "locals:mmm:k", "value": "1", "lines": 1 },
+        { "path": "conductor:aaa", "value": "1", "lines": 1 }
+      ]
+    },
+    {
+      "name": "an absent conductor and an unreadable section give one row each with the message in parentheses",
+      "state": {
+        "context": { "status": "available", "value": { "variables": { "a": "1" } } },
+        "locals": { "status": "unreadable", "reason": "storage error" },
+        "conductor": { "status": "absent", "message": "no conductor state" }
+      },
+      "rows": [
+        { "path": "context:variables:a", "value": "1", "lines": 1 },
+        { "path": "locals", "value": "(storage error)", "lines": 1 },
+        { "path": "conductor", "value": "(no conductor state)", "lines": 1 }
+      ]
+    }
+  ]
+}
