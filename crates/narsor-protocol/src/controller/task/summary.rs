@@ -55,6 +55,8 @@ pub struct TaskSummary {
     pub holds_slot: bool,
     pub generation: u64,
     pub revision: u64,
+    /// 1-based position among the backend's tasks that are not archived,
+    /// computed by the server; 0 for an archived task.
     pub rank: u32,
     pub created_at: DateTime<Utc>,
     /// When the task entered its current owner-visible state, when known.

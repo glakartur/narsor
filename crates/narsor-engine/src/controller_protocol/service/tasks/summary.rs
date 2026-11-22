@@ -16,16 +16,19 @@ impl ProtocolService {
     pub fn summarize(&self, record: &TaskRecord) -> ProtocolResult<TaskSummary> {
         let now = self.control.now();
         let controller = self.controller_presence(&record.assignment.backend_id, now)?;
-        self.summarize_with(record, now, controller)
+        let rank = self.control.queue_position(record)?;
+        self.summarize_with(record, now, controller, rank)
     }
 
     /// [`Self::summarize`] with the controller of the record's backend
-    /// already looked up, as of `now`.
+    /// already looked up, as of `now`, and the record's 1-based position in
+    /// its backend's queue (0 for an archived task).
     pub(super) fn summarize_with(
         &self,
         record: &TaskRecord,
         now: DateTime<Utc>,
         controller: Option<ControllerPresence>,
+        rank: u32,
     ) -> ProtocolResult<TaskSummary> {
         let controller_freshness = controller
             .as_ref()
@@ -75,7 +78,7 @@ impl ProtocolService {
             holds_slot: record.holds_capacity(),
             generation: record.generation,
             revision: record.revision,
-            rank: record.rank,
+            rank,
             created_at: record.created_at,
             state_since: record.state_since,
             queue_sequence: record.queue_sequence,

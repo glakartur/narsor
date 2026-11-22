@@ -1863,4 +1863,93 @@ terminal_states: { completed: completed, cancelled: cancelled }
         assert!(again.task.runner_state.is_archival());
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn clients_see_the_position_among_the_tasks_that_are_not_archived() {
+        // The queue is the backend's: another owner's task ahead in it
+        // counts, a task on another backend does not.
+        use crate::domain::{BackendId, TaskId};
+        use crate::orchestration::{CommandRequest, NewTask, OwnerRef, TaskEventKind};
+        use narsor_protocol::controller::{MoveTaskRequest, MoveTaskTarget};
+        let root = temp_root();
+        let (service, first) = service_and_record(&root, RunnerState::Queued);
+        let owner = first.owner.clone();
+        let other_owner = OwnerRef::new("oidc:https://issuer|other");
+        let backend = first.assignment.backend_id.clone();
+        let other_backend = BackendId::parse("local").unwrap();
+        let id = |id: &str| TaskId::parse(id).unwrap();
+        for (task_id, task_owner, task_backend) in [
+            ("elsewhere-1", &owner, &other_backend),
+            ("task-2", &owner, &backend),
+            ("other-1", &other_owner, &backend),
+            ("task-3", &owner, &backend),
+            ("task-4", &owner, &backend),
+        ] {
+            service
+                .control
+                .create_task(NewTask::new(
+                    id(task_id),
+                    task_owner.clone(),
+                    task_backend.clone(),
+                    first.launch_spec.clone(),
+                ))
+                .unwrap();
+        }
+        service
+            .control
+            .command(
+                &id("task-2"),
+                CommandRequest::new(OwnerCommand::Archive, "archive-1"),
+            )
+            .unwrap();
+
+        let mut ranks: Vec<(String, u32)> = service
+            .list_tasks(&owner)
+            .unwrap()
+            .tasks
+            .iter()
+            .map(|task| (task.task_id.to_string(), task.rank))
+            .collect();
+        ranks.sort();
+        assert_eq!(
+            ranks,
+            [
+                ("elsewhere-1".to_string(), 1),
+                ("task-1".to_string(), 1),
+                ("task-2".to_string(), 0),
+                ("task-3".to_string(), 3),
+                ("task-4".to_string(), 4)
+            ]
+        );
+        assert_eq!(service.task(&owner, "task-2").unwrap().rank, 0);
+
+        let moved = service
+            .move_task(
+                &owner,
+                "task-4",
+                MoveTaskRequest {
+                    target: MoveTaskTarget::After("task-1".to_string()),
+                    expected_generation: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(moved.rank, 2);
+        let moves: Vec<TaskEventKind> = service
+            .control
+            .events_since(&id("task-4"), 0)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .filter(|kind| matches!(kind, TaskEventKind::Moved { .. }))
+            .collect();
+        assert_eq!(
+            moves,
+            [TaskEventKind::Moved {
+                rank: moved.rank,
+                // Another owner's task keeps its place but not its name.
+                order: vec![id("task-1"), id("task-4"), id("task-3")],
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

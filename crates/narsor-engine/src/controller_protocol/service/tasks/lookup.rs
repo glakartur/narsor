@@ -30,7 +30,10 @@ impl ProtocolService {
     ) -> ProtocolResult<TaskListResponse> {
         let mut cursor = StreamCursor::default();
         let mut kept = Vec::new();
-        for record in self.control.list_tasks()? {
+        let all = self.control.list_tasks()?;
+        // Positions count every owner's tasks: the queue is the backend's.
+        let positions = crate::orchestration::scheduler::queue_positions(&all);
+        for record in all {
             if record.owner != *owner {
                 continue;
             }
@@ -59,7 +62,8 @@ impl ProtocolService {
                     controller
                 }
             };
-            tasks.push(self.summarize_with(record, now, controller)?);
+            let rank = positions.get(&record.task_id).copied().unwrap_or(0);
+            tasks.push(self.summarize_with(record, now, controller, rank)?);
         }
         Ok(TaskListResponse {
             tasks,

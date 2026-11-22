@@ -6,6 +6,43 @@ listed here need no special order. The update notes of the remote backends
 (automatic resume, the read-only runner) are in
 [Remote execution backends](remote-backends.md).
 
+## Update to the fixed queue order (D84)
+
+This update keeps every task at its place in its backend's queue until the
+owner moves it. Before, a resume on a full backend, and the resume that an
+answer, a comment or an operator command causes, put the task at the front
+of the queue. Now the task goes back to the queue at its own place.
+
+### What changes
+
+| Area | Before | After |
+|---|---|---|
+| Stored task record | Version 2, with a dense `rank` (1, 2, 3, …). | Version 3, with a sparse `position_key`. |
+| Resume on a full backend | The task goes to the front of the queue. | The task keeps its place in the queue. |
+| Position shown by the clients (`#n`) | The stored rank, archived tasks included. | Computed by the server among the tasks that are not archived. An archived task shows `#0`. |
+
+The protocol between the server, the controllers and the clients does not
+change, so you can update them in any order.
+
+### The migration
+
+The first time the control plane reads a backend that has records below
+version 3, it gives each record of that backend a position key in the
+current queue order. The order that the owner set before the update stays.
+The migration runs under the backend's schedule lock, is safe to stop, and
+continues where it stopped at the next read. It writes nothing when every
+record is already at version 3.
+
+In a queue that the owner reordered, the migration can give a run of tasks
+consecutive keys. The first move into such a run rewrites the keys of some
+tasks in it, one time. Later moves there write only the moved task.
+
+### Rollback
+
+There is no rollback by downgrade: an older server refuses a version 3
+record. Back up the state directory before the update if you may have to go
+back, and restore that backup to roll back.
+
 ## Update to the environment refresh
 
 This update lets the owner refresh the environment of a stopped task

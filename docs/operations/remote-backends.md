@@ -776,13 +776,17 @@ applies without a restart.
   versions called it `lifecycle`, and `Stopped` was `Paused`; both old names
   are still read).
 * Every task has a position (`rank`) in its backend's queue, shown as `#n` by
-  `narsor-cli task list`. A new task joins the end; waiting tasks are admitted in
-  that order. A queued task is reordered with `narsor-cli task move <task>
+  `narsor-cli task list`. The server computes it from the task's position
+  key, counting only the tasks that are not archived. An archived task shows
+  `#0`. A new task joins the end; waiting tasks are admitted in that order.
+  A queued task is reordered with `narsor-cli task move <task>
   --before <other> | --after <other> | --top | --bottom`, only while it is
-  queued and conditional on its generation. Admitted and finished tasks keep
-  their place in the list. Nothing running is ever preempted. Tasks stored by
-  an older version, which had a `priority`, are numbered once from the old
-  order (priority, then creation) the first time the control plane reads them.
+  queued and conditional on its generation. Only a move changes the order: a
+  resume, an answer, a comment, an operator command or a limit stop leaves
+  the task where it was. Admitted and finished tasks keep their place in the
+  list. Nothing running is ever preempted. Tasks stored by an older version
+  get position keys in their current order the first time the control plane
+  reads them (see [Updates](updates.md)).
 * `interrupt`, `transition` and `restart-step` are operator commands for the
   runner of a `Running` task (`POST /control/v1/tasks/:id/operator-commands`).
   They are queued as events (`OperatorCommandQueued`), handed to the runner by
@@ -838,9 +842,9 @@ applies without a restart.
 * A queued task shows why it waits: `waiting for capacity` (position,
   slots in use / limit), `controller offline` (no controller holds the lease),
   `backend unknown`, or `admitted` (starting).
-* Resuming a stopped task needs a free slot; on a full backend the task goes to
-  the front of the queue (state `queued`, no reservation) and starts on the
-  first slot released. The command response says `queued_for_slot`. The
+* Resuming a stopped task needs a free slot; on a full backend the task goes
+  back to the queue at its own place (state `queued`, no reservation) and
+  starts when its turn comes. The command response says `queued_for_slot`. The
   error `backend_at_capacity` no longer applies to a resume.
 * A command that needs the runner to work (an answer to an input, an operator
   command, a message to the conductor) sent to a stopped task is stored and
