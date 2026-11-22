@@ -423,6 +423,33 @@ async fn work(
         OUTBOX_ENV.to_string(),
         storage.outbox_dir().display().to_string(),
     ));
+    let prepared = harness_variables(&config.harness_home, &storage).and_then(|variables| {
+        home_sources::prepare_home_sources(
+            &config.home_sources,
+            config.harness_home.mode,
+            &private_home,
+        )
+        .map(|()| variables)
+    });
+    match prepared {
+        Ok(variables) => environment.task.extend(variables),
+        Err(error) => {
+            return Ok(report_problem(
+                &storage,
+                &mut link,
+                &config.timing,
+                PROBLEM_INITIALIZATION,
+                error.to_string(),
+            )
+            .await)
+        }
+    }
+    // Before the workspace is cloned: the clone is the task's first git
+    // operation and must see what every later one sees — the private HOME
+    // with its file-delivered SSH keys and home sources (`.gitconfig`), and
+    // the `env`-delivered tokens a credential helper reads.
+    apply_environment(&environment);
+
     let git = if config.pinned_git_credential_only {
         GitAccess::PinnedOnly {
             home: private_home.clone(),
@@ -448,29 +475,6 @@ async fn work(
         )
         .await);
     }
-
-    let prepared = harness_variables(&config.harness_home, &storage).and_then(|variables| {
-        home_sources::prepare_home_sources(
-            &config.home_sources,
-            config.harness_home.mode,
-            &private_home,
-        )
-        .map(|()| variables)
-    });
-    match prepared {
-        Ok(variables) => environment.task.extend(variables),
-        Err(error) => {
-            return Ok(report_problem(
-                &storage,
-                &mut link,
-                &config.timing,
-                PROBLEM_INITIALIZATION,
-                error.to_string(),
-            )
-            .await)
-        }
-    }
-    apply_environment(&environment);
 
     let mut session = assemble_session(
         &config,
