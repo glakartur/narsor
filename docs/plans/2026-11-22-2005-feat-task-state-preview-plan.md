@@ -188,12 +188,12 @@ stateDiagram-v2
 
 ### Assumptions
 
-The plan builds these choices. Each one is an owner decision (see "Owner decisions"), the recommended option of the open question (see "Pytania otwarte dla użytkownika"), or a rule of the origin.
+The plan builds these choices. Each one is an owner decision (see "Owner decisions"), or a rule of the origin.
 
 - All sections are shown to the owner, unmasked, and loaded only on demand (Q1, decided by the owner).
 - No size limit on the state (KTD4, Q2, decided by the owner).
 - Arrays that contain an object are flattened per index (R7, Q3, decided by the owner).
-- Per-section read status (KTD3, Q4, still open).
+- Per-section read status (KTD3, Q4, decided by the owner).
 - `Ctrl+R` is the refresh key of the *Stan* tab (KTD8, Q5).
 - The *Stan* tab sits after *Dyrygent* and before *Info*, in the TUI and in the web (origin Z6).
 - The TUI and web `reader_starting` retries have no attempt limit, like the *Dyrygent* tab. The CLI waits up to `READER_WAIT` (30 s), like `show --details`.
@@ -488,18 +488,10 @@ The owner answered these questions of the earlier review. The plan builds each a
 - Q2. **Size limit** (KTD4; origin Z8). Decided: no dedicated limit for now. An oversized state ends as a retryable `503`. The rejected options were a limit per section, one limit for the whole state, and a limit per value.
 - Q3. **Arrays of objects** (R7; origin Z4). Decided: an array with any object item is flattened per index (`conductor:queue:0:payload:…`). An array of scalars stays one row.
 - Q5. **TUI refresh key** (R10; KTD8). Decided: `Ctrl+R` in the *Stan* tab only. A background re-read when the revision changes was rejected (R10, Z7).
+- Q4. **Per-section read status** (KTD3; origin R3, R4, F1). Decided: each section has its own status (`available`, `absent`, `unreadable` with a reason). The whole read fails only when the execution record cannot load.
 
 ---
 
-## Pytania otwarte dla użytkownika
-
-This question does not block implementation. The plan builds the recommended option (KTD3).
-
-- Q4. **Per-section read status** (Planning Contract, KTD3; origin R3, R4, F1). If one source fails to load, its section could look empty, and the owner could conclude, for example, that there is no conductor failure.
-  1. (recommended) Each section has its own status (`available`, `absent`, `unreadable` with a reason). The whole read fails only when the execution record cannot load.
-  2. Keep only the whole-read failure of R3: when any source fails to load, the whole read fails.
-
----
 
 ## Sources & Research
 
