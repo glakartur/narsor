@@ -17,7 +17,7 @@ execution: code
 - **Means:** The harness session id becomes durable in `timeline.json` as soon as the harness reports it (KTD1). One engine lookup finds the session of the current step (KTD2). An owner recovery that carries a message resumes that session (KTD3). The control plane offers the comment action in four more owner/runner states (KTD6).
 - **Execution profile:** One pull request. Units U1 to U7, in dependency order.
 - **Stop conditions:** Stop and report if a harness cannot report its session id before the step ends (U1), or if `timeline.json` or the event log cannot be read during recovery or snapshot building without a full scan that is too slow for a long run (U2).
-- **Who finishes:** The implementer runs `cargo test --workspace` and opens the PR. The owner answers "Pytania otwarte dla użytkownika" in review.
+- **Who finishes:** The implementer runs `cargo test --workspace` and opens the PR. No question is open for the owner. The owner confirms "Założenia do potwierdzenia" in review.
 
 ---
 
@@ -116,6 +116,8 @@ Three gaps cause this (verified in the code):
 
 ### Pytania otwarte dla użytkownika
 
+No question is open. The owner answered the two questions below in the PR. They stay here as a record.
+
 - Q1. **R7 – where the in-flight session id is recorded.** Answered by the owner: in `timeline.json`, not in `state.json` and not in a new event. See KTD1.
 - Q2. **R11 / KTD7 – the harness refuses the stored session at run time.** Answered by the owner: restart the action at once with the text as the operator recovery note. See KTD7.
 
@@ -145,11 +147,11 @@ Three gaps cause this (verified in the code):
 
 ### Key Technical Decisions
 
-- KTD1. **The in-flight session id is a field of the attempt in `timeline.json`, written when the harness first reports an id (and again if the id changes).** The writer is a new method on the sink that already writes the usage readings during a step (`ReadingSink` / `FileReadingSink` in `crates/narsor-exec/src/engine/timeline_file.rs`). It does not touch `state.json`. Reason: the owner chose this in Q1. The file is already written during a step under its own lock, so no second writer for `state.json` is needed, and a metadata write during the step would be overwritten by the final save. Known limit: the file is derived, and a lost file loses its readings, so it also loses the in-flight id. The recovery then gives the text as the operator recovery note (R11). The id of a completed or failed attempt stays in the event log (`AgentSessionCompleted`, `AgentSessionFailed`). No new event type is added. Governs R7. Answered in Q1.
+- KTD1. **The in-flight session id is a field of the attempt in `timeline.json`, written when the harness first reports an id (and again if the id changes).** The file gets a map by `action_execution_id`, next to `readings`, that holds the harness and the harness session id. The writer is a new method on the sink that already writes the usage readings during a step (`ReadingSink` / `FileReadingSink` in `crates/narsor-exec/src/engine/timeline_file.rs`). The per-line loop reaches the sink through the `ReadingTap` of the `ConversationSink`. The tap already carries the execution id, the attempt id and the harness. When the conversation sink has no tap (no store), no id is written, and the recovery follows R11. A rebuild of the timeline from the log keeps the map, as it keeps `readings`. The write does not touch `state.json`. Reason: the owner chose this in Q1. The file is already written during a step under its own lock, so no second writer for `state.json` is needed, and a metadata write during the step would be overwritten by the final save. Known limit: the file is derived, and a lost file loses its readings, so it also loses the in-flight id. The recovery then gives the text as the operator recovery note (R11). The id of a completed or failed attempt stays in the event log (`AgentSessionCompleted`, `AgentSessionFailed`). No new event type is added. Governs R7. Answered in Q1.
 - KTD2. **One engine read, `resumable_agent_session`, implements the R10 lookup, and both the recovery and the snapshot flag call it.** It returns the harness and the harness session id, or nothing. The in-flight source is the id in `timeline.json` for the latest action attempt of the current state (or the latest `AgentSessionFailed` with an id), and only when no `AgentSessionCompleted` follows it for that attempt. Reason: the flag that the owner sees (R6) and the session that the recovery resumes (R9) cannot disagree when they come from one function. This mirrors the "one rule for offer and check" pattern of D66.
 - KTD3. **The owner message rides on `Recovery` as its own field (key and text), not inside the comment.** `prepare_recover` resolves the session through KTD2 before it clears the step failure, rejection and rescue records. With a session, it stores the text as an `agent_input` with that harness and session (the existing `store_agent_input`, `PromptAuthor::User`). Without one, it stores the text as the operator recovery note (R11). The decision comment of the runner (for example "owner resume after the task's workload stopped unexpectedly") stays the recovery note in both cases, so the agent also learns why it was resumed. `prepare_harness_attempt` already applies `continue_session` and sets `skip_output_contract`, because the session holds the contract from its first prompt. The contract still validates the result (R9). Governs R9, R11.
 - KTD4. **Attempt budget: the continue-session recovery is an ordinary owner recovery.** `run_action` starts a new action attempt with a full `retry_policy` round, as for "Uruchom od nowa" today. `max_entries` is not checked on recovery today, and this does not change. Resolves the deferred question and Assumption 4.
-- KTD5. **The snapshot flag is `agent_session_resumable: bool` on `RunnerSnapshotRequest`, the model `RunnerSnapshot` and `RunnerView`, with `#[serde(default)]`.** The runner sets it from KTD2 in every snapshot. `false` covers both "no session" and "an older runner", which is what Assumption 6 asks for. Reason: `TaskSummary` already carries the runner view, and `comment_effect` reads the summary on the server. For a lost workload, the value that counts is the last snapshot before the loss. A new event makes the runner report within `report_interval` (1 s by default), so the flag follows the event closely. Resolves the deferred question on the flag.
+- KTD5. **The snapshot flag is `agent_session_resumable: bool` on `RunnerSnapshotRequest`, the model `RunnerSnapshot` and `RunnerView`, with `#[serde(default)]`.** The runner sets it from KTD2 in every snapshot. `false` covers both "no session" and "an older runner", which is what Assumption 6 asks for. Reason: `TaskSummary` already carries the runner view, and `comment_effect` reads the summary on the server. For a lost workload, the value that counts is the last snapshot before the loss. The sink calls its `on_update` after each write, as it does for a reading (the engine's reading notifier, `Engine::with_reading_notifier`). In U5 the implementer checks that this notifier makes the runner send a new snapshot. If it does not, the flag follows at the next periodic snapshot. Resolves the deferred question on the flag.
 - KTD6. **The control plane widens the comment path only.** `comment_reason`, the pause branch of `submit_comment` and `store_resume_message` accept the R1 states. The resume after a comment goes through a variant of `resume_for_work` that also accepts `Interrupted` and `Unknown`, used only by `submit_comment`. Reason: `submit_input` and operator commands also call `resume_for_work`, and their behavior must not change. Governs R1–R4.
 - KTD7. **A session that the harness refuses at run time restarts the action at once, with the text as the operator recovery note.** When the refused session came with an owner message from a continue-session recovery, the `RESUME_SESSION_REJECTED` branch in `crates/narsor-exec/src/engine/runner/step/attempt.rs` does not stop for the owner. It stores the text as the operator recovery note and starts the next attempt as a new session. Reason: the owner chose this in Q2. The text is not lost, and the owner does not press Enter. A refused session with no owner message keeps today's behavior. Governs R11. Answered in Q2.
 - KTD8. **Exactly once (R13) has two guards.** The engine writes `resume_message_key` in the same save as the `agent_input` or note, inside `prepare_recover`. A repeated recovery with the same key stores nothing again. The runner mark `resume-message:<key>` stays as it is (written after the recovery call succeeds). Reason: today the mark is best effort in `recover` (a failed write only logs a warning), so the engine key closes the window in which the mark is lost.
@@ -226,7 +228,7 @@ U1 → U2 → U3 → U4. U2 → U5 → U6. U7 last. U5 and U6 can be built while
 
 | Risk | Mitigation |
 |---|---|
-| The last snapshot before a pod loss was sent before the session id reached `timeline.json`, so the offer warns although the recovery will resume the session. | Safe direction (Assumption 6). The recovery still uses KTD2 on the event log, so the agent still gets the session. |
+| The last snapshot before a pod loss was sent before the session id reached `timeline.json`, so the offer warns although the recovery will resume the session. | Safe direction (Assumption 6). The recovery reads KTD2 again from `timeline.json` and the event log, so the agent still gets the session. |
 | `Error`/`Unknown` may still have a live workload. A resume would put two runners on one storage. | No new risk: the lifecycle already allows an owner `Resume` from `Unknown`, and the offer already has "Uruchom od nowa" there. The controller's loss confirmation rules (D58) stay as they are. |
 | The resumed agent repeats side effects of the lost part of the step. | Accepted, as for automatic resume (D58). The agent keeps its context, which lowers the risk compared to today's restart. |
 | The message is lost when the pod dies after `take_agent_input` saved and before the harness read the prompt. | Same window as today's comment in a pause. The `resume_message_key` keeps it from being given twice. A test covers the repeated recovery (U3). |
@@ -234,8 +236,8 @@ U1 → U2 → U3 → U4. U2 → U5 → U6. U7 last. U5 and U6 can be built while
 
 ### System-Wide Impact
 
-- **Wire:** a new `EventData` variant and a new snapshot/runner-view field. Both are additive. The upgrade order of D58 applies: control plane first, then runners, then clients with their server. An older control plane drops the field, and the owner sees the warning.
-- **Persisted data:** `StepFailure` gains two optional fields with `#[serde(default)]`. Old records read as "no session".
+- **Wire:** a new snapshot/runner-view field. It is additive. No `EventData` variant is added (KTD1). The upgrade order of D58 applies: control plane first, then runners, then clients with their server. An older control plane drops the field, and the owner sees the warning.
+- **Persisted data:** `StepFailure` gains two optional fields with `#[serde(default)]`. Old records read as "no session". `timeline.json` gains the session map with `#[serde(default)]`. An old file reads with an empty map.
 - **TUI:** no client logic change. The panel shows the comment from the server offer (`docs/solutions/design-patterns/tui-panel-actions-from-server-offer-2026-11-13.md`). A failed step keeps its own panel (`keeps_own_panel`), and "Napisz do agenta" is action 0 of every panel.
 
 ---
@@ -252,20 +254,20 @@ U1 → U2 → U3 → U4. U2 → U5 → U6. U7 last. U5 and U6 can be built while
   - `crates/narsor-exec/src/engine/actions/harness/mod.rs` (`HarnessStreamParser`: a read of the session id the parser holds now)
   - `crates/narsor-exec/src/engine/actions/harness/claude_code.rs`, `codex.rs`, `opencode.rs`, `github_copilot.rs`, `copilot_sdk.rs` (expose the id each parser already holds)
   - `crates/narsor-exec/src/engine/actions/session/process.rs` (per-line loop of `spawn_and_wait`)
-  - `crates/narsor-exec/src/engine/actions/session.rs`, `crates/narsor-exec/src/engine/actions/session/conversation.rs` (pass the `AgentEventSink` to the loop)
+  - `crates/narsor-exec/src/engine/actions/session.rs`, `crates/narsor-exec/src/engine/actions/session/conversation.rs` (`ReadingTap` gets a session write next to the reading write)
   - Tests: `tests/integration/actions_agent.rs`, `tests/integration/timeline.rs`
 - **Approach:**
   1. Add a parser read that returns the session id known so far. The parsers already keep it in their state. `finish()` is unchanged.
-  2. After each stdout line, compare the id with the last reported one. When it is new, write it through the session's `ReadingSink`, in the shape of the `UsageRelay` that the loop already gets.
+  2. After each stdout line, compare the id with the last reported one. When it is new, write it through the `ReadingTap` of the `ConversationSink` that the loop already gets, in the way `record_stdout_line` hands on readings.
   3. The copilot SDK path feeds its records into the github_copilot parser through `feed_copilot_sdk_record`. Apply the same check at that feed site.
   4. When the file is rebuilt from the log, the stored session ids are put back on it, as the readings are.
-- **Patterns to follow:** `UsageRelay` / `UsageReporter` in `conversation.rs`; `docs/solutions/design-patterns/latest-value-reports-coalesce-per-key-one-send-at-a-time-2026-10-31.md`.
+- **Patterns to follow:** `ReadingTap` in `conversation.rs` and `record_reading` in `timeline_file.rs` (a write under `FILE_LOCK`); `docs/solutions/design-patterns/latest-value-reports-coalesce-per-key-one-send-at-a-time-2026-10-31.md`.
 - **Test scenarios:**
   - A recorded claude_code stream whose first line is the `system` line puts that id on the attempt in `timeline.json` before the step ends.
   - A stream where the id is reported on several lines (opencode repeats `sessionID`) is written once, not once per line.
   - A harness process killed after its id line (the test fake stops mid-run) leaves the id in `timeline.json`.
   - A stream without an id writes no id.
-  - The timeline position of an attempt that was cut after the event shows its `harness_session_id`.
+  - The timeline position of an attempt that was cut after its id line shows its `harness_session_id`.
   - A `timeline.json` without the new field still reads, and a rebuild of the file keeps the ids.
 - **Verification:** the id is in `timeline.json` before the step ends for each of the five parsers' fixtures.
 
@@ -286,7 +288,7 @@ U1 → U2 → U3 → U4. U2 → U5 → U6. U7 last. U5 and U6 can be built while
   - Covers F2. A step that failed its output contract after the harness reported "s-2": the failure record holds "s-2", and the lookup returns "s-2" although `completed_agent_sessions` holds "s-1" for the same state from an earlier entry.
   - A step that timed out after the harness reported "s-3": the failure record holds "s-3".
   - An attempt cut mid-step (the execution is `Unknown` after reconcile): the lookup returns the in-flight id.
-  - An attempt whose `AgentSessionCompleted` follows the event: the in-flight source gives nothing, and the lookup returns the entry from `completed_agent_sessions`.
+  - An attempt with an id in `timeline.json` and an `AgentSessionCompleted` in the log: the in-flight source gives nothing, and the lookup returns the entry from `completed_agent_sessions`.
   - A step that failed before any id: the lookup returns nothing.
   - A `step_failure` record written before this change (no new fields) still reads.
 - **Verification:** the scenarios pass, and `StepFailure` round-trips with and without the new fields.
@@ -414,7 +416,7 @@ U1 → U2 → U3 → U4. U2 → U5 → U6. U7 last. U5 and U6 can be built while
 - Every unit's test scenarios exist and pass, and `cargo test --workspace` passes.
 - AE1–AE5 each have at least one test that names them.
 - The comment offer and `require_available` agree for every row of the HLD table.
-- Old event logs, old `step_failure` records and snapshot JSON without the new field still read.
+- Old event logs, old `step_failure` records, old `timeline.json` files and snapshot JSON without the new fields still read.
 - `docs/dev/architecture.md` and `docs/user/tui.md` are updated (U7).
 - No code from abandoned attempts is left in the diff.
 - The answers to Q1 and Q2 (KTD1, KTD7) are implemented.
