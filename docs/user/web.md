@@ -86,11 +86,24 @@ The sign-in form says which token it needs (*Skąd wziąć token?*).
 - **Task list:** the queue in server order, with the same state icons as the
   TUI, a text filter, *ukryj ✓* (hide finished tasks) and *następne ?* (the
   next task that waits for you). ▲ ▼ move a queued task.
-- **Details:** the workspaces, the status row, the usage row, and five tabs —
+- **Details:** the workspaces, the status row, the usage row, and six tabs —
   *Rozmowa* (the agent conversation, tool calls folded, subagents grouped),
   *Przebieg* (the steps; a chosen step shows its conversation), *Zdarzenia*
   (the workflow events), *Dyrygent* (the conductor: chat, proposals,
-  decisions) and *Info*.
+  decisions), *Stan* (the execution state) and *Info*.
+- **Stan:** every value the workflow sees now, as one sorted list of
+  `path: value` rows: the context (`context:variables:NAME`,
+  `context:artifacts:NAME:location`, …), the local values of each step
+  (`locals:STEP:NAME`) and the conductor's state (`conductor:…`). A string
+  shows as its text; other values show as JSON. The tab reads the state when
+  you open it and when you press *Odśwież*, never in the background, and
+  shows the time of the read. A value with more than one line, or one that
+  does not fit the width, is folded to its first line (`›`); a click, or
+  `Enter` / `Space` on the row, unfolds it (`⌄`) and folds it again.
+  Unfolded rows stay unfolded after *Odśwież*. When the state cannot be read
+  (an archived task, a task that has not started), the tab says why. The same
+  list prints with `narsor-cli task state TASK_ID` (`--json` for the state
+  unflattened).
 - **Czeka na Ciebie:** the forms the server offers for the task. Choose an
   entry, fill its fields, send. What you type stays when the list refreshes
   and when you look at another task; the browser asks before it closes a tab
