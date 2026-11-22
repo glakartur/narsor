@@ -839,9 +839,6 @@ pub(super) fn print_created(task: &TaskSummary) {
     print_status(task);
 }
 
-/// Refuses unless the control plane is a trusted local daemon: the only one
-/// that reads workflow files of its own disk for its owner. Any other
-/// server is refused with the reason it gives.
 /// The task's current generation, for a request that must not apply to a
 /// task that moved on meanwhile.
 async fn current_generation(client: &ApiClient, task_id: &str) -> Result<u64> {
@@ -852,6 +849,9 @@ async fn current_generation(client: &ApiClient, task_id: &str) -> Result<u64> {
     Ok(task.generation)
 }
 
+/// Refuses unless the control plane is a trusted local daemon: the only one
+/// that reads workflow files of its own disk for its owner. Any other
+/// server is refused with the reason it gives.
 pub(super) async fn require_local_daemon(client: &ApiClient, what: &str) -> Result<()> {
     let capabilities = client
         .control_capabilities()

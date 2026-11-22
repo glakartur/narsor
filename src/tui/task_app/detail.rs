@@ -823,9 +823,11 @@ impl TaskApp {
         {
             return;
         }
-        let (generation, outcome) = match self.settle(result) {
-            Ok(task) => (task.generation, DriftOutcome::Known(task.environment_drift)),
-            Err(_) => (generation, DriftOutcome::Unknown),
+        // Filed under the generation asked for, so a response that is ahead
+        // of the list still settles the read the list is waiting on.
+        let outcome = match self.settle(result) {
+            Ok(task) => DriftOutcome::Known(task.environment_drift),
+            Err(_) => DriftOutcome::Unknown,
         };
         self.detail
             .view_mut(task_id)

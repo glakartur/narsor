@@ -121,6 +121,7 @@ export function eventDetail(data) {
       const source = d.source ? `subagent ${elide(d.source.name, 40)}` : 'agent';
       return ['odmowa pominięta', source, elide(d.tool_name, 40), elide(d.summary, 80)].filter(Boolean).join(' · ');
     }
+    case 'environment_refreshed': return `environment_refreshed  by ${d.requested_by}`;
     case 'agent_message':
       return `agent_message  (${d.role}) attempt ${shortAttempt(d.action_execution_id)}: ${firstLine(d.content)}`;
     default:

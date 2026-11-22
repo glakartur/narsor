@@ -31,6 +31,7 @@ import { eventDetail, groupEntries, pagingDone, sumUsage, usageLine, attemptsOf,
 
 test('event details follow the TUI texts', () => {
   assert.equal(eventDetail({ type: 'state_exited', state_id: 'work', output_label: 'done' }), 'state_exited  work → done');
+  assert.equal(eventDetail({ type: 'environment_refreshed', requested_by: 'alice', diff: {} }), 'environment_refreshed  by alice');
   assert.equal(eventDetail({ type: 'human_input_received', close_reason: 'cancel', answered_by: 'conductor' }), 'human_input_received  closed by cancel (conductor)');
   assert.equal(eventDetail({ type: 'human_input_received', output_label: 'ok' }), 'human_input_received  operator → ok');
   assert.equal(eventDetail({ type: 'agent_session_started', harness: 'codex', action_execution_id: '0123456789' }), 'agent_session_started  codex (attempt 01234567)');
