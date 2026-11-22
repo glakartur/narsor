@@ -1590,27 +1590,37 @@ async fn a_refreshed_environment_replaces_the_storage_copy_once() {
 }
 
 /// The marker is written before the copy: a runner that died between the
-/// two leaves the new digest beside the old copy, and the next start
-/// replaces the copy and goes on.
+/// two leaves a moved marker beside the old copy, and the next start
+/// replaces the copy and goes on. The marker may be at the new launch, or
+/// at an earlier refresh the owner refreshed again before a restart
+/// succeeded; either way the task and workspace commit are kept.
 #[tokio::test]
 async fn a_replacement_interrupted_after_the_marker_is_finished_by_the_next_start() {
-    let root = TempRoot::new();
-    let old = spec(ONE_STEP, "claude-code");
-    let storage = initialized(&root, &old);
+    let earlier = spec(ONE_STEP, "gemini");
     let new = refreshed(|_| {});
-    let marker = storage.marker().unwrap().expect("the marker");
-    storage
-        .write_marker(&marker.for_launch(&new.digest))
-        .unwrap();
-    let plane = SpecPlane::serving(Some(serde_json::to_value(&new).unwrap()));
+    for (name, moved_to) in [
+        ("the new launch", new.digest.clone()),
+        ("an earlier refresh", earlier.digest.clone()),
+    ] {
+        let root = TempRoot::new();
+        let old = spec(ONE_STEP, "claude-code");
+        let storage = initialized(&root, &old);
+        let before = storage.marker().unwrap().expect("the marker");
+        storage.write_marker(&before.for_launch(&moved_to)).unwrap();
+        let plane = SpecPlane::serving(Some(serde_json::to_value(&new).unwrap()));
 
-    let (loaded, _) = load_and_initialize(&root, &storage, &plane, &new.digest)
-        .await
-        .expect("the replacement is finished");
+        let (loaded, _) = load_and_initialize(&root, &storage, &plane, &new.digest)
+            .await
+            .unwrap_or_else(|error| panic!("{name}: the replacement is finished: {error}"));
 
-    assert_eq!(loaded, new);
-    assert_eq!(stored_copy(&storage), new);
-    assert_eq!(storage.marker().unwrap().unwrap().launch_digest, new.digest);
+        assert_eq!(loaded, new, "{name}");
+        assert_eq!(stored_copy(&storage), new, "{name}");
+        let marker = storage.marker().unwrap().unwrap();
+        assert_eq!(marker.launch_digest, new.digest, "{name}");
+        assert_eq!(marker.task_id, before.task_id, "{name}");
+        assert_eq!(marker.workspace_commit, before.workspace_commit, "{name}");
+        assert_eq!(marker.initialized_at, before.initialized_at, "{name}");
+    }
 }
 
 /// Only an environment change replaces the copy: a served spec that misses

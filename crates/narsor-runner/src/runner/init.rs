@@ -23,9 +23,10 @@
 //! into.
 //!
 //! The one change a resumed storage takes is a refreshed environment of the
-//! same task ([`AcceptedReplacement`]): the marker moves to the new launch
-//! digest, keeping its task and workspace commit, and then the spec copy is
-//! replaced. Nothing is cloned again.
+//! same task ([`AcceptedReplacement`]): the marker of that task moves to the
+//! new launch digest, whatever launch it was at, keeping its task and
+//! workspace commit, and then the spec copy is replaced. Nothing is cloned
+//! again.
 
 use std::fs;
 use std::path::Path;
@@ -60,20 +61,27 @@ pub fn initialize(
     secrets: &MountedSecrets,
     git: &GitAccess,
 ) -> Result<Initialization, RunnerError> {
-    let replaced = replacement.map(|replacement| replacement.replaced_digest.as_str());
     if let Some(marker) = storage.marker()? {
-        // A refresh may meet the marker before or after it was moved to the
-        // new launch: a runner that died between the two writes left it
-        // moved and the old copy in place.
-        let known_launch =
-            marker.launch_digest == spec.digest || Some(marker.launch_digest.as_str()) == replaced;
+        // With a replacement, the copy was already proved to be this task's
+        // and `spec` an environment-only change of it, so the marker only
+        // has to belong to this task. Its launch may be the copy's, the new
+        // one, or that of an earlier refresh a runner died in the middle of
+        // (marker moved, copy not yet replaced) before the owner refreshed
+        // again: each one moves to the new launch.
+        let known_launch = replacement.is_some() || marker.launch_digest == spec.digest;
         if marker.task_id != task_id.as_str() || !known_launch {
             return Err(RunnerError::ForeignStorage(format!(
                 "it was initialized for task '{}' with launch {}, not task '{}' with launch {}",
                 marker.task_id, marker.launch_digest, task_id, spec.digest
             )));
         }
-        if replacement.is_some() {
+        if let Some(replacement) = replacement {
+            tracing::info!(
+                replaced = %replacement.replaced_digest,
+                marker = %marker.launch_digest,
+                launch = %spec.digest,
+                "replacing the storage's launch spec with a refreshed environment"
+            );
             // The marker first, then the copy: the two cannot be written
             // together, and an old copy beside a moved marker sends the
             // next start down this path again.
@@ -801,11 +809,13 @@ terminal_states: [completed]
         let _ = fs::remove_dir_all(base);
     }
 
-    /// A replacement only moves a marker that belongs to this task and to
-    /// the launch it replaces (or already to the new one); any other marker
-    /// is a foreign storage, and neither the marker nor the copy changes.
+    /// A replacement only moves a marker that belongs to this task; a
+    /// marker of another task is a foreign storage, and neither the marker
+    /// nor the copy changes. (The marker's launch is not checked: the copy
+    /// check in `load_spec` is the guard, and an interrupted earlier refresh
+    /// may have left the marker at a launch the copy never had.)
     #[test]
-    fn a_replacement_is_refused_on_a_marker_of_another_task_or_launch() {
+    fn a_replacement_is_refused_on_a_marker_of_another_task() {
         let base = temp("replace-foreign");
         let old = spec(TaskWorkspace::none());
         let new = old
@@ -816,12 +826,12 @@ terminal_states: [completed]
         };
         let cases = [
             (
-                "another task",
+                "another task at the replaced launch",
                 InitializationMarker::new("task-2", &old.digest, None),
             ),
             (
-                "another launch",
-                InitializationMarker::new("task-1", "sha256:other", None),
+                "another task at the new launch",
+                InitializationMarker::new("task-2", &new.digest, None),
             ),
         ];
         for (name, marker) in cases {

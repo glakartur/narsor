@@ -606,16 +606,42 @@ struct LoadedSpec {
     replacement: Option<AcceptedReplacement>,
 }
 
-/// Proof that [`load_spec`] accepted a served spec as an environment-only
-/// refresh of the storage's copy: it recomputes to the pinned digest, its
-/// digest field and environment identity match its content, and everything
-/// the task was created with equals the copy. Only [`load_spec`] makes one,
-/// and only with one does [`initialize`] replace the copy and the marker's
-/// digest.
+/// Proof that a served spec was accepted as an environment-only refresh of
+/// the storage's copy: it recomputes to the pinned digest, its digest field
+/// and environment identity match its content, and everything the task was
+/// created with equals the copy. Only [`AcceptedReplacement::accept`] makes
+/// one, and only with one does [`initialize`] replace the copy and move the
+/// marker to the new launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedReplacement {
     /// Digest of the storage's copy the spec replaces.
-    replaced_digest: String,
+    pub(crate) replaced_digest: String,
+}
+
+impl AcceptedReplacement {
+    /// Accepts `served`, which the control plane serves under `pinned`, as
+    /// the replacement of `stored`, the storage's copy that misses the pin
+    /// — the check a working runner makes before [`initialize`] replaces
+    /// the copy.
+    pub fn accept(
+        stored: &TaskLaunchSpec,
+        served: &TaskLaunchSpec,
+        pinned: &str,
+    ) -> Result<Self, RunnerError> {
+        check_served_spec(served, pinned)?;
+        if !served.is_environment_refresh_of(stored) {
+            let problem = stored
+                .check_pinned_digest(pinned)
+                .err()
+                .unwrap_or_else(|| format!("it already is the pinned launch {pinned}"));
+            return Err(RunnerError::LaunchSpec(format!(
+                "the storage's copy: {problem}"
+            )));
+        }
+        Ok(Self {
+            replaced_digest: stored.digest.clone(),
+        })
+    }
 }
 
 /// The task's launch spec: the storage's copy once it holds one, else the
@@ -643,20 +669,14 @@ async fn load_spec(
         let Some(pinned) = pinned else {
             return Ok(unchanged(stored));
         };
-        let Err(problem) = stored.check_pinned_digest(pinned) else {
+        if stored.check_pinned_digest(pinned).is_ok() {
             return Ok(unchanged(stored));
-        };
-        let served = fetch_pinned_spec(link, &config.timing, pinned).await?;
-        if !served.is_environment_refresh_of(&stored) {
-            return Err(RunnerError::LaunchSpec(format!(
-                "the storage's copy: {problem}"
-            )));
         }
+        let served = fetch_pinned_spec(link, &config.timing, pinned).await?;
+        let replacement = AcceptedReplacement::accept(&stored, &served, pinned)?;
         return Ok(LoadedSpec {
             spec: served,
-            replacement: Some(AcceptedReplacement {
-                replaced_digest: stored.digest,
-            }),
+            replacement: Some(replacement),
         });
     }
     let pinned = pinned.ok_or_else(|| {
@@ -687,6 +707,13 @@ async fn fetch_pinned_spec(
             "the control plane served a malformed spec: {error}"
         ))
     })?;
+    check_served_spec(&spec, pinned)?;
+    Ok(spec)
+}
+
+/// Whether a spec the control plane served recomputes to `pinned` and its
+/// digest field and environment identity match its content.
+fn check_served_spec(spec: &TaskLaunchSpec, pinned: &str) -> Result<(), RunnerError> {
     spec.check_pinned_digest(pinned).map_err(|problem| {
         RunnerError::LaunchSpec(format!("the control plane served {problem}"))
     })?;
@@ -697,7 +724,7 @@ async fn fetch_pinned_spec(
                 .to_string(),
         ));
     }
-    Ok(spec)
+    Ok(())
 }
 
 /// Fetches the launch spec with the runner's credential, retrying with the

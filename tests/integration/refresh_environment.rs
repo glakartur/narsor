@@ -458,3 +458,106 @@ async fn the_single_task_view_says_whether_the_environment_still_matches_the_cat
     }
     fx.server.shutdown().await;
 }
+
+/// System-wide: a task refreshed and resumed through the real control plane
+/// is accepted by the runner on the storage its first start initialized.
+/// The runner's own spec fetch needs a running process, so the test serves
+/// the spec as the controller reads it and drives the runner's check
+/// ([`AcceptedReplacement::accept`]) and [`initialize`] on real storage.
+#[tokio::test]
+async fn a_refreshed_and_resumed_task_resumes_on_its_storage_with_the_new_spec() {
+    use narsor_runner::runner::{
+        initialize, AcceptedReplacement, Initialization, MountedSecrets, TaskStorage,
+    };
+    use narsor_runner::workspace::GitAccess;
+
+    let fx = Fixture::new().await;
+    let identity = ControllerIdentity {
+        controller_id: CONTROLLER.to_string(),
+        backend_id: backend(),
+    };
+    // The spec a runner receives travels as JSON.
+    let served = |generation: u64| {
+        let spec = fx
+            .service
+            .launch_spec(&identity, TASK, generation)
+            .expect("the controller reads the spec");
+        serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap()
+    };
+    let initialize_with = |storage: &TaskStorage, spec, replacement| {
+        initialize(
+            storage,
+            &storage.store(),
+            &task_id(),
+            spec,
+            replacement,
+            &MountedSecrets::new(None),
+            &GitAccess::User,
+        )
+    };
+
+    // The first start initializes the storage from the sealed spec.
+    let lease = fx.started_task().await;
+    let first = served(fx.record().generation);
+    let storage = TaskStorage::new(fx.state.join("task-storage"));
+    storage.prepare().unwrap();
+    assert_eq!(
+        initialize_with(&storage, &first, None).unwrap(),
+        Initialization::Fresh
+    );
+    let marker = storage.marker().unwrap().expect("the marker");
+    fx.report(&lease, Observation::WorkloadLost { state_known: true });
+
+    // The owner refreshes with a catalogue that adds a component and resumes.
+    fx.write_task_image(
+        "  base: debian:trixie-slim\n  components:\n    \
+         - { name: glab, install: { inline: \"apt-get install -y glab\" } }\n",
+    );
+    let refreshed = fx
+        .client
+        .control_refresh_environment(TASK, &RefreshEnvironmentRequest::default())
+        .await
+        .expect("the refresh is accepted");
+    assert!(matches!(
+        refreshed.outcome,
+        EnvironmentRefreshResult::Refreshed { .. }
+    ));
+    fx.client
+        .control_command(
+            TASK,
+            &OwnerCommandRequest {
+                command: OwnerCommand::Resume,
+                idempotency_key: "resume-refreshed".to_string(),
+                expected_generation: Some(fx.record().generation),
+            },
+        )
+        .await
+        .expect("the task resumes");
+    let command = fx.desired_command().await;
+    let new = served(command.generation);
+    assert_eq!(new.digest, command.launch_digest);
+    assert!(new.environment.task_image.is_some());
+
+    // The runner on the storage: its copy misses the new pin, and the spec
+    // the control plane resealed is accepted as an environment refresh.
+    let copy = storage
+        .store()
+        .load_task_launch_spec(&task_id())
+        .unwrap()
+        .expect("the storage's copy");
+    assert!(copy.check_pinned_digest(&command.launch_digest).is_err());
+    let replacement = AcceptedReplacement::accept(&copy, &new, &command.launch_digest)
+        .expect("the resealed spec is an environment refresh of the copy");
+    assert_eq!(
+        initialize_with(&storage, &new, Some(&replacement)).unwrap(),
+        Initialization::Resumed
+    );
+
+    assert_eq!(
+        storage.store().load_task_launch_spec(&task_id()).unwrap(),
+        Some(new.clone())
+    );
+    let moved = storage.marker().unwrap().expect("the marker");
+    assert_eq!(moved, marker.for_launch(&new.digest));
+    fx.server.shutdown().await;
+}

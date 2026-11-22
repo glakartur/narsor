@@ -881,7 +881,7 @@ narsor-cli task create implement-feature --input ticket=NAR-1 \
   [--repository api --commit <sha>] [--workflow-version 1] [--task-id my-id]
 narsor-cli task create --file ./workflow.yaml --input name=value   # local daemon only
 narsor-cli task list [--archived] [--json]       # the attention mark `?`/`!`, the title; --archived: the history
-narsor-cli task show <task> [--json]             # title, links, what it waits on, observations
+narsor-cli task show <task> [--json [--drift]]   # title, links, what it waits on, observations; --drift: environment drift in JSON
 narsor-cli task pause|resume|start|archive <task> [--expected-generation N]
 narsor-cli task move <task> --before <other> | --after <other> | --top | --bottom
 narsor-cli task refresh-env <task>               # re-resolve a stopped task's environment from the catalogue

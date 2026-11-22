@@ -322,6 +322,11 @@ pub enum TaskCommand {
         /// Print the task summary as JSON instead.
         #[arg(long)]
         json: bool,
+        /// With `--json`, also compare the task's environment with the
+        /// catalogue (`environment_drift`); the server reads the catalogue
+        /// for it. The human-readable view always shows it.
+        #[arg(long, requires = "json")]
+        drift: bool,
     },
     /// Brings a running task to a safe point and releases its compute.
     Pause(CommandArgs),
@@ -1095,10 +1100,15 @@ pub async fn task(
             }
             Ok(())
         }
-        TaskCommand::Show { task_id, json } => {
+        TaskCommand::Show {
+            task_id,
+            json,
+            drift,
+        } => {
             // The comparison with the catalogue makes the server read it, so
-            // only the human-readable view, which shows it, asks for it.
-            let task = if json {
+            // JSON asks for it only with `--drift`; the human-readable view
+            // shows it and always asks.
+            let task = if json && !drift {
                 client.control_task(&task_id).await
             } else {
                 client.control_task_with_drift(&task_id).await

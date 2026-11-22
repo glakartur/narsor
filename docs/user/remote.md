@@ -19,7 +19,7 @@ narsor-cli task create implement-feature --input repo=acme-api --branch repo=dev
 narsor-cli task create --file ./my-workflow.yaml --input name=value   # a workflow file of the local daemon, checked first
 narsor-cli task list [--archived] [--json]        # queue position (#n), `?`/`!` attention mark, backend, lifecycle, title; --archived: the history
 narsor-cli task move <task> --before|--after <other> | --top | --bottom   # reorder a queued task
-narsor-cli task show <task> [--json]              # title and links, what it waits on, observations with their age, timeline, conversation
+narsor-cli task show <task> [--json [--drift]]   # title and links, what it waits on, observations with their age, timeline, conversation; --drift: JSON also compares the environment with the catalogue
 narsor-cli task pause|resume|start|archive <task> # archive (only at a terminal state of the workflow) deletes the workload and its storage
 narsor-cli task refresh-env <task>                # a stopped task takes the environment the catalogue resolves to now
 narsor-cli task input <task> --field reason=ok [--artifact name=path] [--variable k=v] [--label L] [--waiting-id ID]   # answer the input the runner waits for
