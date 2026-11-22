@@ -339,19 +339,12 @@ impl CatalogLaunchResolver {
         resolved.load().map_err(|error| unknown(error.to_string()))
     }
 
-    fn profile(&self, intent: &LaunchIntent) -> Result<ProfileRecord, LaunchError> {
-        let id = intent
-            .profile
-            .clone()
-            .unwrap_or_else(|| self.owner.default_profile.clone());
+    /// The profile `id`, refused when it is not defined unless
+    /// `absent_is_empty`, which makes a missing one the empty profile.
+    fn profile(&self, id: String, absent_is_empty: bool) -> Result<ProfileRecord, LaunchError> {
         let record = match self.catalog.profile(&id)? {
             Some(record) => record,
-            // Only the implicit default may be absent: a fresh installation
-            // runs without any profile file, but a profile someone *named*
-            // and nobody defined is a mistake worth reporting.
-            None if intent.profile.is_none() && id == DEFAULT_PROFILE => {
-                ProfileRecord::empty(id.clone())
-            }
+            None if absent_is_empty => ProfileRecord::empty(id.clone()),
             None => return Err(LaunchError::UnknownProfile(id)),
         };
         let problems = record.problems();
@@ -684,11 +677,133 @@ impl CatalogLaunchResolver {
         let (repository, workspace) =
             self.workspace(intent, &definition, &backend_id, &backend, &mut secrets)?;
 
+        let profile_id = intent
+            .profile
+            .clone()
+            .unwrap_or_else(|| self.owner.default_profile.clone());
+        // Only the implicit default may be absent: a fresh installation runs
+        // without any profile file, but a profile someone *named* and nobody
+        // defined is a mistake worth reporting.
+        let absent_is_empty = intent.profile.is_none() && profile_id == DEFAULT_PROFILE;
+        let environment = self.environment(
+            EnvironmentRequest {
+                definition: &definition,
+                backend_id: &backend_id,
+                backend: &backend,
+                repository: repository.as_ref(),
+                profile_id,
+                absent_is_empty,
+                secrets,
+            },
+            |profile| self.harness(intent, profile, &definition, &backend_id, &backend),
+        )?;
+        let resources = self.resources(intent, &backend_id, &backend)?;
+        let inputs = match &intent.inputs {
+            Value::Null => Value::Object(Default::default()),
+            other => other.clone(),
+        };
+        let spec = TaskLaunchSpec::new(
+            definition.id.clone(),
+            definition.version,
+            inputs,
+            workspace,
+            environment,
+            resources,
+        )
+        .with_definition(&definition)
+        .map_err(|error| LaunchError::InvalidWorkflow {
+            workflow: definition.id.clone(),
+            problems: vec![format!("the definition cannot be snapshotted: {error}")],
+        })?
+        .with_labels(intent.ticket.clone(), intent.title.clone());
+        Ok(ResolvedLaunch { backend_id, spec })
+    }
+
+    /// Re-resolves the catalogue-derived environment of the sealed `spec` of
+    /// a task on `backend_id`, with the rules of creation (see
+    /// [`LaunchResolver::resolve_environment`]).
+    ///
+    /// Everything the task chose at creation stays: the definition snapshot
+    /// decides the images, the stored profile id the profile, the stored
+    /// workspace the repository and its git credentials, and the stored
+    /// fallback harness is kept as it is.
+    fn refreshed_environment(
+        &self,
+        backend_id: &BackendId,
+        spec: &TaskLaunchSpec,
+    ) -> Result<ResolvedEnvironment, LaunchError> {
+        let backend = self.usable_backend(backend_id)?;
+        let definition = spec
+            .definition()
+            .map_err(|error| LaunchError::InvalidWorkflow {
+                workflow: spec.workflow_id.clone(),
+                problems: vec![error.to_string()],
+            })?;
+        // The flat secret set does not say where each reference came from,
+        // so the workspace's references are rebuilt from its git identities.
+        let mut secrets = SecretSet::default();
+        for credential in spec
+            .workspace
+            .git_identities()
+            .filter_map(|identity| identity.credential.as_ref())
+        {
+            secrets.insert(credential.clone());
+        }
+        // The repository's `base_image` is only a fallback behind
+        // `globals.image`, so its entry is read only when it can decide.
+        let repository = match (
+            &definition.globals.image,
+            primary_registry_id(&definition, &spec.workspace),
+        ) {
+            (None, Some(id)) => Some(
+                self.registry
+                    .get(id)?
+                    .ok_or_else(|| LaunchError::UnknownRepository(id.to_string()))?,
+            ),
+            _ => None,
+        };
+        let profile_id = spec.environment.profile.id.clone();
+        // The default profile without a profile file is the empty profile,
+        // as the implicit default is at creation; any other id must exist.
+        let absent_is_empty = profile_id == DEFAULT_PROFILE;
+        self.environment(
+            EnvironmentRequest {
+                definition: &definition,
+                backend_id,
+                backend: &backend,
+                repository: repository.as_ref(),
+                profile_id,
+                absent_is_empty,
+                secrets,
+            },
+            |_| Ok(spec.environment.harness.clone()),
+        )
+    }
+
+    /// The catalogue-derived environment of a task, sealed: base and step
+    /// images, the task image, the runtime bundle, the profile with its tools
+    /// and secret references. Shared by creation and refresh, so an unchanged
+    /// catalogue yields the same identity on both paths. `harness` picks the
+    /// fallback harness once the profile is known.
+    fn environment(
+        &self,
+        request: EnvironmentRequest<'_>,
+        harness: impl FnOnce(&ProfileRecord) -> Result<String, LaunchError>,
+    ) -> Result<ResolvedEnvironment, LaunchError> {
+        let EnvironmentRequest {
+            definition,
+            backend_id,
+            backend,
+            repository,
+            profile_id,
+            absent_is_empty,
+            mut secrets,
+        } = request;
         let runtime = self.runtime()?;
         let task_image = runtime
             .as_ref()
             .and_then(|runtime| runtime.task_image.as_ref());
-        let base_image = match (&definition.globals.image, &repository) {
+        let base_image = match (&definition.globals.image, repository) {
             (Some(image), _) => Some(self.resolve_image(
                 "globals.image",
                 image,
@@ -738,7 +853,7 @@ impl CatalogLaunchResolver {
         if base_image.is_none() && backend.kind.runs_container_images() {
             return Err(LaunchError::MissingBaseImage {
                 backend: backend_id.to_string(),
-                repository: repository.as_ref().map(|entry| entry.id.clone()),
+                repository: repository.map(|entry| entry.id.clone()),
                 workflow: definition.id.clone(),
             });
         }
@@ -771,7 +886,7 @@ impl CatalogLaunchResolver {
             }
         }
 
-        let profile = self.profile(intent)?;
+        let profile = self.profile(profile_id, absent_is_empty)?;
         let bundle = runtime.as_ref().and_then(|runtime| runtime.bundle.as_ref());
         let runtime_bundle = match (bundle, backend.kind.runs_container_images()) {
             (Some(bundle), true) => Some(self.resolve_image(
@@ -800,16 +915,15 @@ impl CatalogLaunchResolver {
         }
         for name in &profile.secrets {
             secrets.require(
-                &backend_id,
-                &backend,
+                backend_id,
+                backend,
                 name,
                 &format!("profile '{}'", profile.id),
             )?;
         }
 
-        let harness = self.harness(intent, &profile, &definition, &backend_id, &backend)?;
-        let resources = self.resources(intent, &backend_id, &backend)?;
-        let environment = ResolvedEnvironment {
+        let harness = harness(&profile)?;
+        Ok(ResolvedEnvironment {
             base_image,
             step_images,
             runtime_bundle,
@@ -819,26 +933,41 @@ impl CatalogLaunchResolver {
             secrets: secrets.0.into_values().collect(),
             task_image: sealed_task_image,
             identity: String::new(),
-        };
-        let inputs = match &intent.inputs {
-            Value::Null => Value::Object(Default::default()),
-            other => other.clone(),
-        };
-        let spec = TaskLaunchSpec::new(
-            definition.id.clone(),
-            definition.version,
-            inputs,
-            workspace,
-            environment,
-            resources,
-        )
-        .with_definition(&definition)
-        .map_err(|error| LaunchError::InvalidWorkflow {
-            workflow: definition.id.clone(),
-            problems: vec![format!("the definition cannot be snapshotted: {error}")],
-        })?
-        .with_labels(intent.ticket.clone(), intent.title.clone());
-        Ok(ResolvedLaunch { backend_id, spec })
+        }
+        .sealed())
+    }
+}
+
+/// What a task's environment is resolved from besides the catalogue (see
+/// [`CatalogLaunchResolver::environment`]).
+struct EnvironmentRequest<'a> {
+    definition: &'a WorkflowDefinition,
+    backend_id: &'a BackendId,
+    backend: &'a BackendRecord,
+    /// Registry entry of the primary repository: its deprecated `base_image`
+    /// is a base image fallback.
+    repository: Option<&'a RepositoryEntry>,
+    profile_id: String,
+    /// Whether a missing `profile_id` is the empty profile, not an error.
+    absent_is_empty: bool,
+    /// The secret references the workspace already needs.
+    secrets: SecretSet,
+}
+
+/// The registry id of the primary repository of a sealed `workspace`, when
+/// the definition has one and it came from the registry.
+fn primary_registry_id<'a>(
+    definition: &WorkflowDefinition,
+    workspace: &'a TaskWorkspace,
+) -> Option<&'a str> {
+    let primary = definition.primary_repository()?;
+    let repository = workspace
+        .repositories
+        .iter()
+        .find(|repository| repository.name == primary.name)?;
+    match &repository.source {
+        TaskRepositorySource::Git(identity) => identity.repository.as_deref(),
+        TaskRepositorySource::Local { .. } => None,
     }
 }
 
@@ -948,8 +1077,12 @@ impl SecretSet {
                 wanted_by: wanted_by.to_string(),
             }
         })?;
-        self.0.insert(reference.name.clone(), reference.clone());
+        self.insert(reference.clone());
         Ok(reference)
+    }
+
+    fn insert(&mut self, reference: SecretReference) {
+        self.0.insert(reference.name.clone(), reference);
     }
 }
 
@@ -993,6 +1126,14 @@ impl LaunchResolver for CatalogLaunchResolver {
     fn resolve(&self, intent: &LaunchIntent) -> Result<ResolvedLaunch, LaunchError> {
         let definition = self.workflow(intent)?;
         self.resolve_definition(intent, definition)
+    }
+
+    fn resolve_environment(
+        &self,
+        backend: &BackendId,
+        spec: &TaskLaunchSpec,
+    ) -> Result<ResolvedEnvironment, LaunchError> {
+        self.refreshed_environment(backend, spec)
     }
 
     fn workflow_definition(&self, workflow_id: &str) -> Result<WorkflowDefinition, LaunchError> {

@@ -1499,6 +1499,16 @@ mod tests {
             ))
         }
 
+        fn resolve_environment(
+            &self,
+            backend: &crate::domain::BackendId,
+            _spec: &crate::domain::TaskLaunchSpec,
+        ) -> Result<crate::domain::ResolvedEnvironment, crate::environment::LaunchError> {
+            Err(crate::environment::LaunchError::UnknownBackend(
+                backend.to_string(),
+            ))
+        }
+
         fn check_backend(
             &self,
             backend: &crate::domain::BackendId,

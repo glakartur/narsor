@@ -1818,3 +1818,162 @@ fn a_declared_workstation_backend_resolves_on_a_network_server() {
         .expect("the laptop takes tasks");
     assert_eq!(launch.backend_id.as_str(), "laptop");
 }
+
+// ---------------------------------------------------------------------------
+// Refreshing the environment of an existing task (R2, R3, R6)
+// ---------------------------------------------------------------------------
+
+/// The environment `launch`'s task gets when it is refreshed now.
+fn refresh(root: &TempRoot, launch: &ResolvedLaunch) -> Result<ResolvedEnvironment, LaunchError> {
+    resolver(root.path()).resolve_environment(&launch.backend_id, &launch.spec)
+}
+
+fn local_backend(root: &TempRoot) {
+    let mut local = BackendRecord::new(
+        "local",
+        BackendKind::Local,
+        TrustScope::Workstation,
+        backend("x").limits,
+    );
+    local.harnesses = Vec::new();
+    root.catalog().save_backend(&local).unwrap();
+}
+
+/// A profile `dev` with the seeded tool and no secret, so a task's only
+/// secret reference can come from its workspace.
+fn dev_profile() -> ProfileRecord {
+    ProfileRecord {
+        id: "dev".to_string(),
+        ..profile(&[], &["gh"])
+    }
+}
+
+#[test]
+fn an_unchanged_catalogue_refreshes_to_the_identity_sealed_at_creation() {
+    type Setup = fn(&TempRoot) -> LaunchIntent;
+    let cases: [(&str, Setup); 4] = [
+        ("implicit default profile without a profile file", |_| {
+            intent("wf")
+        }),
+        ("repository base_image on an image backend", |root| {
+            root.registry()
+                .add(
+                    RepositoryEntry::new("app", "https://example.com/app.git")
+                        .with_base_image(ImageSpec::pinned(pinned('d'))),
+                )
+                .unwrap();
+            root.write_workflow("on-app", &repository_workflow("", ""));
+            on_app()
+        }),
+        ("named profile and a repository credential", |root| {
+            root.catalog().save_profile(&dev_profile()).unwrap();
+            root.registry()
+                .add(
+                    RepositoryEntry::new("app", "https://example.com/app.git")
+                        .with_git_credential("github-token"),
+                )
+                .unwrap();
+            root.write_workflow(
+                "on-app",
+                &repository_workflow(&format!("  image: \"{}\"\n", pinned('e')), ""),
+            );
+            LaunchIntent {
+                profile: Some("dev".to_string()),
+                ..on_app()
+            }
+        }),
+        ("task image sealed on the local backend", |root| {
+            local_backend(root);
+            root.write_workflow("bare", &workflow_yaml("bare", None));
+            write_task_image(
+                root,
+                "  base: debian:trixie-slim\n  components:\n    \
+                 - { name: tools, install: { inline: \"echo tools\" } }\n",
+            );
+            on_local("bare")
+        }),
+    ];
+    for (case, setup) in cases {
+        let root = TempRoot::new();
+        let launch = root.resolve(&setup(&root)).expect(case);
+        let refreshed = refresh(&root, &launch).expect(case);
+        assert_eq!(refreshed, launch.spec.environment, "{case}");
+    }
+}
+
+#[test]
+fn a_refresh_seals_a_task_image_added_to_the_catalogue_since_creation() {
+    let root = TempRoot::new();
+    local_backend(&root);
+    root.write_workflow("bare", &workflow_yaml("bare", None));
+    let launch = root.resolve(&on_local("bare")).unwrap();
+    assert!(launch.spec.environment.task_image.is_none());
+
+    write_task_image(
+        &root,
+        "  base: debian:trixie-slim\n  components:\n    \
+         - { name: tools, install: { inline: \"echo tools\" } }\n",
+    );
+    let refreshed = refresh(&root, &launch).expect("refresh");
+
+    let task_image = refreshed.task_image.as_ref().expect("sealed task image");
+    assert_eq!(task_image.components[0].install, "echo tools");
+    assert_ne!(refreshed.identity, launch.spec.environment.identity);
+    assert!(refreshed.identity_is_valid());
+    assert_eq!(
+        refreshed,
+        root.resolve(&on_local("bare")).unwrap().spec.environment,
+        "a refresh resolves what a new task would"
+    );
+}
+
+#[test]
+fn a_refresh_on_an_image_backend_takes_a_new_bundle_and_seals_no_task_image() {
+    let root = TempRoot::new();
+    let launch = root.resolve(&intent("wf")).unwrap();
+
+    fs::write(
+        root.path().join("runtime.yaml"),
+        format!(
+            "bundle: ghcr.io/narsor/runtime@{}\ntask_image:\n  base: debian:trixie-slim\n",
+            digest('d')
+        ),
+    )
+    .unwrap();
+    let refreshed = refresh(&root, &launch).expect("refresh");
+
+    assert_eq!(
+        refreshed.runtime_bundle.expect("bundle").digest.as_str(),
+        digest('d')
+    );
+    assert!(refreshed.task_image.is_none());
+    assert_eq!(refreshed.base_image, launch.spec.environment.base_image);
+}
+
+#[test]
+fn a_refresh_against_a_broken_catalogue_is_refused_like_a_create() {
+    // A profile the task was sealed with is gone: no default is substituted.
+    let root = TempRoot::new();
+    root.catalog().save_profile(&dev_profile()).unwrap();
+    let launch = root
+        .resolve(&LaunchIntent {
+            profile: Some("dev".to_string()),
+            ..intent("wf")
+        })
+        .unwrap();
+    fs::remove_file(root.path().join("profiles/dev.yaml")).unwrap();
+    let error = refresh(&root, &launch).expect_err("profile gone");
+    assert_eq!(error.code(), "unknown_profile", "{error}");
+    assert!(error.to_string().contains("'dev'"), "{error}");
+
+    // An unusable runtime catalogue.
+    let root = TempRoot::new();
+    let launch = root.resolve(&intent("wf")).unwrap();
+    fs::write(
+        root.path().join("runtime.yaml"),
+        "bundle: ghcr.io/narsor/runtime:latest\n",
+    )
+    .unwrap();
+    let error = refresh(&root, &launch).expect_err("invalid runtime");
+    assert!(matches!(error, LaunchError::InvalidRuntime(_)), "{error:?}");
+}
