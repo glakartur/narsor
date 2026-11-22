@@ -1866,20 +1866,31 @@ terminal_states: { completed: completed, cancelled: cancelled }
 
     #[test]
     fn clients_see_the_position_among_the_tasks_that_are_not_archived() {
-        use crate::domain::TaskId;
-        use crate::orchestration::{CommandRequest, NewTask, TaskEventKind};
+        // The queue is the backend's: another owner's task ahead in it
+        // counts, a task on another backend does not.
+        use crate::domain::{BackendId, TaskId};
+        use crate::orchestration::{CommandRequest, NewTask, OwnerRef, TaskEventKind};
         use narsor_protocol::controller::{MoveTaskRequest, MoveTaskTarget};
         let root = temp_root();
         let (service, first) = service_and_record(&root, RunnerState::Queued);
         let owner = first.owner.clone();
+        let other_owner = OwnerRef::new("oidc:https://issuer|other");
+        let backend = first.assignment.backend_id.clone();
+        let other_backend = BackendId::parse("local").unwrap();
         let id = |id: &str| TaskId::parse(id).unwrap();
-        for task_id in ["task-2", "task-3", "task-4"] {
+        for (task_id, task_owner, task_backend) in [
+            ("elsewhere-1", &owner, &other_backend),
+            ("task-2", &owner, &backend),
+            ("other-1", &other_owner, &backend),
+            ("task-3", &owner, &backend),
+            ("task-4", &owner, &backend),
+        ] {
             service
                 .control
                 .create_task(NewTask::new(
                     id(task_id),
-                    owner.clone(),
-                    first.assignment.backend_id.clone(),
+                    task_owner.clone(),
+                    task_backend.clone(),
                     first.launch_spec.clone(),
                 ))
                 .unwrap();
@@ -1892,20 +1903,22 @@ terminal_states: { completed: completed, cancelled: cancelled }
             )
             .unwrap();
 
-        let ranks: Vec<(String, u32)> = service
+        let mut ranks: Vec<(String, u32)> = service
             .list_tasks(&owner)
             .unwrap()
             .tasks
             .iter()
             .map(|task| (task.task_id.to_string(), task.rank))
             .collect();
+        ranks.sort();
         assert_eq!(
             ranks,
             [
+                ("elsewhere-1".to_string(), 1),
                 ("task-1".to_string(), 1),
                 ("task-2".to_string(), 0),
-                ("task-3".to_string(), 2),
-                ("task-4".to_string(), 3)
+                ("task-3".to_string(), 3),
+                ("task-4".to_string(), 4)
             ]
         );
         assert_eq!(service.task(&owner, "task-2").unwrap().rank, 0);
@@ -1933,6 +1946,7 @@ terminal_states: { completed: completed, cancelled: cancelled }
             moves,
             [TaskEventKind::Moved {
                 rank: moved.rank,
+                // Another owner's task keeps its place but not its name.
                 order: vec![id("task-1"), id("task-4"), id("task-3")],
             }]
         );
