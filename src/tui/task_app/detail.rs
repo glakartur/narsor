@@ -10,7 +10,7 @@
 //! ● running · krok 3 · implement · code-review v3 · 14m
 //! razem $68.30 · ✨ $34.15 ↑304 ↓72k (👥 2 $12 ↑100 ↓20k) · ⚡ $34.15 ↑304 ↓72k
 //! ├──────────────────────────────────────────────────────────────────┤
-//! │  Rozmowa   Przebieg   Zdarzenia   Dyrygent   Info                │
+//! │  Rozmowa   Przebieg   Zdarzenia   Dyrygent   Stan   Info         │
 //! ├──━━━━━━━─────────────────────────────────────────────────────────┤
 //! ──────────────────────────────────────────── ↧ śledzi [f] ─
 //!   ✓ plan  11-12 09:01:12  2m  …
@@ -88,6 +88,7 @@ use super::tabs::conversation::{
 use super::tabs::events::{self, Events};
 use super::tabs::info::{self, DriftOutcome, Info};
 use super::tabs::progress::{self, AxisRows, Progress, StepView};
+use super::tabs::state::{self as state_tab, State};
 use super::workspace_rows::{self, Part, Piece};
 use super::{failure_reason, DetailTab, DetailView, StepFocus, TaskApp};
 
@@ -99,6 +100,7 @@ pub struct TaskDetail {
     pub(super) conversation: Conversation,
     pub(super) events: Events,
     info: Info,
+    pub(super) state: State,
     pub(super) conductor: Conductor,
     /// The answer panel at the bottom (U10).
     pub(super) waiting: WaitingPanel,
@@ -121,6 +123,7 @@ impl TaskDetail {
             conversation: Conversation::new(task_id),
             events: Events::default(),
             info: Info::default(),
+            state: State::new(),
             conductor: Conductor::new(task_id),
             waiting: WaitingPanel::default(),
             details_opened: false,
@@ -159,6 +162,11 @@ impl TaskDetail {
 
     pub(super) fn info_mut(&mut self) -> &mut Info {
         &mut self.info
+    }
+
+    /// *Stan*.
+    pub fn state(&self) -> &State {
+        &self.state
     }
 
     /// *Dyrygent*.
@@ -209,6 +217,7 @@ impl TaskDetail {
             DetailTab::Events => self.events.on_action(action),
             DetailTab::Info => self.info.on_action(action),
             DetailTab::Conductor => self.conductor.on_action(action),
+            DetailTab::State => self.state.on_action(action),
         }
     }
 
@@ -724,6 +733,10 @@ impl TaskApp {
         if unopened || !started {
             return;
         }
+        // The state is read on its own: it needs nothing the timeline says.
+        if tab == DetailTab::State {
+            self.start_state_read(&id);
+        }
 
         // The timeline first: the other reads are made of what it says.
         if self.detail.view_mut(&id).progress.needs_read(revision) {
@@ -766,7 +779,7 @@ impl TaskApp {
                 }
             }
             DetailTab::Events => self.start_events_read(&id, revision),
-            DetailTab::Conductor | DetailTab::Info => {}
+            DetailTab::Conductor | DetailTab::State | DetailTab::Info => {}
         }
     }
 
@@ -833,6 +846,76 @@ impl TaskApp {
             .view_mut(task_id)
             .info
             .apply_drift(generation, outcome);
+    }
+
+    /// Starts the read of the execution state when *Stan* wants it.
+    fn start_state_read(&mut self, id: &str) {
+        if !self
+            .detail
+            .view_mut(id)
+            .state
+            .needs_read(std::time::Instant::now())
+        {
+            return;
+        }
+        let client = self.client.clone();
+        let task_id = id.to_string();
+        let started = self.background.start(
+            JobKey::Detail(task_id.clone(), DetailJob::State),
+            async move {
+                let result =
+                    bounded_read(RELAYED_READ_LIMIT, client.control_execution_state(&task_id))
+                        .await;
+                Outcome::new(move |app: &mut TaskApp| app.on_state_read(&task_id, result))
+            },
+        );
+        if started {
+            self.detail.view_mut(id).state.begin_read();
+        }
+    }
+
+    /// Takes the answer of a read of `task_id`'s execution state in. A
+    /// failure stays in the tab; only an unreachable server counts against
+    /// the connection.
+    pub fn on_state_read(
+        &mut self,
+        task_id: &str,
+        result: Result<crate::controller_protocol::ExecutionStateResponse, ClientError>,
+    ) {
+        if !self
+            .list
+            .tasks()
+            .iter()
+            .any(|task| task.task_id.as_str() == task_id)
+        {
+            return;
+        }
+        let result = self.settle(result);
+        self.detail
+            .view_mut(task_id)
+            .state
+            .apply(std::time::Instant::now(), result);
+    }
+
+    /// `Ctrl+R`: *Stan* reads the state again. On another tab it says where
+    /// the key works.
+    pub(super) fn reread_state(&mut self) {
+        let Some(id) = self.list.selected_id().map(str::to_string) else {
+            return;
+        };
+        if self.detail.tab != DetailTab::State {
+            let key = super::super::keymap::key_of(
+                super::super::keymap::Context::Details,
+                Action::RereadState,
+            )
+            .unwrap_or_default();
+            self.notify(
+                Severity::Warning,
+                format!("{key}: to działa w zakładce Stan"),
+            );
+            return;
+        }
+        self.detail.view_mut(&id).state.request_read();
     }
 
     fn start_timeline_read(&mut self, id: &str, revision: u64) {
@@ -1391,7 +1474,8 @@ pub(super) fn render_view(
             DetailTab::Progress
             | DetailTab::Conversation
             | DetailTab::Events
-            | DetailTab::Conductor,
+            | DetailTab::Conductor
+            | DetailTab::State,
             Some(message),
         ) => {
             frame.render_widget(
@@ -1464,6 +1548,17 @@ pub(super) fn render_view(
                 styles,
                 &mut view.detail.conductor,
                 view.task,
+                stale,
+                focused,
+                glyph,
+            );
+        }
+        (DetailTab::State, None) => {
+            state_tab::render(
+                frame,
+                content,
+                styles,
+                &mut view.detail.state,
                 stale,
                 focused,
                 glyph,

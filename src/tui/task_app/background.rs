@@ -58,6 +58,8 @@ pub(super) enum DetailJob {
     /// The task once more, with its environment compared with the catalogue
     /// (*Info*).
     Drift,
+    /// The execution state of the task (*Stan*).
+    State,
 }
 
 /// What a view that opens reads for.

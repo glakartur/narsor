@@ -174,17 +174,20 @@ pub enum DetailTab {
     Events,
     /// The conductor's chat and decisions.
     Conductor,
+    /// Every value the workflow sees now: context, step locals, conductor.
+    State,
     /// Sealed inputs, workflow, workspace, runner, controller.
     Info,
 }
 
 impl DetailTab {
     /// Every tab, left to right.
-    pub const ALL: [DetailTab; 5] = [
+    pub const ALL: [DetailTab; 6] = [
         DetailTab::Conversation,
         DetailTab::Progress,
         DetailTab::Events,
         DetailTab::Conductor,
+        DetailTab::State,
         DetailTab::Info,
     ];
 
@@ -195,6 +198,7 @@ impl DetailTab {
             Self::Conversation => "Rozmowa",
             Self::Events => "Zdarzenia",
             Self::Conductor => "Dyrygent",
+            Self::State => "Stan",
             Self::Info => "Info",
         }
     }
@@ -932,6 +936,7 @@ impl TaskApp {
             {
                 return self.on_conductor_action(action);
             }
+            Action::RereadState if context == Context::Details => self.reread_state(),
             Action::NextWaiting => {
                 if !self.change_list(TaskList::select_next_waiting) {
                     self.notify(Severity::Warning, "żadne zadanie nie czeka na Ciebie");
@@ -1027,6 +1032,17 @@ impl TaskApp {
                 .and_then(|id| self.detail.views.get_mut(id))
             {
                 view.info_mut().invalidate_drift();
+            }
+        }
+        // Opening *Stan* reads the state afresh; nothing else does but the
+        // refresh key.
+        if tab == DetailTab::State && self.detail.tab != DetailTab::State {
+            if let Some(view) = self
+                .list
+                .selected_id()
+                .and_then(|id| self.detail.views.get_mut(id))
+            {
+                view.state.request_read();
             }
         }
         self.detail.set_tab(tab);
