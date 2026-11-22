@@ -460,6 +460,18 @@ pub enum TaskCommand {
         #[arg(value_name = "TASK_ID")]
         task_id: String,
     },
+    /// Prints every value the task's workflow sees now: its context, the
+    /// local values of each step and the conductor's state, one
+    /// `path: value` row per line. Read through the task's runner, or a
+    /// read-only runner started for a stopped task.
+    State {
+        /// The task id.
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+        /// The state as JSON, unflattened.
+        #[arg(long)]
+        json: bool,
+    },
     /// Prints the task's control-plane events, or with `--execution` the
     /// raw events of its workflow execution (read from the live runner, or
     /// from the task's storage when this host holds it).
@@ -1335,6 +1347,19 @@ pub async fn task(
             }
             for position in &timeline.positions {
                 crate::cli::commands::print_position(position);
+            }
+            Ok(())
+        }
+        TaskCommand::State { task_id, json } => {
+            let lines = crate::cli::commands::task_state_lines(
+                &client,
+                &task_id,
+                crate::cli::commands::READER_WAIT,
+                json,
+            )
+            .await?;
+            for line in lines {
+                println!("{line}");
             }
             Ok(())
         }

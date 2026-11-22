@@ -19,17 +19,19 @@ use std::time::Duration;
 use chrono::Utc;
 use narsor::cli::commands::{
     execution_conversation_lines, execution_event_lines, execution_list_lines,
-    execution_show_details_lines, execution_show_lines, execution_steps_lines,
+    execution_show_details_lines, execution_show_lines, execution_steps_lines, task_state_lines,
 };
 use narsor_api_client::api::token::TokenSource;
 use narsor_api_client::api::{ApiClient, ClientError};
-use narsor_engine::api::{conversation_response_from_snapshot, execution_details};
+use narsor_engine::api::{conversation_response_from_snapshot, execution_details, execution_state};
 use narsor_engine::conductor::{
-    Annotation, ConductorState, ConductorStore, FailureOutcome, FailureReport, QueuedRequest,
+    Annotation, ConductorState, ConductorStore, FailureOutcome, FailureReport, PendingInvocation,
+    QueuedRequest,
 };
 use narsor_engine::controller_protocol::{
-    ControllerIdentity, ExecutionEventsPage, ProtocolConfig, ProtocolService,
-    RunnerCredentialRequest, RunnerDirective, RunnerIdentity, RunnerPollQuery, LOCAL_OWNER,
+    ControllerIdentity, ExecutionEventsPage, ExecutionStateResponse, ProtocolConfig,
+    ProtocolService, RunnerCredentialRequest, RunnerDirective, RunnerIdentity, RunnerPollQuery,
+    LOCAL_OWNER,
 };
 use narsor_engine::domain::{
     BackendId, ConductorPurpose, ConductorTrigger, Context, Event, EventData, ExecutionStatus,
@@ -314,7 +316,7 @@ impl Drop for Fixture {
     }
 }
 
-/// A runner's side of the relayed reads: answers every events,
+/// A runner's side of the relayed reads: answers every events, state,
 /// conversation and details read of its task from `store`, as
 /// `narsor-runner` does, until it is told to go.
 async fn serve_reads(
@@ -365,6 +367,14 @@ async fn serve_reads(
                 &request.request_id,
                 execution_details(&store, &execution).unwrap(),
             );
+        }
+        for request in response.execution_states {
+            let _ = match execution_state(&store, &execution) {
+                Ok(state) => service.runner_execution_state(&identity, &request.request_id, state),
+                Err(error) => {
+                    service.runner_relay_failure(&identity, &request.request_id, &error.to_string())
+                }
+            };
         }
     }
 }
@@ -878,6 +888,10 @@ async fn an_execution_of_a_task_the_caller_does_not_own_is_refused_like_its_task
         fx.client.control_execution_details("task-1").await,
         Err(ClientError::NotFound)
     ));
+    assert!(matches!(
+        fx.client.control_execution_state("task-1").await,
+        Err(ClientError::NotFound)
+    ));
 }
 
 /// The server reads no task's storage (R8): its sources do not name the
@@ -910,4 +924,192 @@ fn the_server_sources_never_name_task_storage() {
             assert!(!text.contains(name), "{} names {name}", file.display());
         }
     }
+}
+
+/// Gives the execution in `store` a multi-line context variable, the local
+/// values of a step, and a conductor that diagnoses a failed step.
+fn give_the_execution_state(store: &ExecutionStore, execution: &str) {
+    let mut record = store.load_execution(execution).unwrap();
+    record
+        .context
+        .variables
+        .insert("plan".to_string(), json!("first step\nsecond step"));
+    record
+        .context
+        .variables
+        .insert("branch".to_string(), json!("feat/x"));
+    record.metadata = json!({"engine": {"step_locals": {"review": {"NOTE": "keep it short"}}}});
+    store.save_execution(&record).unwrap();
+    let request = QueuedRequest::new(
+        ConductorTrigger::StepFailure,
+        ConductorPurpose::DiagnoseFailure,
+    );
+    ConductorStore::new(store.paths(), execution)
+        .save_state(&ConductorState {
+            pending: Some(PendingInvocation {
+                invocation_id: "inv-1".to_string(),
+                request,
+                started_at: Utc::now(),
+            }),
+            failure: Some(FailureReport {
+                key: ATTEMPT.to_string(),
+                episode: "episode-1".to_string(),
+                state_id: "plan".to_string(),
+                reason: "the tests do not compile".to_string(),
+                outcome: FailureOutcome::Unanswered {
+                    error: "exit status 1".to_string(),
+                },
+                concluded_at: Utc::now(),
+            }),
+            ..ConductorState::default()
+        })
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_state_prints_every_value_the_workflow_sees_of_a_running_or_stopped_task() {
+    for stopped in [false, true] {
+        let fx = Fixture::new().await;
+        give_the_execution_state(&fx.storage("task-1"), EXECUTION);
+        fx.running_task("task-1", LOCAL_OWNER, "local");
+        let reader = stopped.then(|| {
+            fx.stop("task-1", "local");
+            fx.start_readers("task-1", "local")
+        });
+
+        let lines = task_state_lines(&fx.client, "task-1", READER_WAIT, false)
+            .await
+            .unwrap();
+
+        let at = |prefix: &str| {
+            lines
+                .iter()
+                .position(|line| line.starts_with(prefix))
+                .unwrap_or_else(|| panic!("stopped {stopped}: no {prefix}: {lines:#?}"))
+        };
+        let plan = at("context:variables:plan: ");
+        assert_eq!(lines[plan], "context:variables:plan: first step");
+        assert_eq!(
+            lines[plan + 1],
+            "    second step",
+            "the next line, indented"
+        );
+        assert!(at("context:variables:branch: feat/x") < plan, "{lines:#?}");
+        assert!(lines.contains(&"locals:review:NOTE: keep it short".to_string()));
+        // The conductor waits on the failed step: what it concluded and
+        // what it works on.
+        assert!(lines.contains(&"conductor:failure:reason: the tests do not compile".to_string()));
+        assert!(lines.contains(&"conductor:pending:invocation_id: inv-1".to_string()));
+        assert!(at("context:") < at("locals:") && at("locals:") < at("conductor:"));
+
+        let json = task_state_lines(&fx.client, "task-1", READER_WAIT, true)
+            .await
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_str(&json.join("\n")).unwrap();
+        assert_eq!(
+            state["context"]["value"]["variables"]["plan"],
+            "first step\nsecond step"
+        );
+        assert_eq!(state["locals"]["value"]["review"]["NOTE"], "keep it short");
+        assert_eq!(state["conductor"]["status"], "available");
+        if let Some(reader) = reader {
+            reader.abort();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_state_reaches_the_owner_without_terminal_controls_and_with_its_line_feeds() {
+    let fx = Fixture::new().await;
+    let store = fx.storage("task-1");
+    let mut record = store.load_execution(EXECUTION).unwrap();
+    record.context.variables.insert(
+        "na\u{1b}[31mme\u{202e}".to_string(),
+        json!("one\u{1b}[2J\ntwo\u{202e}"),
+    );
+    store.save_execution(&record).unwrap();
+    fx.running_task("task-1", LOCAL_OWNER, "local");
+
+    let ExecutionStateResponse::Available { state, read_at, .. } =
+        fx.client.control_execution_state("task-1").await.unwrap()
+    else {
+        panic!("the state of a running task is available");
+    };
+
+    let narsor_engine::controller_protocol::StateSection::Available { value } = &state.context
+    else {
+        panic!("the context is available: {:?}", state.context);
+    };
+    let variables = value["variables"].as_object().unwrap();
+    let (name, value) = variables.iter().next().unwrap();
+    assert!(
+        !name.contains('\u{1b}') && !name.contains('\u{202e}'),
+        "{name:?}"
+    );
+    let value = value.as_str().unwrap();
+    assert!(
+        !value.contains('\u{1b}') && !value.contains('\u{202e}'),
+        "{value:?}"
+    );
+    assert_eq!(value.lines().count(), 2, "{value:?}");
+    assert!(read_at <= Utc::now());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_state_says_why_when_the_state_cannot_be_read() {
+    // A runner whose execution record does not load fails the read: the
+    // owner hears it at once, as a retryable refusal.
+    let fx = Fixture::new().await;
+    fx.running_task("task-1", LOCAL_OWNER, "local");
+    fs::remove_file(fx.storage("task-1").paths().state_file(EXECUTION)).unwrap();
+    let error = task_state_lines(&fx.client, "task-1", READER_WAIT, false)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .message
+            .starts_with("The execution's state cannot be read: ")
+            && error
+                .message
+                .contains("could not read the execution's state"),
+        "{}",
+        error.message
+    );
+
+    // An archived task has no storage left to read.
+    let fx = Fixture::new().await;
+    fx.running_task("task-1", LOCAL_OWNER, "local");
+    fx.stop("task-1", "local");
+    fx.service
+        .apply_command(
+            &TaskId::parse("task-1").unwrap(),
+            CommandRequest::new(OwnerCommand::Archive, "archive-1"),
+        )
+        .unwrap();
+    let error = task_state_lines(&fx.client, "task-1", READER_WAIT, false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.message,
+        "The task's state cannot be read: the task is archived: its storage was deleted"
+    );
+
+    // A task without an execution has no state yet.
+    let fx = Fixture::new().await;
+    fx.service
+        .control_plane()
+        .create_task(NewTask::new(
+            TaskId::parse("task-2").unwrap(),
+            OwnerRef::new(LOCAL_OWNER),
+            BackendId::parse("local").unwrap(),
+            launch_spec(),
+        ))
+        .unwrap();
+    let error = task_state_lines(&fx.client, "task-2", READER_WAIT, false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.message,
+        "The task's state cannot be read: the task has no execution yet"
+    );
 }
