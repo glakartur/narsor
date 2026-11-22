@@ -446,7 +446,7 @@ action:
     model: <small|medium|large|max>   #   not lower than the step's own `model`
     effort: <low|medium|high|max>     #   not lower than the step's own `effort`
   workspace_access: <read-write|read-only> # schema v1 only; read-write by default (v2: step `workspaces`, §3.2.1).
-  prompt: |                           # Instruction for the agent
+  message: |                           # Instruction for the agent
     Analyze the code in the current directory.
     Find potential security bugs.
     Write the report to the file security_report.md.
@@ -833,7 +833,7 @@ Launches a second AI agent session that analyzes the result of the previous acti
 decision:
   type: agent
   harness: claude-code
-  prompt: |
+  message: |
     Analyze the result of the previous step.
     Are the changes safe to deploy?
     Choose a transition: 'safe_to_merge', 'needs_more_tests', 'rollback'.
@@ -915,7 +915,7 @@ the workspace:
 
 ```yaml
 open_pr:
-  action: { type: agent, prompt: Open the pull request. }
+  action: { type: agent, message: Open the pull request. }
   variables:
     - { name: pr_url }
   exit:
@@ -1007,7 +1007,7 @@ A short example:
 implement:
   action:
     type: agent
-    prompt: Implement the change.
+    message: Implement the change.
   variables:
     - name: summary
       description: What was done.
@@ -1151,12 +1151,12 @@ choices:
     rendered like the other values of `set`. A value that renders empty does not replace the earlier
     one. The header shows them (§3.6).
 
-#### 3.7.6. Prompt and message parts (`when`)
+#### 3.7.6. Message parts (`when`)
 
-The `prompt` of an agent and the `message` of a decision step are a string or a list of parts.
+The `message` of an agent, profile, decision or human step is a string or a list of parts. `prompt` is a deprecated alias of `message`, accepted during the transition period. A step must not have both keys. Errors name `message`.
 
 ```yaml
-prompt:
+message:
   - Draft the change.
   - when: local.memory
     text: "Your notes from the last attempt: {{ local.memory }}"
@@ -1175,7 +1175,7 @@ prompt:
     `steps.ID.reply`). No braces, no filter, no white space, and the list must not be empty. The
     loader checks a reference like a `{{ }}` placeholder in the same text. An undeclared input, and a
     `steps.ID.reply` of a script step, are errors.
-*   An error message about a text with several parts names the part (for example `prompt[2].when`).
+*   An error message about a text with several parts names the part (for example `message[2].when`).
 *   A text that is one plain string works as before.
 
 #### 3.7.7. The label of an earlier step (`steps.ID.label`)
@@ -1225,7 +1225,7 @@ profile:
     type: profile
     model: small                 # optional, as on an agent action
     effort: low                  # optional, as on an agent action
-    prompt: |                    # required, a prompt text (§3.7.6)
+    message: |                    # required, a prompt text (§3.7.6)
       Judge how hard each step is from the plan:
 
       {{ steps.plan.reply }}
@@ -1311,7 +1311,7 @@ states:
     action:
       type: agent
       harness: claude-code
-      prompt: |
+      message: |
         Analyze the repository with a view to implementing: {{ inputs.description }}.
         Identify the files that need to be modified.
         Write the plan to the file plan.md.
@@ -1352,7 +1352,7 @@ states:
     action:
       type: agent
       harness: claude-code
-      prompt: |
+      message: |
         Implement the feature according to the plan in {{ artifacts.plan_doc }}
         and the requirement: {{ inputs.description }}.
         Human clarifications (empty if there were none): {{ context.clarification_text }}
@@ -1387,7 +1387,7 @@ states:
     action:
       type: agent
       harness: claude-code
-      prompt: |
+      message: |
         The tests did not pass. Analyze the logs and fix the code.
     choices:
       - fixed
@@ -1466,7 +1466,7 @@ states:
     action:
       type: agent
       harness: claude-code
-      prompt:
+      message:
         - |
           Analyze the repository with a view to implementing: {{ inputs.description }}.
           Identify the files that need to be modified.
@@ -1510,7 +1510,7 @@ states:
     action:
       type: agent
       harness: claude-code
-      prompt: |
+      message: |
         Implement the feature according to the plan in {{ artifacts.plan_doc }}
         and the requirement: {{ inputs.description }}.
         Make sure the code compiles.
@@ -1535,7 +1535,7 @@ states:
     action:
       type: agent
       harness: claude-code
-      prompt: |
+      message: |
         The tests did not pass ({{ steps.test.label }}). Analyze the logs and fix the code.
         {{ steps.test.stdout }}
     exit:
@@ -1591,7 +1591,7 @@ Before a workflow is run, the definition must pass validation:
 
 2.  **Action Correctness:**
     *   The action type must be supported (`agent`, `script`, `human`; in the unified shape also `decision` and `profile`). The removed type `wait` is a load error that names its replacement (§3.3.D).
-    *   The required fields for a given action type must be present (e.g. `prompt` for an agent, `command` for a script).
+    *   The required fields for a given action type must be present (e.g. `message` for an agent, `command` for a script).
         `harness` is **not** required: every setting has a built-in value,
         so "no harness anywhere" cannot occur, and validation
         remains a function of the source alone.
@@ -1627,7 +1627,7 @@ Before a workflow is run, the definition must pass validation:
     *   `exit` is a reserved label and cannot be a key in `choices`. Every exit object has `next`.
     *   `terminal_states` is a mapping. There is no `human` action. A `decision` action is not allowed in a legacy file.
     *   A `decision` step has a non-blank `message` and at least one choice. It may define `variables`, not `artifacts`.
-    *   A `profile` step has a non-blank `prompt` and `exit`, never `choices`. It defines no `variables` and no `artifacts`. A `profile` action is not allowed in a legacy file (§3.7.10).
+    *   A `profile` step has a non-blank `message` and `exit`, never `choices`. It defines no `variables` and no `artifacts`. A `profile` action is not allowed in a legacy file (§3.7.10).
     *   A script step with `exit` cannot have `exit_codes`.
     *   In the unified shape only an agent or a script step can declare a `timeout` choice; a `decision` step cannot. The old shape keeps accepting a `timeout` label on any step, because a human gate may use it as an ordinary choice.
     *   `resume_comment_field` on a decision step names a variable of `type: text`.

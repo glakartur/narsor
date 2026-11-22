@@ -511,7 +511,7 @@ fn compile_action(action: ActionSchema, without_section: bool) -> ActionConfig {
             }
             ActionConfig::Agent(AgentActionConfig {
                 harness_step,
-                prompt: agent.prompt,
+                prompt: agent.message,
                 history: agent.history,
             })
         }
@@ -552,7 +552,7 @@ fn compile_action(action: ActionSchema, without_section: bool) -> ActionConfig {
             }
             ActionConfig::Profile(ProfileActionConfig {
                 harness_step,
-                prompt: profile.prompt,
+                prompt: profile.message,
             })
         }
         ActionSchema::Decision(decision) => ActionConfig::Decision(DecisionActionConfig {
@@ -572,7 +572,7 @@ fn compile_decision(decision: DecisionSchema) -> DecisionConfig {
         DecisionSchema::Rules => DecisionConfig::Rules,
         DecisionSchema::Agent(agent) => DecisionConfig::Agent(AgentDecisionConfig {
             harness: agent.harness,
-            prompt: agent.prompt,
+            prompt: agent.message,
         }),
         DecisionSchema::Human(human) => DecisionConfig::Human(HumanDecisionConfig {
             message: human.message,

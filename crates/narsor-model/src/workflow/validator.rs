@@ -482,7 +482,7 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
                 errors.push(missing_field(state, "agent", "harness"));
             }
             if agent.prompt.is_blank() {
-                errors.push(missing_field(state, "agent", "prompt"));
+                errors.push(missing_field(state, "agent", "message"));
             }
             if state.choices.is_empty() {
                 errors.push(ValidationError::EmptyChoices {
@@ -501,7 +501,7 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
                 errors.push(missing_field(state, "profile", "harness"));
             }
             if profile.prompt.is_blank() {
-                errors.push(missing_field(state, "profile", "prompt"));
+                errors.push(missing_field(state, "profile", "message"));
             }
             // One way on: the step writes the profile and the workflow
             // continues; it never picks a label.
@@ -874,7 +874,7 @@ fn validate_decision(state: &State, errors: &mut Vec<ValidationError>) {
         if is_blank(agent.prompt.as_deref()) {
             errors.push(ValidationError::AgentDecisionMissingField {
                 state: state.id.clone(),
-                field: "prompt",
+                field: "message",
             });
         }
     }
@@ -1043,7 +1043,7 @@ fn validate_state_templates(
             if let Some(harness) = &harness_step.harness {
                 templated.push(("action.harness".to_string(), harness.clone()));
             }
-            templated.extend(prompt_templates(state, "action.prompt", prompt, errors));
+            templated.extend(prompt_templates(state, "action.message", prompt, errors));
             if let Some(model) = &harness_step.model {
                 templated.push(("action.model".to_string(), model.clone()));
             }
@@ -1083,7 +1083,7 @@ fn validate_state_templates(
                 templated.push(("decision.harness".to_string(), harness.clone()));
             }
             if let Some(prompt) = &agent.prompt {
-                templated.push(("decision.prompt".to_string(), prompt.clone()));
+                templated.push(("decision.message".to_string(), prompt.clone()));
             }
         }
         Some(DecisionConfig::Human(human)) => {
@@ -1099,7 +1099,7 @@ fn validate_state_templates(
 
     for (field, text) in templated {
         let text = text.as_str();
-        let allowed = field.starts_with("action.prompt") || field.starts_with("action.message");
+        let allowed = field.starts_with("action.message");
         for source in step_reply_references(text) {
             if !allowed {
                 errors.push(ValidationError::StepReplyNotAllowed {
@@ -1949,14 +1949,14 @@ globals:
     }
 
     #[test]
-    fn a_profile_step_needs_a_prompt_and_a_usable_harness() {
+    fn a_profile_step_needs_a_message_and_a_usable_harness() {
         let errors = profile_step_errors(
             "    action: { type: profile, prompt: \"  \", harness: \" \" }\n    exit: { next: work }",
         );
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("profile action") && e.contains("'prompt'")),
+                .any(|e| e.contains("profile action") && e.contains("'message'")),
             "{errors:?}"
         );
         assert!(
@@ -1997,7 +1997,7 @@ globals:
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("unknown input 'ghost'") && e.contains("action.prompt")),
+                .any(|e| e.contains("unknown input 'ghost'") && e.contains("action.message")),
             "{errors:?}"
         );
         // An agent's reply may be read: the source is checked, not refused.
