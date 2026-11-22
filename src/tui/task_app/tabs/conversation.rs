@@ -27,6 +27,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -1272,10 +1273,18 @@ const STEP_SEPARATOR: &str = " · ";
 /// Where steps are cut off the strip.
 const STEP_MORE: &str = "…";
 
+/// The cells before a step's name on the strip: its status glyph and a space.
+const STEP_PREFIX_CELLS: usize = 2;
+
+/// The cells the steps and the segment under them are indented by.
+const STEP_INDENT: u16 = 2;
+
 /// Draws the strip of steps over the whole of `area` (its first
 /// [`STEP_STRIP_ROWS`] rows): a rule across the full width, the steps newest
 /// first indented like the tab's content, and a rule again. The selected step
-/// is bold and underlined, in the focus role while the keys are in the tab.
+/// is bold, in the focus role while the keys are in the tab, with a heavy
+/// segment (`━`) under its name in the bottom rule, as the tab bar marks the
+/// open tab.
 /// A strip wider than the area keeps the selected step in view, `…` where
 /// steps are cut.
 pub fn render_step_strip(
@@ -1298,10 +1307,34 @@ pub fn render_step_strip(
             styles.of(if stale { Role::Done } else { Role::Attention }),
         )
     };
+    let steps = Rect::new(
+        area.x.saturating_add(STEP_INDENT),
+        area.y + 1,
+        area.width.saturating_sub(3),
+        1,
+    );
+    let (line, marked) = step_strip_line(conversation, usize::from(steps.width), focused, styles);
+    let segment = marked.map(|(start, width)| {
+        // The segment stays inside the steps' room, as the steps do.
+        let indent = usize::from(STEP_INDENT);
+        let limit = indent + usize::from(steps.width);
+        let start = (indent + start).min(limit);
+        let end = (start + width).min(limit);
+        let role = if focused && !stale {
+            Role::Focus
+        } else {
+            Role::Done
+        };
+        (
+            start,
+            end.saturating_sub(start),
+            styles.of(role).add_modifier(Modifier::BOLD),
+        )
+    });
     let rows = [
         rule_line(area.width, done, None, Some(label)),
         Line::default(),
-        rule_line(area.width, done, None, None),
+        rule_line(area.width, done, segment, None),
     ];
     for (offset, line) in (0..area.height.min(STEP_STRIP_ROWS)).zip(rows) {
         frame.render_widget(
@@ -1312,37 +1345,24 @@ pub fn render_step_strip(
     if area.height < 2 {
         return;
     }
-    let steps = Rect::new(
-        area.x.saturating_add(2),
-        area.y + 1,
-        area.width.saturating_sub(3),
-        1,
-    );
-    frame.render_widget(
-        Paragraph::new(step_strip_line(
-            conversation,
-            usize::from(steps.width),
-            focused,
-            styles,
-        )),
-        steps,
-    );
+    frame.render_widget(Paragraph::new(line), steps);
 }
 
-/// The steps of the strip that fit in `width`, with the selected one in view.
+/// The steps of the strip that fit in `width`, with the selected one in view,
+/// and the `(start, width)` in cells of the selected step's name.
 fn step_strip_line(
     conversation: &Conversation,
     width: usize,
     focused: bool,
     styles: &Styles,
-) -> Line<'static> {
+) -> (Line<'static>, Option<(usize, usize)>) {
     let steps = conversation.steps();
     if steps.is_empty() {
-        return Line::styled("brak kroków", styles.of(Role::Done));
+        return (Line::styled("brak kroków", styles.of(Role::Done)), None);
     }
     let chip_widths: Vec<usize> = steps
         .iter()
-        .map(|step| 2 + cells(&step_name(step.icon, &one_line(&step.label))))
+        .map(|step| STEP_PREFIX_CELLS + cells(&step_name(step.icon, &one_line(&step.label))))
         .collect();
     let separator = Span::raw(STEP_SEPARATOR).width();
     let more = Span::raw(STEP_MORE).width() + 1;
@@ -1359,6 +1379,7 @@ fn step_strip_line(
     }
     let mut spans = Vec::new();
     let mut used = 0;
+    let mut marked = None;
     if first > 0 {
         spans.push(Span::styled(format!("{STEP_MORE} "), styles.of(Role::Done)));
         used += more;
@@ -1374,10 +1395,16 @@ fn step_strip_line(
         if gap > 0 {
             spans.push(Span::styled(STEP_SEPARATOR, styles.of(Role::Done)));
         }
+        if index == selected {
+            marked = Some((
+                used + gap + STEP_PREFIX_CELLS,
+                chip_widths[index] - STEP_PREFIX_CELLS,
+            ));
+        }
         spans.extend(step_chip(step, index == selected, focused, styles));
         used += gap + chip_widths[index];
     }
-    Line::from(spans)
+    (Line::from(spans), marked)
 }
 
 /// A step on the strip: its status glyph and its name.
@@ -1391,7 +1418,7 @@ fn step_chip(
     let label = one_line(&step.label);
     let label_style = if selected {
         let role = if focused { Role::Focus } else { Role::Calm };
-        styles.selected_step(role)
+        styles.selected_tab(role)
     } else {
         styles.of(Role::Done)
     };
@@ -1471,4 +1498,176 @@ pub fn render(
         stale,
         focused,
     );
+}
+
+#[cfg(test)]
+mod strip_marker_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
+
+    fn position(label: &str) -> Position {
+        Position {
+            label: label.into(),
+            state_id: label.into(),
+            visit: 1,
+            action_execution_id: None,
+            action_type: Some("agent".into()),
+            status: PositionStatus::Succeeded,
+            started_at: None,
+            ended_at: None,
+            error: None,
+            resumed_harness_session: None,
+            harness_session_interrupted: false,
+            retry_pending: false,
+            conversation: ConversationState::Recorded,
+            session_number: Some(1),
+            attempts: Vec::new(),
+            harness: None,
+            model: None,
+            effort: None,
+            harness_session_id: None,
+            usage: None,
+            decision_by: None,
+        }
+    }
+
+    /// Steps in the order they ran; the newest is selected.
+    fn conversation_of(labels: &[&str]) -> Conversation {
+        let positions: Vec<Position> = labels.iter().map(|label| position(label)).collect();
+        let mut conversation = Conversation::new("task");
+        conversation.rebuild(&positions, &Attempts::default());
+        conversation
+    }
+
+    fn draw(
+        conversation: &Conversation,
+        styles: &Styles,
+        size: (u16, u16),
+        focused: bool,
+    ) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_step_strip(frame, frame.area(), styles, conversation, focused, false)
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_symbols(buffer: &Buffer, row: u16) -> Vec<String> {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, row)].symbol().to_string())
+            .collect()
+    }
+
+    /// The columns holding `━` in `row`.
+    fn heavy_columns(buffer: &Buffer, row: u16) -> Vec<u16> {
+        (0..buffer.area.width)
+            .filter(|&x| buffer[(x, row)].symbol() == "━")
+            .collect()
+    }
+
+    /// The column of the first icon in the steps' row: where a name starts.
+    fn first_name_column(buffer: &Buffer) -> u16 {
+        row_symbols(buffer, 1)
+            .iter()
+            .position(|symbol| symbol == "✨")
+            .unwrap() as u16
+    }
+
+    #[test]
+    fn marks_the_selected_step_with_a_heavy_segment_and_no_underline() {
+        let styles = Styles::new(false);
+        let conversation = conversation_of(&["plan #1", "review #1"]);
+
+        let buffer = draw(&conversation, &styles, (60, 3), true);
+
+        let start = first_name_column(&buffer);
+        let name = &buffer[(start, 1)];
+        assert!(name.modifier.contains(Modifier::BOLD));
+        assert!(!name.modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(name.fg, styles.of(Role::Focus).fg.unwrap());
+        // "✨ review #1" is 12 cells wide.
+        assert_eq!(
+            heavy_columns(&buffer, 2),
+            (start..start + 12).collect::<Vec<_>>()
+        );
+        let segment = &buffer[(start, 2)];
+        assert_eq!(segment.fg, styles.of(Role::Focus).fg.unwrap());
+        assert!(segment.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn the_segment_moves_with_the_selection() {
+        let styles = Styles::new(false);
+        let mut conversation = conversation_of(&["plan #1", "review #1"]);
+        conversation.select_older();
+
+        let buffer = draw(&conversation, &styles, (60, 3), true);
+
+        let names: Vec<u16> = row_symbols(&buffer, 1)
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| *symbol == "✨")
+            .map(|(x, _)| x as u16)
+            .collect();
+        assert_eq!(names.len(), 2);
+        // "✨ plan #1" is 10 cells wide, the older step comes second.
+        assert_eq!(
+            heavy_columns(&buffer, 2),
+            (names[1]..names[1] + 10).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_segment_stays_under_the_selected_name_when_the_strip_is_cut() {
+        let styles = Styles::new(false);
+        let labels: Vec<String> = (0..12).map(|index| format!("step{index} #1")).collect();
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let mut conversation = conversation_of(&labels);
+        while conversation.select_older() {}
+
+        let buffer = draw(&conversation, &styles, (40, 3), true);
+
+        assert_eq!(row_symbols(&buffer, 1)[2], "…");
+        let start = row_symbols(&buffer, 1)
+            .iter()
+            .rposition(|symbol| symbol == "✨")
+            .unwrap() as u16;
+        // The oldest step is last on the strip: "✨ step0 #1" is 11 cells wide.
+        assert_eq!(
+            heavy_columns(&buffer, 2),
+            (start..start + 11).collect::<Vec<_>>()
+        );
+        assert!(heavy_columns(&buffer, 2).iter().all(|&x| x < 2 + 37));
+    }
+
+    #[test]
+    fn the_segment_is_grey_without_the_keys_and_absent_without_room_or_steps() {
+        let styles = Styles::new(false);
+        let conversation = conversation_of(&["plan #1", "review #1"]);
+
+        let unfocused = draw(&conversation, &styles, (60, 3), false);
+        let segment = &unfocused[(first_name_column(&unfocused), 2)];
+        assert_eq!(segment.symbol(), "━");
+        assert_eq!(segment.fg, styles.of(Role::Done).fg.unwrap_or_default());
+        assert!(segment.modifier.contains(Modifier::BOLD));
+
+        let plain = draw(&conversation, &Styles::new(true), (60, 3), true);
+        let start = first_name_column(&plain);
+        assert!(plain[(start, 1)].modifier.contains(Modifier::BOLD));
+        assert_eq!(plain[(start, 2)].symbol(), "━");
+        assert_eq!(plain[(start + 12, 2)].symbol(), "─");
+
+        let low = draw(&conversation, &styles, (60, 2), true);
+        assert!(heavy_columns(&low, 0).is_empty() && heavy_columns(&low, 1).is_empty());
+        assert!(low[(first_name_column(&low), 1)]
+            .modifier
+            .contains(Modifier::BOLD));
+
+        let empty = draw(&Conversation::new("task"), &styles, (60, 3), true);
+        assert!(heavy_columns(&empty, 2).is_empty());
+    }
 }

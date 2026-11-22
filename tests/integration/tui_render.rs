@@ -3725,7 +3725,7 @@ mod task_app_detail_render {
                     .trim_end_matches('│')
                     .trim_end()
                     .chars()
-                    .all(|c| c == '─')
+                    .all(|c| c == '─' || c == '━')
                     && details.chars().filter(|&c| c == '─').count() > 60,
                 "a full rule at {rule}:\n{}",
                 screen(&buffer)
@@ -3741,8 +3741,13 @@ mod task_app_detail_render {
         let selected = &buffer[(x, y)];
         assert!(
             selected.modifier.contains(Modifier::BOLD)
-                && selected.modifier.contains(Modifier::UNDERLINED),
-            "the selected step is marked"
+                && !selected.modifier.contains(Modifier::UNDERLINED),
+            "the selected step is bold without an underline"
+        );
+        assert_eq!(
+            buffer[(x, y + 1)].symbol(),
+            "━",
+            "the segment is under the selected step"
         );
         let (y, x) = spot(&buffer, "plan #1");
         assert!(!buffer[(x, y)].modifier.contains(Modifier::UNDERLINED));
@@ -3792,7 +3797,7 @@ mod task_app_detail_render {
             "{screen_text}"
         );
         let (y, x) = spot(&buffer, "plan #1");
-        assert!(buffer[(x, y)].modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(buffer[(x, y + 1)].symbol(), "━");
 
         press(&mut app, KeyCode::Left);
         let screen_text = screen(&render(&mut app, &styles));
