@@ -1030,3 +1030,32 @@ fn a_command_carries_the_launch_digest_and_no_launch_spec() {
     assert!(command.get("launch_spec").is_none(), "{command}");
     assert_eq!(command["launch_digest"], "sha256:abc");
 }
+
+#[test]
+fn an_environment_refresh_outcome_decodes_from_raw_json_and_tolerates_newer_kinds() {
+    use super::EnvironmentRefreshResult;
+    let refreshed: EnvironmentRefreshResult = serde_json::from_value(serde_json::json!({
+        "type": "refreshed",
+        "old_identity": "env-old",
+        "new_identity": "env-new",
+        "generation": 4,
+        "diff": { "task_image_components": { "added": ["glab"] } },
+    }))
+    .unwrap();
+    let EnvironmentRefreshResult::Refreshed {
+        generation, diff, ..
+    } = refreshed
+    else {
+        panic!("refreshed: {refreshed:?}");
+    };
+    assert_eq!(
+        (generation, diff.task_image_components.added),
+        (4, vec!["glab".to_string()])
+    );
+
+    // A client that predates an outcome reads it as `Unrecognized`.
+    let newer: EnvironmentRefreshResult =
+        serde_json::from_value(serde_json::json!({ "type": "deferred", "until": "later" }))
+            .unwrap();
+    assert_eq!(newer, EnvironmentRefreshResult::Unrecognized);
+}

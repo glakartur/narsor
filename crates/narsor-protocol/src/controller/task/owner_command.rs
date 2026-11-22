@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::controller::{RunnerState, TaskSummary};
+use crate::controller::{EnvironmentDiff, RunnerState, TaskSummary};
 
 /// Actor recorded for a runner state command receipt.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -77,6 +77,53 @@ pub struct MoveTaskRequest {
     /// Refuse unless the task is still at this desired generation.
     #[serde(default)]
     pub expected_generation: Option<u64>,
+}
+
+/// `POST /control/v1/tasks/:task_id/refresh-environment`.
+///
+/// The body names no requester: the server records the owner it
+/// authenticated, and ignores any other field a client sends.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefreshEnvironmentRequest {
+    /// Refuse unless the task is still at this desired generation.
+    #[serde(default)]
+    pub expected_generation: Option<u64>,
+}
+
+/// Response of an environment refresh: what happened, and the task after it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RefreshEnvironmentResponse {
+    pub outcome: EnvironmentRefreshResult,
+    pub task: TaskSummary,
+}
+
+/// What an environment refresh did to the task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum EnvironmentRefreshResult {
+    /// The launch spec now carries the environment the catalogue resolves
+    /// to, under a new generation.
+    Refreshed {
+        /// The environment identity before the refresh.
+        old_identity: String,
+        /// The environment identity after the refresh.
+        new_identity: String,
+        /// The task's desired generation after the refresh.
+        generation: u64,
+        /// What changed, part by part.
+        #[serde(default)]
+        diff: Box<EnvironmentDiff>,
+    },
+    /// The catalogue resolves to the environment the task already has:
+    /// nothing was stored and no event was recorded.
+    Unchanged {
+        /// The environment identity the task keeps.
+        #[serde(default)]
+        identity: String,
+    },
+    /// An outcome a newer control plane sent that this client does not know.
+    #[serde(other)]
+    Unrecognized,
 }
 
 /// An owner's requested change to a task's desired runner state.
