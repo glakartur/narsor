@@ -26,10 +26,10 @@ pub use narsor_protocol::controller::{
 
 /// Current schema version of [`TaskRecord`].
 ///
-/// Version 2 replaced the owner `priority` with the queue position
-/// [`TaskRecord::rank`]; the store migrates a version 1 record when it first
-/// reads it (see [`super::store`]).
-pub const TASK_RECORD_VERSION: u32 = 2;
+/// Version 2 replaced the owner `priority` with a dense queue rank. Version 3
+/// replaced the rank with the sparse [`TaskRecord::position_key`]. The store
+/// migrates an older record when it first reads it (see [`super::store`]).
+pub const TASK_RECORD_VERSION: u32 = 3;
 
 /// How much a read of a task's details adds to its slot-release wait at
 /// least: a read that would move the deadline by less changes nothing, so
@@ -280,14 +280,19 @@ pub struct TaskRecord {
     pub assignment: TaskAssignment,
     /// The immutable launch input (R18).
     pub launch_spec: TaskLaunchSpec,
-    /// 1-based position among the tasks of the backend, the queue order:
-    /// the scheduler admits waiting tasks by it, lowest first. Dense —
-    /// renumbered under the backend's schedule lock on every move — and
-    /// kept by a task once it is admitted or finished.
+    /// The task's place in its backend's queue: the scheduler admits
+    /// waiting tasks by it, lowest first. Sparse, and written only when the
+    /// task is created and when the owner moves it or a move makes room
+    /// next to it; every other change of the task keeps it. Archived tasks
+    /// keep a key but are not part of the order.
     #[serde(default)]
-    pub rank: u32,
-    /// The priority a version 1 record carried, read only to number such a
-    /// record once and never written back.
+    pub position_key: u64,
+    /// The dense rank a version 2 record carried, read only to give such a
+    /// record its key once and never written back.
+    #[serde(default, rename = "rank", skip_serializing)]
+    pub(crate) legacy_rank: Option<u32>,
+    /// The priority a version 1 record carried, read only to give such a
+    /// record its key once and never written back.
     #[serde(default, rename = "priority", skip_serializing)]
     pub(crate) legacy_priority: Option<i32>,
     /// When the task was created.
@@ -295,7 +300,7 @@ pub struct TaskRecord {
     /// When the task entered its current owner-visible state, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_since: Option<DateTime<Utc>>,
-    /// Creation order across all tasks, the tie-breaker among equal ranks
+    /// Creation order across all tasks, the tie-breaker among equal keys
     /// (U10). Strictly increasing, never reused.
     pub queue_sequence: u64,
     /// Current orchestration state.

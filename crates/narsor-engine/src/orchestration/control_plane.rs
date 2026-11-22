@@ -25,6 +25,7 @@ use super::model::{
     ResumeState, RunnerState, SlotReleaseClass, SlotReleaseReason, TaskAssignment, TaskEvent,
     TaskEventKind, TaskRecord, WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
 };
+use super::position::key_at;
 use super::resume::{
     auto_resume_key, count_loss, loss_from_history, owner_slot_release_key, slot_release_key,
     ResumePolicy,
@@ -155,16 +156,17 @@ impl ControlPlane {
             .max()
             .unwrap_or(0)
             + 1;
-        // A new task joins the end of its backend's queue; the schedule
-        // lock keeps a concurrent move from renumbering under it.
-        let rank = tasks
+        let now = self.clock.now();
+        // A new task joins the end of its backend's queue: its creation time
+        // is its key, unless a key of the backend (an archived task's too)
+        // is not below it. The schedule lock keeps a concurrent move from
+        // writing keys under it.
+        let position_key = tasks
             .iter()
             .filter(|task| task.assignment.backend_id == request.backend_id)
-            .map(|task| task.rank)
+            .map(|task| task.position_key)
             .max()
-            .unwrap_or(0)
-            + 1;
-        let now = self.clock.now();
+            .map_or(key_at(now), |last| key_at(now).max(last.saturating_add(1)));
         // An observer's task says so from its first event on (R19).
         let created = match &request.provenance {
             Some(provenance) => TaskEventKind::CreatedByObserver {
@@ -180,7 +182,8 @@ impl ControlPlane {
                 resource_key: request.task_id.to_string(),
             },
             launch_spec: request.launch_spec,
-            rank,
+            position_key,
+            legacy_rank: None,
             legacy_priority: None,
             created_at: now,
             state_since: Some(now),
@@ -240,7 +243,7 @@ impl ControlPlane {
         self.store.load_task(task_id)
     }
 
-    /// Every task, in creation order.
+    /// Every task, grouped by backend and in queue order within each.
     pub fn list_tasks(&self) -> Result<Vec<TaskRecord>> {
         self.store.list_tasks()
     }
@@ -271,10 +274,11 @@ impl ControlPlane {
     }
 
     /// [`Self::command`] with the scheduler's decision on where a resume of
-    /// a `Stopped` task goes: `queue_resume` sends it to the front of the
-    /// queue (`Queued`, no reservation) instead of straight to
-    /// `Provisioning`, because the backend has no free slot (R20). Decided
-    /// by the caller under the backend's schedule lock.
+    /// a `Stopped` task goes: `queue_resume` sends it back to the queue
+    /// (`Queued`, no reservation) instead of straight to `Provisioning`,
+    /// because the backend has no free slot. The task keeps its position
+    /// key, so it waits at the place the owner gave it. Decided by the
+    /// caller under the backend's schedule lock.
     pub(crate) fn command_routed(
         &self,
         task_id: &TaskId,
@@ -379,15 +383,13 @@ impl ControlPlane {
                 CommandEffect::ArchiveConverged => {}
                 CommandEffect::Transition(next) => {
                     let previous = record.runner_state;
-                    // No free slot: the resume waits in the queue, ahead of
-                    // everyone, holding nothing (R20). The ranks of the
-                    // others are shifted by the caller under the schedule
-                    // lock; rank 0 is before every dense rank.
+                    // No free slot: the resume waits in the queue at its own
+                    // key, holding nothing. Only the owner's move changes
+                    // the order.
                     let next = if queue_resume
                         && previous == RunnerState::Stopped
                         && next == RunnerState::Provisioning
                     {
-                        record.rank = 0;
                         record.reservation = None;
                         record.queue = None;
                         RunnerState::Queued
@@ -899,7 +901,7 @@ impl ControlPlane {
                     let previous = record.runner_state;
                     // The safe point a lowered limit asked for: the compute
                     // is gone, and the task goes back to the queue on its
-                    // own rank, with no reservation, as the resume that
+                    // own key, with no reservation, as the resume that
                     // starts it again.
                     let next = if next == RunnerState::Stopped && record.limit_stop_accepted {
                         record.limit_stop_accepted = false;
@@ -1044,7 +1046,7 @@ impl ControlPlane {
                 republished_events.push((task_id.clone(), record.revision));
             }
             // One task's unreadable history must not cost every other task
-            // its rank repair and material cleanup: it is skipped, and
+            // its material cleanup: it is skipped, and
             // adopted at a later start once readable.
             match self.adopt_loss(&mut record) {
                 Ok(true) => adopted_losses.push(task_id),
@@ -1056,7 +1058,6 @@ impl ControlPlane {
                 ),
             }
         }
-        self.normalise_ranks()?;
         let materials = crate::materials::MaterialStore::new(
             self.store.paths(),
             crate::materials::MaterialLimits::default(),
@@ -1084,7 +1085,7 @@ impl ControlPlane {
     /// Gives a task interrupted (or unknown) before losses were remembered
     /// the loss its event log shows, counted as a fresh one, so the resume
     /// policy resumes it — unless it was lost while pausing. Call under the
-    /// task's lock. Like rank repair, it announces nothing: the record's
+    /// task's lock. It announces nothing: the record's
     /// runner state does not change, and clients' next read shows the state.
     fn adopt_loss(&self, record: &mut TaskRecord) -> Result<bool> {
         let lost = matches!(

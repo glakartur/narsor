@@ -1863,4 +1863,79 @@ terminal_states: { completed: completed, cancelled: cancelled }
         assert!(again.task.runner_state.is_archival());
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn clients_see_the_position_among_the_tasks_that_are_not_archived() {
+        use crate::domain::TaskId;
+        use crate::orchestration::{CommandRequest, NewTask, TaskEventKind};
+        use narsor_protocol::controller::{MoveTaskRequest, MoveTaskTarget};
+        let root = temp_root();
+        let (service, first) = service_and_record(&root, RunnerState::Queued);
+        let owner = first.owner.clone();
+        let id = |id: &str| TaskId::parse(id).unwrap();
+        for task_id in ["task-2", "task-3", "task-4"] {
+            service
+                .control
+                .create_task(NewTask::new(
+                    id(task_id),
+                    owner.clone(),
+                    first.assignment.backend_id.clone(),
+                    first.launch_spec.clone(),
+                ))
+                .unwrap();
+        }
+        service
+            .control
+            .command(
+                &id("task-2"),
+                CommandRequest::new(OwnerCommand::Archive, "archive-1"),
+            )
+            .unwrap();
+
+        let ranks: Vec<(String, u32)> = service
+            .list_tasks(&owner)
+            .unwrap()
+            .tasks
+            .iter()
+            .map(|task| (task.task_id.to_string(), task.rank))
+            .collect();
+        assert_eq!(
+            ranks,
+            [
+                ("task-1".to_string(), 1),
+                ("task-2".to_string(), 0),
+                ("task-3".to_string(), 2),
+                ("task-4".to_string(), 3)
+            ]
+        );
+        assert_eq!(service.task(&owner, "task-2").unwrap().rank, 0);
+
+        let moved = service
+            .move_task(
+                &owner,
+                "task-4",
+                MoveTaskRequest {
+                    target: MoveTaskTarget::After("task-1".to_string()),
+                    expected_generation: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(moved.rank, 2);
+        let moves: Vec<TaskEventKind> = service
+            .control
+            .events_since(&id("task-4"), 0)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .filter(|kind| matches!(kind, TaskEventKind::Moved { .. }))
+            .collect();
+        assert_eq!(
+            moves,
+            [TaskEventKind::Moved {
+                rank: moved.rank,
+                order: vec![id("task-1"), id("task-4"), id("task-3")],
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
