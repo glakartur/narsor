@@ -5960,6 +5960,18 @@ mod task_app_actions_render {
                 "{expected:?} is missing:\n{screen}"
             );
         }
+        // The path and the step are in the frame title; the step content
+        // starts on the first row inside the frame.
+        let rows: Vec<&str> = screen.lines().collect();
+        let frame_row = rows
+            .iter()
+            .position(|row| row.contains('╭') && row.contains("Akcje"))
+            .unwrap_or_else(|| panic!("no panel frame row:\n{screen}"));
+        assert!(
+            rows[frame_row].contains("Akcje › Stop · krok 2 z 2"),
+            "{screen}"
+        );
+        assert!(rows[frame_row + 1].contains("Stop"), "{screen}");
 
         let finished = with_runner(
             with_controller(task("a", "local", "running", 1)),

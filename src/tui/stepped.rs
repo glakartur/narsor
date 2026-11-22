@@ -6,6 +6,10 @@
 //! what it is used for: its owner gives it a tree of [`StepEntry`] (a leaf, or
 //! a submenu of further entries) and gets back one [`SteppedOutcome`].
 //!
+//! The form draws only the step. Its owner shows the path and the step, for
+//! example in its frame title, from [`SteppedForm::heading`] and
+//! [`SteppedForm::step_text`]:
+//!
 //! ```text
 //! Akcje › Wybierz krok · krok 1 z 3     Akcje › Wybierz krok › work · krok 2 z 3
 //! | 1 | work        │ Opis              komentarz (opcjonalny)
@@ -649,7 +653,7 @@ impl SteppedForm {
 
     /// The rows the form would like for an area `width` columns wide.
     pub fn preferred_height(&self, width: u16) -> u16 {
-        let body = match self.stage {
+        match self.stage {
             Stage::Choice => self.chooser().preferred_height(width),
             Stage::Fields => {
                 1 + self
@@ -660,16 +664,13 @@ impl SteppedForm {
                 let lines = confirm_lines(self, &Styles::new(false), width);
                 u16::try_from(lines.len()).unwrap_or(u16::MAX)
             }
-        };
-        body.saturating_add(HEADING_ROWS)
+        }
     }
 }
 
-/// The rows of the heading: the path and the step, then a gap.
-const HEADING_ROWS: u16 = 2;
-
-/// Draws `form` into `area`: the heading with the path and the step, then
-/// the step itself. `focused` says whether its owner has the keys.
+/// Draws the step of `form` into `area`. The path and the step are not drawn:
+/// the owner shows them, for example in its frame title. `focused` says
+/// whether its owner has the keys.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -680,27 +681,7 @@ pub fn render(
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let role = if focused { Role::Focus } else { Role::Done };
-    let heading = Line::from(vec![
-        Span::styled(
-            one_line(&form.heading()),
-            styles.of(role).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!(" · {}", form.step_text()), styles.of(Role::Done)),
-    ]);
-    frame.render_widget(
-        Paragraph::new(heading),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    let body = Rect::new(
-        area.x,
-        area.y.saturating_add(HEADING_ROWS),
-        area.width,
-        area.height.saturating_sub(HEADING_ROWS),
-    );
-    if body.height == 0 {
-        return;
-    }
+    let body = area;
     match form.stage {
         Stage::Choice => {
             let chooser = &mut form.level_mut().chooser;
