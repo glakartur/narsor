@@ -71,8 +71,38 @@ impl ProtocolService {
         record: &TaskRecord,
         work_key: &str,
     ) -> ProtocolResult<()> {
+        self.resume_from(record, work_key, &[RunnerState::Stopped])
+    }
+
+    /// [`Self::resume_for_work`] for the owner's comment, which also goes on
+    /// with a task whose workload was lost or whose runner is unknown: the
+    /// next launch recovers the step with it.
+    pub(crate) fn resume_for_comment(
+        &self,
+        record: &TaskRecord,
+        comment_key: &str,
+    ) -> ProtocolResult<()> {
+        self.resume_from(
+            record,
+            comment_key,
+            &[
+                RunnerState::Stopped,
+                RunnerState::Interrupted,
+                RunnerState::Unknown,
+            ],
+        )
+    }
+
+    /// Resumes the task for the work of `work_key` when its runner is in one
+    /// of `states`.
+    fn resume_from(
+        &self,
+        record: &TaskRecord,
+        work_key: &str,
+        states: &[RunnerState],
+    ) -> ProtocolResult<()> {
         let current = self.control.task(&record.task_id)?;
-        if current.runner_state != RunnerState::Stopped {
+        if !states.contains(&current.runner_state) {
             return Ok(());
         }
         let outcome = self.control.command_with_capacity_from(

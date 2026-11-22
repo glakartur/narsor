@@ -368,9 +368,10 @@ impl ControlPlane {
         Ok(changed)
     }
 
-    /// Keeps the owner's comment on a paused task for the runner of its next
-    /// launch. The same key and text stored again change nothing and say so
-    /// (`true`); a task that is not paused cannot take it, and one comment
+    /// Keeps the owner's comment on a stopped task (paused, or stopped on a
+    /// lost workload or a failed step) for the runner of its next launch.
+    /// The same key and text stored again change nothing and say so
+    /// (`true`); a task whose runner works cannot take it, and one comment
     /// waits at a time, until a runner says it took it.
     pub fn store_resume_message(&self, task_id: &TaskId, key: &str, text: &str) -> Result<bool> {
         let (_, replayed) = self.mutate(task_id, |record, _| {
@@ -391,7 +392,12 @@ impl ControlPlane {
                 }
                 return Ok(Mutation::Unchanged(true));
             }
-            if record.runner_state != RunnerState::Stopped {
+            // A pause, a lost workload, a runner nobody knows about: the
+            // next launch gives the comment.
+            if !matches!(
+                record.runner_state,
+                RunnerState::Stopped | RunnerState::Interrupted | RunnerState::Unknown
+            ) {
                 return Err(OrchestrationError::TaskNotAcceptingInput {
                     task_id: record.task_id.clone(),
                     runner_state: record.runner_state,
