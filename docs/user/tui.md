@@ -195,6 +195,21 @@ Action 0, `Napisz do agenta`, is the first choice of every panel: type a
 message and send it. The panel keeps the text when the send fails and empties
 the field when it succeeds.
 
+You can also write to the agent after the task's workload was lost or its step
+failed: when the task is paused or in error with an interrupted runner, in
+error with an unknown runner, or in error after a failed step. The task starts
+again, and the agent goes on with the step in the same session, with your text
+and the context of the step. The description of the action says which of two
+things happens:
+
+- *Wznawia krok w tej samej sesji agenta*: the agent continues its session.
+- *Uwaga: sesji agenta nie da się wznowić*: there is no session to continue
+  (for example, the harness stopped before it reported one). The step starts
+  again in a new session, and the agent gets your text as a note.
+
+If the harness refuses the session when the task starts again, the step starts
+in a new session with your text as a note. You do not have to confirm it.
+
 When the server offers forms for the task (`TaskSummary.panel`), the panel
 shows one form at a time — an answer, the free conversation with the agent, an
 action of the workflow, a permission, the entry limit — and `Esc` steps through
