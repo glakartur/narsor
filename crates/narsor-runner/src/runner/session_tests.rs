@@ -1732,6 +1732,45 @@ async fn an_unreachable_control_plane_is_retried_then_reported() {
     assert!(plane.fetches() > 1, "retried: {}", plane.fetches());
 }
 
+/// The workspace clone is the task's first git operation, so it runs in the
+/// task's environment: the private HOME with the file-delivered SSH key and
+/// the `env`-delivered tokens are applied before it. Here the clone fails,
+/// and the environment had already been applied when it did.
+#[tokio::test]
+async fn the_task_environment_is_applied_before_the_workspace_is_cloned() {
+    let root = TempRoot::new();
+    let storage = root.dir("storage");
+    let mut served = spec(WORKSPACES_TWO_STEPS, "claude-code");
+    served.workspace = TaskWorkspace {
+        repositories: vec![
+            git_repository("code", &root.0.join("no-code-origin")),
+            git_repository("docs", &root.0.join("no-docs-origin")),
+        ],
+    };
+    served.digest = served.compute_digest();
+    let plane = SpecPlane::serving(Some(serde_json::to_value(&served).unwrap()));
+    let config = pinned_config(&root, &storage, &served.digest);
+    let link = plane.link(&config);
+    let mut home_at_apply = None;
+
+    let exit = work(config, link, |environment| {
+        home_at_apply = environment
+            .variables()
+            .find(|(name, _)| *name == "HOME")
+            .map(|(_, value)| value.to_string());
+    })
+    .await
+    .expect("the runner ends");
+
+    let RunnerExit::Problem(problem) = exit else {
+        panic!("a problem: {exit:?}");
+    };
+    assert_eq!(problem.code, PROBLEM_INITIALIZATION, "{}", problem.message);
+    assert!(problem.message.contains("clone"), "{}", problem.message);
+    let private_home = TaskStorage::new(&storage).home_dir().display().to_string();
+    assert_eq!(home_at_apply, Some(private_home));
+}
+
 /// What a runner that cannot work reports waits for the owner as a problem
 /// named by its code.
 #[test]
