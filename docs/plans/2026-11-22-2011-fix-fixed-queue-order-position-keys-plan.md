@@ -23,7 +23,7 @@ execution: code
 
 ## Product Contract
 
-Product Contract carried from the origin document. Meaning and IDs unchanged. Open points that the origin did not settle are in "Pytania otwarte dla użytkownika".
+Product Contract carried from the origin document. Meaning and IDs unchanged. Open points that the origin did not settle are in "Open questions for the user".
 
 ### Summary
 
@@ -347,7 +347,7 @@ flowchart TB
 
 ---
 
-## Pytania otwarte dla użytkownika
+## Open questions for the user
 
 - Q1 (DECIDED by the owner: option 1). Product Contract, R1 (which tasks are out of the order). Does a task in `Archiving` (archive asked for, not yet confirmed) leave the order now, or only when it is `Archived`?
   - Option 1 (recommended): Only `Archived` leaves the order. An `Archiving` task still holds a slot and still shows in the list, and it leaves the order when the archive completes.

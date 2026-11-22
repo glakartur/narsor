@@ -253,7 +253,7 @@ the current date and time.
 
 ---
 
-## Założenia do potwierdzenia
+## Assumptions to confirm
 
 - **A1. Unit of the key.** The key is the creation time in **microseconds**
   since the Unix epoch, stored as a 64-bit integer. Microseconds give more
@@ -292,9 +292,9 @@ the current date and time.
 
 ---
 
-## Pytania otwarte dla użytkownika
+## Open questions for the user
 
-None. Every point that was not clear is in "Założenia do potwierdzenia".
+None. Every point that was not clear is in "Assumptions to confirm".
 
 ---
 
