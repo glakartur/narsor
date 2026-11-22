@@ -56,7 +56,7 @@ enum Unknown {
 /// A failure encountered while rendering a template.
 ///
 /// Every variant carries a `location` — a short human-readable description of
-/// where the template came from (for example `state 'implement', prompt`) —
+/// where the template came from (for example `state 'implement', message`) —
 /// because the same message is what the operator sees in the failed action.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TemplateError {
@@ -469,12 +469,12 @@ impl<'a> TemplateScope<'a> {
     ) -> Result<ActionConfig, TemplateError> {
         match action {
             ActionConfig::Agent(config) => Ok(ActionConfig::Agent(AgentActionConfig {
-                prompt: self.render_text(&config.prompt, &format!("{location}, prompt"))?,
+                prompt: self.render_text(&config.prompt, &format!("{location}, message"))?,
                 ..config.clone()
             })),
 
             ActionConfig::Profile(config) => Ok(ActionConfig::Profile(ProfileActionConfig {
-                prompt: self.render_text(&config.prompt, &format!("{location}, prompt"))?,
+                prompt: self.render_text(&config.prompt, &format!("{location}, message"))?,
                 ..config.clone()
             })),
 

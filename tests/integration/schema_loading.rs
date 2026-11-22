@@ -2374,3 +2374,68 @@ fn a_profile_step_with_variables_or_artifacts_is_rejected_when_validated() {
         );
     }
 }
+
+/// A legacy state with the given action block, ending in a terminal state.
+fn legacy_step(action: &str) -> String {
+    format!(
+        "name: alias\nversion: 1\nstates:\n  work:\n    action: {action}\n    choices: [done]\n    \
+         transitions: {{ done: finished }}\n  finished: {{ description: done }}\n\
+         terminal_states: [finished]\n"
+    )
+}
+
+/// A unified step with the given action block.
+fn unified_step(action: &str) -> String {
+    format!(
+        "schema: v2\nname: alias\nversion: 1\nstates:\n  work:\n    action: {action}\n    \
+         choices:\n      done: {{ next: finished }}\n  finished:\n    description: done\n\
+         terminal_states:\n  finished: completed\n"
+    )
+}
+
+#[test]
+fn prompt_is_an_alias_of_message_on_every_step_text() {
+    let rows = [
+        legacy_step("{ type: agent, KEY: look }"),
+        legacy_step("{ type: human, KEY: look }"),
+        unified_step("{ type: agent, KEY: look }"),
+        unified_step("{ type: profile, KEY: look }"),
+        unified_step("{ type: decision, by: human, KEY: look }"),
+        unified_step(
+            "{ type: decision, by: human, KEY: [ { text: look, when: \"{{ vars.x }}\" } ] }",
+        ),
+    ];
+    for row in rows {
+        let load = |key: &str| load_from_str(&row.replace("KEY", key));
+        let a = load("message").unwrap_or_else(|e| panic!("message must load: {e}\n{row}"));
+        let b = load("prompt").unwrap_or_else(|e| panic!("prompt must load: {e}\n{row}"));
+        assert_eq!(
+            serde_json::to_value(&a).unwrap(),
+            serde_json::to_value(&b).unwrap(),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn a_step_with_message_and_prompt_is_rejected_with_the_alias_hint() {
+    let rows = [
+        legacy_step("{ type: agent, message: a, prompt: b }"),
+        unified_step("{ type: decision, by: human, message: a, prompt: b }"),
+    ];
+    for row in rows {
+        let error = load_from_str(&row).unwrap_err().to_string();
+        assert!(error.contains("states.work"), "{error}");
+        assert!(error.contains("'message' and 'prompt'"), "{error}");
+        assert!(error.contains("keep only 'message'"), "{error}");
+    }
+}
+
+#[test]
+fn an_agent_step_without_step_text_names_message_as_missing() {
+    let error = load_from_str(&legacy_step("{ type: agent }"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("states.work"), "{error}");
+    assert!(error.contains("missing field `message`"), "{error}");
+}

@@ -243,12 +243,34 @@ fn legacy_marker(
     })
 }
 
+/// A step that writes both `message` and `prompt` names one field twice;
+/// say so, since serde would only report a duplicate field.
+fn reject_both_message_keys(id: &str, value: &serde_yaml::Value) -> Result<(), String> {
+    for block in ["action", "decision"] {
+        let Some(map) = value.get(block).and_then(serde_yaml::Value::as_mapping) else {
+            continue;
+        };
+        let in_scope = matches!(
+            map.get("type").and_then(serde_yaml::Value::as_str),
+            Some("agent" | "profile" | "decision" | "human")
+        );
+        if in_scope && map.contains_key("message") && map.contains_key("prompt") {
+            return Err(format!(
+                "states.{id}.{block}: 'message' and 'prompt' are aliases of one field; \
+                 keep only 'message'"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_state(
     shape: StateShape,
     id: &str,
     value: serde_yaml::Value,
 ) -> Result<StateSchema, String> {
     let failed = |error: serde_yaml::Error| format!("states.{id}: {error}");
+    reject_both_message_keys(id, &value)?;
     let state = match shape {
         StateShape::Legacy => serde_yaml::from_value::<LegacyStateSchema>(value)
             .map(StateSchema::from)
@@ -1170,6 +1192,7 @@ pub struct DecisionActionSchema {
     pub by: DecisionMaker,
 
     /// What the decider is asked; templated like an agent prompt.
+    #[serde(alias = "prompt")]
     pub message: PromptText,
 
     /// The observer queue the gate puts its wait episode on (`by: human`
@@ -1272,7 +1295,8 @@ pub struct AgentActionSchema {
     #[serde(default)]
     pub workspace_access: Option<crate::domain::WorkspaceAccess>,
 
-    pub prompt: PromptText,
+    #[serde(alias = "prompt")]
+    pub message: PromptText,
 
     #[serde(default)]
     pub parameters: HashMap<String, serde_json::Value>,
@@ -1358,7 +1382,8 @@ pub struct ProfileActionSchema {
 
     /// Where the agent finds what the work is about; the engine adds the
     /// steps to profile and the allowed values.
-    pub prompt: PromptText,
+    #[serde(alias = "prompt")]
+    pub message: PromptText,
 
     #[serde(default)]
     pub parameters: HashMap<String, serde_json::Value>,
@@ -1413,6 +1438,7 @@ pub struct ScriptActionSchema {
 #[serde(deny_unknown_fields)]
 pub struct HumanActionSchema {
     /// Message shown in the UI; the domain calls this field `instruction`.
+    #[serde(alias = "prompt")]
     pub message: String,
 
     /// Form fields the operator fills in.
@@ -1465,15 +1491,15 @@ pub struct AgentDecisionSchema {
     #[serde(default)]
     pub harness: Option<String>,
 
-    #[serde(default)]
-    pub prompt: Option<String>,
+    #[serde(default, alias = "prompt")]
+    pub message: Option<String>,
 }
 
 /// `decision: { type: human }` (§3.4.C).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanDecisionSchema {
-    #[serde(default)]
+    #[serde(default, alias = "prompt")]
     pub message: Option<String>,
 }
 

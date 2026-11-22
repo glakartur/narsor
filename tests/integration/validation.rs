@@ -368,7 +368,7 @@ fn a_step_reply_from_a_human_state_is_rejected() {
         errors.iter().any(|err| matches!(
             err,
             ValidationError::InvalidStepReplySource { state, step_id, field }
-                if state == "work" && step_id == "gate" && field == "action.prompt"
+                if state == "work" && step_id == "gate" && field == "action.message"
         )),
         "got: {}",
         describe(&errors)
@@ -382,7 +382,7 @@ fn a_step_reply_from_a_script_state_is_rejected() {
         errors.iter().any(|err| matches!(
             err,
             ValidationError::InvalidStepReplySource { state, step_id, field }
-                if state == "work" && step_id == "check" && field == "action.prompt"
+                if state == "work" && step_id == "check" && field == "action.message"
         )),
         "got: {}",
         describe(&errors)
@@ -396,7 +396,7 @@ fn a_step_field_other_than_reply_is_rejected() {
         errors.iter().any(|err| matches!(
             err,
             ValidationError::UnsupportedStepReference { state, field, reference }
-                if state == "work" && field == "action.prompt" && reference == "steps.review.data"
+                if state == "work" && field == "action.message" && reference == "steps.review.data"
         )),
         "got: {}",
         describe(&errors)
@@ -511,7 +511,7 @@ fn an_artifact_reference_no_step_defines_is_rejected() {
         matches!(
             errors.as_slice(),
             [ValidationError::UnknownArtifactReference { state, field, artifact }]
-                if state == "work" && field == "action.prompt" && artifact == "unknown"
+                if state == "work" && field == "action.message" && artifact == "unknown"
         ),
         "got: {}",
         describe(&errors)
@@ -679,7 +679,7 @@ fn agent_decision_without_a_prompt_is_rejected() {
         errors.iter().any(|err| matches!(
             err,
             ValidationError::AgentDecisionMissingField { state, field }
-                if state == "start" && *field == "prompt"
+                if state == "start" && *field == "message"
         )),
         "got: {}",
         describe(&errors)
@@ -706,7 +706,7 @@ fn unknown_input_in_a_prompt_is_rejected() {
         errors.iter().any(|err| matches!(
             err,
             ValidationError::UnknownInputReference { state, field, variable }
-                if state == "start" && field == "action.prompt" && variable == "nonexistent"
+                if state == "start" && field == "action.message" && variable == "nonexistent"
         )),
         "got: {}",
         describe(&errors)
@@ -720,7 +720,7 @@ fn a_condition_on_an_undeclared_input_is_rejected_and_names_the_part() {
         errors.iter().any(|err| matches!(
             err,
             ValidationError::UnknownInputReference { state, field, variable }
-                if state == "work" && field == "action.prompt[2].when" && variable == "nonexistent"
+                if state == "work" && field == "action.message[2].when" && variable == "nonexistent"
         )),
         "got: {}",
         describe(&errors)
@@ -734,7 +734,7 @@ fn a_condition_with_a_filter_is_rejected() {
         errors.iter().any(|err| matches!(
             err,
             ValidationError::InvalidWhen { state, field, .. }
-                if state == "work" && field == "action.prompt[2].when"
+                if state == "work" && field == "action.message[2].when"
         )),
         "got: {}",
         describe(&errors)
@@ -748,7 +748,7 @@ fn a_condition_on_the_reply_of_a_script_step_is_rejected() {
         errors.iter().any(|err| matches!(
             err,
             ValidationError::InvalidStepReplySource { state, step_id, field }
-                if state == "work" && step_id == "build" && field == "action.prompt[2].when"
+                if state == "work" && step_id == "build" && field == "action.message[2].when"
         )),
         "got: {}",
         describe(&errors)
@@ -1532,7 +1532,7 @@ fn a_prompt_reading_an_undeclared_workspace_names_the_step_and_the_reference() {
     assert!(
         has_workspace_reference_error(
             &errors,
-            "action.prompt",
+            "action.message",
             "context.workspace.payments.pr_url"
         ),
         "got: {}",
@@ -1548,7 +1548,7 @@ fn a_prompt_reading_a_field_no_workspace_has_is_a_violation() {
     );
 
     assert!(
-        has_workspace_reference_error(&errors, "action.prompt", "context.workspace.code.title"),
+        has_workspace_reference_error(&errors, "action.message", "context.workspace.code.title"),
         "got: {}",
         describe(&errors)
     );
@@ -1563,7 +1563,7 @@ fn a_workspace_reference_without_a_field_is_a_violation() {
         );
 
         assert!(
-            has_workspace_reference_error(&errors, "action.prompt", reference),
+            has_workspace_reference_error(&errors, "action.message", reference),
             "{reference}: {}",
             describe(&errors)
         );
@@ -1581,7 +1581,7 @@ fn a_condition_of_a_prompt_part_reads_workspace_fields_like_a_placeholder() {
 
     assert!(good.is_empty(), "got: {}", describe(&good));
     assert!(
-        has_workspace_reference_error(&bad, "action.prompt[2].when", "context.workspace.nope.pr"),
+        has_workspace_reference_error(&bad, "action.message[2].when", "context.workspace.nope.pr"),
         "got: {}",
         describe(&bad)
     );

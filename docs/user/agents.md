@@ -15,7 +15,7 @@ analyze:
     harness: claude-code          # optional; or: codex, github-copilot, opencode
     model: large                  # optional tier: small, medium, large or max; the harness maps it to a model
     workspace_access: read-only   # optional; default: read-write
-    prompt: |
+    message: |
       Analyse the repository for: {{ inputs.description }}.
       Write the plan to plan.md.
     parameters:                   # optional, harness-specific but not access control
@@ -35,7 +35,7 @@ labels and their targets sit together:
 analyze:
   action:
     type: agent
-    prompt: |
+    message: |
       Analyse the repository for: {{ inputs.description }}.
       Write the plan to plan.md.
   choices:
@@ -115,11 +115,11 @@ An agent step of the unified shape may have `exit` instead of `choices`. The
 agent then gives no `choice`. It answers with `reason`, `variables` and
 `artifacts`, and the step goes on to the `next` of the `exit`.
 
-The `prompt` is a string, or a list of parts. A part may have a `when`: the
+The `message` is a string, or a list of parts. A part may have a `when`: the
 engine adds that part only when every value named in `when` is not empty.
 
 ```yaml
-prompt:
+message:
   - Draft the change.
   - when: local.memory
     text: "Your notes from the last attempt: {{ local.memory }}"
@@ -181,7 +181,7 @@ untouched, in the same directory the checkpoint bundle lives beside.
 
 Resumption is **half-wired on purpose.** `parameters.resume_session: <id>`
 continues a known session (`--resume` / `--session`), but `parameters` is not
-template-expanded — only `prompt` is — so a session captured by one state
+template-expanded — only `message` is — so a session captured by one state
 cannot yet be chained into the next by writing
 `{{ context.variables.agent_session_id }}`. The id is captured and exposed so
 that chaining becomes a one-line change in the template scope, and nothing more.
