@@ -77,12 +77,29 @@ pub struct StepFailure {
     /// Whether this is the failure of the conductor's own retry.
     #[serde(default)]
     pub conductor_retry: bool,
+
+    /// The harness the failed attempt ran on, when it started a session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+
+    /// The harness's own id of the failed attempt's session, when the
+    /// harness said it: the session the step can be continued in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_session_id: Option<String>,
 }
 
 impl StepFailure {
     /// The key of this failure (KTD9).
     pub fn key(&self) -> &str {
         &self.action_execution_id
+    }
+
+    /// The session the step failed in, when the record names one.
+    pub(crate) fn session(&self) -> Option<ResumableSession> {
+        metadata::agent_session::session_of(
+            self.harness.clone(),
+            self.harness_session_id.clone(),
+        )
     }
 }
 
@@ -106,6 +123,19 @@ pub struct Recovery {
     /// The conductor's one retry (R21, KTD14): exactly one attempt, in the
     /// failure's episode. Requires `episode`.
     pub conductor_retry: bool,
+    /// What the owner wrote to the agent: the step goes on in its harness
+    /// session with it when there is one to continue
+    /// ([`resumable_agent_session`]), and starts afresh with it in the note
+    /// otherwise.
+    pub owner_message: Option<OwnerMessage>,
+}
+
+/// A message of the owner's for the agent, left once under its key: a
+/// recovery repeated with the same key leaves nothing again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerMessage {
+    pub key: String,
+    pub text: String,
 }
 
 impl Recovery {
@@ -117,6 +147,7 @@ impl Recovery {
             comment,
             episode,
             conductor_retry: false,
+            owner_message: None,
         }
     }
 
@@ -183,7 +214,10 @@ impl Engine {
             .or_else(|| execution.current_action_execution.clone())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let retry = retry.filter(|retry| retry.state_id == state_id);
+        let session = self.attempt_session(&execution.id, &action_execution_id);
         let failure = StepFailure {
+            harness: session.as_ref().map(|session| session.harness.clone()),
+            harness_session_id: session.map(|session| session.harness_session_id),
             episode: retry
                 .as_ref()
                 .map(|retry| retry.episode.clone())
@@ -239,6 +273,24 @@ impl Engine {
             )?;
         }
         Ok(())
+    }
+
+    /// The harness session attempt `action_execution_id` of `execution_id`
+    /// ran in, when it is known: an unreadable log only loses it.
+    fn attempt_session(
+        &self,
+        execution_id: &str,
+        action_execution_id: &str,
+    ) -> Option<ResumableSession> {
+        let events = match self.store.event_log(execution_id).read_all() {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::warn!(execution_id, %error, "the failed step's session cannot be read");
+                return None;
+            }
+        };
+        let reported = crate::engine::timeline_file::reported_sessions(&self.store, execution_id);
+        attempt_session(&events, &reported, action_execution_id).map(|(session, _)| session)
     }
 
     /// Whether the agent or script attempt `action_execution_id`, which

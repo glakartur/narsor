@@ -2,6 +2,7 @@
 
 use super::*;
 
+pub(super) mod agent_session;
 mod checkpoint;
 mod engine_record;
 pub(super) mod keys;
@@ -10,6 +11,7 @@ pub(super) mod pending_step;
 mod state_entries;
 mod step_replies;
 
+pub(super) use agent_session::*;
 pub(super) use engine_record::*;
 pub(super) use keys::*;
 pub(super) use last_agent_step::*;

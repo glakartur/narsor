@@ -261,6 +261,7 @@ fn safe_point_snapshot(sequence: u64) -> RunnerSnapshot {
         problem: None,
         attention: Vec::new(),
         conductor_available: false,
+        agent_session_resumable: false,
         conductor_unavailable_reason: None,
         default_harness_unavailable: None,
         workspaces: Vec::new(),

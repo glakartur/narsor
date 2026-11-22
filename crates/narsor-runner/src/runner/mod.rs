@@ -129,7 +129,9 @@ use crate::domain::{
     WorkspaceRepository,
 };
 use crate::engine::{reconcile, ReconciliationOutcome};
-use crate::engine::{Engine, EngineError, HumanInputDelivery, Recovery, UsageReporter};
+use crate::engine::{
+    Engine, EngineError, HumanInputDelivery, OwnerMessage, Recovery, UsageReporter,
+};
 use crate::persistence::PersistenceError;
 use crate::workspace::{GitAccess, WorkspaceError};
 use home::CLAUDE_CONFIG_DIR_ENV;
@@ -820,6 +822,7 @@ async fn report_problem(
         problem: Some(problem.clone()),
         conductor_available: false,
         conductor_unavailable_reason: Some("the runner cannot work".to_string()),
+        agent_session_resumable: false,
         default_harness_unavailable: None,
         workspaces: Vec::new(),
         generated_title: None,
@@ -1190,8 +1193,7 @@ impl Session {
                 // without the comment, which stays in the record.
                 let _ =
                     tokio::time::timeout(self.timing.clean_launch_wait, self.await_launch()).await;
-                self.take_resume_message()?;
-                self.resume_pass()?;
+                self.go_on()?;
             }
             Continuation::Recover(decision) => self.recover(decision)?,
         }
@@ -1477,31 +1479,76 @@ impl Session {
                 }
         );
         if needs_recovery {
-            // The recovery's own note would replace the owner's comment, so
-            // the comment rides on it.
+            // The owner's comment rides on the recovery: it continues the
+            // step's session with it, or puts it in the note.
             let message = self.untaken_resume_message()?;
-            let comment = match &message {
-                Some(message) => format!("{}\n\n{}", decision.comment(), message.text),
-                None => decision.comment(),
-            };
-            let handle = self
-                .engine
-                .try_begin_recover_with(&execution_id, Recovery::with_comment(Some(comment)))?;
-            // The comment is in the note already: a mark that cannot be
-            // written risks a second delivery, a failed launch would lose it.
-            if let Some(message) = message {
-                if let Err(error) = self
-                    .storage
-                    .record_consumed_input(&resume_message_mark(&message))
-                {
-                    tracing::warn!(%error, "the comment on the pause cannot be marked as given");
-                }
-            }
-            self.spawn_pass(handle);
+            self.recover_with_message(&execution_id, Some(decision.comment()), message)?;
             return Ok(());
         }
-        self.take_resume_message()?;
+        self.go_on()
+    }
+
+    /// Goes on after a stop with nothing to reconcile. A step that failed
+    /// and the owner wrote to since is recovered with the comment, in the
+    /// session it failed in when there is one; a running or paused execution
+    /// gets the comment for the work that goes on. Any other execution (one
+    /// that waits for an event or has ended) cannot take it: the comment
+    /// stays stored and the launch goes on without it.
+    fn go_on(&mut self) -> Result<(), RunnerError> {
+        let Some(execution_id) = self.execution_id.clone() else {
+            self.take_resume_message()?;
+            return self.resume_pass();
+        };
+        let status = self.engine.store().load_execution(&execution_id)?.status;
+        match status {
+            ExecutionStatus::Failed => {
+                if let Some(message) = self.untaken_resume_message()? {
+                    return self.recover_with_message(&execution_id, None, Some(message));
+                }
+            }
+            ExecutionStatus::Running | ExecutionStatus::Paused => self.take_resume_message()?,
+            _ => {
+                if self.untaken_resume_message()?.is_some() {
+                    tracing::warn!(
+                        ?status,
+                        "a comment to the agent waits, but the execution cannot take it"
+                    );
+                }
+            }
+        }
         self.resume_pass()
+    }
+
+    /// Recovers the execution with the runner's `comment` and the owner's
+    /// `message`, and starts its pass.
+    fn recover_with_message(
+        &mut self,
+        execution_id: &str,
+        comment: Option<String>,
+        message: Option<ResumeMessage>,
+    ) -> Result<(), RunnerError> {
+        let recovery = Recovery {
+            comment,
+            owner_message: message.as_ref().map(|message| OwnerMessage {
+                key: message.key.clone(),
+                text: message.text.clone(),
+            }),
+            ..Recovery::default()
+        };
+        let handle = self.engine.try_begin_recover_with(execution_id, recovery)?;
+        // The execution holds the comment already, under its key: a mark
+        // that cannot be written risks no second delivery, a failed launch
+        // would lose it.
+        if let Some(message) = message {
+            if let Err(error) = self
+                .storage
+                .record_consumed_input(&resume_message_mark(&message))
+            {
+                tracing::warn!(%error, "the comment to the agent cannot be marked as given");
+            }
+        }
+        self.spawn_pass(handle);
+        Ok(())
     }
 
     /// Starts a pass for a runnable execution; leaves one that waits for

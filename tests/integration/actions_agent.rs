@@ -972,6 +972,69 @@ async fn a_failed_run_ends_the_session_with_a_failure_event() {
     );
 }
 
+/// The harness says its session on its first line and then works on: the
+/// session is in the timeline file while the step still runs, and stays
+/// there when the process is killed before the step ends, as with a lost
+/// workload.
+#[tokio::test]
+async fn the_session_a_harness_reports_is_kept_before_the_step_ends() {
+    use narsor_engine::engine::timeline_file::reported_sessions;
+    use narsor_engine::engine::FileReadingSink;
+
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&ndjson(&[
+        json!({ "type": "system", "subtype": "init", "session_id": "hs-early" }),
+    ]))
+    .sleeps(30);
+    let store = ExecutionStore::new(root.dir("store"));
+    let executor = Arc::new(
+        executor(&fake).with_reading_sink(Arc::new(FileReadingSink::new(store.clone(), None))),
+    );
+
+    let workspace = root.workspace();
+    let running = tokio::spawn({
+        let executor = Arc::clone(&executor);
+        let conversations = store.conversation_store(EXECUTION_ID);
+        async move {
+            let action = ActionConfig::Agent(agent_action("work long"));
+            executor
+                .execute(
+                    ActionRequest::new(&action, &workspace, ACTION_EXECUTION_ID)
+                        .with_execution_id(EXECUTION_ID)
+                        .with_conversation_store(&conversations),
+                )
+                .await
+        }
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let reported = loop {
+        if let Some(session) = reported_sessions(&store, EXECUTION_ID).remove(ACTION_EXECUTION_ID)
+        {
+            break session;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the session never reached the timeline file"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(!running.is_finished(), "the step still runs");
+    assert_eq!(reported.harness, "claude-code");
+    assert_eq!(reported.harness_session_id, "hs-early");
+
+    // The workload is lost: the step never ends, its session stays known.
+    running.abort();
+    let _ = running.await;
+    assert_eq!(
+        reported_sessions(&store, EXECUTION_ID)
+            .get(ACTION_EXECUTION_ID)
+            .map(|session| session.harness_session_id.as_str()),
+        Some("hs-early")
+    );
+}
+
 #[tokio::test]
 async fn a_session_to_resume_reaches_the_argv() {
     let root = TempRoot::new();

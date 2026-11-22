@@ -26,6 +26,11 @@ pub(crate) enum AttemptOutcome {
     /// A `decision` declared `by: conductor`: the conductor is asked, with
     /// the message as the step rendered it.
     AwaitingConductor(String),
+    /// The harness refused the session the owner's message of a recovery
+    /// was for, with this error: the step starts again in a new session at
+    /// once, the message already in its note. Not a retry: the policy's
+    /// count does not move.
+    SessionRefused(String),
 }
 
 /// How the whole action of a state ended, retries included.

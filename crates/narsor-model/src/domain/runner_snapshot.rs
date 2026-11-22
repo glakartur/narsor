@@ -87,6 +87,11 @@ pub struct RunnerSnapshot {
     /// Why there is no conductor, when there is none.
     #[serde(default)]
     pub conductor_unavailable_reason: Option<String>,
+    /// Whether the current step has a harness session the owner's message
+    /// would continue (rather than start a new session with). `false` also
+    /// from a runner that does not say.
+    #[serde(default)]
+    pub agent_session_resumable: bool,
     /// The installation's default harness this task cannot switch to, while
     /// it cannot (U7, R16c): its backend does not run it, or its binary is
     /// not in the task's environment. The task keeps its harness meanwhile;
@@ -135,6 +140,7 @@ impl RunnerSnapshot {
             attention: snapshot.attention.clone(),
             conductor_available: snapshot.conductor_available,
             conductor_unavailable_reason: snapshot.conductor_unavailable_reason.clone(),
+            agent_session_resumable: snapshot.agent_session_resumable,
             default_harness_unavailable: snapshot.default_harness_unavailable.clone(),
             workspaces: snapshot.workspaces.clone(),
             generated_title: snapshot.generated_title.clone(),
@@ -167,6 +173,7 @@ impl RunnerSnapshot {
             attention: request.attention,
             conductor_available: request.conductor_available,
             conductor_unavailable_reason: request.conductor_unavailable_reason,
+            agent_session_resumable: request.agent_session_resumable,
             default_harness_unavailable: request.default_harness_unavailable,
             workspaces: request.workspaces,
             generated_title: request.generated_title,

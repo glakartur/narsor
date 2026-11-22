@@ -58,6 +58,7 @@ impl ProtocolService {
                         .snapshot
                         .conductor_unavailable_reason
                         .clone(),
+                    agent_session_resumable: runner.snapshot.agent_session_resumable,
                     default_harness_unavailable: runner
                         .snapshot
                         .default_harness_unavailable

@@ -13,8 +13,8 @@
 //! decision; their words are kept.
 
 use narsor_protocol::api::{
-    HumanInputActionDto, HumanInputDeliveryDto, InputContinuationView, PendingHumanInputView,
-    PermissionDecisionDto, PermissionDecisionKindDto,
+    ExecutionStatusDto, HumanInputActionDto, HumanInputDeliveryDto, InputContinuationView,
+    PendingHumanInputView, PermissionDecisionDto, PermissionDecisionKindDto,
 };
 use narsor_protocol::controller::{
     placeholder, AttentionKind, Freshness, OperatorCommand, RunnerState, StepKind,
@@ -551,9 +551,10 @@ fn decision_reason(task: &TaskSummary, id: TaskActionId) -> Option<String> {
 
 /// Why the owner cannot comment on the task now.
 ///
-/// A comment has somewhere to go in four stops: a question of the agent, an
-/// approval, a permission, and a pause of the operator. A failed step, a
-/// problem of the runner and a failed provisioning are not among them.
+/// A comment has somewhere to go at a question of the agent, an approval, a
+/// permission, a pause of the operator, and a stop on a lost workload or a
+/// failed step ([`stopped_by_loss_or_failure`]). A problem of the runner and
+/// a failed provisioning are not among them.
 pub(super) fn comment_reason(task: &TaskSummary) -> Option<String> {
     if let Some(form) = waiting(task) {
         return match form.continuation {
@@ -571,6 +572,9 @@ pub(super) fn comment_reason(task: &TaskSummary) -> Option<String> {
         };
     }
     if task.runner_state == RunnerState::Stopped && task.state == TaskState::Paused {
+        return None;
+    }
+    if stopped_by_loss_or_failure(task) {
         return None;
     }
     if task.state == TaskState::Queued {
@@ -597,7 +601,48 @@ fn comment_effect(task: &TaskSummary) -> &'static str {
             "Nie zatwierdza wyniku: agent wznowi sesję z Twoją uwagą."
         }
         Some(_) => "Wysyła wiadomość do agenta w tej samej sesji.",
+        None if stopped_by_loss_or_failure(task) => {
+            let resumable = task
+                .runner
+                .as_ref()
+                .is_some_and(|runner| runner.agent_session_resumable);
+            if resumable {
+                "Wznawia krok w tej samej sesji agenta. Agent dostaje Twój tekst i zachowuje \
+                 kontekst kroku."
+            } else {
+                "Uwaga: sesji agenta nie da się wznowić. Krok zacznie się od nowa w nowej \
+                 sesji, a agent dostanie Twój tekst jako notatkę."
+            }
+        }
         None => "Wysyła tekst do agenta i wznawia zadanie jednym krokiem.",
+    }
+}
+
+/// Whether `task` stopped on a lost workload or a failed step, where the
+/// owner's comment goes on with the step: paused or in error with its
+/// workload lost, in error while nobody knows whether its workload still
+/// runs, or stopped on a failed execution. A lost or unknown workload takes
+/// the comment only while its execution can go on with a step (running,
+/// paused, unknown or failed), not while it waits for an event or has ended.
+/// A task the runner never reported on stays open to the comment, with the
+/// warning that the agent session cannot be resumed.
+fn stopped_by_loss_or_failure(task: &TaskSummary) -> bool {
+    match (task.state, task.runner_state) {
+        (TaskState::Paused | TaskState::Error, RunnerState::Interrupted)
+        | (TaskState::Error, RunnerState::Unknown) => task.runner.as_ref().is_none_or(|runner| {
+            matches!(
+                runner.execution_status,
+                ExecutionStatusDto::Running
+                    | ExecutionStatusDto::Paused
+                    | ExecutionStatusDto::Unknown
+                    | ExecutionStatusDto::Failed
+            )
+        }),
+        (TaskState::Error, RunnerState::Stopped) => task
+            .runner
+            .as_ref()
+            .is_some_and(|runner| runner.execution_status == ExecutionStatusDto::Failed),
+        _ => false,
     }
 }
 
@@ -991,10 +1036,14 @@ impl ProtocolService {
         }
         let summary = self.summarize(&record)?;
         let Some((pending_input_id, delivery)) = comment_delivery(&summary, text) else {
-            // A pause: nothing waits on an answer, so the comment waits on
-            // the record for the runner of the next launch, and the task is
+            // A pause, or a stop on a lost workload or a failed step:
+            // nothing waits on an answer, so the comment waits on the
+            // record for the runner of the next launch, and the task is
             // resumed (a retry repairs a resume that did not happen).
-            if record.runner_state == RunnerState::Stopped {
+            if matches!(
+                record.runner_state,
+                RunnerState::Stopped | RunnerState::Interrupted | RunnerState::Unknown
+            ) {
                 // A comment a launch already took did its resume: a retry
                 // of it must not undo a pause the owner asked for since.
                 if comment_taken(&record) {
@@ -1018,7 +1067,7 @@ impl ProtocolService {
                 if !replayed {
                     self.notify(&record.task_id);
                 }
-                self.resume_for_work(&record, &request.idempotency_key)?;
+                self.resume_for_comment(&record, &request.idempotency_key)?;
                 return Ok(SubmitCommentResponse {
                     task: self.summarize(&self.owned_task(owner, task_id)?)?,
                     replayed,
@@ -1861,6 +1910,182 @@ terminal_states: { completed: completed, cancelled: cancelled }
         assert!(retry.replayed);
         assert_eq!(retry.receipt, accepted.receipt);
         assert!(again.task.runner_state.is_archival());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------
+    // The comment after a lost workload or a failed step
+    // -----------------------------------------------------------------
+
+    /// A task in `state`/`runner_state` whose runner last reported the
+    /// execution `execution`, `resumable` saying whether its step's session
+    /// can be continued; no runner view when `execution` is `None`.
+    fn stopped(
+        runner_state: &str,
+        state: &str,
+        execution: Option<ExecutionStatusDto>,
+        resumable: bool,
+    ) -> TaskSummary {
+        let mut task = summary(runner_state, state, false);
+        task.runner = execution.map(|status| {
+            let mut view = runner("work", "agent");
+            view.execution_status = status;
+            view.agent_session_resumable = resumable;
+            view
+        });
+        task
+    }
+
+    #[test]
+    fn the_comment_is_offered_after_a_lost_workload_or_a_failed_step_and_nowhere_new() {
+        use ExecutionStatusDto::{Completed, Failed, Paused, Running, Unknown, WaitingForEvent};
+        let rows = [
+            ("stopped", "paused", Some(Paused), true),
+            ("interrupted", "paused", Some(Running), true),
+            ("interrupted", "error", Some(Running), true),
+            ("unknown", "error", Some(Unknown), true),
+            ("unknown", "error", None, true),
+            // A lost or unknown workload whose execution waits for an event or
+            // has ended cannot take a comment.
+            ("interrupted", "paused", Some(WaitingForEvent), false),
+            ("interrupted", "error", Some(Completed), false),
+            ("unknown", "error", Some(WaitingForEvent), false),
+            ("unknown", "error", Some(Completed), false),
+            ("stopped", "error", Some(Failed), true),
+            ("stopped", "error", Some(Completed), false),
+            ("stopped", "error", None, false),
+            ("interrupted", "running", Some(Running), false),
+            ("queued", "queued", None, false),
+            ("stopped", "finished", Some(Completed), false),
+            ("archived", "archived", None, false),
+        ];
+        for (runner_state, state, execution, expected) in rows {
+            let task = stopped(runner_state, state, execution, false);
+            let row = format!("{state}/{runner_state} ({execution:?})");
+            assert_eq!(
+                offered(&task, TaskActionId::Comment).is_some(),
+                expected,
+                "{row}"
+            );
+            match reason(&task, TaskActionId::Comment) {
+                None => assert!(expected, "{row}"),
+                Some(reason) => {
+                    assert!(!expected, "{row}");
+                    assert!(reason.starts_with(state_phrase(&task)), "{row}: {reason}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_comment_says_whether_the_agent_keeps_its_session() {
+        use ExecutionStatusDto::{Failed, Running, Unknown};
+        let new_states = [
+            ("interrupted", "paused", Running),
+            ("interrupted", "error", Running),
+            ("unknown", "error", Unknown),
+            ("stopped", "error", Failed),
+        ];
+        for (runner_state, state, execution) in new_states {
+            let row = format!("{state}/{runner_state}");
+            let continues = stopped(runner_state, state, Some(execution), true);
+            let effect = offered(&continues, TaskActionId::Comment)
+                .and_then(|offer| offer.effect)
+                .expect("offered with an effect");
+            assert!(effect.contains("tej samej sesji"), "{row}: {effect}");
+
+            let fresh = stopped(runner_state, state, Some(execution), false);
+            let warning = offered(&fresh, TaskActionId::Comment)
+                .and_then(|offer| offer.effect)
+                .expect("offered with an effect");
+            assert!(warning.contains("nowej"), "{row}: {warning}");
+        }
+        // Without a runner view nobody knows: the warning, never the promise.
+        let unknown = stopped("unknown", "error", None, false);
+        let effect = offered(&unknown, TaskActionId::Comment)
+            .and_then(|offer| offer.effect)
+            .expect("offered with an effect");
+        assert!(effect.contains("nowej"), "{effect}");
+    }
+
+    /// A task lost while it still showed an agent's question keeps today's
+    /// path: the comment answers the question.
+    #[test]
+    fn a_comment_on_a_lost_task_that_shows_a_question_answers_it() {
+        let mut task = waiting_on("resume_agent");
+        task.runner_state = RunnerState::Interrupted;
+        task.state = TaskState::Error;
+        assert!(offered(&task, TaskActionId::Comment).is_some());
+        assert!(comment_delivery(&task, "Use v2").is_some());
+    }
+
+    /// `record` saved in the control plane as it stands.
+    fn saved(service: &ProtocolService, mut record: TaskRecord) -> TaskRecord {
+        service.control.store().save_task(&mut record).unwrap();
+        record
+    }
+
+    fn comment(key: &str, text: &str) -> SubmitCommentRequest {
+        serde_json::from_value(json!({ "idempotency_key": key, "text": text }))
+            .expect("a comment request")
+    }
+
+    #[test]
+    fn a_comment_on_a_task_whose_workload_was_lost_waits_for_the_next_launch() {
+        let root = temp_root();
+        let (service, record) = service_and_record(&root, RunnerState::Interrupted);
+        let record = saved(&service, reported(record, "failed", "work"));
+        let owner = record.owner.clone();
+        let summary = service.summarize(&record).unwrap();
+        assert_eq!(summary.state, TaskState::Error);
+
+        let sent = service
+            .submit_comment(&owner, "task-1", comment("c-1", "Dokończ testy"))
+            .expect("the comment is taken");
+        assert!(!sent.replayed);
+        let after = service.control.task(&record.task_id).unwrap();
+        assert_eq!(
+            after.resume_message.as_ref().map(|message| message.text.as_str()),
+            Some("Dokończ testy")
+        );
+        assert_ne!(after.runner_state, RunnerState::Interrupted, "resumed");
+
+        let again = service
+            .submit_comment(&owner, "task-1", comment("c-1", "Dokończ testy"))
+            .expect("a retry is answered");
+        assert!(again.replayed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn covers_ae5_a_comment_on_a_finished_task_is_refused_with_the_reason_of_the_offer() {
+        let root = temp_root();
+        let (service, record) = service_and_record(&root, RunnerState::Stopped);
+        let record = saved(&service, reported(record, "completed", "completed"));
+        let summary = service.summarize(&record).unwrap();
+        let expected = reason(&summary, TaskActionId::Comment).expect("a reason");
+
+        let refused = service
+            .submit_comment(&record.owner, "task-1", comment("c-1", "Popraw"))
+            .map(|_| ());
+        let (code, message) = conflict(refused);
+        assert_eq!(code, "action_unavailable");
+        assert_eq!(message, expected);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Only the comment goes on with a lost task: other work the owner sends
+    /// waits for the owner's own resume.
+    #[test]
+    fn work_other_than_a_comment_does_not_resume_a_lost_task() {
+        let root = temp_root();
+        let (service, record) = service_and_record(&root, RunnerState::Interrupted);
+        let record = saved(&service, record);
+
+        service.resume_for_work(&record, "answer-1").unwrap();
+
+        let after = service.control.task(&record.task_id).unwrap();
+        assert_eq!(after.runner_state, RunnerState::Interrupted);
         let _ = std::fs::remove_dir_all(&root);
     }
 

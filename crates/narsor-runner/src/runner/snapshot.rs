@@ -21,7 +21,10 @@ use crate::domain::runner_snapshot::{PendingInputRef, RunnerSnapshot};
 use crate::domain::{ExecutionStatus, ParamType, WorkflowDefinition, WorkflowExecution};
 use crate::engine::conversation_summary::summaries;
 pub(crate) use crate::engine::conversation_summary::ConversationCache;
-use crate::engine::{current_timeline, step_failure, Engine, InputContinuation, PendingHumanInput};
+use crate::engine::{
+    current_timeline, resumable_agent_session, step_failure, Engine, InputContinuation,
+    PendingHumanInput,
+};
 use crate::persistence::ExecutionStore;
 use narsor_protocol::controller::{
     AttentionItem, AttentionKind, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
@@ -77,6 +80,7 @@ pub(crate) fn build(
             attention: attention_items(None, context.problem.as_ref(), observed_at),
             problem: context.problem,
             conductor_available: context.conductor_unavailable.is_none(),
+            agent_session_resumable: false,
             conductor_unavailable_reason: context.conductor_unavailable.map(str::to_string),
             default_harness_unavailable: context.default_harness_unavailable.cloned(),
             workspaces: context.workspaces.headers(&BTreeMap::new()),
@@ -155,6 +159,7 @@ pub(crate) fn build(
         attention,
         problem: context.problem,
         conductor_available: context.conductor_unavailable.is_none(),
+        agent_session_resumable: resumable_agent_session(store, &execution, &events).is_some(),
         conductor_unavailable_reason: context.conductor_unavailable.map(str::to_string),
         default_harness_unavailable: context.default_harness_unavailable.cloned(),
         workspaces: context.workspaces.headers(&execution.context.workspace_prs),
@@ -407,6 +412,97 @@ mod tests {
         assert_eq!(cursor.action_execution_id.as_deref(), Some("act-plan"));
         assert_eq!(cursor.current_action_type, None);
         assert_eq!(cursor.current_decision_by, None);
+    }
+
+    /// The snapshot says whether the owner's message would continue the
+    /// current step's session: one its harness reported while the step ran,
+    /// or the one the failure of the step records; not when there is none.
+    #[test]
+    fn the_snapshot_says_whether_the_steps_session_can_be_continued() {
+        use crate::engine::timeline_file::{record_session, ReportedSession};
+
+        let cases = [
+            ("a session reported mid-step", ExecutionStatus::Running, true, None),
+            ("no session", ExecutionStatus::Running, false, None),
+            (
+                "a failure in a session",
+                ExecutionStatus::Failed,
+                false,
+                Some("s-failed"),
+            ),
+        ];
+        for (name, status, reported, failed_in) in cases {
+            let root = TempRoot(
+                std::env::temp_dir().join(format!("narsor-resumable-{}", uuid::Uuid::new_v4())),
+            );
+            let store = ExecutionStore::new(&root.0);
+            let mut execution = execution("exec-r");
+            execution.status = status;
+            if let Some(session) = failed_in {
+                execution.metadata = serde_json::json!({ "engine": { "step_failure": {
+                    "state_id": "plan",
+                    "action_execution_id": "act-1",
+                    "episode": "act-1",
+                    "error": "the build broke",
+                    "side_effect_free": false,
+                    "harness": "claude-code",
+                    "harness_session_id": session,
+                } } });
+            }
+            store.save_execution(&execution).expect("execution");
+            store
+                .event_log("exec-r")
+                .append_next(&execution.id, started("act-1"))
+                .expect("event");
+            if reported {
+                record_session(
+                    &store,
+                    "exec-r",
+                    "act-1",
+                    ReportedSession {
+                        harness: "claude-code".to_string(),
+                        harness_session_id: "s-1".to_string(),
+                    },
+                )
+                .expect("session");
+            }
+
+            let engine = Engine::new(store.clone());
+            let workspaces = WorkspaceTracker::new(
+                &crate::runner::storage::TaskStorage::new(&root.0),
+                &crate::domain::TaskWorkspace::none(),
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+            );
+            let snapshot = build(
+                &engine,
+                &mut ConversationCache::default(),
+                SnapshotContext {
+                    workspaces: &workspaces,
+                    execution_id: Some("exec-r"),
+                    pass_active: false,
+                    problem: None,
+                    stopping: false,
+                    conductor_unavailable: Some("no conductor in this test"),
+                    default_harness_unavailable: None,
+                },
+            )
+            .expect("snapshot");
+
+            let expected = reported || failed_in.is_some();
+            assert_eq!(snapshot.agent_session_resumable, expected, "{name}");
+            // The flag reaches the wire, and a request without it reads as
+            // "no session".
+            let mut request = serde_json::to_value(snapshot.to_request().expect("request"))
+                .expect("json");
+            assert_eq!(request["agent_session_resumable"], expected, "{name}");
+            request
+                .as_object_mut()
+                .expect("an object")
+                .remove("agent_session_resumable");
+            let older: narsor_protocol::controller::RunnerSnapshotRequest =
+                serde_json::from_value(request).expect("a request of an older runner");
+            assert!(!older.agent_session_resumable, "{name}");
+        }
     }
 
     /// The daemon reads a stopped local task's summaries with the very

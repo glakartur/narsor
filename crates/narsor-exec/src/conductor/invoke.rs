@@ -400,12 +400,12 @@ impl HarnessInvoker {
     /// invocation's episode.
     fn reading_tap(&self, invocation: &Invocation, harness: &str) -> Option<ReadingTap> {
         let sink = self.readings.as_ref()?;
-        Some(ReadingTap {
-            sink: Arc::new(ConductorReadings(Arc::clone(sink))),
-            execution_id: invocation.execution_id.clone(),
-            attempt_id: invocation.request.episode.clone()?,
-            harness: harness.to_string(),
-        })
+        Some(ReadingTap::new(
+            Arc::new(ConductorReadings(Arc::clone(sink))),
+            invocation.execution_id.clone(),
+            invocation.request.episode.clone()?,
+            harness.to_string(),
+        ))
     }
 
     /// The pinned definition's YAML and the outputs of the current state.

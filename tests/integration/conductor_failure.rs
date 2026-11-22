@@ -904,6 +904,8 @@ fn a_failure(key: &str) -> StepFailure {
         error: "the build broke".to_string(),
         side_effect_free: false,
         conductor_retry: false,
+        harness: None,
+        harness_session_id: None,
     }
 }
 

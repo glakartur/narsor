@@ -52,6 +52,11 @@ pub struct RunnerSnapshotRequest {
     pub conductor_available: bool,
     #[serde(default)]
     pub conductor_unavailable_reason: Option<String>,
+    /// Whether the current step has a harness session the owner's message
+    /// would continue (rather than start a new session with). `false` also
+    /// from a runner that does not say.
+    #[serde(default)]
+    pub agent_session_resumable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_harness_unavailable: Option<HarnessUnavailable>,
     /// The header values of the task's workspaces, in the workflow's order.

@@ -5835,6 +5835,38 @@ mod task_app_waiting {
         assert!(note(&app).contains(&reason), "{}", note(&app));
     }
 
+    /// A stopped task whose step failed: action 0 writes to the agent, with
+    /// the server's words for what the message does.
+    #[test]
+    fn write_to_the_agent_is_offered_on_a_failed_step_with_the_servers_description() {
+        let failed = waiting_on(
+            with_runner(
+                task("a", "local", "stopped", 1),
+                ExecutionStatus::Failed,
+                "work",
+            ),
+            AttentionKind::FailedStep,
+            "fk1",
+            Some("work"),
+        );
+        let offer = failed
+            .actions
+            .as_ref()
+            .and_then(|actions| {
+                actions.iter().find(|offer| {
+                    offer.id == narsor_engine::controller_protocol::TaskActionId::Comment
+                })
+            })
+            .cloned()
+            .expect("the server offers the comment");
+        let app = opened(failed);
+        let first = chooser_of(&app).items()[0].clone();
+        assert_eq!(first.label, "Napisz do agenta");
+        assert_eq!(first.unavailable, None);
+        assert_eq!(Some(first.description.clone()), offer.description);
+        assert!(first.description.contains("nowej sesji"), "{}", first.description);
+    }
+
     /// R8: a send that fails keeps the text in the field, and the panel says
     /// why.
     #[tokio::test(flavor = "multi_thread")]

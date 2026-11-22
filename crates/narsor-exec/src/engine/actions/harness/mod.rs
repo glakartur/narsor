@@ -280,6 +280,14 @@ pub trait HarnessStreamParser: Send {
         None
     }
 
+    /// The harness's own session id, as far as the stream has said it so
+    /// far: the id [`Self::finish`] would put in [`HarnessRun::session_id`]
+    /// now. `None` while no line carried one, and for a harness that cannot
+    /// tell (the default).
+    fn session_id(&self) -> Option<&str> {
+        None
+    }
+
     /// Distills the run once the process has exited.
     ///
     /// `exit_code` is a failure for every harness regardless of what the

@@ -421,6 +421,10 @@ impl ClaudeCodeStreamParser {
 }
 
 impl HarnessStreamParser for ClaudeCodeStreamParser {
+    fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
     fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement> {
         // Limits belong to the line that reported them, and to no later one.
         self.usage = None;

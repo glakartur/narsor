@@ -1,5 +1,5 @@
 use super::*;
-use crate::engine::timeline_file::{reading_from_element, ReadingSink};
+use crate::engine::timeline_file::{reading_from_element, ReadingSink, ReportedSession};
 use narsor_protocol::chat::{SubagentRef, TechnicalCategory};
 
 /// Receives the agent-session events of a run.
@@ -52,7 +52,9 @@ impl UsageRelay<'_> {
 
 /// Records one stdout line the parser has just been fed, with its
 /// `elements` and the `subagent` that wrote it (`None` for the main agent):
-/// in the conversation, unless the line was a usage report.
+/// in the conversation, unless the line was a usage report. A harness
+/// session id the stream has said by now goes to the conversation's
+/// reading tap, so it is kept before the attempt ends.
 ///
 /// A usage report is not part of the conversation (R8a): its limits go to
 /// `usage` instead, when there are any and somewhere to send them.
@@ -64,6 +66,9 @@ pub(crate) fn record_stdout_line(
     elements: &[ChatElement],
     subagent: Option<&SubagentRef>,
 ) {
+    if let Some(session_id) = parser.session_id() {
+        conversation.report_session(session_id);
+    }
     match parser.take_usage() {
         None => conversation.append(ConversationSource::Stdout, line, elements, subagent),
         Some(limits) if limits.is_empty() => {}
@@ -128,10 +133,50 @@ pub(crate) struct ConversationSink(Option<Arc<Mutex<ConversationWriter>>>, Optio
 /// is a reading of.
 #[derive(Clone)]
 pub(crate) struct ReadingTap {
-    pub(crate) sink: Arc<dyn ReadingSink>,
-    pub(crate) execution_id: String,
-    pub(crate) attempt_id: String,
-    pub(crate) harness: String,
+    sink: Arc<dyn ReadingSink>,
+    execution_id: String,
+    attempt_id: String,
+    harness: String,
+    /// The harness session id last handed on, so a harness that repeats it
+    /// on every line has it written once.
+    reported_session: Arc<Mutex<Option<String>>>,
+}
+
+impl ReadingTap {
+    pub(crate) fn new(
+        sink: Arc<dyn ReadingSink>,
+        execution_id: String,
+        attempt_id: String,
+        harness: String,
+    ) -> Self {
+        Self {
+            sink,
+            execution_id,
+            attempt_id,
+            harness,
+            reported_session: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Hands `session_id` on when it is not the one handed on last.
+    fn report_session(&self, session_id: &str) {
+        let mut reported = self
+            .reported_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reported.as_deref() == Some(session_id) {
+            return;
+        }
+        *reported = Some(session_id.to_string());
+        self.sink.record_session(
+            &self.execution_id,
+            &self.attempt_id,
+            ReportedSession {
+                harness: self.harness.clone(),
+                harness_session_id: session_id.to_string(),
+            },
+        );
+    }
 }
 
 /// The elements as the conversation file keeps them. What an agent used lives
@@ -200,6 +245,14 @@ impl ConversationSink {
     pub(super) fn with_readings(mut self, tap: ReadingTap) -> Self {
         self.1 = Some(tap);
         self
+    }
+
+    /// Hands the harness session id the stream has said on to the reading
+    /// tap, when there is one.
+    fn report_session(&self, session_id: &str) {
+        if let Some(tap) = &self.1 {
+            tap.report_session(session_id);
+        }
     }
 
     /// Appends one entry with its elements, logging (and otherwise
@@ -280,8 +333,123 @@ impl ConversationSink {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::engine::actions::answer::AnswerShape;
+    use crate::engine::actions::harness::{
+        ClaudeCodeAdapter, CodexAdapter, GitHubCopilotAdapter, HarnessAdapter, OpenCodeAdapter,
+    };
+    use crate::engine::timeline_file::UsageReading;
+
+    /// A reading sink that keeps the sessions it is given.
+    #[derive(Debug, Default)]
+    pub(crate) struct RecordedSessions(pub(crate) Mutex<Vec<(String, ReportedSession)>>);
+
+    impl ReadingSink for RecordedSessions {
+        fn record(&self, _execution_id: &str, _attempt_id: &str, _reading: UsageReading) {}
+
+        fn record_session(&self, _execution_id: &str, attempt_id: &str, session: ReportedSession) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((attempt_id.to_string(), session));
+        }
+    }
+
+    /// A conversation sink handing what the harness reports to `sessions`,
+    /// for attempt `a1` on `harness`.
+    pub(crate) fn tapped(sessions: &Arc<RecordedSessions>, harness: &str) -> ConversationSink {
+        ConversationSink::none().with_readings(ReadingTap::new(
+            Arc::clone(sessions) as Arc<dyn ReadingSink>,
+            "e1".to_string(),
+            "a1".to_string(),
+            harness.to_string(),
+        ))
+    }
+
+    #[test]
+    fn each_harness_hands_on_its_session_id_once_as_soon_as_it_says_it() {
+        let cases: Vec<(Box<dyn HarnessAdapter>, Vec<Value>, Option<&str>)> = vec![
+            (
+                Box::new(ClaudeCodeAdapter::new()),
+                vec![
+                    serde_json::json!({ "type": "system", "subtype": "init", "session_id": "c-1" }),
+                    serde_json::json!({ "type": "assistant", "message": { "content": [] } }),
+                ],
+                Some("c-1"),
+            ),
+            (
+                Box::new(CodexAdapter::new()),
+                vec![
+                    serde_json::json!({ "type": "thread.started", "thread_id": "t-1" }),
+                    serde_json::json!({ "type": "turn.started" }),
+                ],
+                Some("t-1"),
+            ),
+            (
+                Box::new(OpenCodeAdapter::new()),
+                vec![
+                    serde_json::json!({ "type": "step_start", "sessionID": "o-1" }),
+                    serde_json::json!({ "type": "tool_use", "sessionID": "o-1" }),
+                    serde_json::json!({ "type": "text", "sessionID": "o-1", "text": "hi" }),
+                ],
+                Some("o-1"),
+            ),
+            (
+                Box::new(GitHubCopilotAdapter::new()),
+                vec![
+                    serde_json::json!({ "type": "session", "session_id": "g-1" }),
+                    serde_json::json!({ "type": "assistant", "content": "hi" }),
+                ],
+                Some("g-1"),
+            ),
+            (
+                Box::new(ClaudeCodeAdapter::new()),
+                vec![serde_json::json!({ "type": "assistant", "message": { "content": [] } })],
+                None,
+            ),
+        ];
+        for (adapter, lines, expected) in cases {
+            let sessions = Arc::new(RecordedSessions::default());
+            let conversation = tapped(&sessions, adapter.name());
+            let mut parser = adapter.stream_parser(AnswerShape::Choice);
+            for (index, line) in lines.iter().enumerate() {
+                let line = line.to_string();
+                let elements = parser.on_stdout_line(line.as_bytes());
+                record_stdout_line(
+                    parser.as_mut(),
+                    &conversation,
+                    None,
+                    line.as_bytes(),
+                    &elements,
+                    None,
+                );
+                if index == 0 {
+                    // Kept with the line that said it, before any other.
+                    assert_eq!(
+                        sessions.0.lock().unwrap().len(),
+                        usize::from(expected.is_some()),
+                        "{}",
+                        adapter.name()
+                    );
+                }
+            }
+            let recorded = sessions.0.lock().unwrap().clone();
+            let expected: Vec<(String, ReportedSession)> = expected
+                .map(|id| {
+                    (
+                        "a1".to_string(),
+                        ReportedSession {
+                            harness: adapter.name().to_string(),
+                            harness_session_id: id.to_string(),
+                        },
+                    )
+                })
+                .into_iter()
+                .collect();
+            assert_eq!(recorded, expected, "{}", adapter.name());
+        }
+    }
 
     fn result(text: Option<&str>, is_error: bool) -> ChatElement {
         ChatElement::RunResult {

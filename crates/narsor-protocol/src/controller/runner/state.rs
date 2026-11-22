@@ -167,6 +167,11 @@ pub struct RunnerView {
     pub conductor_available: bool,
     #[serde(default)]
     pub conductor_unavailable_reason: Option<String>,
+    /// Whether the current step has a harness session the owner's message
+    /// would continue (rather than start a new session with). `false` also
+    /// from a runner that does not say.
+    #[serde(default)]
+    pub agent_session_resumable: bool,
     #[serde(default)]
     pub default_harness_unavailable: Option<HarnessUnavailable>,
     pub observed_at: DateTime<Utc>,

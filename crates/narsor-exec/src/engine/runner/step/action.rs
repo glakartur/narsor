@@ -186,6 +186,28 @@ impl Engine {
                         result,
                     })
                 }
+                Ok(AttemptOutcome::SessionRefused(error)) => {
+                    self.emit(
+                        &execution.id,
+                        EventData::ActionAttemptFailed {
+                            action_execution_id: action_execution_id.clone(),
+                            state_id: state.id.clone(),
+                            error,
+                            retry_in_ms: 0,
+                        },
+                    )?;
+                    action_execution_id = Uuid::new_v4().to_string();
+                    execution.current_action_execution = Some(action_execution_id.clone());
+                    self.emit(
+                        &execution.id,
+                        EventData::ActionRetrying {
+                            action_execution_id: action_execution_id.clone(),
+                            retry_count: RetrySchedule::retry_count(attempt),
+                            state_id: Some(state.id.clone()),
+                        },
+                    )?;
+                    continue;
+                }
                 Err(failure) => failure,
             };
 

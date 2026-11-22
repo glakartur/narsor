@@ -116,6 +116,8 @@ enum Reply {
 struct Call {
     prompt: String,
     harness: Option<String>,
+    /// The harness session the call continues.
+    resume_session: Option<String>,
 }
 
 /// The agent actions of a task, answered in-process: each call takes the
@@ -161,6 +163,12 @@ impl ActionExecutor for Agent {
         self.calls.lock().unwrap().push(Call {
             prompt: config.prompt.to_string(),
             harness: config.harness_step.harness.clone(),
+            resume_session: config
+                .harness_step
+                .parameters
+                .get("resume_session")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         });
         let reply = self
             .replies
@@ -3276,6 +3284,169 @@ async fn a_comment_on_an_unknown_execution_goes_with_its_recovery() {
     assert_eq!(fixture.session.untaken_resume_message().unwrap(), None);
 }
 
+/// A runner lost while the step after its pause ran, without closing its
+/// session, after the step's harness reported the session `s-lost`; the
+/// storage it leaves.
+async fn lost_mid_step(root: &TempRoot) -> PathBuf {
+    use crate::engine::timeline_file::{record_session, ReportedSession};
+
+    let storage = paused_between_steps(root).await;
+    let task_storage = TaskStorage::new(&storage);
+    let store = task_storage.store();
+    let execution_id = store.list_execution_ids().unwrap().remove(0);
+    let mut execution = store.load_execution(&execution_id).unwrap();
+    let state_id = execution.current_state.clone().expect("a current state");
+    store
+        .event_log(&execution_id)
+        .append_next(
+            &execution_id,
+            EventData::ActionStarted {
+                action_execution_id: "lost-attempt".to_string(),
+                state_id,
+                action_type: "agent".to_string(),
+                decision_by: None,
+            },
+        )
+        .unwrap();
+    execution.status = ExecutionStatus::Running;
+    execution.current_action_execution = Some("lost-attempt".to_string());
+    store.save_execution(&execution).unwrap();
+    record_session(
+        &store,
+        &execution_id,
+        "lost-attempt",
+        ReportedSession {
+            harness: "claude-code".to_string(),
+            harness_session_id: "s-lost".to_string(),
+        },
+    )
+    .unwrap();
+    task_storage
+        .write_session(&SessionRecord::open("pod-1", Some(1)))
+        .unwrap();
+    storage
+}
+
+/// A runner that stopped cleanly on a step that failed in the session
+/// `s-failed`; the storage it leaves.
+async fn failed_in_a_session(root: &TempRoot) -> PathBuf {
+    let storage = paused_between_steps(root).await;
+    let store = TaskStorage::new(&storage).store();
+    let execution_id = store.list_execution_ids().unwrap().remove(0);
+    let mut execution = store.load_execution(&execution_id).unwrap();
+    let state_id = execution.current_state.clone().expect("a current state");
+    execution.status = ExecutionStatus::Failed;
+    execution.metadata["engine"]["step_failure"] = json!({
+        "state_id": state_id,
+        "action_execution_id": "failed-attempt",
+        "episode": "failed-attempt",
+        "error": "the build broke",
+        "side_effect_free": false,
+        "harness": "claude-code",
+        "harness_session_id": "s-failed",
+    });
+    store.save_execution(&execution).unwrap();
+    storage
+}
+
+/// The owner wrote to the agent after the workload was lost mid-step: the
+/// recovery continues the lost attempt's session with the comment, and the
+/// next poll says it was taken.
+#[tokio::test]
+async fn a_comment_after_a_loss_mid_step_continues_its_session() {
+    let root = TempRoot::new();
+    let storage = lost_mid_step(&root).await;
+    let mut fixture = resumed(&root, &storage, Some(launch_with_comment("pod-2")));
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+    let calls = fixture.agent.calls();
+    assert_eq!(calls[0].resume_session.as_deref(), Some("s-lost"));
+    assert!(
+        calls[0].prompt.starts_with("Mind the flaky test."),
+        "{}",
+        calls[0].prompt
+    );
+    assert_eq!(
+        fixture.session.taken_resume_message_key().as_deref(),
+        Some("c-1")
+    );
+}
+
+/// The owner wrote to the agent of a failed step: the launch recovers the
+/// step in the session it failed in, instead of refusing the comment.
+#[tokio::test]
+async fn a_comment_on_a_failed_step_continues_the_session_it_failed_in() {
+    let root = TempRoot::new();
+    let storage = failed_in_a_session(&root).await;
+    let mut fixture = resumed(&root, &storage, Some(launch_with_comment("pod-2")));
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+    let calls = fixture.agent.calls();
+    assert_eq!(calls[0].resume_session.as_deref(), Some("s-failed"));
+    assert_eq!(calls[0].prompt, "Mind the flaky test.");
+    assert_eq!(fixture.session.untaken_resume_message().unwrap(), None);
+}
+
+/// A failed step stays failed on a launch with no comment to give: none was
+/// left, or this storage gave it before a restart.
+#[tokio::test]
+async fn a_failed_step_without_a_comment_to_give_stays_failed() {
+    for given_before in [false, true] {
+        let root = TempRoot::new();
+        let storage = failed_in_a_session(&root).await;
+        let launch = given_before.then(|| launch_with_comment("pod-2"));
+        if given_before {
+            TaskStorage::new(&storage)
+                .record_consumed_input("resume-message:c-1")
+                .unwrap();
+        }
+        let mut fixture = resumed(&root, &storage, launch);
+
+        assert_eq!(fixture.begin().await, None);
+        fixture.settled().await;
+
+        assert_eq!(fixture.status(), ExecutionStatus::Failed, "{given_before}");
+        assert!(fixture.agent.calls().is_empty(), "{given_before}");
+    }
+}
+
+/// A comment that reached a launch whose execution cannot take it (it waits
+/// for an event or has ended) does not stop the launch: the execution stays
+/// as it was, and the comment stays to be given.
+#[tokio::test]
+async fn a_comment_the_execution_cannot_take_stays_stored_and_the_launch_goes_on() {
+    for status in [ExecutionStatus::WaitingForEvent, ExecutionStatus::Completed] {
+        let root = TempRoot::new();
+        let storage = paused_between_steps(&root).await;
+        let store = TaskStorage::new(&storage).store();
+        let execution_id = store.list_execution_ids().unwrap().remove(0);
+        let mut execution = store.load_execution(&execution_id).unwrap();
+        execution.status = status;
+        store.save_execution(&execution).unwrap();
+        let mut fixture = resumed(&root, &storage, Some(launch_with_comment("pod-2")));
+
+        assert_eq!(fixture.begin().await, None, "{status:?}");
+        fixture.settled().await;
+
+        assert_eq!(fixture.status(), status);
+        assert!(fixture.agent.calls().is_empty(), "{status:?}");
+        assert_eq!(
+            fixture.session.taken_resume_message_key(),
+            None,
+            "{status:?}"
+        );
+        assert!(
+            fixture.session.untaken_resume_message().unwrap().is_some(),
+            "{status:?}"
+        );
+    }
+}
 // ---------------------------------------------------------------------------
 // A `decision` gate on an observer queue (U2)
 // ---------------------------------------------------------------------------

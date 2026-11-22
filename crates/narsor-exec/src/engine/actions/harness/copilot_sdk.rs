@@ -213,6 +213,7 @@ mod copilot_sdk_dispatch_tests {
     use crate::engine::actions::answer::AnswerShape;
     use crate::engine::actions::harness::{GitHubCopilotAdapter, HarnessAdapter};
     use crate::engine::actions::session::conversation::ConversationSink;
+    use crate::engine::actions::session::conversation::tests::{tapped, RecordedSessions};
     use crate::engine::actions::session::process::{
         run_harness_invocation, run_harness_invocation_with_sdk, SpawnEnding, FINAL_ANSWER_GRACE,
     };
@@ -327,6 +328,7 @@ mod copilot_sdk_dispatch_tests {
         let sdk = MockCopilotSdk {
             request: Mutex::new(None),
         };
+        let sessions = std::sync::Arc::new(RecordedSessions::default());
         let result = run_harness_invocation_with_sdk(
             "copilot-sdk",
             &["agent".to_string(), config],
@@ -336,7 +338,7 @@ mod copilot_sdk_dispatch_tests {
             None,
             FINAL_ANSWER_GRACE,
             adapter.stream_parser(AnswerShape::Choice),
-            &ConversationSink::none(),
+            &tapped(&sessions, "github-copilot"),
             None,
             &sdk,
         )
@@ -355,6 +357,10 @@ mod copilot_sdk_dispatch_tests {
             }
             SpawnEnding::TimedOut => panic!("Copilot SDK invocation timed out"),
         }
+        // The session the SDK reported is kept once, as soon as it is said.
+        let recorded = sessions.0.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].1.harness_session_id, "sdk-session");
         assert_eq!(
             sdk.request.lock().unwrap().as_ref(),
             Some(&CopilotSdkRequest {

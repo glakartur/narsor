@@ -14,6 +14,15 @@
 //! them is not the current one the timeline is built again from the log and
 //! the file's readings are put on it. A lost file loses its readings.
 //!
+//! # Sessions
+//!
+//! The harness session id of an attempt reaches the log only when the
+//! attempt ends. The file also keeps the id each attempt's harness reported
+//! while it ran ([`ReportedSession`]), written as soon as the harness says
+//! it: an attempt whose workload was lost mid-step leaves its session here
+//! and nowhere else, so it can still be continued. Like the readings, a lost
+//! file loses them.
+//!
 //! # Readings
 //!
 //! A [`ReadingBasis::Increment`] reading is what one run used, so the
@@ -177,6 +186,18 @@ pub struct TimelineFile {
     /// What each attempt used, by `action_execution_id`.
     #[serde(default)]
     pub readings: BTreeMap<String, UsageReading>,
+    /// The harness session each attempt's harness reported while it ran, by
+    /// `action_execution_id`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sessions: BTreeMap<String, ReportedSession>,
+}
+
+/// The harness session an attempt ran in, as its harness reported it while
+/// the attempt ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportedSession {
+    pub harness: String,
+    pub harness_session_id: String,
 }
 
 /// Where the use that harnesses report goes.
@@ -184,6 +205,12 @@ pub trait ReadingSink: Send + Sync + std::fmt::Debug {
     /// Takes one reading of `attempt_id` of `execution_id`. Recording never
     /// fails a run: what cannot be written is logged and dropped.
     fn record(&self, execution_id: &str, attempt_id: &str, reading: UsageReading);
+
+    /// Takes the harness session `attempt_id` of `execution_id` runs in, as
+    /// soon as its harness reported it. Never fails a run, like
+    /// [`Self::record`]. A sink that keeps no sessions ignores it (the
+    /// default).
+    fn record_session(&self, _execution_id: &str, _attempt_id: &str, _session: ReportedSession) {}
 }
 
 /// A [`ReadingSink`] writing `timeline.json`, and telling `on_update` when it
@@ -206,9 +233,17 @@ impl FileReadingSink {
     }
 }
 
-impl ReadingSink for FileReadingSink {
-    fn record(&self, execution_id: &str, attempt_id: &str, reading: UsageReading) {
-        match record_reading(&self.store, execution_id, attempt_id, reading) {
+impl FileReadingSink {
+    /// Tells `on_update` that `what` of `attempt_id` was written, or logs why
+    /// it was not.
+    fn written(
+        &self,
+        result: Result<(), crate::persistence::PersistenceError>,
+        execution_id: &str,
+        attempt_id: &str,
+        what: &str,
+    ) {
+        match result {
             Ok(()) => {
                 if let Some(on_update) = &self.on_update {
                     on_update();
@@ -218,9 +253,21 @@ impl ReadingSink for FileReadingSink {
                 execution_id,
                 attempt_id,
                 %error,
-                "a usage reading could not be written to the timeline file"
+                "{what} could not be written to the timeline file"
             ),
         }
+    }
+}
+
+impl ReadingSink for FileReadingSink {
+    fn record(&self, execution_id: &str, attempt_id: &str, reading: UsageReading) {
+        let written = record_reading(&self.store, execution_id, attempt_id, reading);
+        self.written(written, execution_id, attempt_id, "a usage reading");
+    }
+
+    fn record_session(&self, execution_id: &str, attempt_id: &str, session: ReportedSession) {
+        let written = record_session(&self.store, execution_id, attempt_id, session);
+        self.written(written, execution_id, attempt_id, "a harness session id");
     }
 }
 
@@ -272,6 +319,43 @@ pub fn record_reading(
     write_json_atomic(&path, &file)
 }
 
+/// Keeps `session` as the harness session `attempt_id` runs in, in the
+/// file. Writes nothing when the file already holds it.
+pub fn record_session(
+    store: &ExecutionStore,
+    execution_id: &str,
+    attempt_id: &str,
+    session: ReportedSession,
+) -> Result<(), crate::persistence::PersistenceError> {
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = file_path(store, execution_id);
+    let mut file = load(&path).unwrap_or_default();
+    if file.sessions.get(attempt_id) == Some(&session) {
+        return Ok(());
+    }
+    file.version = VERSION;
+    file.sessions.insert(attempt_id.to_string(), session);
+    if let Some(timeline) = file.timeline.as_mut() {
+        apply_sessions(timeline, &file.sessions);
+        apply_usage(timeline, &file.readings);
+    }
+    crate::persistence::atomic::ensure_dir(&store.execution_dir(execution_id))?;
+    write_json_atomic(&path, &file)
+}
+
+/// The harness sessions the attempts of `execution_id` reported while they
+/// ran, by `action_execution_id`; empty when the file is missing or
+/// unreadable.
+pub fn reported_sessions(
+    store: &ExecutionStore,
+    execution_id: &str,
+) -> BTreeMap<String, ReportedSession> {
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    load(&file_path(store, execution_id))
+        .map(|file| file.sessions)
+        .unwrap_or_default()
+}
+
 /// The timeline of `execution_id` as it stands, with what its agents used.
 ///
 /// Taken from the file when it was built from this very log position,
@@ -304,6 +388,7 @@ pub fn current_timeline(
 
     let mut file = existing.unwrap_or_default();
     let mut timeline = build_timeline(events, execution_status, recorded);
+    apply_sessions(&mut timeline, &file.sessions);
     apply_usage(&mut timeline, &file.readings);
     file.version = VERSION;
     file.event_cursor = cursor;
@@ -314,6 +399,28 @@ pub fn current_timeline(
         save(&path, &file);
     }
     timeline
+}
+
+/// Gives a position whose session the log does not name the session its
+/// latest attempt reported while it ran: the log names it only once an
+/// attempt ended.
+fn apply_sessions(timeline: &mut Timeline, sessions: &BTreeMap<String, ReportedSession>) {
+    for position in &mut timeline.positions {
+        if position.harness_session_id.is_some() {
+            continue;
+        }
+        let reported = position
+            .attempt_ids()
+            .into_iter()
+            .rev()
+            .find_map(|attempt| sessions.get(attempt));
+        if let Some(session) = reported {
+            position.harness_session_id = Some(session.harness_session_id.clone());
+            if position.harness.is_none() {
+                position.harness = Some(session.harness.clone());
+            }
+        }
+    }
 }
 
 /// Puts what `readings` say on the positions of `timeline`.
