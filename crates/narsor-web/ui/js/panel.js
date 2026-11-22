@@ -213,7 +213,8 @@ export function fillPlaceholders(command, texts) {
 }
 
 /**
- * The request an action sends: `{route: 'owner'|'operator'|'comment', body}`.
+ * The request an action sends:
+ * `{route: 'owner'|'operator'|'comment'|'refresh_environment', body}`.
  * Throws `Error` when it cannot be sent.
  */
 export function resolveSend(send, texts) {
@@ -229,8 +230,46 @@ export function resolveSend(send, texts) {
       if (!text) throw new Error(`Pole '${send.field}' jest wymagane.`);
       return { route: 'comment', body: text };
     }
+    case 'refresh_environment':
+      return { route: 'refresh_environment', body: null };
     default:
       throw new Error('Ta akcja wymaga nowszej wersji klienta.');
+  }
+}
+
+const DIFF_VALUES = ['task_image_base', 'base_image', 'runtime_bundle', 'profile'];
+const DIFF_NAMES = ['task_image_components', 'task_image_secrets', 'secrets', 'step_images', 'tools'];
+
+/** How many single changes an `EnvironmentDiff` holds (`EnvironmentDiff::change_count`). */
+export function diffChangeCount(diff) {
+  if (!diff || typeof diff !== 'object') return 0;
+  const values = DIFF_VALUES.filter((key) => diff[key]).length;
+  const names = DIFF_NAMES.reduce((sum, key) => {
+    const part = diff[key] ?? {};
+    return sum + ['added', 'removed', 'changed'].reduce((n, side) => n + (part[side]?.length ?? 0), 0);
+  }, 0);
+  return values + names;
+}
+
+function changesWord(count) {
+  if (count === 1) return 'zmiana';
+  const ones = count % 10;
+  const tens = count % 100;
+  return ones >= 2 && ones <= 4 && !(tens >= 12 && tens <= 14) ? 'zmiany' : 'zmian';
+}
+
+/** What the notice says of an environment refresh (`EnvironmentRefreshResult`), as the TUI's bar. */
+export function refreshOutcomeText(outcome) {
+  switch (outcome?.type) {
+    case 'refreshed': {
+      const count = diffChangeCount(outcome.diff);
+      if (count === 0) return 'środowisko odświeżone';
+      return `środowisko odświeżone — ${count} ${changesWord(count)}; zadanie dostanie je przy następnym uruchomieniu`;
+    }
+    case 'unchanged':
+      return 'środowisko bez zmian — katalog daje to samo środowisko';
+    default:
+      return 'odświeżenie środowiska przyjęte';
   }
 }
 

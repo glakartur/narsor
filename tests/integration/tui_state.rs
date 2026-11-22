@@ -7074,8 +7074,9 @@ mod task_app_actions {
     use narsor::tui::keymap::{self, Action, Context};
     use narsor::tui::stepped::Stage;
     use narsor::tui::task_app::actions::{
-        availability, refusal_reason, verb, ActionPanel, ActionRequest, ActionSend, Availability,
-        Overlay, PanelContent, TaskAction, NOTHING_TEXT, NOT_OFFERED, NO_DATA_TEXT, NO_OFFER,
+        availability, environment_refresh_notice, refusal_reason, verb, ActionPanel, ActionRequest,
+        ActionSend, Availability, Overlay, PanelContent, TaskAction, NOTHING_TEXT, NOT_OFFERED,
+        NO_DATA_TEXT, NO_OFFER,
     };
     use narsor::tui::task_app::notify::Severity;
     use narsor::tui::task_app::{Request, TaskApp};
@@ -7667,6 +7668,47 @@ mod task_app_actions {
             assert!(chooser.items()[1].irreversible, "stop cannot be undone");
             assert!(chooser.items()[0].description.contains("skończy krok"));
             assert_eq!(app.key_context().base, Context::Menu);
+        }
+
+        #[test]
+        fn a_stopped_task_refreshes_its_environment_at_the_generation_the_operator_saw() {
+            let mut stopped = runner_state("stopped");
+            stopped.generation = 4;
+            let mut app = loaded(stopped);
+            let request = act(choose(&mut app, "Odśwież środowisko"));
+            assert_eq!(request.send, ActionSend::RefreshEnvironment);
+            assert_eq!(request.generation, 4);
+            assert!(
+                !panel_of(running("a", 1)).contains(&"Odśwież środowisko".to_string()),
+                "a running task is paused first"
+            );
+        }
+
+        #[test]
+        fn the_bar_says_what_the_environment_refresh_found() {
+            use narsor_protocol::controller::{EnvironmentDiff, EnvironmentRefreshResult};
+            let refreshed = |diff: serde_json::Value| EnvironmentRefreshResult::Refreshed {
+                old_identity: "a".to_string(),
+                new_identity: "b".to_string(),
+                generation: 2,
+                diff: Box::new(serde_json::from_value::<EnvironmentDiff>(diff).unwrap()),
+            };
+            let two = refreshed(serde_json::json!({
+                "profile": {"before": "small", "after": "large"},
+                "tools": {"added": ["glab"], "removed": []}
+            }));
+            for (outcome, said) in [
+                (two, "środowisko odświeżone — 2 zmiany"),
+                (
+                    EnvironmentRefreshResult::Unchanged {
+                        identity: "a".to_string(),
+                    },
+                    "środowisko bez zmian",
+                ),
+            ] {
+                let text = environment_refresh_notice(&outcome);
+                assert!(text.starts_with(said), "{text}");
+            }
         }
 
         #[test]

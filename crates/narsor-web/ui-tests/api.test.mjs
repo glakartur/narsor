@@ -98,3 +98,12 @@ test('streamEvents throws when the stream cannot open', async () => {
   await assert.rejects(async () => { for await (const _ of api.streamEvents('bad')) { /* none */ } },
     (error) => error.code === 'invalid_cursor' && error.kind === 'request');
 });
+
+test('refreshEnvironment posts the generation the owner saw to the refresh route', async () => {
+  const seen = [];
+  const api = new Api('http://h/', 't', fakeFetch(200, '{"outcome":{"type":"unchanged","identity":"e"}}', seen));
+  const result = await api.refreshEnvironment('task-1', 4);
+  assert.equal(result.outcome.type, 'unchanged');
+  assert.equal(seen[0].url, 'http://h/control/v1/tasks/task-1/refresh-environment');
+  assert.deepEqual(JSON.parse(seen[0].init.body), { expected_generation: 4 });
+});

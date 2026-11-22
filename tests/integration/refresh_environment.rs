@@ -17,11 +17,11 @@ use narsor_engine::controller_protocol::{
 use narsor_engine::domain::{BackendId, TaskId};
 use narsor_engine::environment::{BackendKind, BackendRecord, EnvironmentCatalog, TrustScope};
 use narsor_engine::orchestration::{
-    ControlPlane, ControllerReport, Observation, ObservedSummary, OwnerCommand, OwnerRef,
-    RunnerState, TaskEventKind, TaskRecord,
+    ControlPlane, ControllerReport, LeaseToken, Observation, ObservedSummary, OwnerCommand,
+    OwnerRef, RunnerState, TaskEventKind, TaskRecord,
 };
 use narsor_engine::persistence::ServerStatePaths;
-use narsor_protocol::controller::{CreateTaskRequest, LaunchRequest};
+use narsor_protocol::controller::{CreateTaskRequest, LaunchRequest, TaskActionId, TaskSummary};
 use narsor_server::api::{start_with_services, ApiHandle, ApiServices};
 
 const TASK: &str = "task-refresh";
@@ -96,6 +96,18 @@ impl Fixture {
     /// starts it through a controller and loses its workload: the task is
     /// `Interrupted`, sealed without a task image.
     async fn interrupted_task(&self) -> TaskRecord {
+        let lease = self.started_task().await;
+        self.report(&lease, Observation::WorkloadLost { state_known: true });
+        let record = self.record();
+        assert_eq!(record.runner_state, RunnerState::Interrupted);
+        assert!(record.launch_spec.environment.task_image.is_none());
+        record
+    }
+
+    /// Creates the task over HTTP and has a controller accept its start:
+    /// the task holds its slot and runs. The lease comes back for later
+    /// reports.
+    async fn started_task(&self) -> LeaseToken {
         self.client
             .create_control_task(&CreateTaskRequest {
                 task_id: Some(TASK.to_string()),
@@ -114,37 +126,37 @@ impl Fixture {
             })
             .await
             .expect("create the task");
-        let control = self.service.control_plane();
-        let lease = control
+        let lease = self
+            .service
+            .control_plane()
             .acquire_lease(&backend(), CONTROLLER, Duration::days(1))
-            .expect("acquire lease");
+            .expect("acquire lease")
+            .token();
         self.service.reschedule(&backend());
-        for observation in [
-            Observation::StartAccepted,
-            Observation::WorkloadLost { state_known: true },
-        ] {
-            let generation = self.record().generation;
-            control
-                .report(ControllerReport {
-                    task_id: task_id(),
-                    lease: lease.token(),
-                    desired_generation: generation,
-                    observation,
-                    resource: None,
-                    summary: ObservedSummary {
-                        workload_present: true,
-                        storage_present: true,
-                        runner_status: None,
-                        detail: None,
-                    },
-                    observed_at: Utc::now(),
-                })
-                .expect("controller report");
-        }
-        let record = self.record();
-        assert_eq!(record.runner_state, RunnerState::Interrupted);
-        assert!(record.launch_spec.environment.task_image.is_none());
-        record
+        self.report(&lease, Observation::StartAccepted);
+        lease
+    }
+
+    /// A report of the controller holding `lease` on the task at its
+    /// current generation.
+    fn report(&self, lease: &LeaseToken, observation: Observation) {
+        self.service
+            .control_plane()
+            .report(ControllerReport {
+                task_id: task_id(),
+                lease: lease.clone(),
+                desired_generation: self.record().generation,
+                observation,
+                resource: None,
+                summary: ObservedSummary {
+                    workload_present: true,
+                    storage_present: true,
+                    runner_status: None,
+                    detail: None,
+                },
+                observed_at: Utc::now(),
+            })
+            .expect("controller report");
     }
 
     fn record(&self) -> TaskRecord {
@@ -345,5 +357,54 @@ async fn a_catalogue_that_does_not_resolve_refuses_the_refresh_and_the_task_resu
         fx.desired_command().await.launch_digest,
         before.launch_spec.digest
     );
+    fx.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_offer_and_the_refresh_refuse_a_running_task_and_allow_it_once_the_workload_is_gone() {
+    let fx = Fixture::new().await;
+    let lease = fx.started_task().await;
+    let offers_refresh = |task: &TaskSummary| {
+        task.actions
+            .iter()
+            .flatten()
+            .any(|offer| offer.id == TaskActionId::RefreshEnvironment)
+    };
+
+    let running = fx.client.control_task(TASK).await.unwrap();
+    assert!(!offers_refresh(&running), "{:?}", running.actions);
+    let refused = fx
+        .client
+        .control_refresh_environment(
+            TASK,
+            &RefreshEnvironmentRequest {
+                expected_generation: Some(running.generation),
+            },
+        )
+        .await
+        .unwrap_err();
+    let ClientError::Refused { code, message } = &refused else {
+        panic!("a refusal with its reason: {refused:?}");
+    };
+    assert_eq!(code, "action_unavailable");
+    assert!(message.contains("wstrzymaj"), "{message}");
+
+    fx.report(&lease, Observation::WorkloadLost { state_known: true });
+    let interrupted = fx.client.control_task(TASK).await.unwrap();
+    assert!(offers_refresh(&interrupted), "{:?}", interrupted.actions);
+    let accepted = fx
+        .client
+        .control_refresh_environment(
+            TASK,
+            &RefreshEnvironmentRequest {
+                expected_generation: Some(interrupted.generation),
+            },
+        )
+        .await
+        .expect("the offered refresh is accepted");
+    assert!(matches!(
+        accepted.outcome,
+        EnvironmentRefreshResult::Unchanged { .. }
+    ));
     fx.server.shutdown().await;
 }

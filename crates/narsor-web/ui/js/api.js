@@ -187,6 +187,9 @@ export class Api {
       ...command, idempotency_key: key, expected_generation: expectedGeneration,
     });
   }
+  refreshEnvironment(taskId, expectedGeneration) {
+    return this.post(`/control/v1/tasks/${path(taskId)}/refresh-environment`, { expected_generation: expectedGeneration });
+  }
   comment(taskId, text, expectedGeneration, key = idempotencyKey()) {
     return this.post(`/control/v1/tasks/${path(taskId)}/comment`, {
       text, idempotency_key: key, expected_generation: expectedGeneration,
