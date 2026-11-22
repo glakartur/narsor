@@ -822,6 +822,7 @@ async fn report_problem(
         problem: Some(problem.clone()),
         conductor_available: false,
         conductor_unavailable_reason: Some("the runner cannot work".to_string()),
+        agent_session_resumable: false,
         default_harness_unavailable: None,
         workspaces: Vec::new(),
         generated_title: None,
