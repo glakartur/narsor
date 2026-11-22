@@ -21,8 +21,8 @@ use narsor_engine::domain::{
     ExecutionStatus, RepositoryDefinition, RepositorySource, RepromptedBy, WorkflowExecution,
 };
 use narsor_engine::engine::{
-    owed_output_rescue, step_failure, ActionKind, Engine, EngineError, PendingHumanInput,
-    PendingStep, Recovery, StepFailure,
+    owed_output_rescue, resumable_agent_session, step_failure, ActionKind, Engine, EngineError,
+    PendingHumanInput, PendingStep, Recovery, StepFailure,
 };
 use narsor_engine::engine::{reconcile, ReconciliationOutcome};
 use serde_json::json;
@@ -913,6 +913,8 @@ fn fail_for_the_conductor(harness: &Harness, execution: &mut WorkflowExecution, 
         error: "the build broke".to_string(),
         side_effect_free: true,
         conductor_retry: false,
+        harness: None,
+        harness_session_id: None,
     };
     execution.status = ExecutionStatus::Failed;
     execution.current_state = Some("first".to_string());
@@ -1468,4 +1470,232 @@ async fn every_repository_of_a_task_is_checkpointed_and_materialised_on_its_own(
             assert_eq!(std::fs::read_to_string(fresh.join(file)).unwrap(), content);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The session the current step can be continued in
+// ---------------------------------------------------------------------------
+
+/// An engine whose agent runs on the fake harness, with the log and the
+/// timeline file written as a runner writes them.
+fn engine_on_the_fake_harness(harness: &Harness) -> (engine_support::FakeHarness, Arc<Engine>) {
+    use narsor_engine::engine::{
+        AgentExecutor, ClaudeCodeAdapter, FileReadingSink, HarnessRegistry, LoggingEventSink,
+    };
+    let fake = engine_support::FakeHarness::install(harness.root().join("bin"));
+    let store = harness.store();
+    let agent = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(ClaudeCodeAdapter::with_program(fake.program()))),
+    )
+    .with_event_sink(Arc::new(LoggingEventSink::new(store.clone(), None)))
+    .with_reading_sink(Arc::new(FileReadingSink::new(store.clone(), None)));
+    let engine = Engine::new(store)
+        .with_agent_timeout(Some(1))
+        .with_executor(ActionKind::Agent, Arc::new(agent));
+    (fake, Arc::new(engine))
+}
+
+/// The `system` line a claude harness opens its stream with.
+fn session_line(session: &str) -> String {
+    format!(
+        "{}\n",
+        json!({ "type": "system", "subtype": "init", "session_id": session })
+    )
+}
+
+/// Records that the state `state` completed a session `session` on an
+/// earlier entry.
+fn completed_earlier(execution: &mut WorkflowExecution, state: &str, session: &str) {
+    execution.metadata["engine"]["completed_agent_sessions"] = json!({
+        state: { "action_execution_id": "earlier", "harness": "claude-code", "session_id": session }
+    });
+}
+
+/// Runs the `agent_failure` workflow to its failure, after the state's
+/// earlier entry completed session `s-1`.
+async fn fail_after_an_earlier_session(
+    harness: &Harness,
+    engine: &Arc<Engine>,
+) -> WorkflowExecution {
+    let definition = workflow("agent_failure");
+    let mut execution = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    completed_earlier(&mut execution, "work", "s-1");
+    harness.store().save_execution(&execution).expect("save");
+    let failed = engine
+        .try_begin_resume(&execution.id)
+        .expect("resume")
+        .run_to_completion(&definition)
+        .await
+        .expect("run to the failure");
+    assert_eq!(failed.status, ExecutionStatus::Failed);
+    failed
+}
+
+/// The step failed in the session its harness reported, whether the
+/// harness ended with an error or ran out of time: the failure records that
+/// session, and the step is continued in it, not in the session an earlier
+/// entry of the state completed.
+#[tokio::test]
+async fn a_failed_step_is_continued_in_the_session_it_failed_in() {
+    for (case, session) in [("harness error", "s-2"), ("timeout", "s-3")] {
+        let harness = Harness::new();
+        let (fake, engine) = engine_on_the_fake_harness(&harness);
+        fake.answers(&session_line(session));
+        if case == "timeout" {
+            fake.sleeps(5);
+        } else {
+            fake.fails(1, "the harness broke");
+        }
+
+        let failed = fail_after_an_earlier_session(&harness, &engine).await;
+
+        let failure = step_failure(&failed)
+            .expect("read the record")
+            .expect("the failure is recorded");
+        assert_eq!(failure.harness.as_deref(), Some("claude-code"), "{case}");
+        assert_eq!(failure.harness_session_id.as_deref(), Some(session), "{case}");
+        let events = harness.events(&failed.id);
+        let resumable = resumable_agent_session(&harness.store(), &failed, &events)
+            .unwrap_or_else(|| panic!("{case}: a session to continue"));
+        assert_eq!(resumable.harness_session_id, session, "{case}");
+
+        // The timeline file is lost: the failure record still names the
+        // session, and the earlier one of the state stays out of it.
+        let timeline = harness.store().execution_dir(&failed.id).join("timeline.json");
+        std::fs::remove_file(timeline).expect("drop the timeline file");
+        let resumable = resumable_agent_session(&harness.store(), &failed, &events)
+            .unwrap_or_else(|| panic!("{case}: the failure's session without the file"));
+        assert_eq!(resumable.harness_session_id, session, "{case}");
+    }
+}
+
+/// What the log and the timeline file say about the current step decides
+/// the session, in order: an attempt cut mid-step is continued in the
+/// session it reported; one whose session ended well gives way to the
+/// session the state completed; a step that never had a session has none.
+#[tokio::test]
+async fn the_session_to_continue_follows_the_steps_latest_attempt() {
+    use narsor_engine::engine::timeline_file::{record_session, ReportedSession};
+
+    struct Case {
+        name: &'static str,
+        reported: Option<&'static str>,
+        completed: bool,
+        earlier: Option<&'static str>,
+        expected: Option<&'static str>,
+    }
+    let cases = [
+        Case {
+            name: "cut after its session was reported",
+            reported: Some("s-cut"),
+            completed: false,
+            earlier: Some("s-old"),
+            expected: Some("s-cut"),
+        },
+        Case {
+            name: "its session ended well",
+            reported: Some("s-done"),
+            completed: true,
+            earlier: Some("s-state"),
+            expected: Some("s-state"),
+        },
+        Case {
+            name: "cut before any session",
+            reported: None,
+            completed: false,
+            earlier: None,
+            expected: None,
+        },
+    ];
+    for case in cases {
+        let harness = Harness::new();
+        let engine = harness.engine();
+        let definition = workflow("agent_failure");
+        let mut execution = engine
+            .start(&definition, json!({}), harness.workspace())
+            .expect("start");
+        if let Some(earlier) = case.earlier {
+            completed_earlier(&mut execution, "work", earlier);
+        }
+        execution.current_state = Some("work".to_string());
+        harness.store().save_execution(&execution).expect("save");
+        let log = harness.store().event_log(&execution.id);
+        let attempt = "work-under-way";
+        log.append_next(
+            &execution.id,
+            EventData::ActionStarted {
+                action_execution_id: attempt.to_string(),
+                state_id: "work".to_string(),
+                action_type: "agent".to_string(),
+                decision_by: None,
+            },
+        )
+        .expect("append");
+        log.append_next(
+            &execution.id,
+            EventData::AgentSessionStarted {
+                session_id: "narsor-session".to_string(),
+                harness: "claude-code".to_string(),
+                action_execution_id: Some(attempt.to_string()),
+                resumed_session: None,
+                model: None,
+                effort: None,
+            },
+        )
+        .expect("append");
+        if let Some(reported) = case.reported {
+            record_session(
+                &harness.store(),
+                &execution.id,
+                attempt,
+                ReportedSession {
+                    harness: "claude-code".to_string(),
+                    harness_session_id: reported.to_string(),
+                },
+            )
+            .expect("record the session");
+        }
+        if case.completed {
+            log.append_next(
+                &execution.id,
+                EventData::AgentSessionCompleted {
+                    session_id: "narsor-session".to_string(),
+                    action_execution_id: Some(attempt.to_string()),
+                    harness_session_id: case.reported.map(str::to_string),
+                },
+            )
+            .expect("append");
+        } else {
+            let reconciliation = reconcile(&harness.store(), &execution.id).expect("reconcile");
+            assert_eq!(reconciliation.status, ExecutionStatus::Unknown, "{}", case.name);
+        }
+
+        let execution = harness.store().load_execution(&execution.id).expect("load");
+        let events = harness.events(&execution.id);
+        let found = resumable_agent_session(&harness.store(), &execution, &events);
+        assert_eq!(
+            found.map(|session| session.harness_session_id).as_deref(),
+            case.expected,
+            "{}",
+            case.name
+        );
+    }
+}
+
+/// A failure recorded before the session was kept with it reads as one
+/// without a session.
+#[test]
+fn a_step_failure_recorded_without_its_session_still_reads() {
+    let failure: StepFailure = serde_json::from_value(json!({
+        "state_id": "work",
+        "action_execution_id": "a-1",
+        "episode": "a-1",
+        "error": "the build broke",
+        "side_effect_free": false,
+    }))
+    .expect("an old record reads");
+    assert_eq!((failure.harness, failure.harness_session_id), (None, None));
 }

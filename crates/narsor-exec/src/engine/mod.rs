@@ -30,7 +30,8 @@ pub use recovery::{reconcile, Reconciliation, ReconciliationOutcome};
 pub use retry::RetrySchedule;
 pub use runner::{
     execution_episode, manual_override_allowed, owed_output_rescue, owed_reprompt,
-    plan_operator_transition, record_manual_transition, step_failure, terminal_status, ActionKind,
+    plan_operator_transition, record_manual_transition, resumable_agent_session, step_failure,
+    terminal_status, ActionKind, ResumableSession,
     Engine, EngineError, LastAgentStep, ManualTransition, OperatorTransition, OutputDecisionUndo,
     OutputRejection, OutputRescue, PendingStep, Recovery, RunHandle, StepFailure, TransitionPlan,
     UndoneOutputDecision, DEFAULT_ESCALATION_THRESHOLD, EVENT_CHANNEL_CAPACITY,
