@@ -12,7 +12,7 @@ execution: code
 ## Goal Capsule
 
 - **Objective:** On *Rozmowa*, the operator sees the selected step on the step strip marked in the same way as the open tab in the tab bar directly above it: a changed colour on the name and a heavy segment (`━`) under the name. The underline on the step name goes away.
-- **Means:** Reuse the tab bar's marker technique. The strip already has a rule row below the steps; draw the heavy segment in that row under the selected step, and drop the underline from `Styles::selected_step`.
+- **Means:** Reuse the tab bar's marker technique. The strip already has a rule row below the steps; draw the heavy segment in that row under the selected step, and remove `Styles::selected_step` so the name uses `selected_tab` (KTD3).
 - **Product authority:** The request from the operator (2026-11-22). Assumptions taken without the operator are in "Założenia do potwierdzenia".
 - **Open blockers:** None.
 - **Execution profile:** One small PR. TUI-only change in the `narsor` binary (`src/tui/`).
@@ -79,18 +79,69 @@ None. Each unclear point has a safe assumption above.
 
 ---
 
+
 ## Planning Contract
 
-### Notes for planning
+Product Contract preservation: Product Contract unchanged.
 
-- `step_strip_line` must also return where the selected name starts and how wide it is (in cells, relative to the steps' area), like `tab_bar` does. The glyph and its space come before the name inside a chip.
-- The steps' area starts 2 cells right of the strip's left edge and is `width - 3` wide; the segment offset in the rule must add the same 2 and be clamped to the room (R4), as in the tab bar code.
-- Tests: one test that renders the strip into a test buffer and checks AE1 (the `━` cells match the selected name's cells, the name has no underline), and one for AE3 or the narrow case (R5). Add them where the existing strip or tab bar render tests live.
+### Key Technical Decisions
+
+- KTD1. **`step_strip_line` also returns the selected name's start and width.** It returns them in cells, relative to the steps' area, next to the `Line`, as `tab_bar` in `src/tui/task_app/detail.rs` does. The layout loop already tracks `used`; the name starts at `used + gap + 2` (glyph and its space; `chip_widths` already counts them as 2) and is `chip_widths[selected] - 2` wide. Here "name" is the styled span that `step_name` builds: the step icon when there is one, its space, and the label (for example `✨ review #1`). A `…` prefix is already in `used`. With no steps (`brak kroków`) there is no selection to return, so no segment is drawn (R5). This keeps one layout pass as the only source of positions, so the segment cannot drift from the names (R2, R4).
+- KTD2. **`render_step_strip` builds the bottom rule with a segment.** It offsets the start by the same 2 cells as the steps' area and clamps start and end to `2 + room`, where `room` is the steps' area width (R4). It picks the segment style by the R3 rule with its own `focused` and `stale` arguments. The rest of the rule keeps `Role::Done` (A4). The strip's `focused` argument is the same flag the tab bar gets in `render_view`, so the two cues change focus together.
+- KTD3. **Remove `Styles::selected_step`; `step_chip` calls `Styles::selected_tab`.** This is the KD2 choice. `selected_step` has one caller (`step_chip`), and without the underline it would only alias `selected_tab`. Removing it also removes the doc comment that says the strip has no marker row.
+- KTD4. **The segment clamp and style choice are written again in `conversation.rs`, not shared with the tab bar.** The duplicated part is about five lines. A shared helper would change the tab bar code, and the stop conditions put tab bar changes out of scope.
+
+### Assumptions
+
+- The status glyphs from `progress::status_look` (`✓`, `✗`, `●`, `?`) are one cell wide. The existing layout depends on this already (`2 + cells(name)` per chip). KTD1 depends on it in the same way.
+
+### Scope Boundaries (planning)
+
+- Considered and not built: a shared "marker segment" helper for the tab bar and the strip (KTD4). It would be worth doing if a third marker row appears.
+
+---
+
+## Implementation Units
+
+### U1. Heavy segment under the selected step, no underline
+
+- **Goal:** The strip marks the selected step like the open tab: bold coloured name and `━` under it in the bottom rule.
+- **Requirements:** R1–R6, AE1–AE3. KD1, KD2.
+- **Dependencies:** None.
+- **Files:**
+  - `src/tui/task_app/tabs/conversation.rs` — `step_strip_line`, `render_step_strip`, `step_chip`, and the doc comment on `render_step_strip` (it says "bold and underlined").
+  - `src/tui/style.rs` — remove `selected_step` (KTD3).
+  - `tests/integration/tui_render.rs` — strip render tests.
+- **Approach:**
+  1. In `step_strip_line`, return the selected name's start and width with the line (KTD1).
+  2. In `render_step_strip`, build the third row with `rule_line(area.width, done, Some(segment), None)` when there is a selection (KTD2). The rows loop stops at `area.height`, so a strip lower than 3 rows draws no rule and no segment (R5). Keep the steps' row drawn after the rules.
+  3. In `step_chip`, use `styles.selected_tab(role)` for the selected name (R1, KTD3). Remove `Styles::selected_step`.
+  4. Update the `render_step_strip` doc comment to describe the new cue.
+- **Patterns to follow:** The tab bar marker in `render_view` (`src/tui/task_app/detail.rs`): `tab_bar` returns start and width, and the caller clamps them to the names' room and builds the segment style.
+- **Test scenarios** (in `tests/integration/tui_render.rs`, beside the existing strip tests. The direct `render_step_strip` tests catch layout and style on the strip. The full-screen tests catch the wiring in `render_view`. Neither catches what a real terminal does with wide emoji.):
+  - Covers AE1. Update `the_conversation_tab_has_the_steps_newest_first_between_two_rules`: the selected `✨ review #1` name is bold and not underlined. The row under the steps has `━` on exactly the buffer columns of `✨ review #1` (icon included, KTD1), with the focus foreground. No `━` is under the glyph or under `plan #1`. The existing "full rule" check on that row must accept `━`, so change it to allow `━` only in the selected name's cells. Do not remove it.
+  - Covers AE2. Update `right_shows_the_older_step_and_left_the_newer_one`: after `Right`, `━` is under `✨ plan #1` and not under `✨ review #1`. This replaces its underline assertion.
+  - Covers AE3. New test with 12 steps in a 40-cell strip, built like `a_narrow_strip_keeps_the_selected_step_in_view`, with the oldest step selected so the line starts with `…`: the `━` cells in row 2 are exactly the buffer columns of `✨ step0 #1` in row 1, and no `━` goes past column `2 + 37`.
+  - Edge (R5). In the same new test, as a table: a strip of height 2 draws no `━`, and a strip with no steps (`brak kroków`) has a bottom rule of `─` only.
+  - R3 and R6. In the same table: with `focused` false the segment is `━` in bold `Role::Done`. With `Styles::new(true)` (no colour) the name is bold and the segment is still `━` against `─`.
+- **Verification:** On *Rozmowa* the selected step has no underline and a `━` segment under its name that follows `h` / `l` and follow mode. The tests above pass.
+
+---
+
+## Verification Contract
+
+| Check | Command or step | Proves |
+|---|---|---|
+| Workspace tests | `cargo test --workspace` | R1–R6 through U1's tests. No other test broke. |
+| Build | `cargo build --workspace --bins` | `selected_step` has no other caller left. |
+| Manual look (optional) | Run `narsor`, open a task with several steps on *Rozmowa*, press `h` / `l`, `f`, and move the keys to the list | The segment follows the selection and turns grey when the strip loses the keys. Run it once with `NO_COLOR=1` for R6. |
 
 ---
 
 ## Definition of Done
 
-- R1–R6 hold, and AE1 plus one edge case (AE3 or R5) have tests.
-- No other test was weakened.
+- R1–R6 hold, and AE1, AE2, AE3, R3 (grey segment), R5 and R6 have tests (U1).
+- The two existing tests that asserted the underline now assert the new cue. No assertion was removed without a replacement, and no other test was weakened.
+- `Styles::selected_step` is gone, and no doc comment says the strip has an underline or no marker row.
+- No code from abandoned attempts stays in the diff.
 - `cargo test --workspace` passes.
