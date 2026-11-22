@@ -230,27 +230,23 @@ mod tests {
         std::fs::metadata(path).unwrap().mode() & 0o777
     }
 
+    /// A missing run directory is created, and one this user left wider
+    /// is tightened: either way only the owner may enter it.
     #[test]
-    fn creates_a_missing_run_dir_owner_only() {
-        let root = TempRoot::new("create");
-        let run = RunPaths::new(root.0.join("state"));
+    fn the_run_dir_is_owner_only_whether_missing_or_left_wider() {
+        for existing_mode in [None, Some(0o755)] {
+            let root = TempRoot::new(&format!("prepare-{existing_mode:?}"));
+            let run = RunPaths::new(root.0.join("state"));
+            if let Some(mode) = existing_mode {
+                std::fs::create_dir_all(run.dir()).unwrap();
+                std::fs::set_permissions(run.dir(), std::fs::Permissions::from_mode(mode)).unwrap();
+            }
 
-        run.prepare().expect("prepare a new run directory");
+            run.prepare().expect("prepare the run directory");
 
-        assert_eq!(mode_of(run.dir()), 0o700);
-        assert_eq!(run.daemon_file(), root.0.join("state/run/daemon.json"));
-    }
-
-    #[test]
-    fn tightens_a_wider_run_dir_of_this_user() {
-        let root = TempRoot::new("tighten");
-        let run = RunPaths::new(&root.0);
-        std::fs::create_dir(run.dir()).unwrap();
-        std::fs::set_permissions(run.dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        run.prepare().expect("tighten the run directory");
-
-        assert_eq!(mode_of(run.dir()), 0o700);
+            assert_eq!(mode_of(run.dir()), 0o700, "{existing_mode:?}");
+            assert_eq!(run.daemon_file(), root.0.join("state/run/daemon.json"));
+        }
     }
 
     #[test]

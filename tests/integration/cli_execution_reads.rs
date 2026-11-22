@@ -25,7 +25,7 @@ use narsor_api_client::api::token::TokenSource;
 use narsor_api_client::api::{ApiClient, ClientError};
 use narsor_engine::api::{conversation_response_from_snapshot, execution_details};
 use narsor_engine::conductor::{
-    ConductorState, ConductorStore, FailureOutcome, FailureReport, QueuedRequest,
+    Annotation, ConductorState, ConductorStore, FailureOutcome, FailureReport, QueuedRequest,
 };
 use narsor_engine::controller_protocol::{
     ControllerIdentity, ExecutionEventsPage, ProtocolConfig, ProtocolService,
@@ -36,7 +36,7 @@ use narsor_engine::domain::{
     GitIdentity, RepositoryInfo, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec,
     TaskRepository, TaskRepositorySource, TaskWorkspace, WorkflowExecution, Workspace,
 };
-use narsor_engine::engine::current_timeline;
+use narsor_engine::engine::{current_timeline, PendingHumanInput};
 use narsor_engine::orchestration::{
     BackendAvailability, BackendLease, CommandRequest, ControlPlane, ControllerReport,
     ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, NewTask, Observation,
@@ -505,19 +505,50 @@ fn fail_the_step_with_a_conductor_report(store: &ExecutionStore, execution: &str
 /// What `show --details` adds to the task record's lines for the execution
 /// [`fail_the_step_with_a_conductor_report`] leaves — as `show` printed it
 /// when the server still read local storage.
-fn expected_details() -> Vec<String> {
-    [
-        "Context variables:",
-        "  attempts = 2",
-        "  branch = \"feat/x\"",
-        "Problem (failure): the tests do not compile",
-        "  Failure: attempt-1",
-        "  Restart with: narsor-cli task restart-step <TASK> --failure-key attempt-1 [--note TEXT]",
-        "Conductor working: reply_to_chat (chat, since <T>)",
-    ]
-    .map(String::from)
-    .to_vec()
+const FAILED_STEP_DETAILS: &[&str] = &[
+    "Context variables:",
+    "  attempts = 2",
+    "  branch = \"feat/x\"",
+    "Problem (failure): the tests do not compile",
+    "  Failure: attempt-1",
+    "  Restart with: narsor-cli task restart-step <TASK> --failure-key attempt-1 [--note TEXT]",
+    "Conductor working: reply_to_chat (chat, since <T>)",
+];
+
+/// Makes the execution in `store` wait for its owner's input in `review`,
+/// with the conductor's summary of the gate beside it.
+fn wait_for_input_with_a_conductor_summary(store: &ExecutionStore, execution: &str) {
+    let mut record = store.load_execution(execution).unwrap();
+    record.status = ExecutionStatus::InputNeeded;
+    store.save_execution(&record).unwrap();
+    let pending: PendingHumanInput = serde_json::from_value(json!({
+        "execution_id": execution,
+        "state_id": "review",
+        "action_execution_id": "review-1",
+        "instruction": "Approve the plan?",
+        "episode": "episode-2",
+        "requested_at": Utc::now(),
+    }))
+    .unwrap();
+    store.save_pending_input(execution, &pending).unwrap();
+    ConductorStore::new(store.paths(), execution)
+        .save_annotation(&Annotation {
+            key: pending.episode_key().to_string(),
+            summary: "the plan covers both modules".to_string(),
+            recommendation: Some("approve".to_string()),
+            created_at: Utc::now(),
+        })
+        .unwrap();
 }
+
+/// What `show --details` adds for the execution
+/// [`wait_for_input_with_a_conductor_summary`] leaves.
+const INPUT_WITH_SUMMARY_DETAILS: &[&str] = &[
+    "Context variables:",
+    "  (none)",
+    "Conductor's summary: the plan covers both modules",
+    "  Recommends: approve",
+];
 
 /// What the runner of the execution in `store` reports: its status, its
 /// cursor and the timeline it works out of the store.
@@ -682,9 +713,30 @@ async fn cli_reads_a_stopped_local_task_through_a_reader_started_on_demand() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn show_details_adds_what_the_task_storage_holds_of_a_running_or_stopped_task() {
-    for stopped in [false, true] {
+    type Prepare = fn(&ExecutionStore, &str);
+    let cases: [(&str, Prepare, bool, &[&str]); 3] = [
+        (
+            "a failed step, running",
+            fail_the_step_with_a_conductor_report,
+            false,
+            FAILED_STEP_DETAILS,
+        ),
+        (
+            "a failed step, stopped",
+            fail_the_step_with_a_conductor_report,
+            true,
+            FAILED_STEP_DETAILS,
+        ),
+        (
+            "an input with the conductor's summary",
+            wait_for_input_with_a_conductor_summary,
+            false,
+            INPUT_WITH_SUMMARY_DETAILS,
+        ),
+    ];
+    for (name, prepare, stopped, expected) in cases {
         let fx = Fixture::new().await;
-        fail_the_step_with_a_conductor_report(&fx.storage("task-1"), EXECUTION);
+        prepare(&fx.storage("task-1"), EXECUTION);
         fx.running_task("task-1", LOCAL_OWNER, "local");
         let reader = stopped.then(|| {
             fx.stop("task-1", "local");
@@ -703,9 +755,9 @@ async fn show_details_adds_what_the_task_storage_holds_of_a_running_or_stopped_t
         let split = details
             .iter()
             .position(|line| line == "Context variables:")
-            .unwrap_or_else(|| panic!("no details (stopped: {stopped}): {details:#?}"));
-        assert_eq!(details[..split], show[..], "stopped: {stopped}");
-        assert_eq!(details[split..], expected_details(), "stopped: {stopped}");
+            .unwrap_or_else(|| panic!("{name}: no details: {details:#?}"));
+        assert_eq!(details[..split], show[..], "{name}");
+        assert_eq!(details[split..], expected[..], "{name}");
         if let Some(reader) = reader {
             reader.abort();
         }

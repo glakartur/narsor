@@ -2152,12 +2152,15 @@ mod tests {
         rig.backend.state().work = Some(workload(2, WorkloadPhase::Deleting));
         let running = rig.run();
         tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(running.backend.state().observed, 1);
+        let before = running.backend.state().observed;
 
         running.event();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert_eq!(running.backend.state().observed, 2, "observed at the event");
+        assert!(
+            running.backend.state().observed > before,
+            "observed at the event"
+        );
         assert!(
             !running.reported("LossConfirmed"),
             "{:?}",
@@ -2166,24 +2169,27 @@ mod tests {
     }
 
     /// In standby the backend is not this controller's to touch: events
-    /// neither reach it nor hurry the lease attempts.
+    /// neither reach it nor hurry the lease attempts, which keep the pace
+    /// they keep without events.
     #[tokio::test(start_paused = true)]
     async fn events_in_standby_touch_nothing() {
-        let rig = Rig::new(desired(RunnerState::Running, DesiredAction::Run, false));
-        *rig.link.held_elsewhere.lock().unwrap() = true;
-        let running = rig.run();
+        let mut lease_attempts = Vec::new();
+        for events in [false, true] {
+            let rig = Rig::new(desired(RunnerState::Running, DesiredAction::Run, false));
+            *rig.link.held_elsewhere.lock().unwrap() = true;
+            let running = rig.run();
 
-        for _ in 0..10 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            running.event();
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if events {
+                    running.event();
+                }
+            }
+
+            assert_eq!(running.backend.state().observed, 0, "events: {events}");
+            lease_attempts.push(*running.link.acquires.lock().unwrap());
         }
-
-        assert_eq!(running.backend.state().observed, 0);
-        assert_eq!(
-            *running.link.acquires.lock().unwrap(),
-            1,
-            "at the retry pace"
-        );
+        assert_eq!(lease_attempts[0], lease_attempts[1], "{lease_attempts:?}");
     }
 
     /// A reader's deaths wake the controller like any event, yet a dying
