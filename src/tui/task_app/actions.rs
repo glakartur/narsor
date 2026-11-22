@@ -1662,9 +1662,9 @@ fn framed(frame: &mut Frame, place: Rect, role: Role, title: &str, styles: &Styl
 /// come on top.
 const PANEL_FRAME_ROWS: u16 = 2;
 
-/// The fewest rows the action panel takes: its heading and two entries, or
-/// the message that it has none (R7). Below it, the list scrolls.
-pub const PANEL_MIN_ROWS: u16 = 6;
+/// The fewest rows the action panel takes: two entries, or the message that
+/// it has none (R7). Below it, the list scrolls.
+pub const PANEL_MIN_ROWS: u16 = 4;
 
 /// The rows the action panel would like for an area `width` columns wide,
 /// inside its frame.
@@ -1685,11 +1685,18 @@ pub fn render_panel(
     panel: &mut ActionPanel,
     styles: &Styles,
 ) {
-    let heading = if title.is_empty() {
-        "Akcje".to_string()
-    } else {
-        format!("Akcje · {title}")
+    // With a form, the frame title carries its path and step. Without one it
+    // is `Akcje`, which is also the start of the path.
+    let mut heading = match panel.content {
+        PanelContent::Entries => {
+            format!("{} · {}", panel.form.heading(), panel.form.step_text())
+        }
+        PanelContent::Nothing | PanelContent::NoData => "Akcje".to_string(),
     };
+    if !title.is_empty() {
+        heading.push_str(" · ");
+        heading.push_str(title);
+    }
     let inner = framed(frame, place, Role::Focus, &heading, styles);
     let padded = Rect::new(
         inner.x.saturating_add(1),

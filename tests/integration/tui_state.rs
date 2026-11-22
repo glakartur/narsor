@@ -7674,6 +7674,24 @@ mod task_app_actions {
             let text = screen(&mut app, 120, 40);
             assert!(text.contains(NOTHING_TEXT), "{text}");
             assert_eq!(unavailable(&task, TaskAction::Comment), NOT_OFFERED);
+            // No form, so the frame title has no step indicator. The check is
+            // on the frame row: the task header can say `krok`.
+            let frame_row = text
+                .lines()
+                .find(|row| row.contains('╭') && row.contains("Akcje"))
+                .unwrap_or_else(|| panic!("no panel frame row:\n{text}"));
+            assert!(!frame_row.contains("krok"), "{text}");
+        }
+
+        #[test]
+        fn the_panel_takes_no_rows_for_a_heading() {
+            // Covers AE3: the same panel was 2 rows higher with the heading.
+            let mut app = loaded(running("a", 1));
+            ch(&mut app, '.');
+            assert_eq!(
+                narsor::tui::task_app::actions::panel_height(panel(&app), 100),
+                8
+            );
         }
 
         #[test]
@@ -8295,8 +8313,20 @@ mod task_app_actions {
             assert_eq!(panel(&app).form().heading(), "Akcje › Wybierz krok");
             assert_eq!(panel_labels(&app), ["profile", "work", "check"]);
             let text = screen(&mut app, 120, 40);
-            assert!(text.contains("Akcje › Wybierz krok"), "{text}");
+            let frame_row = |text: &str| {
+                text.lines()
+                    .find(|row| row.contains('╭') && row.contains("Akcje"))
+                    .unwrap_or_else(|| panic!("no panel frame row:\n{text}"))
+                    .to_string()
+            };
+            assert!(
+                frame_row(&text).contains("Akcje › Wybierz krok · krok 1 z"),
+                "{text}"
+            );
             press(&mut app, KeyCode::Esc);
+            let text = screen(&mut app, 120, 40);
+            assert!(frame_row(&text).contains("Akcje · krok 1"), "{text}");
+            assert!(!text.contains("Akcje › Wybierz krok"), "{text}");
             assert_eq!(panel(&app).form().heading(), "Akcje");
             assert!(panel_labels(&app).contains(&"Wybierz krok".to_string()));
         }
