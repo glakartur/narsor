@@ -1,4 +1,5 @@
-//! What `narsor-cli list|show|events|steps|conversation` print for a task's
+//! What `narsor-cli list|show [--details]|events|steps|conversation` print
+//! for a task's
 //! execution, read from a served control plane (U8).
 //!
 //! The execution lives on the task's storage, which only its runner reads:
@@ -18,19 +19,22 @@ use std::time::Duration;
 use chrono::Utc;
 use narsor::cli::commands::{
     execution_conversation_lines, execution_event_lines, execution_list_lines,
-    execution_show_lines, execution_steps_lines,
+    execution_show_details_lines, execution_show_lines, execution_steps_lines,
 };
 use narsor_api_client::api::token::TokenSource;
 use narsor_api_client::api::{ApiClient, ClientError};
-use narsor_engine::api::conversation_response_from_snapshot;
+use narsor_engine::api::{conversation_response_from_snapshot, execution_details};
+use narsor_engine::conductor::{
+    ConductorState, ConductorStore, FailureOutcome, FailureReport, QueuedRequest,
+};
 use narsor_engine::controller_protocol::{
     ControllerIdentity, ExecutionEventsPage, ProtocolConfig, ProtocolService,
     RunnerCredentialRequest, RunnerDirective, RunnerIdentity, RunnerPollQuery, LOCAL_OWNER,
 };
 use narsor_engine::domain::{
-    BackendId, Context, Event, EventData, ExecutionStatus, GitIdentity, RepositoryInfo,
-    ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec, TaskRepository,
-    TaskRepositorySource, TaskWorkspace, WorkflowExecution, Workspace,
+    BackendId, ConductorPurpose, ConductorTrigger, Context, Event, EventData, ExecutionStatus,
+    GitIdentity, RepositoryInfo, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec,
+    TaskRepository, TaskRepositorySource, TaskWorkspace, WorkflowExecution, Workspace,
 };
 use narsor_engine::engine::current_timeline;
 use narsor_engine::orchestration::{
@@ -310,9 +314,9 @@ impl Drop for Fixture {
     }
 }
 
-/// A runner's side of the relayed reads: answers every events and
-/// conversation read of its task from `store`, as `narsor-runner` does,
-/// until it is told to go.
+/// A runner's side of the relayed reads: answers every events,
+/// conversation and details read of its task from `store`, as
+/// `narsor-runner` does, until it is told to go.
 async fn serve_reads(
     service: Arc<ProtocolService>,
     identity: RunnerIdentity,
@@ -353,6 +357,13 @@ async fn serve_reads(
                 &identity,
                 &request.request_id,
                 conversation_response_from_snapshot(snapshot),
+            );
+        }
+        for request in response.execution_details {
+            let _ = service.runner_execution_details(
+                &identity,
+                &request.request_id,
+                execution_details(&store, &execution).unwrap(),
             );
         }
     }
@@ -449,6 +460,65 @@ fn write_execution(store: &ExecutionStore, execution: &str) {
     conversations.close_attempt(ATTEMPT).unwrap();
 }
 
+/// Fails the step `plan` of the execution in `store` for good, as the engine
+/// records it, with context variables beside it: the conductor reported the
+/// failure as a problem and has a chat message queued.
+fn fail_the_step_with_a_conductor_report(store: &ExecutionStore, execution: &str) {
+    let mut record = store.load_execution(execution).unwrap();
+    record.status = ExecutionStatus::Failed;
+    record.current_state = Some("plan".to_string());
+    record.metadata = json!({"engine": {"step_failure": {
+        "state_id": "plan",
+        "action_execution_id": ATTEMPT,
+        "episode": "episode-1",
+        "error": "exit status 1",
+        "side_effect_free": false,
+    }}});
+    store.save_execution(&record).unwrap();
+    let mut context = Context::new();
+    context
+        .variables
+        .insert("branch".to_string(), json!("feat/x"));
+    context.variables.insert("attempts".to_string(), json!(2));
+    store.save_context(execution, &context).unwrap();
+    ConductorStore::new(store.paths(), execution)
+        .save_state(&ConductorState {
+            queue: vec![QueuedRequest::new(
+                ConductorTrigger::Chat,
+                ConductorPurpose::ReplyToChat,
+            )],
+            failure: Some(FailureReport {
+                key: ATTEMPT.to_string(),
+                episode: "episode-1".to_string(),
+                state_id: "plan".to_string(),
+                reason: "the tests do not compile".to_string(),
+                outcome: FailureOutcome::Unanswered {
+                    error: "exit status 1".to_string(),
+                },
+                concluded_at: Utc::now(),
+            }),
+            ..ConductorState::default()
+        })
+        .unwrap();
+}
+
+/// What `show --details` adds to the task record's lines for the execution
+/// [`fail_the_step_with_a_conductor_report`] leaves — as `show` printed it
+/// when the server still read local storage.
+fn expected_details() -> Vec<String> {
+    [
+        "Context variables:",
+        "  attempts = 2",
+        "  branch = \"feat/x\"",
+        "Problem (failure): the tests do not compile",
+        "  Failure: attempt-1",
+        "  Restart with: narsor-cli task restart-step <TASK> --failure-key attempt-1 [--note TEXT]",
+        "Conductor working: reply_to_chat (chat, since <T>)",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
 /// What the runner of the execution in `store` reports: its status, its
 /// cursor and the timeline it works out of the store.
 fn runner_snapshot(
@@ -497,17 +567,19 @@ fn runner_snapshot(
     }
 }
 
-/// `lines` with every RFC 3339 timestamp replaced by `<T>`.
+/// `lines` with every RFC 3339 timestamp replaced by `<T>`, closing
+/// parentheses after it kept.
 fn without_times(lines: Vec<String>) -> Vec<String> {
     lines
         .into_iter()
         .map(|line| {
             line.split(' ')
                 .map(|word| {
-                    if chrono::DateTime::parse_from_rfc3339(word).is_ok() {
-                        "<T>"
+                    let time = word.trim_end_matches(')');
+                    if chrono::DateTime::parse_from_rfc3339(time).is_ok() {
+                        format!("<T>{}", &word[time.len()..])
                     } else {
-                        word
+                        word.to_string()
                     }
                 })
                 .collect::<Vec<_>>()
@@ -609,6 +681,38 @@ async fn cli_reads_a_stopped_local_task_through_a_reader_started_on_demand() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_details_adds_what_the_task_storage_holds_of_a_running_or_stopped_task() {
+    for stopped in [false, true] {
+        let fx = Fixture::new().await;
+        fail_the_step_with_a_conductor_report(&fx.storage("task-1"), EXECUTION);
+        fx.running_task("task-1", LOCAL_OWNER, "local");
+        let reader = stopped.then(|| {
+            fx.stop("task-1", "local");
+            fx.start_readers("task-1", "local")
+        });
+
+        let show = without_times(execution_show_lines(&fx.client, EXECUTION).await.unwrap());
+        let details = without_times(
+            execution_show_details_lines(&fx.client, EXECUTION, READER_WAIT)
+                .await
+                .unwrap(),
+        );
+
+        // The record's lines, then what only the storage holds; `show`
+        // itself reads the record only.
+        let split = details
+            .iter()
+            .position(|line| line == "Context variables:")
+            .unwrap_or_else(|| panic!("no details (stopped: {stopped}): {details:#?}"));
+        assert_eq!(details[..split], show[..], "stopped: {stopped}");
+        assert_eq!(details[split..], expected_details(), "stopped: {stopped}");
+        if let Some(reader) = reader {
+            reader.abort();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_task_whose_reader_does_not_start_is_a_readable_error() {
     let fx = Fixture::new().await;
     fx.running_task("task-1", LOCAL_OWNER, "local");
@@ -643,6 +747,20 @@ async fn a_stopped_task_whose_reader_does_not_start_is_a_readable_error() {
     assert_eq!(
         without_times(execution_steps_lines(&fx.client, EXECUTION).await.unwrap()),
         expected_steps()
+    );
+    // `show --details` prints the record's part and says why the rest is
+    // missing.
+    let show = execution_show_lines(&fx.client, EXECUTION).await.unwrap();
+    let details = execution_show_details_lines(&fx.client, EXECUTION, wait)
+        .await
+        .unwrap();
+    let (unavailable, record) = details.split_last().unwrap();
+    assert_eq!(record, &show[..]);
+    assert!(
+        unavailable
+            .starts_with("Details (context variables, conductor, step problem) cannot be read: ")
+            && unavailable.contains("read-only runner is starting"),
+        "{unavailable}"
     );
 }
 
@@ -681,6 +799,9 @@ async fn an_execution_of_a_task_the_caller_does_not_own_is_refused_like_its_task
         execution_event_lines(&fx.client, EXECUTION, READER_WAIT)
             .await
             .unwrap_err(),
+        execution_show_details_lines(&fx.client, EXECUTION, READER_WAIT)
+            .await
+            .unwrap_err(),
     ];
     for refusal in refusals {
         assert_eq!(
@@ -699,6 +820,10 @@ async fn an_execution_of_a_task_the_caller_does_not_own_is_refused_like_its_task
     ));
     assert!(matches!(
         fx.client.control_timeline("task-1").await,
+        Err(ClientError::NotFound)
+    ));
+    assert!(matches!(
+        fx.client.control_execution_details("task-1").await,
         Err(ClientError::NotFound)
     ));
 }

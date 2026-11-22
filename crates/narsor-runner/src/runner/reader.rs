@@ -12,8 +12,8 @@
 //!    exist already; nothing is created or opened for writing, on a read-only
 //!    mount too;
 //! 2. finds the initialization marker and the launch spec on the storage;
-//! 3. long-polls with `read_only` set and answers only page, event and
-//!    conductor reads, until the directive is anything but `continue` or the
+//! 3. long-polls with `read_only` set and answers only page, event,
+//!    conductor and details reads, until the directive is anything but `continue` or the
 //!    control plane refuses its credential.
 //!
 //! It skips every step of a working start that writes: no directory
@@ -34,8 +34,8 @@ use std::time::Duration;
 
 use crate::api::ClientError;
 use crate::controller_client::{
-    ConductorReadRequest, ConversationPageRequest, ExecutionEventsPage, ExecutionEventsRequest,
-    RelayFailure, RunnerDirective, RunnerPollQuery, RunnerPollResponse,
+    ConductorReadRequest, ConversationPageRequest, ExecutionDetailsRequest, ExecutionEventsPage,
+    ExecutionEventsRequest, RelayFailure, RunnerDirective, RunnerPollQuery, RunnerPollResponse,
 };
 use crate::persistence::ExecutionStore;
 use narsor_protocol::controller::RunnerProblem;
@@ -176,6 +176,12 @@ fn waiting_request_ids(response: RunnerPollResponse) -> Vec<String> {
                 .into_iter()
                 .map(|request| request.request_id),
         )
+        .chain(
+            response
+                .execution_details
+                .into_iter()
+                .map(|request| request.request_id),
+        )
         .collect()
 }
 
@@ -247,6 +253,9 @@ async fn answer(
             view.without_conductor(NO_CONDUCTOR)
         })
         .await;
+    }
+    for request in response.execution_details {
+        serve_details(link, timing, store, execution_id, request).await;
     }
     None
 }
@@ -326,6 +335,34 @@ pub(super) fn events_page(
         .event_log(execution_id)
         .read_after(request.after, request.limit as usize)?;
     Ok(ExecutionEventsPage { events, has_more })
+}
+
+/// Uploads the details of the execution an owner waits for: its context
+/// variables, the conductor's summary and activity, a failed step's problem.
+pub(super) async fn serve_details(
+    link: &mut Link,
+    timing: &RunnerTiming,
+    store: &ExecutionStore,
+    execution_id: &str,
+    request: ExecutionDetailsRequest,
+) {
+    let Some(client) = link.client() else {
+        return;
+    };
+    let details = match crate::api::execution_details(store, execution_id) {
+        Ok(details) => details,
+        Err(error) => {
+            tracing::warn!(%error, "cannot read the execution's details");
+            fail_read(link, timing, &request.request_id, &error.to_string()).await;
+            return;
+        }
+    };
+    if let Err(error) = client
+        .upload_execution_details(&request.request_id, &details)
+        .await
+    {
+        link.failed(&error, timing);
+    }
 }
 
 /// Uploads the conductor's state an owner waits for; `describe` says whether

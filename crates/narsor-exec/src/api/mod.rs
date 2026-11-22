@@ -13,5 +13,7 @@ pub use dto::{
     SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse, TransitionRequest,
 };
 pub use narsor_shared::api_error::{handle_json_response, ClientError};
+mod details;
 mod projection;
+pub use details::execution_details;
 pub use projection::conversation_response_from_snapshot;

@@ -1,8 +1,13 @@
-//! Conversation and execution-event reads relayed through a runner.
+//! Conversation, execution-event and execution-details reads relayed
+//! through a runner.
+
+use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::api::{ActiveProblem, AnnotationDto, ConductorActivity};
 use crate::event::Event;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,6 +29,52 @@ pub struct ExecutionEventsRequest {
 pub struct ExecutionEventsPage {
     pub events: Vec<crate::event::Event>,
     pub has_more: bool,
+}
+
+/// A runner's request for the details of its execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionDetailsRequest {
+    pub request_id: String,
+}
+
+/// What only a task's storage holds about its execution, beside what its
+/// task record says: the context variables, the conductor's summary of the
+/// question it waits on, what the conductor works on, and the problem a
+/// failed step leaves the owner.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionDetails {
+    #[serde(default)]
+    pub variables: HashMap<String, Value>,
+    /// The conductor's report on the step the execution is failed on, when
+    /// it leaves a problem to the owner. An output problem is the pending
+    /// input's, and in the task record already.
+    #[serde(default)]
+    pub problem: Option<ActiveProblem>,
+    /// The conductor's summary of the pending input.
+    #[serde(default)]
+    pub annotation: Option<AnnotationDto>,
+    /// What the conductor works on, or the diagnosis a failed step owes.
+    #[serde(default)]
+    pub conductor: Option<ConductorActivity>,
+}
+
+/// Result of the owner task's execution-details request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ExecutionDetailsResponse {
+    /// The details, read from the task's storage.
+    Available {
+        details: Box<ExecutionDetails>,
+        /// Where they were read from.
+        source: ExecutionEventsSource,
+    },
+    /// Not readable right now.
+    Unavailable {
+        /// Why the details cannot be read.
+        reason: ConversationUnavailableReason,
+        /// Human-readable explanation.
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

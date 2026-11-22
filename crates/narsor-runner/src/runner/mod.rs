@@ -118,9 +118,9 @@ use tokio::time::Instant;
 use crate::api::ClientError;
 use crate::conductor::LiveHarness;
 use crate::controller_client::{
-    ConversationPageRequest, DeliveredInput, ExecutionEventsRequest, RunnerClient, RunnerDirective,
-    RunnerLaunchView, RunnerPollQuery, RunnerPollResponse, RunnerSnapshotResponse,
-    TaskDefaultHarness,
+    ConversationPageRequest, DeliveredInput, ExecutionDetailsRequest, ExecutionEventsRequest,
+    RunnerClient, RunnerDirective, RunnerLaunchView, RunnerPollQuery, RunnerPollResponse,
+    RunnerSnapshotResponse, TaskDefaultHarness,
 };
 use crate::domain::runner_snapshot::RunnerSnapshot;
 use crate::domain::{
@@ -1645,6 +1645,9 @@ impl Session {
         for request in response.conductor_reads {
             self.serve_conductor_read(request).await;
         }
+        for request in response.execution_details {
+            self.serve_details(request).await;
+        }
         if !response.materials.is_empty() && !self.materials_deferred() {
             self.receive_materials(response.materials).await;
         }
@@ -1775,6 +1778,21 @@ impl Session {
             return;
         };
         reader::serve_page(
+            &mut self.link,
+            &self.timing,
+            self.engine.store(),
+            &execution_id,
+            request,
+        )
+        .await;
+    }
+
+    /// Uploads the details of the execution an owner waits for.
+    async fn serve_details(&mut self, request: ExecutionDetailsRequest) {
+        let Some(execution_id) = self.execution_id.clone() else {
+            return;
+        };
+        reader::serve_details(
             &mut self.link,
             &self.timing,
             self.engine.store(),

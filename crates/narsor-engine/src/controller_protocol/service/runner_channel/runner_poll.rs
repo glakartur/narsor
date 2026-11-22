@@ -217,6 +217,7 @@ impl ProtocolService {
                 conversation_pages: self.lock_pages().requests_of(&identity.task_id),
                 execution_events: self.lock_event_reads().requests_of(&identity.task_id),
                 conductor_reads: self.lock_conductor_reads().requests_of(&identity.task_id),
+                execution_details: self.lock_detail_reads().requests_of(&identity.task_id),
                 materials,
                 default_harness: self.default_harness_of(&record),
             })
@@ -246,6 +247,7 @@ impl ProtocolService {
                     || !response.conversation_pages.is_empty()
                     || !response.execution_events.is_empty()
                     || !response.conductor_reads.is_empty()
+                    || !response.execution_details.is_empty()
                     || (!defer_materials && !response.materials.is_empty())
                     || response.directive != RunnerDirective::Continue;
                 Ok(actionable.then_some(response))

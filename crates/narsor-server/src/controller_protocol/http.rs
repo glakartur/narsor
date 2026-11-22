@@ -167,6 +167,10 @@ where
         )
         .route("/control/v1/tasks/{task_id}/conductor", get(get_conductor))
         .route(
+            "/control/v1/tasks/{task_id}/execution-details",
+            get(get_execution_details),
+        )
+        .route(
             "/control/v1/tasks/{task_id}/conversation",
             get(get_conversation),
         )
@@ -275,6 +279,10 @@ where
         .route(
             "/runner/v1/conductor-reads/{request_id}",
             post(post_conductor_read),
+        )
+        .route(
+            "/runner/v1/execution-details/{request_id}",
+            post(post_execution_details),
         )
         .route(
             "/runner/v1/relay-failures/{request_id}",
@@ -542,6 +550,14 @@ async fn get_conductor(
     Query(query): Query<ConductorReadQuery>,
 ) -> ProtocolResult<Json<ConductorReadResponse>> {
     Ok(Json(service.conductor(&owner, &task_id, query).await?))
+}
+
+async fn get_execution_details(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(task_id): Path<String>,
+) -> ProtocolResult<Json<ExecutionDetailsResponse>> {
+    Ok(Json(service.execution_details(&owner, &task_id).await?))
 }
 
 async fn get_conversation(
@@ -1020,6 +1036,20 @@ async fn post_relay_failure(
     Ok(Json(
         blocking(&service, move |s| {
             s.runner_relay_failure(&identity, &request_id, &failure.reason)
+        })
+        .await?,
+    ))
+}
+
+async fn post_execution_details(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Path(request_id): Path<String>,
+    Json(details): Json<ExecutionDetails>,
+) -> ProtocolResult<Json<ConversationPageAccepted>> {
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.runner_execution_details(&identity, &request_id, details)
         })
         .await?,
     ))

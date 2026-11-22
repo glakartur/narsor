@@ -7,6 +7,8 @@
 //! the same for every backend (U8). Its events and conversation come from
 //! the task's runner — for a stopped task, a read-only runner started on
 //! demand (D63) — and its steps from the timeline the runner reported.
+//! `show` reads the task record only; `show --details` adds what the
+//! runner reads from the task's storage.
 
 use std::path::Path;
 use std::time::Duration;
@@ -14,11 +16,12 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::time::Instant;
 
-use crate::api::{ApiClient, ClientError, ConversationResponse};
+use crate::api::{ApiClient, ClientError, ConversationResponse, ExecutionSummary};
 use crate::config::Flags;
 use crate::controller_protocol::{
-    ConversationPageQuery, ConversationUnavailableReason, ExecutionEventsQuery,
-    ExecutionEventsResponse, CONVERSATION_READER_STARTING,
+    ConversationPageQuery, ConversationUnavailableReason, ExecutionDetails,
+    ExecutionDetailsResponse, ExecutionEventsQuery, ExecutionEventsResponse,
+    CONVERSATION_READER_STARTING,
 };
 use crate::domain::{without_unsafe_chars, Event};
 use crate::tui::conversation::{classify, unclassified_preview};
@@ -87,18 +90,92 @@ fn print_lines(lines: Vec<String>) {
     }
 }
 
-/// `narsor show <id>` — the current state, the status and what waits on
-/// the owner, as the execution's task record holds them.
-pub async fn show(state: &Path, flags: &Flags, execution_id: &str) -> Result<()> {
+/// `narsor show <id> [--details]` — the current state, the status and what
+/// waits on the owner, as the execution's task record holds them; with
+/// `details`, also what only the task's storage holds, read through its
+/// runner ([`execution_show_details_lines`]).
+pub async fn show(state: &Path, flags: &Flags, execution_id: &str, details: bool) -> Result<()> {
     let client = daemon_client(state, flags).await?;
-    print_lines(execution_show_lines(&client, execution_id).await?);
+    let lines = if details {
+        execution_show_details_lines(&client, execution_id, READER_WAIT).await?
+    } else {
+        execution_show_lines(&client, execution_id).await?
+    };
+    print_lines(lines);
     Ok(())
 }
 
-/// The lines `narsor show` prints for one execution.
+/// The lines `narsor show` prints for one execution: its task record only,
+/// so no runner is asked and none is started.
 pub async fn execution_show_lines(client: &ApiClient, execution_id: &str) -> Result<Vec<String>> {
     let execution = load_execution_summary(client, execution_id).await?;
+    Ok(show_lines(&execution, false))
+}
 
+/// The lines `narsor show --details` prints: those of the task record with
+/// the context variables, the conductor's summary and activity and a failed
+/// step's problem the task's runner reads from its storage; a stopped task's
+/// read-only runner is waited for up to `reader_wait`.
+///
+/// When the details cannot be read, the task record's lines are printed with
+/// a line that says why.
+pub async fn execution_show_details_lines(
+    client: &ApiClient,
+    execution_id: &str,
+    reader_wait: Duration,
+) -> Result<Vec<String>> {
+    let found = load_execution(client, execution_id).await?;
+    let mut execution = found.execution;
+    match execution_details(client, execution_id, &found.task_id, reader_wait).await? {
+        Ok(details) => {
+            execution.variables = details.variables;
+            execution.problem = execution.problem.or(details.problem);
+            execution.annotation = details.annotation;
+            execution.conductor = details.conductor;
+            Ok(show_lines(&execution, true))
+        }
+        Err(reason) => {
+            let mut lines = show_lines(&execution, false);
+            lines.push(format!(
+                "Details (context variables, conductor, step problem) cannot be read: {}",
+                without_unsafe_chars(&reason)
+            ));
+            Ok(lines)
+        }
+    }
+}
+
+/// The details of the execution of `task_id` from its runner, or why they
+/// cannot be read. Only a failure to reach the daemon or to be let in is an
+/// error.
+async fn execution_details(
+    client: &ApiClient,
+    execution_id: &str,
+    task_id: &str,
+    reader_wait: Duration,
+) -> Result<std::result::Result<ExecutionDetails, String>> {
+    let deadline = Instant::now() + reader_wait;
+    loop {
+        match client.control_execution_details(task_id).await {
+            Ok(ExecutionDetailsResponse::Available { details, .. }) => return Ok(Ok(*details)),
+            Ok(ExecutionDetailsResponse::Unavailable {
+                reason: ConversationUnavailableReason::ReaderStarting,
+                ..
+            }) if Instant::now() < deadline => tokio::time::sleep(READER_RETRY).await,
+            Ok(ExecutionDetailsResponse::Unavailable { message, .. }) => return Ok(Err(message)),
+            Err(
+                ClientError::Refused { message, .. }
+                | ClientError::Degraded { message, .. }
+                | ClientError::Request { message, .. },
+            ) => return Ok(Err(message)),
+            Err(ClientError::Server(detail)) => return Ok(Err(detail)),
+            Err(error) => return Err(client_error(execution_id, error)),
+        }
+    }
+}
+
+/// The lines of `execution`; with `details`, its context variables too.
+fn show_lines(execution: &ExecutionSummary, details: bool) -> Vec<String> {
     let mut lines = vec![
         format!("Execution:     {}", execution.id),
         format!(
@@ -116,11 +193,25 @@ pub async fn execution_show_lines(client: &ApiClient, execution_id: &str) -> Res
         lines.push(format!("Finished:      {}", completed_at.to_rfc3339()));
     }
 
+    if details {
+        lines.push("Context variables:".to_string());
+        if execution.variables.is_empty() {
+            lines.push("  (none)".to_string());
+        } else {
+            let mut names: Vec<&String> = execution.variables.keys().collect();
+            names.sort();
+            for name in names {
+                let value = &execution.variables[name];
+                lines.push(format!("  {name} = {value}"));
+            }
+        }
+    }
+
     if let Some(pending) = &execution.pending_input {
         lines.extend(pending_input_lines(pending));
     }
-    lines.extend(conductor_matter_lines(&execution));
-    Ok(lines)
+    lines.extend(conductor_matter_lines(execution));
+    lines
 }
 
 /// `narsor events <id> [--follow]` — the event log, in sequence order.

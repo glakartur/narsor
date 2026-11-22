@@ -105,6 +105,7 @@ Task id and backend id: 1–128 characters of `[A-Za-z0-9._-]`, first character 
 | T12 | GET | `/control/v1/tasks/{task_id}/attempts/{attempt_id}/conversation?from=N&byte_budget=B` | 200 `ConversationPage` | yes |
 | T13 | GET | `/control/v1/tasks/{task_id}/execution-events?after=N&limit=L` | 200 `ExecutionEventsResponse` | yes |
 | T14 | GET | `/control/v1/tasks/{task_id}/conductor?after=N&limit=L` | 200 `ConductorReadResponse` | yes |
+| T15 | GET | `/control/v1/tasks/{task_id}/execution-details` | 200 `ExecutionDetailsResponse` | CLI |
 | S1 | GET | `/control/v1/events/stream?cursor=C&task_id=ID` | 200 `text/event-stream` | yes |
 | M1 | GET | `/control/v1/tasks/{task_id}/materials` | 200 `MaterialListResponse` | CLI |
 | M2 | POST | `/control/v1/tasks/{task_id}/materials` | **201** (or 200 when replayed) `MaterialUploadResponse` | CLI |
@@ -942,6 +943,37 @@ Errors: `503 runner_timeout | runner_read_failed`, `404`.
 ```
 
 To act: T7 with `confirm_proposal` / `reject_proposal` (`proposal_id`), `undo_decision` (`decision_id`, only when `undoable`), `conductor_chat` (`text`), `restart_step` (`failure_key` = `failure.key`).
+
+### T15 `GET /control/v1/tasks/{task_id}/execution-details`
+
+What only the task's storage holds about its execution, beside the task record
+(`narsor-cli show --details`). No query. Relayed like T12: the live runner
+answers it, or for a stopped task a read-only runner the control plane starts.
+The same owner check as every task read: a task of another owner is `404`.
+Response 200, tagged with `status`:
+
+```json
+{ "status": "available", "source": "runner", "details": {
+    "variables": { "branch": "feat/x", "attempts": 2 },
+    "problem": { "kind": "failure", "reason": "…", "episode": "attempt-id" },
+    "annotation": { "key": "…", "summary": "…", "recommendation": "…", "created_at": "…" },
+    "conductor": { "purpose": "diagnose_failure", "trigger": "step_failure", "episode": "…", "started_at": "…" } } }
+{ "status": "unavailable", "reason": "reader_starting", "message": "…" }
+```
+
+- `variables`: the execution's context variables (any JSON values).
+- `problem`: the conductor's report on the step a `failed` execution is stopped
+  on, when it leaves a problem to the owner; `null` otherwise. An output
+  problem is the pending input's and is in the task record (`ExecutionSummary.problem`).
+- `annotation`: the conductor's summary of the pending input; `null` when there
+  is none.
+- `conductor`: what the conductor works on (the invocation under way, else the
+  first queued request, else the diagnosis a failed step still owes); `null`
+  when it has nothing to do.
+
+`unavailable` is a **200** answer, as for T13; ask again on `reader_starting`.
+Errors: `503 runner_timeout | runner_read_failed` (retry), `404`. The runner
+uploads its answer with `POST /runner/v1/execution-details/{request_id}`.
 
 ---
 

@@ -581,6 +581,20 @@ impl RunnerClient {
             .await
     }
 
+    /// `POST /runner/v1/execution-details/:request_id`.
+    pub async fn upload_execution_details(
+        &self,
+        request_id: &str,
+        details: &ExecutionDetails,
+    ) -> Result<ConversationPageAccepted, ClientError> {
+        self.transport
+            .post(
+                &format!("/runner/v1/execution-details/{request_id}"),
+                details,
+            )
+            .await
+    }
+
     /// `POST /runner/v1/conductor-reads/:request_id`.
     pub async fn upload_conductor_read(
         &self,

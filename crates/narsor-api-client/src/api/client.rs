@@ -79,8 +79,8 @@ use crate::controller_protocol::ConductorReadResponse;
 use narsor_protocol::controller::{
     CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
     ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest,
-    CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery,
-    ExecutionEventsResponse, HarnessUsageResponse, ObserverClaimResponse,
+    CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionDetailsResponse,
+    ExecutionEventsQuery, ExecutionEventsResponse, HarnessUsageResponse, ObserverClaimResponse,
     ObserverCreateTaskRequest, ObserverDecideRequest, ObserverEffectResponse, ObserverRunReport,
     ObserverRunResultResponse, ObserverWorkerRun, OwnerCommandRequest, RepositoryBranchesResponse,
     RepositoryListResponse, RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest,
@@ -597,6 +597,22 @@ impl ApiClient {
             self.base_url
         );
         self.get_relayed(&url, query).await
+    }
+
+    /// The details of a task's execution that only its storage holds — the
+    /// context variables, the conductor's summary and activity, a failed
+    /// step's problem — from the live runner or, for a stopped task, its
+    /// read-only runner, through the relay. Waits for the runner like an
+    /// events page, so it shares its timeout.
+    pub async fn control_execution_details(
+        &self,
+        task_id: &str,
+    ) -> Result<ExecutionDetailsResponse, ClientError> {
+        let url = format!(
+            "{}/control/v1/tasks/{task_id}/execution-details",
+            self.base_url
+        );
+        self.get_relayed(&url, &()).await
     }
 
     /// The state of a task's conductor — chat after `query.after`,
