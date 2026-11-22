@@ -80,8 +80,8 @@ Current state (from `crates/narsor-model/src/workflow/schema.rs`):
   names the state and says that the keys are aliases and only `message` must
   stay. No precedence rule is applied.
 - R4. Validation and template errors that name the field (missing or blank
-  field, a part path such as `prompt[2].when`, rendering locations) name the
-  key the author wrote. Where the key is missing, the error names `message`.
+  field, a part path such as `message[2].when`, rendering locations) name the
+  canonical key `message`, whichever key the author wrote.
 - R5. Required/optional status, blank-text checks, `PromptText` parts and
   `when`, the `steps.ID.*` reference rules and every other rule of a field do
   not change. Only the key name changes.
@@ -149,8 +149,9 @@ Current state (from `crates/narsor-model/src/workflow/schema.rs`):
   `message` in the same change; test fixtures stay as they are. Reason: new
   authors copy from docs and templates; fixtures that keep `prompt` test the
   alias.
-- Z8. Error messages name the key the author wrote (R4). Reason: an error that
-  names a key that is not in the file confuses the author.
+- Z8. Error messages name the canonical key `message` (R4). Reason: the
+  compiled model keeps one field, so echoing the written key would need a new
+  field in the sealed snapshot. Decided by the author (Q1, option a).
 
 ---
 
@@ -166,8 +167,4 @@ These entries are review items left for the author. They do not block implementa
 
 ### From 2026-11-22 review
 
-- **Echoing the author's key in errors needs the written key stored in the workflow model** — R4 and Z8 (P2, feasibility and scope-guardian, confidence 75)
-
-  Requirement R4 asks every error that names the step text field to repeat the key the author wrote. A serde alias is resolved while the file is parsed, so the compiled workflow model keeps only one field. The validator and the template renderer both run on that model and hard-code the key name in their messages. To keep R4, the written key must be stored per field in the model and survive the round trip through the sealed task data. This is much more than the "only the key name changes" that R5 and the Scope Boundaries state. Whether to relax R4 and Z8 is the author's decision.
-
-  Change: Make every validation and template error name the canonical key `message`, with the state and location prefix the loader already adds. Drop the requirement to echo the author's key, and update the example part path in R4 to `message[2].when`.
+- Resolved: R4 and Z8 now say that errors name the canonical key `message` (Q1, option a). No open items.

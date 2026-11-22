@@ -16,16 +16,16 @@ execution: code
 
 - **Objective:** A workflow author writes `message:` for the step text on every step type that has one, and every workflow that loads today still loads and runs the same way.
 - **Means:** a serde alias `prompt` on the canonical `message` key of each in-scope schema struct, plus a raw-YAML check per state that rejects both keys on one step (KTD1, KTD2).
-- **Authority:** the origin requirements (R1–R9) win on product behavior. KTDs win on mechanism. Units override neither. The only planned deviation from the origin is R4, and it is gated on the person's answer (see "Pytania otwarte dla użytkownika", Q1).
+- **Authority:** the origin requirements (R1–R9) win on product behavior. KTDs win on mechanism. Units override neither.
 - **Stop conditions:** stop and report if a sealed launch spec turns out to store workflow YAML (not the compiled JSON definition), or if a serde alias on a field of an internally tagged enum variant does not behave as KTD1 expects.
 - **Execution profile:** one pull request. All changes sit in `crates/narsor-model`, docs and the bundled workflows.
-- **Who finishes:** the implementer runs `cargo test --workspace` and opens the PR. The merge waits on the answer to Q1.
+- **Who finishes:** the implementer runs `cargo test --workspace` and opens the PR.
 
 ---
 
 ## Product Contract
 
-Product Contract preservation: changed: R4 — planned in its relaxed form (every model-level error names the canonical `message`), pending the person's answer to Q1. All other R/A/F IDs unchanged.
+Product Contract preservation: unchanged. R4 in the origin now names the canonical `message` (Q1, option a).
 
 ### Summary
 
@@ -57,7 +57,7 @@ Authors must remember that `agent` and `profile` take `prompt` while `decision` 
 
 **Errors and field rules**
 
-- R4. (Planned form, pending Q1.) Every validation and template error that names the step-text field names the canonical key `message`, with the state and location prefix that the loader and renderer already add. A part path reads `message[2].when`. Origin form: errors name the key the author wrote, and `message` only where the key is missing.
+- R4. Every validation and template error that names the step-text field names the canonical key `message`, with the state and location prefix that the loader and renderer already add. A part path reads `message[2].when`.
 - R5. Required/optional status, blank-text checks, `PromptText` parts and `when`, the `steps.ID.*` reference rules and every other rule of the field stay the same. Only the key name changes.
 
 **Compatibility**
@@ -79,7 +79,7 @@ Authors must remember that `agent` and `profile` take `prompt` while `decision` 
 - **Deprecation is documented only, no load diagnostic** (origin Z5). Governs R8. See Q2: the premise of Z5 is not correct, because a `LoadDiagnostic` channel exists.
 - **Internal Rust field names do not change** (origin Z6). Governs R5.
 - **Docs, template and bundled workflows move to `message`; test fixtures stay** (origin Z7). Governs R8, R9.
-- **Error messages name the canonical key** (replaces origin Z8, pending Q1). Governs R4.
+- **Error messages name the canonical key** (origin Z8, decided in Q1). Governs R4.
 
 ### Success Criteria
 
@@ -94,18 +94,17 @@ Authors must remember that `agent` and `profile` take `prompt` while `decision` 
 - Removing the `prompt` alias is not part of this work.
 - `script` steps have no step text and are out of scope.
 - Mass rewrite of test fixtures from `prompt` to `message` is not required.
-- Considered and not built: storing the written key in the compiled `State` so that every error can echo it (origin R4 form). It touches the sealed snapshot format and the signature of `TemplateScope::render_action`. U5 describes it in case the person keeps the origin R4 (Q1).
+- Considered and not built: storing the written key in the compiled `State` so that every error can echo it (Q1, option b). It touches the sealed snapshot format and the signature of `TemplateScope::render_action`. The person chose option a.
 - Considered and not built: a `LoadDiagnostic` for `prompt` (Q2). Evidence that would change the call: the person asks for it.
 
 ### Pytania otwarte dla użytkownika
 
-Te pytania wymagają decyzji osoby. Plan ma rekomendowaną odpowiedź dla każdego pytania. Odpowiedź na Q1 blokuje scalenie (merge) zmiany, ale nie blokuje implementacji.
+Obie decyzje są podjęte: Q1 i Q2, opcja 1. Nic nie blokuje scalenia.
 
 - Q1. **R4 / Z8 (sekcja Requirements, Errors and field rules): czy błędy mają powtarzać klucz, który napisał autor?** Alias serde jest rozwiązywany podczas parsowania, więc skompilowany model (`WorkflowDefinition`) zna tylko jedno pole. Walidator działa na tym modelu w kilku miejscach (ładowanie katalogu, tworzenie zadania, wznowienie zadania z zapieczętowanej migawki), a renderer szablonów działa w czasie wykonania.
-  1. (Rekomendowane, zaplanowane w U3) Wszystkie błędy walidacji i renderowania podają kanoniczny klucz `message`, np. `message[2].when`. Błąd R3 (oba klucze) podaje oba klucze. Najmniej zmian, bez zmiany formatu migawki.
-  2. Zachować R4 w oryginalnej formie: zapisać napisany klucz w `State` i przekazać go do walidatora i renderera (U5). Większa zmiana: nowe pole w zapieczętowanej migawce, zmiana sygnatury `render_action`. Zadania zapieczętowane przed zmianą i tak pokażą `message`.
+  1. (Wybrane przez osobę, zaplanowane w U3) Wszystkie błędy walidacji i renderowania podają kanoniczny klucz `message`, np. `message[2].when`. Błąd R3 (oba klucze) podaje oba klucze. Najmniej zmian, bez zmiany formatu migawki.
 - Q2. **Z5 (sekcja Key Decisions): czy loader ma zgłaszać ostrzeżenie o przestarzałym kluczu `prompt`?** Założenie Z5 mówi, że loader nie ma kanału ostrzeżeń. To nie jest prawda: `LoadDiagnostic` w `crates/narsor-model/src/workflow/loader.rs` już istnieje (np. `DeprecatedStateShape`), a `load_from_file` i `compile` zapisują diagnostyki do logu.
-  1. (Rekomendowane, zaplanowane) Bez ostrzeżenia w tej zmianie; deprecjacja tylko w dokumentacji, zgodnie z Z5. Ostrzeżenie można dodać razem z decyzją o usunięciu aliasu (Z4).
+  1. (Wybrane przez osobę, zaplanowane) Bez ostrzeżenia w tej zmianie; deprecjacja tylko w dokumentacji, zgodnie z Z5. Ostrzeżenie można dodać razem z decyzją o usunięciu aliasu (Z4).
   2. Dodać jeden wariant `LoadDiagnostic` (jedno ostrzeżenie na workflow, który używa `prompt`). Mała zmiana w `narsor-model`, ale wiele testowych fixture'ów z `prompt` też będzie go generować.
 
 ---
@@ -117,7 +116,7 @@ Te pytania wymagają decyzji osoby. Plan ma rekomendowaną odpowiedź dla każde
 - KTD1. **A serde `alias = "prompt"` on a field renamed to `message` in each schema struct.** `AgentActionSchema`, `ProfileActionSchema` and `AgentDecisionSchema` rename their field to `message` with alias `prompt`. `DecisionActionSchema`, `HumanActionSchema` and `HumanDecisionSchema` add alias `prompt` to `message`. With `deny_unknown_fields`, serde accepts either key, and a missing required key reports ``missing field `message` `` under the existing `states.<id>:` prefix that `parse_state` adds. The compile step maps the schema field to the unchanged domain field. Rejected: a custom `Deserialize` per struct (more code, same result).
 - KTD2. **R3 is a check on the raw YAML of each state, before serde runs.** `parse_state` in `crates/narsor-model/src/workflow/schema.rs` already holds each state as a `serde_yaml::Value` with its id. A small helper looks at the `action` mapping (both shapes) and the legacy `decision` mapping. When the mapping's `type` is an in-scope type and it contains both `message` and `prompt`, it returns `states.<id>.action: 'message' and 'prompt' are aliases of one field; keep only 'message'` (or `states.<id>.decision: …`). Without this check serde would report only ``duplicate field `message` ``, which does not say the keys are aliases. Rejected: relying on the serde duplicate-field error.
 - KTD3. **Sealed tasks need no change.** `TaskLaunchSpec.definition` stores the compiled `WorkflowDefinition` as JSON with the internal Rust names (`crates/narsor-model/src/domain/task.rs`). The YAML key never reaches the snapshot, so R6 holds without migration, and the digest of existing specs does not change.
-- KTD4. **Validator and renderer labels move to `message` for the agent and profile step text** (R4 planned form). In `crates/narsor-model/src/workflow/validator.rs`: the `missing_field(state, "agent"|"profile", "prompt")` calls, the `AgentDecisionMissingField { field: "prompt" }` entry, the `"action.prompt"` and `"decision.prompt"` template locations. In `crates/narsor-model/src/workflow/template.rs`: the `"{location}, prompt"` locations in `render_action`. The step-reply allowlist in the validator already accepts `action.message`, so the `action.prompt` branch can go.
+- KTD4. **Validator and renderer labels move to `message` for the agent and profile step text** (R4). In `crates/narsor-model/src/workflow/validator.rs`: the `missing_field(state, "agent"|"profile", "prompt")` calls, the `AgentDecisionMissingField { field: "prompt" }` entry, the `"action.prompt"` and `"decision.prompt"` template locations. In `crates/narsor-model/src/workflow/template.rs`: the `"{location}, prompt"` locations in `render_action`. The step-reply allowlist in the validator already accepts `action.message`, so the `action.prompt` branch can go.
 - KTD5. **Docs, template and bundled workflows switch in the same PR.** `crates/narsor-exec/src/workflows/mod.rs` embeds `workflows/template.yaml` with `include_str!`, so the template change ships in the binary. `tests/integration/builtin_workflows.rs` loads the bundled workflows and proves they still load.
 
 ### Assumptions
@@ -128,7 +127,7 @@ Te pytania wymagają decyzji osoby. Plan ma rekomendowaną odpowiedź dla każde
 
 ### Sequencing
 
-U1 → U2 → U3 → U4. U5 runs only if the person picks Q1 option 2; it then replaces U3's label change.
+U1 → U2 → U3 → U4.
 
 ---
 
@@ -194,21 +193,6 @@ U1 → U2 → U3 → U4. U5 runs only if the person picks Q1 option 2; it then r
 - **Test expectation:** none for the docs themselves -- `tests/integration/builtin_workflows.rs` and `tests/integration/docs_links.rs` already cover that the bundled workflows load and the doc links resolve.
 - **Verification:** `grep` finds no `prompt:` step-text key in the files listed above; the bundled-workflow tests pass.
 
-### U5. (Only if Q1 option 2) Echo the written key in every error
-
-- **Goal:** errors name the key the author wrote (origin R4 and Z8).
-- **Requirements:** origin R4.
-- **Dependencies:** U1, U2; replaces U3's label change.
-- **Files:** `crates/narsor-model/src/workflow/schema.rs`, `crates/narsor-model/src/workflow/loader.rs`, `crates/narsor-model/src/domain/workflow_definition.rs`, `crates/narsor-model/src/workflow/validator.rs`, `crates/narsor-model/src/workflow/template.rs`, `crates/narsor-exec/src/engine/runner/step/attempt.rs`.
-- **Approach:**
-  1. The raw-YAML helper from U2 also records which key the step used.
-  2. `State` gets an optional field for the written key, serialized only when it is `prompt`, so existing snapshots and their digests stay the same.
-  3. The validator and `render_action` take their label from that field.
-- **Patterns to follow:** `docs/solutions/conventions/removing-a-field-from-serde-wire-and-persisted-types-2026-11-18.md` for adding a field to a persisted serde type.
-- **Test scenarios:**
-  - An `agent` step written with `prompt:` and an invalid `when` in part 2 reports `action.prompt[2].when`; the same step with `message:` reports `action.message[2].when`.
-  - A launch spec sealed before the change still deserializes and validates.
-- **Verification:** both scenarios pass; U3's label assertions are adapted to the written key.
 
 ---
 
@@ -225,11 +209,11 @@ U1 → U2 → U3 → U4. U5 runs only if the person picks Q1 option 2; it then r
 
 ## Definition of Done
 
-- U1–U4 are done and their test scenarios pass. U5 is done only if the person picked Q1 option 2.
+- U1–U4 are done and their test scenarios pass.
 - `cargo test --workspace` passes.
 - No YAML example in the R8 files uses `prompt:` as the step-text key.
 - No dead code from abandoned attempts (for example an unused custom `Deserialize`) stays in the diff.
-- The PR description lists Q1 and Q2 with the answer used.
+- The PR description lists Q1 (option a) and Q2 (option a).
 
 ---
 
