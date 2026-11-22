@@ -23,7 +23,7 @@ execution: code
 
 ## Product Contract
 
-Product Contract preservation: changed: R4, R6, R8, R10. The origin names the `context.json` sections `artifacts_index` and `workspace_info`. The stored file has the keys `task`, `variables`, `artifacts`, `repositories`, `workspace` and `workspace_prs` (`crates/narsor-model/src/domain/context.rs`). R4 and R6 now use the stored keys. Scope is unchanged: R4 already asks for "all sections". R8 states the per-section sort that the origin review gave as the intended reading. R10 drops the origin words "the refresh key of the other tabs", because the TUI task view has no such key. KTD8 chooses the key (Q5). R7 now flattens arrays that contain objects per index, as the owner decided (Q3); the origin said every array is one row.
+Product Contract preservation: changed: R4, R6, R7, R8, R10. The origin names the `context.json` sections `artifacts_index` and `workspace_info`. The stored file has the keys `task`, `variables`, `artifacts`, `repositories`, `workspace` and `workspace_prs` (`crates/narsor-model/src/domain/context.rs`). R4 and R6 now use the stored keys. Scope is unchanged: R4 already asks for "all sections". R8 states the per-section sort that the origin review gave as the intended reading. R10 drops the origin words "the refresh key of the other tabs", because the TUI task view has no such key. KTD8 chooses the key (Q5). R7 now flattens arrays that contain objects per index, as the owner decided (Q3); the origin said every array is one row.
 
 ### Summary
 
@@ -142,14 +142,14 @@ Today the owner sees only parts of the state. `narsor-cli show --details` prints
 - KTD1. **Endpoint, wire names and CLI command.** Owner route `GET /control/v1/tasks/{task_id}/execution-state` (T16 in the wire reference). Runner upload route `POST /runner/v1/execution-states/{request_id}`. Poll field `execution_states` on `RunnerPollResponse`, with `#[serde(default)]` so older runners and servers keep working. CLI command `narsor-cli task state TASK_ID [--json]`. The relay timeout is the existing `conversation_page_timeout`. The names follow `execution-details` and the `task` subcommands, which take task ids.
 - KTD2. **Wire shape.** The protocol types live in `crates/narsor-protocol/src/controller/relay.rs` beside `ExecutionDetails`. `ExecutionState` has three sections, `context`, `locals` and `conductor`. Each is a `StateSection`: `available { value }` (a JSON value), `absent { message }`, or `unreadable { reason }`. `ExecutionStateResponse` is `available { state, source, read_at }` or `unavailable { reason, message }`, tagged by `status` like `ExecutionDetailsResponse`. The server sets `read_at` when the upload arrives, so the time comes from the trusted clock. Section values are raw JSON, so new fields of `Context` or `ConductorState` appear without a wire change (R4 "any section added later").
 - KTD3. **Each section is read and reported separately.** The runner loads the execution record (`state.json`) once and takes both `context` and `locals` from it. `state.json` is the authority, and `context.json` is only a projection of the same context (`crates/narsor-store/src/execution_store.rs`), so the two sections come from one consistent snapshot. The conductor section comes from `ConductorStore` (`load_state` and `load_generated_title`). It is `absent` when the store does not exist. A source that fails to load makes its section `unreadable` with the error text. It never shows as empty. The whole read fails (relay failure, `503 runner_read_failed`) only when the execution record cannot load. This closes the origin review item "a section that fails to load looks empty" (Q4).
-- KTD4. **No dedicated size limit.** The owner decided to add none for now (Q2). The runner uploads the state as is, under the default body limit of the upload route (about 2 MiB). An oversized state ends as a retryable `503`. Add a limit when that happens.
+- KTD4. **No dedicated size limit.** The owner decided to add none for now (Q2). The runner uploads the state as is, under the default body limit of the upload route (about 2 MiB). An oversized state ends as a retryable `503 runner_read_failed` (U3). Add a limit when that happens.
 - KTD5. **The flattening function is in the client library.** It is in `src/client/state_rows.rs`, registered in `src/client_lib.rs`. It takes an `ExecutionState` and returns ordered rows (path, display value, line count). Both the TUI and the CLI use it (R9). A non-`available` section gives one row whose path is the section name and whose value is its message or reason in parentheses, for example `conductor: (no conductor state)`.
 - KTD6. **One fixture keeps the Rust and JS flattening equal.** `crates/narsor-web/ui-tests/fixtures/state-rows.json` holds input states and the expected rows, starting with AE1. A Rust test (via `include_str!`) and a `node --test` test both check it. Without it, nothing would catch the two copies drifting apart (success criterion "same rows").
 - KTD7. **TUI read model.** A new `DetailJob::State` runs through `Background`, like the *Info* tab's `Drift` read. `TaskApp::start_detail_reads` starts it only when *Stan* is the active tab and the tab needs a read: it was never read, the owner asked for a refresh, or the answer was `reader_starting` and `READER_RETRY` (2 s) has passed. The list refresh (`DetailState::invalidate_changed`) does not invalidate it (R10).
 - KTD8. **TUI refresh key `Ctrl+R`.** There is no manual refresh key in the TUI task view today, so R10's "refresh key of the other tabs" does not exist. The owner chose `Ctrl+R` (answer to Q5). The plan binds `Ctrl+R` in `Context::Details`, scoped to the *Stan* tab ("zakładka Stan: odczytaj stan ponownie"). `r` is `RetrySend` and stays unchanged. Implementation must check that no other binding or terminal handling uses `Ctrl+R` in `Context::Details`.
 - KTD9. **Web read model.** The state view uses `useRead` (`crates/narsor-web/ui/js/ui/read.js`) keyed on the task id and a local refresh counter, not on the revision. `useRead` retries only a thrown error with code `conversation_reader_starting`, so the view's load function turns a `200 unavailable(reader_starting)` answer into that error. The existing 1500 ms retry then applies. Every other `unavailable` answer stays data, and the view shows its reason (R3). Only an "Odśwież" button increases the counter. The global key handler in `ui/js/ui/app.js` already maps `u`, `Enter` and `Space` to other actions, so the view binds no refresh key.
-- KTD11. **Loading and failure display, TUI and web.** Before the first answer, the tab shows a short "odczytuję stan…" line. A re-read keeps the old rows and the old read time, with a marker that a read is running. A `503` or connection error keeps the old rows and shows a retryable error note. When there are no old rows, the note is shown alone. The texts follow the existing error texts of the *Dyrygent* tab in each interface.
 - KTD10. **Reading the state is a details read.** `ProtocolService::execution_state` calls `note_details_read` like `execution_details`, so reading a stopped task extends its slot release deadline in the same way (D62).
+- KTD11. **Loading and failure display, TUI and web.** Before the first answer, the tab shows a short "odczytuję stan…" line. A re-read keeps the old rows and the old read time, with a marker that a read is running. A `503` or connection error keeps the old rows and shows a retryable error note. When there are no old rows, the note is shown alone. The texts follow the existing error texts of the *Dyrygent* tab in each interface.
 
 ### High-Level Technical Design
 
@@ -168,7 +168,7 @@ sequenceDiagram
     else runner available
         S->>S: open relay request "state-N", notify
         R->>S: GET /runner/v1/poll -> execution_states[...]
-        R->>R: load state.json once, conductor store, per-section limit
+        R->>R: load state.json once, then the conductor store
         R->>S: POST /runner/v1/execution-states/{request_id}
         S->>S: clean texts (R5), set read_at
         S-->>C: 200 available(state, source, read_at)
@@ -188,12 +188,12 @@ stateDiagram-v2
 
 ### Assumptions
 
-These are unconfirmed choices. The plan builds them; each matches the recommended option of a question in "Pytania otwarte dla użytkownika".
+The plan builds these choices. Each one is an owner decision (see "Owner decisions"), the recommended option of the open question (see "Pytania otwarte dla użytkownika"), or a rule of the origin.
 
 - All sections are shown to the owner, unmasked, and loaded only on demand (Q1, decided by the owner).
 - No size limit on the state (KTD4, Q2, decided by the owner).
 - Arrays that contain an object are flattened per index (R7, Q3, decided by the owner).
-- Per-section read status (KTD3, Q4).
+- Per-section read status (KTD3, Q4, still open).
 - `Ctrl+R` is the refresh key of the *Stan* tab (KTD8, Q5).
 - The *Stan* tab sits after *Dyrygent* and before *Info*, in the TUI and in the web (origin Z6).
 - The TUI and web `reader_starting` retries have no attempt limit, like the *Dyrygent* tab. The CLI waits up to `READER_WAIT` (30 s), like `show --details`.
@@ -294,13 +294,14 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 - `crates/narsor-runner/src/runner/mod.rs` (live poll loop, `serve_state` method)
 - Test: `crates/narsor-runner/src/runner/reader.rs` tests module
 
-**Approach:** Mirror `serve_details`. Call `fail_read` when the execution record cannot load, and when the runner has no execution id.
+**Approach:** Mirror `serve_details`. Call `fail_read` when the execution record cannot load, and when the runner has no execution id. Also call `fail_read` (reason "state too large to send") when the server refuses the upload with a client error such as `413`. Do not treat that as a link failure: otherwise the runner uploads again on each poll until the timeout, and the backoff delays the live task's polls (KTD4).
 
 **Patterns to follow:** `reader::serve_details`, `waiting_request_ids`.
 
 **Test scenarios:**
 - Happy path: a reader that gets one `execution_states` request uploads a state built from its store.
 - Error path: a reader without an execution answers the request with a relay failure, like the other read kinds.
+- Error path: an upload refused with `413` ends the read with a relay failure, and the runner does not upload it again.
 
 **Verification:** The runner tests pass. The integration test in U5 drives the live and the reader paths end to end.
 
@@ -381,7 +382,7 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 1. Use the markers `›`, `⌄` and `·` as in `TranscriptState::lines_for` (`src/tui/transcript/state.rs`). Extract them into shared constants so the two views cannot differ.
 2. Fold rule (R11): a row folds when its value has more than one line, or when the row (marker, path and value) is wider than the tab's width.
 3. Cursor and scroll (R12): keep a `ScrollState` over visual lines. A line move inside an unfolded row taller than the viewport scrolls one line. It moves the cursor only when the row's first or last line is in view.
-4. Refresh keeps the fold set and drops paths that no longer exist.
+4. Refresh keeps the fold set and drops paths that no longer exist. The cursor stays on the row with the same path. When that path is gone, it moves to the next row.
 5. Show the read time (R13) or the unavailable message, and the loading and failure display of KTD11.
 6. `DetailTab::ALL` also drives the history view, where `start_detail_reads` reads only the archived timeline. In the history view, *Stan* starts no read and shows the archived message ("the task is archived: its storage was deleted").
 
@@ -419,7 +420,7 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 
 **Approach:**
 1. Port the flattening rules as a pure function.
-2. Render each row with a marker. A folded row uses a focusable element that toggles on click and on `Enter` or `Space`. Its keydown handler calls `stopPropagation`, so the global handler in `app.js` does not open the details pane or jump to the next waiting task.
+2. Render each row with a marker. The path line of every foldable row, folded or unfolded, is a focusable toggle with `aria-expanded`. It toggles on click and on `Enter` or `Space`, so the same action folds the row again (R14). Unfolded rows stay unfolded after "Odśwież" when their path still exists, as in the TUI (R12). Its keydown handler calls `stopPropagation`, so the global handler in `app.js` does not open the details pane or jump to the next waiting task.
 3. Width-based folding (R11): a row is foldable when its value has more than one line, or when its one-line clipped element has `scrollWidth > clientWidth`. Measure after render and again on resize. An unfolded row shows the value in a `pre-wrap` block under the same path line. Do not use the `<details>` element of `Fold`: it cannot show a clipped first line.
 4. Use the loading and failure display of KTD11.
 
@@ -448,7 +449,7 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 - `docs/user/web.md` (state view)
 - `docs/dev/components.md` (the new relayed read beside the others)
 
-**Approach:** Describe the response, the section statuses, the size limit and the reasons. Use English, as AGENTS.md requires.
+**Approach:** Describe the response, the section statuses, the reasons, and that there is no dedicated size limit (an oversized state gives a retryable `503`, KTD4). Use English, as AGENTS.md requires.
 
 **Test expectation:** none -- documentation only.
 
@@ -479,27 +480,24 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 
 ---
 
+## Owner decisions
+
+The owner answered these questions of the earlier review. The plan builds each answer.
+
+- Q1. **Exposure of the new sections** (R4; origin Z9). Decided: show all sections to the owner, unmasked, and load them only on demand (R2, R10). The "already visible" reasoning of Z9 covers only `context:variables`.
+- Q2. **Size limit** (KTD4; origin Z8). Decided: no dedicated limit for now. An oversized state ends as a retryable `503`. The rejected options were a limit per section, one limit for the whole state, and a limit per value.
+- Q3. **Arrays of objects** (R7; origin Z4). Decided: an array with any object item is flattened per index (`conductor:queue:0:payload:…`). An array of scalars stays one row.
+- Q5. **TUI refresh key** (R10; KTD8). Decided: `Ctrl+R` in the *Stan* tab only. A background re-read when the revision changes was rejected (R10, Z7).
+
+---
+
 ## Pytania otwarte dla użytkownika
 
-These questions do not block implementation. The plan builds the owner's decision where there is one (Q1, Q2, Q3, Q5) and the first option otherwise (Q4).
+This question does not block implementation. The plan builds the recommended option (KTD3).
 
-- Q1. (decided: option 1, loaded on demand only) **Exposure of the new sections** (Product Contract, R4 and Dependencies/Assumptions; origin Z9). The preview shows the owner data that no read shows today: the other context sections (including the workspace path), the step locals, and the payloads of the conductor's queued and pending requests. Origin Z9 says that nothing new is exposed, which is true only for `context:variables`.
-  1. (recommended) Show all sections to the owner, unmasked. Limit the "already visible" reasoning to `context:variables`.
-  2. Drop the sections that are not wanted (for example, the conductor request payloads or the workspace).
-- Q2. (decided: option 4, no limit for now) **Size limit** (Planning Contract, KTD4; origin Z8). The default runner upload limit is about 2 MiB. An oversized state would otherwise end as a retryable `503` and not as a clear error.
-  1. (recommended) A limit per section (1 MiB). An oversized section shows as unreadable with its size, and the other sections still show.
-  2. One limit for the whole state, reported as one error.
-  3. A limit per value: only the oversized value is replaced by a note.
-  4. No dedicated limit: keep the default body limit and accept a `503`.
-- Q3. (decided: option 2) **Arrays of objects** (Product Contract, R7; origin Z4). `conductor:queue` and `conductor:unapplied_decisions` are arrays of objects with free-form payloads. As one compact-JSON row, nested multi-line text shows as escaped `\n` and cannot be unfolded.
-  1. (recommended) Keep R7 as written: every array is one row.
-  2. An array with any object item is flattened per index (`conductor:queue:0:payload:…`), and an array of scalars stays one row.
-- Q4. **Per-section read status** (Planning Contract, KTD3; origin R3/R4/F1). If one source fails to load, the section could look empty, and the owner could conclude, for example, that there is no conductor failure.
+- Q4. **Per-section read status** (Planning Contract, KTD3; origin R3, R4, F1). If one source fails to load, its section could look empty, and the owner could conclude, for example, that there is no conductor failure.
   1. (recommended) Each section has its own status (`available`, `absent`, `unreadable` with a reason). The whole read fails only when the execution record cannot load.
-  2. Keep only the whole-read failure of R3.
-- Q5. **TUI refresh key** (Product Contract, R10; Planning Contract, KTD8). The origin R10 refers to "the refresh key of the other tabs", but the TUI task view has no manual refresh key. Its tabs refresh automatically.
-  1. Decided by the owner: key `Ctrl+R` in the *Stan* tab only.
-  2. Re-read the state when the task's revision changes. This is a background read, which R10 and Z7 exclude.
+  2. Keep only the whole-read failure of R3: when any source fails to load, the whole read fails.
 
 ---
 
