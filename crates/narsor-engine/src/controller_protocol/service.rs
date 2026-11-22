@@ -91,6 +91,8 @@ type ConductorRelay = Relay<ConductorReadRequest, crate::conductor::ConductorVie
 /// Execution-details requests owners are waiting on, relayed the same way.
 type DetailsRelay = Relay<ExecutionDetailsRequest, ExecutionDetails>;
 
+type StateRelay = Relay<ExecutionStateRequest, ExecutionState>;
+
 /// Timing policy of the protocol.
 #[derive(Debug, Clone)]
 pub struct ProtocolConfig {
@@ -168,6 +170,7 @@ pub struct ProtocolService {
     event_reads: Mutex<EventsRelay>,
     conductor_reads: Mutex<ConductorRelay>,
     detail_reads: Mutex<DetailsRelay>,
+    state_reads: Mutex<StateRelay>,
     materials: MaterialStore,
     observers: ObserverStore,
     /// The digest of the observer worker's key, in memory only (D5).
@@ -243,6 +246,7 @@ impl ProtocolService {
             event_reads: Mutex::new(EventsRelay::default()),
             conductor_reads: Mutex::new(ConductorRelay::default()),
             detail_reads: Mutex::new(DetailsRelay::default()),
+            state_reads: Mutex::new(StateRelay::default()),
             harness_usages: Mutex::default(),
             max_concurrent_tasks: Mutex::new(Some(DEFAULT_MAX_CONCURRENT_TASKS)),
             deliveries: runner_channel::Deliveries::default(),

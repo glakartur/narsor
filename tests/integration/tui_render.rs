@@ -2261,7 +2261,14 @@ mod task_app_detail_render {
         assert!(!docs.contains('—'), "no pull request, no dash: {docs}");
         assert!(!state.contains("bez slotu"), "{state}");
         let tabs = &rows[TABS_ROW];
-        for tab in ["Przebieg", "Rozmowa", "Zdarzenia", "Dyrygent", "Info"] {
+        for tab in [
+            "Przebieg",
+            "Rozmowa",
+            "Zdarzenia",
+            "Dyrygent",
+            "Stan",
+            "Info",
+        ] {
             assert!(tabs.contains(tab), "{tab} in {tabs}");
         }
         assert!(!tabs.contains("śledzi"), "{tabs}");
@@ -2386,10 +2393,17 @@ mod task_app_detail_render {
         let mut app = running_app();
         let buffer = render_at(&mut app, &Styles::new(false), 120, 40);
         let tabs = &rows(&buffer)[row_of(&buffer, "Rozmowa")];
-        let positions: Vec<usize> = ["Rozmowa", "Przebieg", "Zdarzenia", "Dyrygent", "Info"]
-            .iter()
-            .map(|tab| tabs.find(tab).unwrap())
-            .collect();
+        let positions: Vec<usize> = [
+            "Rozmowa",
+            "Przebieg",
+            "Zdarzenia",
+            "Dyrygent",
+            "Stan",
+            "Info",
+        ]
+        .iter()
+        .map(|tab| tabs.find(tab).unwrap())
+        .collect();
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{tabs}");
     }
 
@@ -3004,7 +3018,7 @@ mod task_app_detail_render {
             rows[list_row]
         );
 
-        for _ in 0..4 {
+        for _ in 0..5 {
             press(&mut app, KeyCode::Char(']'));
         }
         let info = screen(&draw(120, 50, |frame| {
@@ -3523,7 +3537,7 @@ mod task_app_detail_render {
         press(&mut app, KeyCode::Char(']'));
         assert!(super::screen(&render(&mut app, &Styles::new(false)))
             .contains("jeszcze nie wystartowało"));
-        for _ in 0..2 {
+        for _ in 0..3 {
             press(&mut app, KeyCode::Char(']'));
         }
         let info = super::screen(&render(&mut app, &Styles::new(false)));
@@ -5145,7 +5159,7 @@ mod task_app_detail_render {
     #[test]
     fn info_lists_the_ticket_and_title_only_when_there_are_any() {
         let mut with = labelled_app(Some("NAR-12"), Some("Zmiana API"));
-        for _ in 0..4 {
+        for _ in 0..5 {
             press(&mut with, KeyCode::Char(']'));
         }
         let info = screen(&render(&mut with, &Styles::new(false)));
@@ -5153,7 +5167,7 @@ mod task_app_detail_render {
         assert!(info.contains("Zmiana API"), "{info}");
 
         let mut without = labelled_app(None, None);
-        for _ in 0..4 {
+        for _ in 0..5 {
             press(&mut without, KeyCode::Char(']'));
         }
         let info = screen(&render(&mut without, &Styles::new(false)));
@@ -9318,5 +9332,160 @@ mod task_app_usage_render {
         press(&mut overlay, KeyCode::Char('.'));
         assert!(overlay.overlay().is_some());
         assert!(shown(&mut overlay).ends_with(AE4));
+    }
+}
+
+/// *Stan*: the rows, their markers, the time of the read and what the tab says
+/// when there is no state.
+mod task_app_state_render {
+    use super::*;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use narsor::api::{ApiClient, ClientError};
+    use narsor::tui::task_app::{layout, DetailTab, TaskApp};
+    use narsor_engine::domain::ExecutionStatus;
+    use narsor_protocol::controller::{
+        ConversationUnavailableReason, ExecutionEventsSource, ExecutionState,
+        ExecutionStateResponse, StateSection,
+    };
+    use serde_json::json;
+
+    use crate::task_app_support::{
+        archived, archived_step, archived_timeline, listing, task, titled, with_controller,
+        with_runner,
+    };
+
+    fn press(app: &mut TaskApp, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn draw_app(app: &mut TaskApp, width: u16, height: u16) -> String {
+        screen(&draw(width, height, |frame| {
+            layout::render(frame, app, &Styles::new(false), Instant::now())
+        }))
+    }
+
+    fn new_app() -> TaskApp {
+        TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        )
+    }
+
+    fn opened() -> TaskApp {
+        let mut app = new_app();
+        let running = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        );
+        app.load(listing(vec![titled(running, "NAR-12")], "c"));
+        press(&mut app, KeyCode::Enter);
+        app.detail_mut().set_tab(DetailTab::State);
+        app
+    }
+
+    fn plan_state() -> ExecutionStateResponse {
+        ExecutionStateResponse::Available {
+            state: Box::new(ExecutionState {
+                context: StateSection::Available {
+                    value: json!({ "variables": { "plan": "first\nsecond\nthird" } }),
+                },
+                locals: StateSection::Available { value: json!({}) },
+                conductor: StateSection::Absent {
+                    message: "no conductor state".to_string(),
+                },
+            }),
+            source: ExecutionEventsSource::Runner,
+            read_at: "2026-11-22T10:00:00Z".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    // AE2.
+    fn a_multi_line_value_shows_folded_with_the_read_time_and_enter_unfolds_it() {
+        let mut app = opened();
+        app.on_state_read("a", Ok(plan_state()));
+        let folded = draw_app(&mut app, 130, 30);
+        for expected in [
+            "stan z 2026-11-22 10:00:00 UTC",
+            "Ctrl+R odśwież",
+            "› context:variables:plan: first",
+            "· conductor: (no conductor state)",
+        ] {
+            assert!(folded.contains(expected), "{expected}:\n{folded}");
+        }
+        assert!(!folded.contains("second"), "{folded}");
+
+        press(&mut app, KeyCode::Enter);
+        let unfolded = draw_app(&mut app, 130, 30);
+        assert!(unfolded.contains("⌄ context:variables:plan:"), "{unfolded}");
+        for line in ["first", "second", "third"] {
+            assert!(
+                unfolded.contains(&format!("  {line}")),
+                "{line}:\n{unfolded}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tab_says_the_reader_is_starting_and_keeps_the_rows_when_a_reread_fails() {
+        let mut app = opened();
+        assert!(draw_app(&mut app, 130, 30).contains("odczytuję stan…"));
+
+        app.on_state_read(
+            "a",
+            Ok(ExecutionStateResponse::Unavailable {
+                reason: ConversationUnavailableReason::ReaderStarting,
+                message: "reader starting".to_string(),
+            }),
+        );
+        let starting = draw_app(&mut app, 130, 30);
+        assert!(starting.contains("czytelnik się uruchamia"), "{starting}");
+
+        app.on_state_read("a", Ok(plan_state()));
+        app.on_state_read(
+            "a",
+            Err(ClientError::Degraded {
+                code: "runner_timeout".to_string(),
+                message: "runner nie odpowiada".to_string(),
+            }),
+        );
+        let failed = draw_app(&mut app, 130, 30);
+        assert!(failed.contains("nie udało się odświeżyć stanu"), "{failed}");
+        assert!(failed.contains("context:variables:plan"), "{failed}");
+        assert!(
+            failed.contains("stan z 2026-11-22 10:00:00 UTC"),
+            "{failed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_archived_task_from_the_history_says_its_storage_is_gone_and_reads_nothing() {
+        let mut app = new_app();
+        app.load(listing(vec![], "c"));
+        app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
+        app.open_history(listing(vec![archived("old", "NAR-9", 5)], "c"));
+        app.on_history_timeline(
+            "old",
+            Ok(archived_timeline(
+                "old",
+                vec![archived_step("plan", "claude", "opus", 0.4)],
+            )),
+        );
+        press(&mut app, KeyCode::Enter);
+        while app.history().unwrap().tab() != DetailTab::State {
+            press(&mut app, KeyCode::Char(']'));
+        }
+
+        app.start_detail_reads();
+        assert!(!app.has_running(), "no read starts");
+        let screen = draw_app(&mut app, 130, 30);
+        assert!(
+            screen.contains("storage usunięty przy archiwizacji"),
+            "{screen}"
+        );
+        assert!(!screen.contains("context:"), "no rows:\n{screen}");
     }
 }

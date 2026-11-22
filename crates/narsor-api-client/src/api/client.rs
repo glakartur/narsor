@@ -81,12 +81,13 @@ use narsor_protocol::controller::{
     CapabilitiesView, ConcurrencyLimitView, ConductorReadQuery, ControllerListResponse,
     ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest,
     CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionDetailsResponse,
-    ExecutionEventsQuery, ExecutionEventsResponse, HarnessUsageResponse, ObserverClaimResponse,
-    ObserverCreateTaskRequest, ObserverDecideRequest, ObserverEffectResponse, ObserverRunReport,
-    ObserverRunResultResponse, ObserverWorkerRun, OwnerCommandRequest, RepositoryBranchesResponse,
-    RepositoryListResponse, RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest,
-    SubmitInputRequest, SubmitOperatorCommandRequest, ValidateWorkflowRequest,
-    ValidateWorkflowResponse, WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
+    ExecutionEventsQuery, ExecutionEventsResponse, ExecutionStateResponse, HarnessUsageResponse,
+    ObserverClaimResponse, ObserverCreateTaskRequest, ObserverDecideRequest,
+    ObserverEffectResponse, ObserverRunReport, ObserverRunResultResponse, ObserverWorkerRun,
+    OwnerCommandRequest, RepositoryBranchesResponse, RepositoryListResponse, RepositoryView,
+    SetConcurrencyLimitRequest, SetDefaultBackendRequest, SubmitInputRequest,
+    SubmitOperatorCommandRequest, ValidateWorkflowRequest, ValidateWorkflowResponse,
+    WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
 };
 use narsor_protocol::controller::{ObserverQueueListResponse, ObserverQueueView};
 
@@ -633,6 +634,20 @@ impl ApiClient {
     ) -> Result<ExecutionDetailsResponse, ClientError> {
         let url = format!(
             "{}/control/v1/tasks/{task_id}/execution-details",
+            self.base_url
+        );
+        self.get_relayed(&url, &()).await
+    }
+
+    /// The complete state of a task's execution — context, the local values
+    /// of each step and the conductor's state — through the relay. Waits for
+    /// the runner like an events page, so it shares its timeout.
+    pub async fn control_execution_state(
+        &self,
+        task_id: &str,
+    ) -> Result<ExecutionStateResponse, ClientError> {
+        let url = format!(
+            "{}/control/v1/tasks/{task_id}/execution-state",
             self.base_url
         );
         self.get_relayed(&url, &()).await

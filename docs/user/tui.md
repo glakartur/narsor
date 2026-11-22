@@ -17,7 +17,7 @@ narsor · local ● live             harness claude-code (konfiguracja) · sloty
 ╭▸ Zadania ────────────────╮╭ Zmiana API zamówień ─────────────────────────────────────────╮
 │  ●  NAR-14 Edycja pars…  ││ Zmiana API zamówień · NAR-12                    implement v3 │
 │     edit · 14m           ││ Jira NAR-12 ↗   PR !482 ↗   running · krok 3/5 · 14m         │
-│──────────────────────────││ Przebieg  Rozmowa  Zdarzenia  Dyrygent  Info                 │
+│──────────────────────────││ Przebieg  Rozmowa  Zdarzenia  Dyrygent  Stan  Info           │
 ││ ?  Zmiana API zamówień  ││───────────────────│   Read src/api.rs                        │
 ││    3m                   │││ ● review_api     │   Edit src/api.rs  +12 −3                │
 │──────────────────────────││───────────────────│ │ assistant: Zmieniam sygnaturę…         │
@@ -128,8 +128,8 @@ selected step has a bracket, no fill. On a narrow axis the name is cut first, th
 the duration goes, then the start time. The columns stand three spaces apart. The step list may take up to 75% of a
 tab at least 100 columns wide (70% of a narrower one), and a step that reported nothing leaves those fields empty),
 *Rozmowa* (the agent's conversation), *Zdarzenia*, *Dyrygent* (the conductor's
-chat and decisions; its status line names the harness the conductor runs on)
-and *Info* (the sealed inputs, the observations with their age, the runner and
+chat and decisions; its status line names the harness the conductor runs on),
+*Stan* (the execution state, see below) and *Info* (the sealed inputs, the observations with their age, the runner and
 the controller). `[` / `]` switch the tabs. *Przebieg* has two levels of
 focus: the steps, where the details open, and the conversation of the selected
 step. `Enter` / `→` on a step that has a conversation to show go into it
@@ -151,6 +151,23 @@ the events and the conductor went away with the storage, so *Rozmowa*,
 *Zdarzenia* and *Dyrygent* say `storage usunięty przy archiwizacji`. *Przebieg*
 says it only when the task has no kept run at all. When the read of the run
 fails, *Przebieg* shows why; select the entry again to read it again.
+
+**The *Stan* tab** shows every value the workflow sees now, as one sorted list
+of `path: value` rows: the context (`context:variables:NAME`,
+`context:artifacts:NAME:location`, …), the local values of each step
+(`locals:STEP:NAME`) and the conductor's state (`conductor:…`). A string shows
+as its text; other values show as JSON. The tab reads the state when you open
+it and when you press `Ctrl+R`, never in the background, and shows the time of
+the read. A value with more than one line, or a row wider than the tab, shows
+its first line clipped (`›`); a value that fits has `·`. The movement keys of
+the conversation move the cursor from row to row; `Enter` unfolds the row
+(`⌄`, every line, wrapped) and folds it again. Inside an unfolded value taller
+than the screen, the movement keys first scroll it, and go to the next row
+only at its first or last line. Unfolded rows stay unfolded after `Ctrl+R`.
+When the state cannot be read, the tab says why; while a stopped task's
+read-only runner starts, it asks again by itself. In the history, *Stan* says
+`storage usunięty przy archiwizacji`. The same list prints with
+`narsor-cli task state TASK_ID` (`--json` for the state unflattened).
 
 In the conversation, the entries of one subagent form **one collapsed group**,
 placed at the subagent's first entry even when main-agent entries come between
@@ -278,6 +295,7 @@ itself. It goes on by a comment (agent), *Uruchom od nowa* (script step) or
 | `c` | write to the agent, in one step; it is the conversation's, not the panel's: the server picks what it does by the way the task is stopped — a question: a message in the same session; an approval or a permission: a refusal with your note, never an approval; a stop: the note goes to the agent and the task resumes. A text that was not sent stays as a draft of the task | — |
 | `c` (*Dyrygent*) | write to the conductor | `narsor-cli task conductor chat` |
 | `u` (*Dyrygent*) | undo a decision of the conductor (`!`) | `narsor-cli task conductor undo` |
+| `Ctrl+R` (*Stan*) | read the execution state again | `narsor-cli task state` |
 | the panel | confirm / reject a proposal, restart a failed step with a note | `narsor-cli task conductor confirm` / `reject`, `narsor-cli task restart-step` |
 | `n` | new task (a catalogue workflow, or the path of a definition); each repository input has a branch field next to it, preselected with the repository's default branch, with the branches of the remote as suggestions (you can always type another one) | `narsor-cli task create <workflow> [--branch INPUT=BRANCH]`, `narsor-cli task create --file <path>`; the catalogue is `narsor-cli task workflows`, the check of a file `narsor-cli task validate <path>` |
 | `i` / the panel | answer what waits: fields, `artifacts`, `variables`, label, comment | `narsor-cli task input <task> --field … --artifact … --variable … [--waiting-id ID]` |

@@ -382,3 +382,14 @@ button.queue-mark { cursor: pointer; text-decoration: none; padding: 0 2px; }
   * { animation: none !important; }
 }
 .more { margin: 6px 0; }
+
+.state-tab { padding: 8px 14px; }
+.state-head { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.state-row { font-family: var(--mono); font-size: 12px; border-bottom: 1px solid var(--border); }
+.state-line { display: flex; gap: 6px; padding: 3px 4px; min-width: 0; }
+.state-row.foldable > .state-line { cursor: pointer; }
+.state-row.foldable > .state-line:hover { background: var(--surface-2); }
+.state-marker { flex: none; width: 1ch; color: var(--muted); }
+.state-path { flex: none; color: var(--muted); }
+.state-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.state-full { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 4px 2ch; padding: 4px 8px; background: var(--surface-2); border-radius: 6px; font: inherit; }

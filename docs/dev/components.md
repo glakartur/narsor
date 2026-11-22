@@ -202,4 +202,8 @@ Properties of the runtime:
   and reads no task storage: `/control/v1/executions` lists the executions
   from the task records, and an execution's events and conversation come
   from its task's runner or a read-only runner (D63), for every backend
-  alike (U8).
+  alike (U8). The same relay serves the conductor's state, the execution
+  details (`execution-details`) and the complete execution state
+  (`execution-state`: the context, the step locals and the conductor's
+  state, each section read and reported on its own); the server cleans what
+  the runner uploads and keeps none of it.

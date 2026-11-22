@@ -24,6 +24,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound of one material blob download or publication (U9).
 const MATERIAL_TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The code of the request error a state upload gets when the state is
+/// larger than the control plane takes.
+pub const STATE_TOO_LARGE: &str = "state_too_large";
+
 /// How a controller's client behaves beyond its URL and credential.
 #[derive(Debug, Clone, Default)]
 pub struct ClientOptions {
@@ -593,6 +597,29 @@ impl RunnerClient {
                 details,
             )
             .await
+    }
+
+    /// `POST /runner/v1/execution-states/:request_id`. A state larger than
+    /// the route takes is refused with `413`, which reads as the request
+    /// error [`STATE_TOO_LARGE`]: sending it again cannot succeed.
+    pub async fn upload_execution_state(
+        &self,
+        request_id: &str,
+        state: &ExecutionState,
+    ) -> Result<ConversationPageAccepted, ClientError> {
+        let (request, body) = self.transport.json_post(
+            &format!("/runner/v1/execution-states/{request_id}"),
+            state,
+            REQUEST_TIMEOUT,
+        )?;
+        let response = self.transport.send_raw(request, body).await?;
+        if response.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(ClientError::Request {
+                code: STATE_TOO_LARGE.to_string(),
+                message: "the state is larger than the control plane takes".to_string(),
+            });
+        }
+        handle_json_response(response).await
     }
 
     /// `POST /runner/v1/conductor-reads/:request_id`.

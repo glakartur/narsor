@@ -320,6 +320,7 @@ pub enum Action {
     UndoDecision,
     /// Read the next page of the conductor's chat.
     LoadMore,
+    RereadState,
     /// Choose the installation's default agent harness (the header says
     /// which one is in force).
     ChooseHarness,
@@ -777,6 +778,13 @@ pub static BINDINGS: &[Binding] = &[
         Action::LoadMore,
         "",
         "zakładka Dyrygent: wczytaj dalsze wpisy czatu",
+    ),
+    bind(
+        Context::Details,
+        Key::ctrl('r'),
+        Action::RereadState,
+        "",
+        "zakładka Stan: odczytaj stan ponownie",
     ),
     bind(
         Context::Details,

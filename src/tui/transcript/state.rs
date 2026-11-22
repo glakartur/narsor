@@ -7,6 +7,13 @@ use super::grouping::ExpansionIdentity;
 use super::line::{fragments, raw_display, TranscriptLine};
 use crate::tui::scroll::ScrollState;
 
+/// The marker of an entry that hides part of its text: it unfolds.
+pub const FOLDED_MARKER: &str = "›";
+/// The marker of an entry that shows all its text: it folds again.
+pub const UNFOLDED_MARKER: &str = "⌄";
+/// The marker of an entry that has nothing more to show.
+pub const UNFOLDABLE_MARKER: &str = "·";
+
 /// Restorable reading location independent of a wrapped terminal width.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptAnchor {
@@ -662,12 +669,12 @@ impl TranscriptState {
                     // projection must not turn into a formatting change.
                     let marker = if has_details {
                         if expanded {
-                            "⌄"
+                            UNFOLDED_MARKER
                         } else {
-                            "›"
+                            FOLDED_MARKER
                         }
                     } else {
-                        "·"
+                        UNFOLDABLE_MARKER
                     };
                     lines.insert(
                         0,

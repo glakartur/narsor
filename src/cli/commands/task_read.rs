@@ -21,7 +21,7 @@ use crate::config::Flags;
 use crate::controller_protocol::{
     ConversationPageQuery, ConversationUnavailableReason, ExecutionDetails,
     ExecutionDetailsResponse, ExecutionEventsQuery, ExecutionEventsResponse,
-    CONVERSATION_READER_STARTING,
+    ExecutionStateResponse, CONVERSATION_READER_STARTING,
 };
 use crate::domain::{without_unsafe_chars, Event};
 use crate::tui::conversation::{classify, unclassified_preview};
@@ -172,6 +172,57 @@ async fn execution_details(
             Err(error) => return Err(client_error(execution_id, error)),
         }
     }
+}
+
+/// The lines `narsor-cli task state` prints for task `task_id`: every value
+/// its workflow sees now — the context, the local values of each step, the
+/// conductor's state — one `path: value` row per line, a multi-line value
+/// with its next lines indented under the row. With `json`, the state as
+/// read, unflattened. A stopped task's read-only runner is waited for up to
+/// `reader_wait`.
+///
+/// When the state cannot be read, the error says why.
+pub async fn task_state_lines(
+    client: &ApiClient,
+    task_id: &str,
+    reader_wait: Duration,
+    json: bool,
+) -> Result<Vec<String>> {
+    let deadline = Instant::now() + reader_wait;
+    let state = loop {
+        match client.control_execution_state(task_id).await {
+            Ok(ExecutionStateResponse::Available { state, .. }) => break *state,
+            Ok(ExecutionStateResponse::Unavailable {
+                reason: ConversationUnavailableReason::ReaderStarting,
+                ..
+            }) if Instant::now() < deadline => tokio::time::sleep(READER_RETRY).await,
+            Ok(ExecutionStateResponse::Unavailable { message, .. }) => {
+                return Err(CliError::failure(format!(
+                    "The task's state cannot be read: {}",
+                    without_unsafe_chars(&message)
+                )))
+            }
+            Err(ClientError::NotFound) => {
+                return Err(CliError::failure(format!(
+                    "Could not load task '{task_id}': not found"
+                )))
+            }
+            Err(error) => return Err(read_error("state", error)),
+        }
+    };
+    if json {
+        let text = serde_json::to_string_pretty(&state)
+            .map_err(|error| CliError::failure(format!("Cannot print the state: {error}")))?;
+        return Ok(vec![text]);
+    }
+    let mut lines = Vec::new();
+    for row in crate::state_rows::state_rows(&state) {
+        let mut values = row.value.split('\n').map(without_unsafe_chars);
+        let first = values.next().unwrap_or_default();
+        lines.push(format!("{}: {first}", without_unsafe_chars(&row.path)));
+        lines.extend(values.map(|line| format!("    {line}")));
+    }
+    Ok(lines)
 }
 
 /// The lines of `execution`; with `details`, its context variables too.
