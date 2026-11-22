@@ -175,6 +175,10 @@ where
             get(get_execution_details),
         )
         .route(
+            "/control/v1/tasks/{task_id}/execution-state",
+            get(get_execution_state),
+        )
+        .route(
             "/control/v1/tasks/{task_id}/conversation",
             get(get_conversation),
         )
@@ -287,6 +291,12 @@ where
         .route(
             "/runner/v1/execution-details/{request_id}",
             post(post_execution_details),
+        )
+        .route(
+            "/runner/v1/execution-states/{request_id}",
+            post(post_execution_state).layer(DefaultBodyLimit::max(
+                narsor_protocol::controller::MAX_EXECUTION_STATE_BODY,
+            )),
         )
         .route(
             "/runner/v1/relay-failures/{request_id}",
@@ -584,6 +594,14 @@ async fn get_execution_details(
     Path(task_id): Path<String>,
 ) -> ProtocolResult<Json<ExecutionDetailsResponse>> {
     Ok(Json(service.execution_details(&owner, &task_id).await?))
+}
+
+async fn get_execution_state(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(task_id): Path<String>,
+) -> ProtocolResult<Json<ExecutionStateResponse>> {
+    Ok(Json(service.execution_state(&owner, &task_id).await?))
 }
 
 async fn get_conversation(
@@ -1081,6 +1099,20 @@ async fn post_execution_details(
     ))
 }
 
+async fn post_execution_state(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Path(request_id): Path<String>,
+    Json(state): Json<ExecutionState>,
+) -> ProtocolResult<Json<ConversationPageAccepted>> {
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.runner_execution_state(&identity, &request_id, state)
+        })
+        .await?,
+    ))
+}
+
 async fn post_execution_events(
     State(service): State<Service>,
     Extension(identity): Extension<RunnerIdentity>,
@@ -1300,6 +1332,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_execution_state_over_the_limit_is_refused_with_413() {
+        let router = Router::new().route(
+            "/",
+            post(|_: axum::body::Bytes| async { StatusCode::NO_CONTENT }).layer(
+                DefaultBodyLimit::max(narsor_protocol::controller::MAX_EXECUTION_STATE_BODY),
+            ),
+        );
+        let post_of = |len: usize| {
+            Request::post("/")
+                .body(Body::from(vec![b'x'; len]))
+                .unwrap()
+        };
+        let limit = narsor_protocol::controller::MAX_EXECUTION_STATE_BODY;
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(post_of(limit + 1))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            router.oneshot(post_of(limit)).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+    }
     #[tokio::test]
     async fn a_usage_report_of_a_normal_size_passes_the_limit() {
         assert_eq!(

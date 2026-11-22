@@ -106,6 +106,7 @@ Task id and backend id: 1–128 characters of `[A-Za-z0-9._-]`, first character 
 | T13 | GET | `/control/v1/tasks/{task_id}/execution-events?after=N&limit=L` | 200 `ExecutionEventsResponse` | yes |
 | T14 | GET | `/control/v1/tasks/{task_id}/conductor?after=N&limit=L` | 200 `ConductorReadResponse` | yes |
 | T15 | GET | `/control/v1/tasks/{task_id}/execution-details` | 200 `ExecutionDetailsResponse` | CLI |
+| T16 | GET | `/control/v1/tasks/{task_id}/execution-state` | 200 `ExecutionStateResponse` | yes |
 | S1 | GET | `/control/v1/events/stream?cursor=C&task_id=ID` | 200 `text/event-stream` | yes |
 | M1 | GET | `/control/v1/tasks/{task_id}/materials` | 200 `MaterialListResponse` | CLI |
 | M2 | POST | `/control/v1/tasks/{task_id}/materials` | **201** (or 200 when replayed) `MaterialUploadResponse` | CLI |
@@ -975,6 +976,50 @@ Response 200, tagged with `status`:
 Errors: `503 runner_timeout | runner_read_failed` (retry), `404`. The runner
 uploads its answer with `POST /runner/v1/execution-details/{request_id}`.
 
+### T16 `GET /control/v1/tasks/{task_id}/execution-state`
+
+Every value the task's workflow sees now: all of the execution context, the
+local values of each step and the conductor's state (`narsor-cli task state`,
+the *Stan* tab of the TUI and the web). No query. Relayed like T15: the live
+runner answers it, or for a stopped task a read-only runner the control plane
+starts. The server keeps nothing; every request asks the runner. The same
+owner check as every task read: a task of another owner is `404`. Reading the
+state of a stopped task counts as a details read for its slot, as T15 does.
+Response 200, tagged with `status`:
+
+```json
+{ "status": "available", "source": "runner", "read_at": "2026-11-22T18:00:00Z",
+  "state": {
+    "context":   { "status": "available", "value": {
+        "task": { … }, "variables": { "branch": "feat/x" }, "artifacts": { … },
+        "repositories": { … }, "workspace": { … }, "workspace_prs": { … } } },
+    "locals":    { "status": "available", "value": { "review": { "NOTE": "…" } } },
+    "conductor": { "status": "absent", "message": "no conductor state" } } }
+{ "status": "unavailable", "reason": "archived", "message": "the task is archived: its storage was deleted" }
+```
+
+- `state.context`: the execution context as stored, every section of it. A
+  section added to the context later shows here without a wire change.
+- `state.locals`: the local values of each step, `state_id → { NAME: value }`.
+- `state.conductor`: every field of the conductor's state, and `title` when
+  the conductor generated one.
+- Each section is `available` with a `value` (raw JSON), `absent` with a
+  `message` (the task has no conductor state), or `unreadable` with a
+  `reason` (its source did not load). A section that cannot be read is never
+  shown as empty. Only an execution record that does not load fails the
+  whole read (`503 runner_read_failed`).
+- `read_at`: when the control plane received the state from the runner.
+- Names and texts are cleaned of terminal controls; line feeds stay.
+
+`unavailable` is a **200** answer, as for T15, with the same reasons
+(`not_started`, `reader_starting`, `archived`, …); ask again on
+`reader_starting`. Errors: `503 runner_timeout | runner_read_failed` (retry),
+`404`. There is no dedicated size limit: a state larger than the upload
+route's default body limit (about 2 MiB) fails the read as a retryable
+`503 runner_read_failed`. The runner uploads its answer with
+`POST /runner/v1/execution-states/{request_id}`; the poll answer carries the
+requests in `execution_states`.
+
 ---
 
 ## 8. Materials (CLI only today)
@@ -1225,8 +1270,8 @@ These routes are gone. A client that calls them gets `404`:
 1. **Success codes differ.** T2, R2 → 201. T6, T7, T8, W4 → 202. M2 → 201, or 200 for a replay. Treat 200/201/202 the same.
 2. **401, 403, 404 and 500 have no body.** A 400 can have a JSON body (`{code,message}`), an empty body (legacy), or a **plain-text** body (axum rejection of the query or JSON). 409 has a JSON body or none. Do not call `response.json()` without a guard.
 3. **404 also means "not yours"** (an execution of another owner in H2). `claim` in trusted mode is 404.
-4. **`unavailable` is a 200** for T11, T13, T14 (`status:"unavailable"`). But T12 uses **409** for the same conditions (`conversation_reader_starting`, `conversation_unavailable`), and T13/T14 use **503** for a runner that did not answer.
-5. **Relayed reads are slow** (T12, T13, T14): the server waits up to 20 s for the runner. Use a long client timeout or cancel and ask again. A stopped task starts a read-only runner: expect `reader_starting`, then ask again.
+4. **`unavailable` is a 200** for T11, T13, T14, T15, T16 (`status:"unavailable"`). But T12 uses **409** for the same conditions (`conversation_reader_starting`, `conversation_unavailable`), and T13–T16 use **503** for a runner that did not answer.
+5. **Relayed reads are slow** (T12–T16): the server waits up to 20 s for the runner. Use a long client timeout or cancel and ask again. A stopped task starts a read-only runner: expect `reader_starting`, then ask again.
 6. **Operator command body is flattened** in T7 (`kind` at the top level beside `idempotency_key`), but nested as `command: {kind…}` in `OperatorCommandView`, in task events and in `TaskActionSend`.
 7. **`override`** is the wire name of `Transition.forced`, of `DefaultBackendView.override_backend` and of `HarnessSelectionSnapshot.override_harness`.
 8. **Nested tags with the same name**: `TaskSummary.queue.reason.reason` (`QueueView.reason` is an object tagged with `reason`); task event `{"type":"queue_changed","reason":{"reason":"admitted"}}`.

@@ -23,10 +23,12 @@
 //!
 //! # Order and non-preemption
 //!
-//! Waiting tasks are admitted by `rank`, lowest first, and by creation
-//! order (`queue_sequence`) among equal ranks, which only a crash in the
-//! middle of a renumbering can leave. The owner reorders them with
-//! [`ControlPlane::move_task`]. A reservation, once granted, is never taken
+//! The queue of a backend is its tasks that are not archived, by position
+//! key, lowest first, and by creation order (`queue_sequence`) among equal
+//! keys, which only legacy data can have. Waiting tasks are admitted in
+//! that order. Only the owner's [`ControlPlane::move_task`] changes it:
+//! a resume, an answer, a limit stop or any other change of a task keeps
+//! its key, and so its place. A reservation, once granted, is never taken
 //! back — not by a task moved ahead of it or a controller going away —
 //! and nothing here ever stops a task that holds compute (R11).
 //!
@@ -36,7 +38,7 @@
 //! point: [`ControlPlane::decide_limit_stop`] accepts exactly as many safe
 //! points as the limit is exceeded by, the first ones that arrive, and
 //! answers "continue" to the others. A stopped task goes back to the queue
-//! on its own rank.
+//! with its own key.
 //!
 //! # What holds a slot
 //!
@@ -65,9 +67,12 @@ use super::model::{
     SchedulingPolicy, SlotReleaseReason, TaskEventKind, TaskRecord,
     DEFAULT_BACKEND_SELECTION_VERSION,
 };
+use super::position;
 use super::resume::limit_stop_key;
+use super::store::queue_order;
 use super::{control_plane::Mutation, ControlPlane};
 use crate::domain::{BackendId, TaskId};
+use std::collections::HashMap;
 
 /// What one scheduling pass decided for one queued task.
 enum Verdict {
@@ -107,7 +112,7 @@ impl ControlPlane {
         let _global = self.store().lock_global_schedule()?;
         let _lock = self.store().lock_schedule(backend_id)?;
         let policy = policy();
-        let tasks = self.dense_backend_tasks(backend_id)?;
+        let tasks = self.queue(backend_id)?;
         let online = self.controller_online(backend_id)?;
         let mut in_use = slots_in_use(&self.store().list_tasks()?);
 
@@ -121,7 +126,8 @@ impl ControlPlane {
                     task.runner_state == RunnerState::Queued && task.reservation.is_some()
                 })
                 .collect();
-            reserved.sort_by_key(|task| std::cmp::Reverse((task.rank, task.queue_sequence)));
+            reserved
+                .sort_by_key(|task| std::cmp::Reverse((task.position_key, task.queue_sequence)));
             for task in reserved {
                 if in_use <= limit {
                     break;
@@ -138,7 +144,7 @@ impl ControlPlane {
                     && (task.reservation.is_none() || revoked.contains(&&task.task_id))
             })
             .collect();
-        waiting.sort_by_key(|task| (task.rank, task.queue_sequence));
+        waiting.sort_by_key(|task| (task.position_key, task.queue_sequence));
 
         let mut verdicts: Vec<(TaskId, Verdict)> = tasks
             .iter()
@@ -298,9 +304,8 @@ impl ControlPlane {
     /// backend's schedule lock, like an admission. With a free slot the
     /// resume goes straight to `Provisioning`. On a full backend it does not
     /// fail and stops nothing (R11): the task goes to `Queued` holding
-    /// nothing, at the front of the queue (like [`MoveTarget::Top`]), and
-    /// the next [`ControlPlane::schedule`] pass gives it the first slot
-    /// released (R20). A second such resume goes in front of the first.
+    /// nothing, at its own place in the queue, and a later
+    /// [`ControlPlane::schedule`] pass admits it when its turn comes.
     /// A retry of an accepted command is answered from its receipt as
     /// always, whatever the capacity now.
     pub fn command_with_capacity(
@@ -353,48 +358,21 @@ impl ControlPlane {
                 }
             }
         }
-        let outcome = self.command_routed(task_id, request, queue_resume)?;
-        if queue_resume && !outcome.replayed {
-            self.put_first_in_queue(&backend_id, task_id)?;
-            return Ok(CommandOutcome {
-                task: self.task(task_id)?,
-                ..outcome
-            });
-        }
-        Ok(outcome)
-    }
-
-    /// Gives `task_id` (just sent to the queue at rank 0) rank 1 and
-    /// renumbers the others behind it in their queue order. Under the
-    /// backend's schedule lock. The task's own rank is written last, so a
-    /// crash in between leaves at worst equal ranks, which the next pass
-    /// renumbers.
-    fn put_first_in_queue(&self, backend_id: &BackendId, task_id: &TaskId) -> Result<()> {
-        let mut others = self.backend_tasks(backend_id)?;
-        others.retain(|task| task.task_id != *task_id);
-        others.sort_by_key(|task| (task.rank, task.queue_sequence));
-        for (index, task) in others.iter().enumerate() {
-            let rank = u32::try_from(index + 2).unwrap_or(u32::MAX);
-            if task.rank != rank {
-                self.set_rank(&task.task_id, rank)?;
-            }
-        }
-        self.set_rank(task_id, 1)
+        self.command_routed(task_id, request, queue_resume)
     }
 
     /// Moves a queued task within its backend's queue.
     ///
-    /// The queue is the backend's tasks in `rank` order; the move takes the
-    /// task out and puts it at `target`, then renumbers whoever shifted, all
-    /// under the backend's schedule lock so a concurrent admission, creation
-    /// or move sees either the old order or the new one. Admitted and
-    /// finished tasks keep their place in the list: only the moved task and
-    /// those it passed change rank, so the order they hold relative to each
-    /// other never changes.
+    /// The moved task gets a key between those of its new neighbours; when
+    /// no integer is free there, a few neighbours get new keys first (see
+    /// [`position::plan_move`]).
     ///
     /// Only a `Queued` task can be moved — admission order never touches a
-    /// task that holds compute. A move that leaves the order as it is
-    /// (`Bottom` for the last task, say) writes and announces nothing.
+    /// task that holds compute. An archived anchor is refused: it has no
+    /// place in the queue. A move that leaves the order as it is (`Bottom`
+    /// for the last task, say) writes and announces nothing. A move that
+    /// finds no free key anywhere fails with
+    /// [`OrchestrationError::NoRoomToMove`] and writes nothing.
     /// `expected_generation` makes the move conditional, like an owner
     /// command; the desired generation itself does not move, because nothing
     /// a controller acts on changed. Returns the record and whether the
@@ -407,26 +385,56 @@ impl ControlPlane {
     ) -> Result<(TaskRecord, bool)> {
         let backend_id = self.task(task_id)?.assignment.backend_id;
         let _lock = self.store().lock_schedule(&backend_id)?;
-        let tasks = self.dense_backend_tasks(&backend_id)?;
-        let moved = tasks
+        let all = self.backend_tasks(&backend_id)?;
+        let moved = all
             .iter()
             .find(|task| task.task_id == *task_id)
             .ok_or_else(|| OrchestrationError::TaskNotFound(task_id.clone()))?;
         check_movable(moved, expected_generation)?;
+        if let MoveTarget::Before(anchor) | MoveTarget::After(anchor) = target {
+            if all
+                .iter()
+                .any(|task| task.task_id == *anchor && !in_queue(task))
+            {
+                return Err(OrchestrationError::InvalidMoveAnchor {
+                    task_id: task_id.clone(),
+                    anchor: anchor.clone(),
+                    reason: "the anchor is archived and has no place in the queue",
+                });
+            }
+        }
+        let tasks: Vec<&TaskRecord> = all.iter().filter(|task| in_queue(task)).collect();
 
         let before: Vec<&TaskId> = tasks.iter().map(|task| &task.task_id).collect();
         let after = reordered(&before, task_id, target)?;
         if after == before {
             return Ok((moved.clone(), false));
         }
-        let rank_of = |id: &TaskId| {
-            let position = after.iter().position(|candidate| *candidate == id);
-            u32::try_from(position.unwrap_or(0) + 1).unwrap_or(u32::MAX)
-        };
+        let slot = after
+            .iter()
+            .position(|id| *id == task_id)
+            .expect("the moved task is in the new order");
+        let keys: Vec<(TaskId, u64)> = tasks
+            .iter()
+            .map(|task| (task.task_id.clone(), task.position_key))
+            .collect();
+        let upper = position::upper_bound(
+            position::key_at(self.now()),
+            keys.last().map(|(_, key)| *key),
+        );
+        let mut writes = position::plan_move(&keys, task_id, slot, 0, upper).map_err(|_| {
+            OrchestrationError::NoRoomToMove {
+                task_id: task_id.clone(),
+            }
+        })?;
+        let (_, key) = writes
+            .pop()
+            .expect("a plan ends with the moved task's write");
+        let rank = u32::try_from(slot + 1).unwrap_or(u32::MAX);
         // The event goes to the mover's own stream, so it names only the
         // mover's tasks: the ids of another owner's tasks on a shared
-        // backend are not theirs to learn. Ranks are still those of the
-        // whole queue.
+        // backend are not theirs to learn. The position is still that in
+        // the whole queue.
         let order: Vec<TaskId> = after
             .iter()
             .filter(|id| {
@@ -438,23 +446,15 @@ impl ControlPlane {
             .collect();
 
         // The neighbours first, the moved task last: its `Moved` event is
-        // the one commit point. A crash or failure before it announces
-        // nothing and leaves at worst equal ranks, which the next pass under
-        // this lock renumbers; one after it leaves the order announced.
-        let neighbours: Vec<&TaskRecord> = tasks
-            .iter()
-            .filter(|task| task.task_id != *task_id && task.rank != rank_of(&task.task_id))
-            .collect();
-        for (written, task) in neighbours.iter().enumerate() {
-            if let Err(error) = self.set_rank(&task.task_id, rank_of(&task.task_id)) {
-                self.restore_ranks(&neighbours[..written]);
-                return Err(error);
-            }
+        // the one commit point. Each neighbour write keeps the order, so a
+        // crash or a refusal before the commit leaves the queue as it was,
+        // with some neighbours spaced further apart.
+        for (neighbour, key) in &writes {
+            self.set_position_key(neighbour, *key)?;
         }
-        let rank = rank_of(task_id);
-        let committed = self.mutate(task_id, |record, _now| {
+        let (record, ()) = self.mutate(task_id, |record, _now| {
             check_movable(record, expected_generation)?;
-            record.rank = rank;
+            record.position_key = key;
             Ok(Mutation::Changed(
                 TaskEventKind::Moved {
                     rank,
@@ -462,26 +462,8 @@ impl ControlPlane {
                 },
                 (),
             ))
-        });
-        match committed {
-            Ok((record, ())) => Ok((record, true)),
-            Err(error) => {
-                // Refused (a command raced in): the queue stays as it was.
-                self.restore_ranks(&neighbours);
-                Err(error)
-            }
-        }
-    }
-
-    /// Puts `tasks` back to the ranks they were read with, as far as that
-    /// works: the caller already has an error to report, and whatever stays
-    /// unrestored is equal ranks the next pass renumbers.
-    fn restore_ranks(&self, tasks: &[&TaskRecord]) {
-        for task in tasks {
-            if let Err(error) = self.set_rank(&task.task_id, task.rank) {
-                tracing::warn!(task_id = %task.task_id, %error, "could not restore a rank");
-            }
-        }
+        })?;
+        Ok((record, true))
     }
 
     /// The owner's default-backend override, if one was ever set (R10).
@@ -515,53 +497,37 @@ impl ControlPlane {
         Ok(selection)
     }
 
-    /// Writes a task's new rank without an event: the move that caused it
-    /// announced the whole order already.
-    fn set_rank(&self, task_id: &TaskId, rank: u32) -> Result<()> {
+    /// Writes a task's new key without an event: only a move makes room
+    /// with it, and the move announces the new order.
+    fn set_position_key(&self, task_id: &TaskId, key: u64) -> Result<()> {
         let _lock = self.store().lock_task(task_id)?;
         let mut record = self.store().load_task(task_id)?;
-        record.rank = rank;
+        record.position_key = key;
         self.store().save_task(&mut record)
     }
 
-    /// Renumbers equal ranks of every backend (see
-    /// [`Self::dense_backend_tasks`]), each under its own schedule lock.
-    pub(crate) fn normalise_ranks(&self) -> Result<()> {
-        let mut backends: Vec<BackendId> = Vec::new();
-        for task in self.list_tasks()? {
-            if !backends.contains(&task.assignment.backend_id) {
-                backends.push(task.assignment.backend_id);
-            }
+    /// The 1-based position of `record` in its backend's queue, 0 for an
+    /// archived task, which has none (see [`queue_positions`]).
+    pub fn queue_position(&self, record: &TaskRecord) -> Result<u32> {
+        if !in_queue(record) {
+            return Ok(0);
         }
-        for backend_id in backends {
-            let _lock = self.store().lock_schedule(&backend_id)?;
-            self.dense_backend_tasks(&backend_id)?;
-        }
-        Ok(())
+        let tasks = self.backend_tasks(&record.assignment.backend_id)?;
+        Ok(queue_positions(&tasks)
+            .get(&record.task_id)
+            .copied()
+            .unwrap_or(0))
     }
 
-    /// [`Self::backend_tasks`] with equal ranks renumbered to 1, 2, 3, ...
-    /// in queue order (creation order among the equal ones).
-    ///
-    /// Equal ranks are what a renumbering interrupted by a crash leaves.
-    /// Call under the backend's schedule lock. Renumbering announces
-    /// nothing, like the moves it repairs; the clients' next read sees it.
-    pub(crate) fn dense_backend_tasks(&self, backend_id: &BackendId) -> Result<Vec<TaskRecord>> {
+    /// The backend's queue: its tasks that are not archived, in queue
+    /// order.
+    fn queue(&self, backend_id: &BackendId) -> Result<Vec<TaskRecord>> {
         let mut tasks = self.backend_tasks(backend_id)?;
-        let has_equal_ranks = tasks.windows(2).any(|pair| pair[0].rank == pair[1].rank);
-        if has_equal_ranks {
-            for (index, task) in tasks.iter_mut().enumerate() {
-                let rank = u32::try_from(index + 1).unwrap_or(u32::MAX);
-                if task.rank != rank {
-                    self.set_rank(&task.task_id, rank)?;
-                    task.rank = rank;
-                }
-            }
-        }
+        tasks.retain(in_queue);
         Ok(tasks)
     }
 
-    /// Every task of `backend_id`, in queue order.
+    /// Every task of `backend_id`, archived ones too, in key order.
     fn backend_tasks(&self, backend_id: &BackendId) -> Result<Vec<TaskRecord>> {
         Ok(self
             .list_tasks()?
@@ -618,6 +584,33 @@ impl ControlPlane {
         })?;
         Ok(changed)
     }
+}
+
+/// Whether `task` has a place in its backend's queue: every task but an
+/// archived one.
+fn in_queue(task: &TaskRecord) -> bool {
+    task.runner_state != RunnerState::Archived
+}
+
+/// The 1-based position of every task in its backend's queue, counted
+/// among the backend's tasks that are not archived. An archived task has
+/// none. `tasks` may hold any number of backends, in any order.
+pub fn queue_positions(tasks: &[TaskRecord]) -> HashMap<TaskId, u32> {
+    let mut queued: Vec<&TaskRecord> = tasks.iter().filter(|task| in_queue(task)).collect();
+    queued.sort_by(|left, right| {
+        left.assignment
+            .backend_id
+            .cmp(&right.assignment.backend_id)
+            .then_with(|| queue_order(left, right))
+    });
+    let mut positions = HashMap::with_capacity(queued.len());
+    let mut counts: HashMap<&BackendId, u32> = HashMap::new();
+    for task in queued {
+        let count = counts.entry(&task.assignment.backend_id).or_insert(0);
+        *count = count.saturating_add(1);
+        positions.insert(task.task_id.clone(), *count);
+    }
+    positions
 }
 
 /// Whether `record` may be moved now.

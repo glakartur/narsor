@@ -11,5 +11,5 @@ pub mod controller_runtime;
 pub mod pop;
 pub mod wire;
 
-pub use client::{ClientOptions, ControllerClient, RunnerClient};
+pub use client::{ClientOptions, ControllerClient, RunnerClient, STATE_TOO_LARGE};
 pub use wire::*;

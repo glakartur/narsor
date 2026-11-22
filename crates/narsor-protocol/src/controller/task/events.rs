@@ -60,8 +60,13 @@ pub enum TaskEventKind {
     PriorityChanged {
         priority: i32,
     },
+    /// The owner moved the task within its backend's queue.
     Moved {
+        /// The task's new 1-based position among the backend's tasks that
+        /// are not archived.
         rank: u32,
+        /// The new order of the mover's tasks on the backend, archived ones
+        /// left out.
         order: Vec<crate::identifier::TaskId>,
     },
     QueueChanged {

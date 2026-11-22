@@ -15,4 +15,6 @@ pub use entry::{
     TranscriptGrouping, TranscriptId, TranscriptPresentation,
 };
 pub use line::{raw_display, wrap_visible_lines, TranscriptLine};
-pub use state::{TranscriptAnchor, TranscriptState};
+pub use state::{
+    TranscriptAnchor, TranscriptState, FOLDED_MARKER, UNFOLDABLE_MARKER, UNFOLDED_MARKER,
+};

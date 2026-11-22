@@ -3165,6 +3165,7 @@ mod task_app_detail {
             press(&mut app, KeyCode::Char(']'));
             press(&mut app, KeyCode::Char(']'));
             press(&mut app, KeyCode::Char(']'));
+            press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.detail().tab(), DetailTab::Info);
             let lines = info::lines(
                 app.list().selected().unwrap(),
@@ -13341,5 +13342,326 @@ mod task_app_state_icons {
         ));
         let labels: Vec<String> = app.list().rows().into_iter().map(|row| row.label).collect();
         assert_eq!(labels, ["edit", "#1", "", "", ""]);
+    }
+}
+
+/// *Stan*: the execution state of a task as `path: value` rows that fold,
+/// unfold and keep their place across a new read.
+mod task_app_state {
+    use std::time::{Duration, Instant};
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::{json, Value};
+
+    use narsor::api::{ApiClient, ClientError};
+    use narsor::tui::keymap::{self, Action, Context};
+    use narsor::tui::task_app::tabs::state::State;
+    use narsor::tui::task_app::tabs::READER_RETRY;
+    use narsor::tui::task_app::{DetailTab, Focus, TaskApp};
+    use narsor_engine::controller_protocol::TaskSummary;
+    use narsor_engine::domain::ExecutionStatus;
+    use narsor_protocol::controller::{
+        ConversationUnavailableReason, ExecutionEventsSource, ExecutionState,
+        ExecutionStateResponse, StateSection,
+    };
+
+    use super::task_app_support::{listing, task, titled, with_controller, with_runner};
+
+    fn answer(variables: Value) -> ExecutionStateResponse {
+        ExecutionStateResponse::Available {
+            state: Box::new(ExecutionState {
+                context: StateSection::Available {
+                    value: json!({ "variables": variables }),
+                },
+                locals: StateSection::Available { value: json!({}) },
+                conductor: StateSection::Absent {
+                    message: "no conductor state".to_string(),
+                },
+            }),
+            source: ExecutionEventsSource::Runner,
+            read_at: "2026-11-22T10:00:00Z".parse().unwrap(),
+        }
+    }
+
+    fn reader_starting() -> ExecutionStateResponse {
+        ExecutionStateResponse::Unavailable {
+            reason: ConversationUnavailableReason::ReaderStarting,
+            message: "the reader is starting".to_string(),
+        }
+    }
+
+    fn shown(variables: Value, width: usize, height: usize) -> State {
+        let mut state = State::new();
+        state.set_view(width, height);
+        state.apply(Instant::now(), Ok(answer(variables)));
+        state
+    }
+
+    fn texts(state: &State) -> Vec<String> {
+        state
+            .visible_lines()
+            .into_iter()
+            .map(|line| line.text)
+            .collect()
+    }
+
+    #[test]
+    fn a_tall_unfolded_value_scrolls_line_by_line_before_the_cursor_moves_to_the_next_row() {
+        let plan = (1..=8)
+            .map(|n| format!("l{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut state = shown(json!({ "a": "x", "plan": plan, "z": "y" }), 40, 4);
+        state.on_action(Action::Down);
+        state.on_action(Action::Expand);
+        let (a, plan, z) = (
+            "context:variables:a",
+            "context:variables:plan",
+            "context:variables:z",
+        );
+
+        let steps = [
+            (Action::Down, plan, "⌄ context:variables:plan:", "  l3"),
+            (Action::Down, plan, "  l1", "  l4"),
+            (Action::Down, plan, "  l2", "  l5"),
+            (Action::Down, plan, "  l3", "  l6"),
+            (Action::Down, plan, "  l4", "  l7"),
+            (Action::Down, plan, "  l5", "  l8"),
+            (Action::Down, z, "  l6", "· context:variables:z: y"),
+            (Action::Up, plan, "  l5", "  l8"),
+            (Action::Up, plan, "  l4", "  l7"),
+            (Action::Up, plan, "  l3", "  l6"),
+            (Action::Up, plan, "  l2", "  l5"),
+            (Action::Up, plan, "  l1", "  l4"),
+            (Action::Up, plan, "⌄ context:variables:plan:", "  l3"),
+            (Action::Up, a, "· context:variables:a: x", "  l2"),
+        ];
+        for (index, (action, selected, first, last)) in steps.into_iter().enumerate() {
+            state.on_action(action);
+            let lines = texts(&state);
+            assert_eq!(
+                (
+                    state.selected_path(),
+                    lines.first().map(String::as_str),
+                    lines.last().map(String::as_str)
+                ),
+                (Some(selected), Some(first), Some(last)),
+                "step {index} ({action:?}): {lines:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_unfolds_a_multi_line_value_to_every_line_and_folds_it_again() {
+        let mut state = shown(json!({ "plan": "first\nsecond\nthird" }), 60, 10);
+        let folded = vec![
+            "› context:variables:plan: first".to_string(),
+            "· locals: {}".to_string(),
+            "· conductor: (no conductor state)".to_string(),
+        ];
+        assert_eq!(texts(&state), folded);
+
+        state.on_action(Action::Expand);
+        assert_eq!(
+            texts(&state)[..4],
+            [
+                "⌄ context:variables:plan:",
+                "  first",
+                "  second",
+                "  third"
+            ]
+        );
+
+        state.on_action(Action::Expand);
+        assert_eq!(texts(&state), folded);
+    }
+
+    #[test]
+    fn a_one_line_row_wider_than_the_tab_is_folded_and_clipped_and_a_short_one_is_not() {
+        let long = "w".repeat(60);
+        let state = shown(json!({ "a": "short", "long": long }), 40, 10);
+        let lines = texts(&state);
+        assert_eq!(lines[0], "· context:variables:a: short");
+        assert!(
+            lines[1].starts_with("› context:variables:long: www") && lines[1].ends_with('…'),
+            "{lines:#?}"
+        );
+        assert_eq!(lines[1].chars().count(), 40);
+    }
+
+    #[test]
+    fn a_new_read_keeps_unfolded_paths_that_remain_and_forgets_removed_ones() {
+        let mut state = shown(json!({ "old": "c\nd", "plan": "a\nb", "z": "y" }), 40, 20);
+        state.on_action(Action::Expand); // old
+        state.on_action(Action::Down);
+        state.on_action(Action::Expand); // plan
+        state.on_action(Action::Top);
+
+        state.apply(
+            Instant::now(),
+            Ok(answer(json!({ "plan": "a\nb", "z": "y" }))),
+        );
+        assert!(state.is_unfolded("context:variables:plan"));
+        assert_eq!(
+            state.selected_path(),
+            Some("context:variables:plan"),
+            "the cursor goes to the next row that is still there"
+        );
+
+        state.apply(
+            Instant::now(),
+            Ok(answer(json!({ "old": "c\nd", "plan": "a\nb" }))),
+        );
+        assert!(!state.is_unfolded("context:variables:old"), "forgotten");
+        assert!(state.is_unfolded("context:variables:plan"));
+    }
+
+    #[test]
+    // AE3.
+    fn a_starting_reader_is_asked_again_after_a_pause_and_then_the_state_shows() {
+        let mut state = State::new();
+        let now = Instant::now();
+        assert!(state.needs_read(now), "a tab never read wants a read");
+
+        state.apply(now, Ok(reader_starting()));
+        assert!(state.is_starting());
+        assert!(!state.needs_read(now), "no read without a pause");
+        assert!(state.needs_read(now + READER_RETRY));
+
+        state.apply(now + READER_RETRY, Ok(answer(json!({ "a": "x" }))));
+        assert!(!state.is_starting());
+        assert_eq!(state.rows()[0].path, "context:variables:a");
+        assert!(state.read_at().is_some());
+        assert!(
+            !state.needs_read(now + Duration::from_secs(3600)),
+            "no read in the background"
+        );
+    }
+
+    #[test]
+    fn a_reread_asked_while_a_read_runs_is_not_lost() {
+        let mut state = State::new();
+        let now = Instant::now();
+        state.begin_read();
+        state.request_read();
+        state.apply(now, Ok(answer(json!({ "a": "x" }))));
+        assert!(
+            state.needs_read(now),
+            "the request made during the read stays"
+        );
+
+        state.begin_read();
+        state.apply(now, Ok(answer(json!({ "a": "y" }))));
+        assert!(!state.needs_read(now));
+    }
+
+    #[test]
+    fn an_unfolded_wide_value_wraps_by_display_width() {
+        let mut state = State::new();
+        state.apply(
+            Instant::now(),
+            Ok(answer(json!({ "a": "漢字漢字漢字漢字" }))),
+        );
+        state.set_view(10, 20);
+        state.on_action(Action::Expand);
+        for line in state.visible_lines() {
+            assert!(
+                ratatui::text::Span::raw(line.text.as_str()).width() <= 10,
+                "{:?}",
+                line.text
+            );
+        }
+    }
+
+    #[test]
+    fn an_unfolded_row_with_a_path_wider_than_the_view_still_shows_its_value() {
+        let long = "a_very_long_variable_name_here";
+        let mut state = shown(json!({ long: "VALUE" }), 20, 10);
+        state.on_action(Action::Expand);
+        let all = texts(&state);
+        assert!(all.iter().any(|t| t.trim() == "VALUE"), "{all:?}");
+
+        let tall = (1..=6).map(|n| format!("l{n}")).collect::<Vec<_>>().join("\n");
+        let mut state = shown(json!({ long: tall }), 20, 4);
+        state.on_action(Action::Expand);
+        for _ in 0..12 {
+            state.on_action(Action::Down);
+        }
+        let all = texts(&state);
+        assert!(all.iter().any(|t| t == "  l6"), "{all:?}");
+    }
+
+    fn running(revision: u64) -> TaskSummary {
+        let mut task = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        );
+        task.revision = revision;
+        titled(task, "NAR-12")
+    }
+
+    fn state_wanted(app: &TaskApp) -> bool {
+        app.detail()
+            .view("a")
+            .expect("details")
+            .state()
+            .needs_read(Instant::now())
+    }
+
+    fn press(app: &mut TaskApp, code: KeyCode, modifiers: KeyModifiers) {
+        app.on_key(KeyEvent::new(code, modifiers));
+    }
+
+    #[test]
+    fn opening_the_tab_and_ctrl_r_read_the_state_and_a_new_revision_does_not() {
+        let mut app = TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        );
+        app.load(listing(vec![running(1)], "c"));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.focus(), Focus::Details);
+        app.detail_mut().set_tab(DetailTab::Conductor);
+
+        press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(app.detail().tab(), DetailTab::State, "after Dyrygent");
+        assert!(state_wanted(&app), "opening the tab reads");
+        app.on_state_read("a", Ok(answer(json!({ "a": "x" }))));
+        assert!(!state_wanted(&app));
+
+        app.load(listing(vec![running(2)], "c"));
+        assert!(!state_wanted(&app), "a new revision does not read");
+
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(state_wanted(&app), "Ctrl+R reads");
+        app.on_state_read(
+            "a",
+            Err(ClientError::Degraded {
+                code: "runner_timeout".to_string(),
+                message: "runner nie odpowiada".to_string(),
+            }),
+        );
+        let state = app.detail().view("a").unwrap().state();
+        assert_eq!(state.rows().len(), 3, "a 503 keeps the rows");
+        assert!(state.failure().is_some());
+
+        press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(app.detail().tab(), DetailTab::Info, "before Info");
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(!state_wanted(&app), "Ctrl+R reads only on Stan");
+    }
+
+    #[test]
+    fn ctrl_r_is_the_refresh_of_the_state_tab_in_the_details_and_in_help() {
+        assert_eq!(keymap::check_consistency(keymap::BINDINGS), Ok(()));
+        assert_eq!(
+            keymap::key_of(Context::Details, Action::RereadState).as_deref(),
+            Some("Ctrl+R")
+        );
+        assert!(keymap::help_entries(Context::Details)
+            .iter()
+            .any(|entry| entry.keys == "Ctrl+R" && entry.description.contains("Stan")));
     }
 }

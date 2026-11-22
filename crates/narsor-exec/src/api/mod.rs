@@ -15,5 +15,7 @@ pub use dto::{
 pub use narsor_shared::api_error::{handle_json_response, ClientError};
 mod details;
 mod projection;
+mod state;
 pub use details::execution_details;
 pub use projection::conversation_response_from_snapshot;
+pub use state::{execution_state, NO_CONDUCTOR_STATE};

@@ -13,6 +13,7 @@
 //! * [`events`] — the raw event log with the detail of one event;
 //! * [`gate`] — the entry and exit scripts of a watched gate on *Przebieg*;
 //! * [`conductor`] — the chat with the conductor, its decisions and harness;
+//! * [`state`] — every value the workflow sees now, as `path: value` rows;
 //! * [`info`] — what the control plane knows about the task.
 
 /// How long the interface waits before it asks again for a stopped task whose
@@ -27,3 +28,4 @@ pub mod events;
 pub mod gate;
 pub mod info;
 pub mod progress;
+pub mod state;

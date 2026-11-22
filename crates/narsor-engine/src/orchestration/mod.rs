@@ -12,6 +12,8 @@
 //! * [`control_plane`] — the API owners and controllers mutate tasks through;
 //! * `runner_state` — runner snapshots and owner input on the same record;
 //! * [`resume`] — counting workload losses for the automatic resume;
+//! * `position` — the sparse keys that order a backend's queue, and the
+//!   planner of a move;
 //! * [`scheduler`] — admission of queued tasks under backend availability and
 //!   the global task budget (U10).
 //!
@@ -24,6 +26,7 @@ pub mod error;
 pub(crate) mod lifecycle;
 pub mod model;
 mod operator_commands;
+pub(crate) mod position;
 pub mod resume;
 mod runner_state;
 pub mod scheduler;

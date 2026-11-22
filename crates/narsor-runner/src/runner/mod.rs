@@ -119,8 +119,8 @@ use crate::api::ClientError;
 use crate::conductor::LiveHarness;
 use crate::controller_client::{
     ConversationPageRequest, DeliveredInput, ExecutionDetailsRequest, ExecutionEventsRequest,
-    RunnerClient, RunnerDirective, RunnerLaunchView, RunnerPollQuery, RunnerPollResponse,
-    RunnerSnapshotResponse, TaskDefaultHarness,
+    ExecutionStateRequest, RunnerClient, RunnerDirective, RunnerLaunchView, RunnerPollQuery,
+    RunnerPollResponse, RunnerSnapshotResponse, TaskDefaultHarness,
 };
 use crate::domain::runner_snapshot::RunnerSnapshot;
 use crate::domain::{
@@ -1832,6 +1832,9 @@ impl Session {
         for request in response.execution_details {
             self.serve_details(request).await;
         }
+        for request in response.execution_states {
+            self.serve_state(request).await;
+        }
         if !response.materials.is_empty() && !self.materials_deferred() {
             self.receive_materials(response.materials).await;
         }
@@ -1977,6 +1980,29 @@ impl Session {
             return;
         };
         reader::serve_details(
+            &mut self.link,
+            &self.timing,
+            self.engine.store(),
+            &execution_id,
+            request,
+        )
+        .await;
+    }
+
+    /// Uploads the complete state of the execution an owner waits for. A
+    /// runner without an execution yet says so, so its owner is answered now.
+    async fn serve_state(&mut self, request: ExecutionStateRequest) {
+        let Some(execution_id) = self.execution_id.clone() else {
+            reader::fail_read(
+                &mut self.link,
+                &self.timing,
+                &request.request_id,
+                "the task has no execution yet",
+            )
+            .await;
+            return;
+        };
+        reader::serve_state(
             &mut self.link,
             &self.timing,
             self.engine.store(),

@@ -348,6 +348,14 @@ pub enum OrchestrationError {
         runner_state: RunnerState,
     },
 
+    /// A move found no free key where the task goes, even after it shifted
+    /// the neighbours as far as the queue allows. Nothing was written.
+    #[error("task '{task_id}' cannot be moved there: the queue has no free position key")]
+    NoRoomToMove {
+        /// The task being moved.
+        task_id: TaskId,
+    },
+
     /// A move names a task that is not on the same backend, or the moved
     /// task itself, as its anchor.
     #[error("task '{task_id}' cannot be moved relative to '{anchor}': {reason}")]
