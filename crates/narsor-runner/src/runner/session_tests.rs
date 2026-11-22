@@ -3416,6 +3416,37 @@ async fn a_failed_step_without_a_comment_to_give_stays_failed() {
     }
 }
 
+/// A comment that reached a launch whose execution cannot take it (it waits
+/// for an event or has ended) does not stop the launch: the execution stays
+/// as it was, and the comment stays to be given.
+#[tokio::test]
+async fn a_comment_the_execution_cannot_take_stays_stored_and_the_launch_goes_on() {
+    for status in [ExecutionStatus::WaitingForEvent, ExecutionStatus::Completed] {
+        let root = TempRoot::new();
+        let storage = paused_between_steps(&root).await;
+        let store = TaskStorage::new(&storage).store();
+        let execution_id = store.list_execution_ids().unwrap().remove(0);
+        let mut execution = store.load_execution(&execution_id).unwrap();
+        execution.status = status;
+        store.save_execution(&execution).unwrap();
+        let mut fixture = resumed(&root, &storage, Some(launch_with_comment("pod-2")));
+
+        assert_eq!(fixture.begin().await, None, "{status:?}");
+        fixture.settled().await;
+
+        assert_eq!(fixture.status(), status);
+        assert!(fixture.agent.calls().is_empty(), "{status:?}");
+        assert_eq!(
+            fixture.session.taken_resume_message_key(),
+            None,
+            "{status:?}"
+        );
+        assert!(
+            fixture.session.untaken_resume_message().unwrap().is_some(),
+            "{status:?}"
+        );
+    }
+}
 // ---------------------------------------------------------------------------
 // A `decision` gate on an observer queue (U2)
 // ---------------------------------------------------------------------------

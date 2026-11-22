@@ -197,7 +197,10 @@ the field when it succeeds.
 
 You can also write to the agent after the task's workload was lost or its step
 failed: when the task is paused or in error with an interrupted runner, in
-error with an unknown runner, or in error after a failed step. The task starts
+error with an unknown runner, or in error after a failed step. With an
+interrupted or unknown runner, the step must still be able to go on: a task
+whose execution waits for an event or has ended does not offer the comment.
+The task starts
 again, and the agent goes on with the step in the same session, with your text
 and the context of the step. The description of the action says which of two
 things happens:

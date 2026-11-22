@@ -43,7 +43,7 @@ Three gaps cause this (verified in the code):
 
 **Offer and send (control plane)**
 
-- R1. The comment action is offered in these owner/runner states: `Paused`/`Interrupted`, `Error`/`Interrupted`, `Error`/`Unknown`, and `Error`/`Stopped` when the execution is `Failed`. The states where it is offered today stay unchanged.
+- R1. The comment action is offered in these owner/runner states: `Paused`/`Interrupted`, `Error`/`Interrupted` and `Error`/`Unknown` when the execution is `Running`, `Paused`, `Unknown` or `Failed` (or when no runner view exists, with the new-session warning), and `Error`/`Stopped` when the execution is `Failed`. A lost or unknown workload whose execution waits for an event or has ended does not get the comment: the runner cannot give it to that execution. The states where it is offered today stay unchanged. (Narrowed after review: before, the `Interrupted` and `Unknown` states took the comment for any execution status.)
 - R2. The comment action stays refused in `Finished`, `Archived` and `Queued`, and in every state that is neither named in R1 nor offered today.
 - R3. The offer (`comment_reason`) and the server check at send (`require_available`) give the same answer for every state.
 - R4. A comment sent in an R1 state is stored as the pending resume message, and the task gets `OwnerCommand::Resume`, from `Interrupted` and `Unknown` as well as from `Stopped`.
@@ -187,10 +187,11 @@ Which states offer the comment and what its description says (R1, R2, R5). "Toda
 |---|---|---|---|
 | any state with a waiting question, approval or permission | — | yes (today) | today's texts |
 | `Paused` / `Stopped` | — | yes (today) | today's text (comment in a pause) |
-| `Paused` / `Interrupted` | any | yes (new) | continues the session, or new-session warning |
-| `Error` / `Interrupted` | any | yes (new) | continues the session, or new-session warning |
-| `Error` / `Unknown` | any | yes (new) | continues the session, or new-session warning |
+| `Paused` / `Interrupted` | `Running`, `Paused`, `Unknown`, `Failed`, or no runner view | yes (new) | continues the session, or new-session warning |
+| `Error` / `Interrupted` | `Running`, `Paused`, `Unknown`, `Failed`, or no runner view | yes (new) | continues the session, or new-session warning |
+| `Error` / `Unknown` | `Running`, `Paused`, `Unknown`, `Failed`, or no runner view | yes (new) | continues the session, or new-session warning |
 | `Error` / `Stopped` | `Failed` | yes (new) | continues the session, or new-session warning |
+| `Paused` or `Error` / `Interrupted`, `Error` / `Unknown` | `WaitingForEvent`, `InputNeeded` with no waiting form, `Completed`, `Cancelled` | no | reason, as today |
 | `Error` / `Stopped` | not `Failed` | no | reason, as today |
 | `Running` / `Interrupted` (resume policy still waits) | any | no | reason, as today |
 | `Queued`, `Finished`, `Archived` | — | no | reason, as today |
@@ -371,7 +372,7 @@ U1 → U2 → U3 → U4. U2 → U5 → U6. U7 last. U5 and U6 can be built while
   - `crates/narsor-engine/src/orchestration/runner_state.rs` (`store_resume_message` accepts `Interrupted` and `Unknown`)
   - Tests: the test module of `actions.rs`; `tests/integration/tui_state.rs` for the panel
 - **Approach:**
-  1. `comment_reason`: after the waiting-form check, return `None` for the four R1 states. `Error`/`Stopped` reads `runner.execution_status == Failed` from the summary.
+  1. `comment_reason`: after the waiting-form check, return `None` for the four R1 states. `Error`/`Stopped` reads `runner.execution_status == Failed` from the summary; the `Interrupted` and `Unknown` states read that `runner.execution_status` is `Running`, `Paused`, `Unknown` or `Failed` (no runner view is allowed). As a backstop for a stale summary, the runner gives a stored comment only to a `Running` or `Paused` execution (or recovers a `Failed` one with it); for any other execution it keeps the comment stored and the launch goes on.
   2. `comment_effect`: for the R1 states, pick the continue text or the new-session warning from `agent_session_resumable` (missing view → warning).
   3. `submit_comment`: the branch with no waiting form accepts `Stopped`, `Interrupted` and `Unknown`. It then calls the comment variant of the resume.
   4. The summary already removes the comment while a message waits (`record.resume_message.is_some()`). Keep that.

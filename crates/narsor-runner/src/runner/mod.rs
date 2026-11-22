@@ -1490,18 +1490,32 @@ impl Session {
 
     /// Goes on after a stop with nothing to reconcile. A step that failed
     /// and the owner wrote to since is recovered with the comment, in the
-    /// session it failed in when there is one; otherwise the comment is
-    /// left for the work that goes on, and the pass resumes.
+    /// session it failed in when there is one; a running or paused execution
+    /// gets the comment for the work that goes on. Any other execution (one
+    /// that waits for an event or has ended) cannot take it: the comment
+    /// stays stored and the launch goes on without it.
     fn go_on(&mut self) -> Result<(), RunnerError> {
-        if let Some(execution_id) = self.execution_id.clone() {
-            let status = self.engine.store().load_execution(&execution_id)?.status;
-            if status == ExecutionStatus::Failed {
+        let Some(execution_id) = self.execution_id.clone() else {
+            self.take_resume_message()?;
+            return self.resume_pass();
+        };
+        let status = self.engine.store().load_execution(&execution_id)?.status;
+        match status {
+            ExecutionStatus::Failed => {
                 if let Some(message) = self.untaken_resume_message()? {
                     return self.recover_with_message(&execution_id, None, Some(message));
                 }
             }
+            ExecutionStatus::Running | ExecutionStatus::Paused => self.take_resume_message()?,
+            _ => {
+                if self.untaken_resume_message()?.is_some() {
+                    tracing::warn!(
+                        ?status,
+                        "a comment to the agent waits, but the execution cannot take it"
+                    );
+                }
+            }
         }
-        self.take_resume_message()?;
         self.resume_pass()
     }
 

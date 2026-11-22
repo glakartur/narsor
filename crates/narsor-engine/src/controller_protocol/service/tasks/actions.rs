@@ -621,11 +621,23 @@ fn comment_effect(task: &TaskSummary) -> &'static str {
 /// Whether `task` stopped on a lost workload or a failed step, where the
 /// owner's comment goes on with the step: paused or in error with its
 /// workload lost, in error while nobody knows whether its workload still
-/// runs, or stopped on a failed execution.
+/// runs, or stopped on a failed execution. A lost or unknown workload takes
+/// the comment only while its execution can go on with a step (running,
+/// paused, unknown or failed), not while it waits for an event or has ended.
+/// A task the runner never reported on stays open to the comment, with the
+/// warning that the agent session cannot be resumed.
 fn stopped_by_loss_or_failure(task: &TaskSummary) -> bool {
     match (task.state, task.runner_state) {
-        (TaskState::Paused | TaskState::Error, RunnerState::Interrupted) => true,
-        (TaskState::Error, RunnerState::Unknown) => true,
+        (TaskState::Paused | TaskState::Error, RunnerState::Interrupted)
+        | (TaskState::Error, RunnerState::Unknown) => task.runner.as_ref().is_none_or(|runner| {
+            matches!(
+                runner.execution_status,
+                ExecutionStatusDto::Running
+                    | ExecutionStatusDto::Paused
+                    | ExecutionStatusDto::Unknown
+                    | ExecutionStatusDto::Failed
+            )
+        }),
         (TaskState::Error, RunnerState::Stopped) => task
             .runner
             .as_ref()
@@ -1926,12 +1938,19 @@ terminal_states: { completed: completed, cancelled: cancelled }
 
     #[test]
     fn the_comment_is_offered_after_a_lost_workload_or_a_failed_step_and_nowhere_new() {
-        use ExecutionStatusDto::{Completed, Failed, Paused, Running, Unknown};
+        use ExecutionStatusDto::{Completed, Failed, Paused, Running, Unknown, WaitingForEvent};
         let rows = [
             ("stopped", "paused", Some(Paused), true),
             ("interrupted", "paused", Some(Running), true),
             ("interrupted", "error", Some(Running), true),
             ("unknown", "error", Some(Unknown), true),
+            ("unknown", "error", None, true),
+            // A lost or unknown workload whose execution waits for an event or
+            // has ended cannot take a comment.
+            ("interrupted", "paused", Some(WaitingForEvent), false),
+            ("interrupted", "error", Some(Completed), false),
+            ("unknown", "error", Some(WaitingForEvent), false),
+            ("unknown", "error", Some(Completed), false),
             ("stopped", "error", Some(Failed), true),
             ("stopped", "error", Some(Completed), false),
             ("stopped", "error", None, false),
