@@ -23,7 +23,7 @@ execution: code
 
 ## Product Contract
 
-Product Contract preservation: changed: R4, R6, R8, R10. The origin names the `context.json` sections `artifacts_index` and `workspace_info`. The stored file has the keys `task`, `variables`, `artifacts`, `repositories`, `workspace` and `workspace_prs` (`crates/narsor-model/src/domain/context.rs`). R4 and R6 now use the stored keys. Scope is unchanged: R4 already asks for "all sections". R8 states the per-section sort that the origin review gave as the intended reading. R10 drops the origin words "the refresh key of the other tabs", because the TUI task view has no such key. KTD8 chooses the key (Q5). The origin's R7 and Z4 are kept as written; the review items about them are in "Pytania otwarte dla użytkownika".
+Product Contract preservation: changed: R4, R6, R8, R10. The origin names the `context.json` sections `artifacts_index` and `workspace_info`. The stored file has the keys `task`, `variables`, `artifacts`, `repositories`, `workspace` and `workspace_prs` (`crates/narsor-model/src/domain/context.rs`). R4 and R6 now use the stored keys. Scope is unchanged: R4 already asks for "all sections". R8 states the per-section sort that the origin review gave as the intended reading. R10 drops the origin words "the refresh key of the other tabs", because the TUI task view has no such key. KTD8 chooses the key (Q5). R7 now flattens arrays that contain objects per index, as the owner decided (Q3); the origin said every array is one row.
 
 ### Summary
 
@@ -72,8 +72,8 @@ Today the owner sees only parts of the state. `narsor-cli show --details` prints
 **Flat list (all interfaces)**
 
 - R6. Each interface shows the state as a flat list of `path: value` rows. The path joins the keys with `:`, starting with the section: `context:variables:NAME`, `context:artifacts:NAME:location`, `locals:STATE_ID:NAME`, `conductor:failure:reason`.
-- R7. JSON objects are flattened down to their leaves. A JSON array stays one row whose value is the compact JSON of the array. An empty object is one row with the value `{}`.
-- R8. A string value is shown as its text, without JSON quotes or escapes, so a multi-line string keeps its real lines. Other values (number, bool, `null`, array) are shown as compact JSON. Rows are sorted by path within each section, and the sections come in the fixed order `context`, `locals`, `conductor`.
+- R7. JSON objects are flattened down to their leaves. A JSON array whose items are all scalars stays one row whose value is the compact JSON of the array. An array with any object item is flattened per index (`conductor:queue:0:payload:...`): the index is a path segment, objects inside the item are flattened down to their leaves, and scalar items of such an array get their own index rows. An empty array is one row with the value `[]`. An empty object is one row with the value `{}`.
+- R8. A string value is shown as its text, without JSON quotes or escapes, so a multi-line string keeps its real lines. Other values (number, bool, `null`, an array of scalars) are shown as compact JSON. Rows are sorted by path within each section, and the sections come in the fixed order `context`, `locals`, `conductor`.
 - R9. One flattening function produces the rows for the TUI and the CLI. The web interface follows the same rules (R6–R8).
 
 **TUI**
@@ -117,7 +117,7 @@ Today the owner sees only parts of the state. `narsor-cli show --details` prints
 
 **Considered and not built**
 
-- A per-value size limit that replaces only the oversized value. One section limit (KTD4) already makes an oversized state visible. Build it if owners report that one large variable hides the rest of the context.
+- Any size limit on the state (decided by the owner, Q2). Build one if an oversized state causes a real failure; the default upload limit then ends the read as a retryable `503` (KTD4).
 - An escape for a `:` inside a key. Paths are display text only, and `--json` gives the exact structure. Build it if a client starts to parse paths.
 - Re-reading the state when the task's revision changes. R10 and Z7 forbid background reads.
 
@@ -130,8 +130,8 @@ Today the owner sees only parts of the state. `narsor-cli show --details` prints
 ### Dependencies / Assumptions
 
 - The relay and the read-only runner of D63 serve this read in the same way as `execution-details` and `conductor`.
-- The context does not store large blobs (domain model §2.6), so a normal read is small. KTD4 protects the server anyway.
-- Only the task owner can read the state. The preview does not mask values (origin Z9; see Pytania otwarte, Q1).
+- The context does not store large blobs (domain model §2.6), so a normal read is small. KTD4 adds no limit.
+- Only the task owner can read the state. The preview does not mask values (origin Z9; Q1, decided by the owner). The state is loaded only when the owner opens the view or refreshes it (R2, R10), never in the background or with the task list.
 
 ---
 
@@ -142,7 +142,7 @@ Today the owner sees only parts of the state. `narsor-cli show --details` prints
 - KTD1. **Endpoint, wire names and CLI command.** Owner route `GET /control/v1/tasks/{task_id}/execution-state` (T16 in the wire reference). Runner upload route `POST /runner/v1/execution-states/{request_id}`. Poll field `execution_states` on `RunnerPollResponse`, with `#[serde(default)]` so older runners and servers keep working. CLI command `narsor-cli task state TASK_ID [--json]`. The relay timeout is the existing `conversation_page_timeout`. The names follow `execution-details` and the `task` subcommands, which take task ids.
 - KTD2. **Wire shape.** The protocol types live in `crates/narsor-protocol/src/controller/relay.rs` beside `ExecutionDetails`. `ExecutionState` has three sections, `context`, `locals` and `conductor`. Each is a `StateSection`: `available { value }` (a JSON value), `absent { message }`, or `unreadable { reason }`. `ExecutionStateResponse` is `available { state, source, read_at }` or `unavailable { reason, message }`, tagged by `status` like `ExecutionDetailsResponse`. The server sets `read_at` when the upload arrives, so the time comes from the trusted clock. Section values are raw JSON, so new fields of `Context` or `ConductorState` appear without a wire change (R4 "any section added later").
 - KTD3. **Each section is read and reported separately.** The runner loads the execution record (`state.json`) once and takes both `context` and `locals` from it. `state.json` is the authority, and `context.json` is only a projection of the same context (`crates/narsor-store/src/execution_store.rs`), so the two sections come from one consistent snapshot. The conductor section comes from `ConductorStore` (`load_state` and `load_generated_title`). It is `absent` when the store does not exist. A source that fails to load makes its section `unreadable` with the error text. It never shows as empty. The whole read fails (relay failure, `503 runner_read_failed`) only when the execution record cannot load. This closes the origin review item "a section that fails to load looks empty" (Q4).
-- KTD4. **One size limit per section.** The runner serializes each section. A section over `MAX_STATE_SECTION_BYTES` (1 MiB) is sent as `unreadable` with a reason that gives its size and the limit. The upload route gets an explicit `DefaultBodyLimit` of 4 MiB (three full sections plus envelope), because the axum default of 2 MiB would turn a valid state into a `503`. The oversize error is visible in the section that caused it, and the other sections still show (Q2).
+- KTD4. **No dedicated size limit.** The owner decided to add none for now (Q2). The runner uploads the state as is, under the default body limit of the upload route (about 2 MiB). An oversized state ends as a retryable `503`. Add a limit when that happens.
 - KTD5. **The flattening function is in the client library.** It is in `src/client/state_rows.rs`, registered in `src/client_lib.rs`. It takes an `ExecutionState` and returns ordered rows (path, display value, line count). Both the TUI and the CLI use it (R9). A non-`available` section gives one row whose path is the section name and whose value is its message or reason in parentheses, for example `conductor: (no conductor state)`.
 - KTD6. **One fixture keeps the Rust and JS flattening equal.** `crates/narsor-web/ui-tests/fixtures/state-rows.json` holds input states and the expected rows, starting with AE1. A Rust test (via `include_str!`) and a `node --test` test both check it. Without it, nothing would catch the two copies drifting apart (success criterion "same rows").
 - KTD7. **TUI read model.** A new `DetailJob::State` runs through `Background`, like the *Info* tab's `Drift` read. `TaskApp::start_detail_reads` starts it only when *Stan* is the active tab and the tab needs a read: it was never read, the owner asked for a refresh, or the answer was `reader_starting` and `READER_RETRY` (2 s) has passed. The list refresh (`DetailState::invalidate_changed`) does not invalidate it (R10).
@@ -181,8 +181,8 @@ The section status rules form a small state model per section:
 ```mermaid
 stateDiagram-v2
     [*] --> Loading
-    Loading --> available: loaded and size <= 1 MiB
-    Loading --> unreadable: load error, or size > 1 MiB
+    Loading --> available: loaded
+    Loading --> unreadable: load error
     Loading --> absent: conductor store does not exist
 ```
 
@@ -190,9 +190,9 @@ stateDiagram-v2
 
 These are unconfirmed choices. The plan builds them; each matches the recommended option of a question in "Pytania otwarte dla użytkownika".
 
-- All sections are shown to the owner, unmasked (Q1).
-- A per-section size limit of 1 MiB (KTD4, Q2).
-- Arrays stay one row, as R7 says, including the arrays of objects in the conductor (`queue`, `unapplied_decisions`) (Q3). The array branch of the flattening is one place in each implementation, so a later change touches only that branch and the fixture.
+- All sections are shown to the owner, unmasked, and loaded only on demand (Q1, decided by the owner).
+- No size limit on the state (KTD4, Q2, decided by the owner).
+- Arrays that contain an object are flattened per index (R7, Q3, decided by the owner).
 - Per-section read status (KTD3, Q4).
 - `Ctrl+R` is the refresh key of the *Stan* tab (KTD8, Q5).
 - The *Stan* tab sits after *Dyrygent* and before *Info*, in the TUI and in the web (origin Z6).
@@ -209,7 +209,7 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 
 | Risk | Mitigation |
 |---|---|
-| Three sections at the 1 MiB limit make an upload of about 3 MiB, which can be slow on a remote backend. | The 4 MiB upload limit accepts it. A slow relay gives a retryable `503`. |
+| An oversized state exceeds the default upload limit and gives a retryable `503` (KTD4). | Accepted by the owner (Q2). Add a limit when it happens. |
 | The TUI scroll-inside-a-row behavior (R12) has no existing code to reuse. | U6 builds it in the tab module on `ScrollState` (`src/tui/scroll.rs`), with tests at the visible-line level. |
 | The Rust and JS flattening drift apart. | KTD6 fixture. |
 
@@ -237,7 +237,6 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 1. Add the protocol types per KTD2, with serde tags that match `ExecutionDetailsResponse`.
 2. In `execution_state`, load the execution record once. Serialize `execution.context` for `context` and the step-locals record for `locals` (KTD3).
 3. Read the conductor section from `ConductorStore`: `absent` when `exists()` is false, otherwise the serialized `ConductorState` plus a `title` key when `load_generated_title` returns one.
-4. Apply the per-section size limit of KTD4.
 
 **Patterns to follow:** `crates/narsor-exec/src/api/details.rs` (`execution_details`, `conductor_activity`).
 
@@ -245,7 +244,6 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 - Happy path: an execution with variables, an artifact, locals of two steps and a conductor state with `pending` and `failure` returns three `available` sections whose JSON contains those values and the title. Covers AE5.
 - Edge case: an execution without a conductor directory returns `conductor` as `absent`.
 - Error path: a corrupt conductor `state.json` returns `conductor` as `unreadable` with a reason, while `context` and `locals` stay `available`.
-- Edge case: a variable larger than 1 MiB makes `context` `unreadable` with a reason naming the size and the limit, while `locals` stays `available`.
 - Error path: a missing execution record returns an error, not a state.
 
 **Verification:** The unit tests pass, and the new poll field deserializes from a poll answer that does not have it.
@@ -263,7 +261,7 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 - `crates/narsor-engine/src/controller_protocol/service.rs` (`StateRelay`, the `state_reads` field)
 - `crates/narsor-engine/src/controller_protocol/service/reads/relay_answers.rs` (`lock_state_reads`, `runner_relay_failure` also takes from `state_reads`)
 - `crates/narsor-engine/src/controller_protocol/service/runner_channel/runner_poll.rs` (offer `execution_states`, count them as pending work)
-- `crates/narsor-server/src/controller_protocol/http.rs` (both routes, upload body limit of KTD4)
+- `crates/narsor-server/src/controller_protocol/http.rs` (both routes)
 - Test: `crates/narsor-engine/src/controller_protocol/service/tests.rs`, and a body-limit test for the upload route through the router (`tower::ServiceExt::oneshot`)
 
 **Approach:**
@@ -279,7 +277,6 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 - Error path: a relay failure from the runner gives `503 runner_read_failed`, and no answer within the timeout gives `503 runner_timeout`.
 - Error path: an upload for another task's request id is not delivered.
 - Integration: an uploaded variable name and value with an ANSI escape and a bidi override reach the owner without them, and the value keeps its line feeds.
-- Edge case: an upload of 3 MiB is accepted by the upload route.
 
 **Verification:** The service and route tests pass, and existing `execution-details` tests still pass.
 
@@ -323,12 +320,13 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 
 **Approach:**
 1. Walk each section in the fixed order. Recurse into objects, and emit a leaf row for a scalar, an array (compact JSON) or an empty object (`{}`).
-2. Sort rows by path within a section.
+2. An array with an object item is flattened per index: the index is a path segment, and scalar items of the array get their own index rows. Sort rows by path within a section, with indexes in numeric order.
 3. A string row keeps its raw text. Record its line count for the fold rules of R11.
 
 **Test scenarios:**
 - Covers AE1. The fixture case gives `branch`, `files`, `pr` in that order with `feat/x`, `["a","b"]`, `12`.
 - Happy path: a nested object `artifacts.report.location` becomes `context:artifacts:report:location`, and `locals` gives `locals:STATE_ID:NAME`.
+- Edge case: `conductor:queue` with two objects gives `conductor:queue:0:...` and `conductor:queue:1:...` rows, a multi-line payload keeps its lines, and an array of scalars stays one row.
 - Edge case: an empty object gives one row `{}`, `null` gives `null`, and a three-line string gives one row with three lines.
 - Edge case: sections come out as `context`, `locals`, `conductor` even when a `conductor` path sorts first.
 - Edge case: an `absent` conductor gives one row `conductor: (…)`, and an `unreadable` section gives one row with its reason.
@@ -483,17 +481,17 @@ These are unconfirmed choices. The plan builds them; each matches the recommende
 
 ## Pytania otwarte dla użytkownika
 
-These questions do not block implementation. The plan builds the first option of each (see Assumptions).
+These questions do not block implementation. The plan builds the owner's decision where there is one (Q1, Q2, Q3, Q5) and the first option otherwise (Q4).
 
-- Q1. **Exposure of the new sections** (Product Contract, R4 and Dependencies/Assumptions; origin Z9). The preview shows the owner data that no read shows today: the other context sections (including the workspace path), the step locals, and the payloads of the conductor's queued and pending requests. Origin Z9 says that nothing new is exposed, which is true only for `context:variables`.
+- Q1. (decided: option 1, loaded on demand only) **Exposure of the new sections** (Product Contract, R4 and Dependencies/Assumptions; origin Z9). The preview shows the owner data that no read shows today: the other context sections (including the workspace path), the step locals, and the payloads of the conductor's queued and pending requests. Origin Z9 says that nothing new is exposed, which is true only for `context:variables`.
   1. (recommended) Show all sections to the owner, unmasked. Limit the "already visible" reasoning to `context:variables`.
   2. Drop the sections that are not wanted (for example, the conductor request payloads or the workspace).
-- Q2. **Size limit** (Planning Contract, KTD4; origin Z8). The default runner upload limit is about 2 MiB. An oversized state would otherwise end as a retryable `503` and not as a clear error.
+- Q2. (decided: option 4, no limit for now) **Size limit** (Planning Contract, KTD4; origin Z8). The default runner upload limit is about 2 MiB. An oversized state would otherwise end as a retryable `503` and not as a clear error.
   1. (recommended) A limit per section (1 MiB). An oversized section shows as unreadable with its size, and the other sections still show.
   2. One limit for the whole state, reported as one error.
   3. A limit per value: only the oversized value is replaced by a note.
   4. No dedicated limit: keep the default body limit and accept a `503`.
-- Q3. **Arrays of objects** (Product Contract, R7; origin Z4). `conductor:queue` and `conductor:unapplied_decisions` are arrays of objects with free-form payloads. As one compact-JSON row, nested multi-line text shows as escaped `\n` and cannot be unfolded.
+- Q3. (decided: option 2) **Arrays of objects** (Product Contract, R7; origin Z4). `conductor:queue` and `conductor:unapplied_decisions` are arrays of objects with free-form payloads. As one compact-JSON row, nested multi-line text shows as escaped `\n` and cannot be unfolded.
   1. (recommended) Keep R7 as written: every array is one row.
   2. An array with any object item is flattened per index (`conductor:queue:0:payload:…`), and an array of scalars stays one row.
 - Q4. **Per-section read status** (Planning Contract, KTD3; origin R3/R4/F1). If one source fails to load, the section could look empty, and the owner could conclude, for example, that there is no conductor failure.
