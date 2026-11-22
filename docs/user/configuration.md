@@ -111,7 +111,10 @@ controller:
       update_interval: 24h     # how long a built task image is used before its component versions are checked again; `none` never checks
 runner:
   agent_args:                  # by harness (claude, codex, opencode, copilot); only the running harness's list is added to its command
-    claude: [--dangerously-skip-permissions, --effort, high]  # one list entry is one argument, spaces included; win over Narsor's own values of the same flag
+    claude:                    # one list item is one argument, spaces included; win over Narsor's own values of the same flag
+      - --dangerously-skip-permissions
+      - --effort
+      - high
   conductor:
     model: medium              # the model tier the conductor runs on (small, medium, large, max); empty is the harness's default
     effort: low                # the effort the conductor runs with (low, medium, high, max); empty is the harness's default
@@ -170,7 +173,7 @@ its new one; the program still starts on the values it found.
 | `controller.local.claude_profile_source` | `NARSOR_CONTROLLER__LOCAL__CLAUDE_PROFILE_SOURCE` | empty |
 | `controller.local.mode` | `NARSOR_CONTROLLER__LOCAL__MODE` (`process` or `docker`) | `process` |
 | `controller.local.docker.update_interval` | `NARSOR_CONTROLLER__LOCAL__DOCKER__UPDATE_INTERVAL` | `24h` |
-| `runner.agent_args` | `NARSOR_RUNNER__AGENT_ARGS` (a mapping, e.g. `{claude: [--effort, high]}`) | empty |
+| `runner.agent_args` | `NARSOR_RUNNER__AGENT_ARGS` (a mapping as YAML text; see below) | empty |
 | `runner.conductor.model` | `NARSOR_RUNNER__CONDUCTOR__MODEL` | empty |
 | `runner.conductor.effort` | `NARSOR_RUNNER__CONDUCTOR__EFFORT` | empty |
 | `tui.refresh_interval` | `NARSOR_TUI__REFRESH_INTERVAL` | `10s` |
@@ -182,11 +185,22 @@ its new one; the program still starts on the values it found.
 plus the segments of its path in capitals, joined by `__` (two
 underscores): `server.oidc.issuer` is `NARSOR_SERVER__OIDC__ISSUER`. A list
 is written comma-separated (`NARSOR_SERVER__TLS__TRUSTED_PROXIES=10.0.0.12,10.0.0.13`),
-and `runner.agent_args` as YAML text. A program reads only the variables of
-its own sections, so a bad `NARSOR_WEB__BIND` does not stop the server. The
-`NARSOR_*` variables that are not settings (`NARSOR_SERVER`, `NARSOR_TOKEN`,
-`NARSOR_TOKEN_FILE`, `NARSOR_TOKEN_COMMAND`, `NARSOR_CONTROL_PLANE`,
-`NARSOR_ENROLLMENT_CODE`, …) are not part of the tree and keep their names.
+and `runner.agent_args` as YAML text, which can be block YAML on several
+lines:
+
+```bash
+export NARSOR_RUNNER__AGENT_ARGS='claude:
+  - --effort
+  - high'
+```
+
+A program reads only the variables of its own sections, so a bad
+`NARSOR_WEB__BIND` does not stop the server. The file that `narsor-cli init`
+writes names the variable of each setting in an `Env:` comment above it
+(`# Env: NARSOR_CONTROLLER__LOCAL__HOME`). The `NARSOR_*` variables that are
+not settings (`NARSOR_SERVER`, `NARSOR_TOKEN`, `NARSOR_TOKEN_FILE`,
+`NARSOR_TOKEN_COMMAND`, `NARSOR_CONTROL_PLANE`, `NARSOR_ENROLLMENT_CODE`, …)
+are not part of the tree and keep their names.
 
 The `server.mode`, `server.oidc` and `server.tls` settings are described in
 [Remote execution backends](../operations/remote-backends.md#network-mode).
