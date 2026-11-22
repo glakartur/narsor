@@ -13328,8 +13328,6 @@ mod task_app_state {
         }
     }
 
-    /// A tab that shows `variables` in a list `width` columns wide and
-    /// `height` lines high.
     fn shown(variables: Value, width: usize, height: usize) -> State {
         let mut state = State::new();
         state.set_view(width, height);
@@ -13360,7 +13358,6 @@ mod task_app_state {
             "context:variables:z",
         );
 
-        // (key, row under the cursor, first line in view, last line in view)
         let steps = [
             (Action::Down, plan, "⌄ context:variables:plan:", "  l3"),
             (Action::Down, plan, "  l1", "  l4"),
@@ -13458,6 +13455,7 @@ mod task_app_state {
     }
 
     #[test]
+    // AE3.
     fn a_starting_reader_is_asked_again_after_a_pause_and_then_the_state_shows() {
         let mut state = State::new();
         let now = Instant::now();
@@ -13478,7 +13476,58 @@ mod task_app_state {
         );
     }
 
-    // -- in the application -----------------------------------------------------
+    #[test]
+    fn a_reread_asked_while_a_read_runs_is_not_lost() {
+        let mut state = State::new();
+        let now = Instant::now();
+        state.begin_read();
+        state.request_read();
+        state.apply(now, Ok(answer(json!({ "a": "x" }))));
+        assert!(
+            state.needs_read(now),
+            "the request made during the read stays"
+        );
+
+        state.begin_read();
+        state.apply(now, Ok(answer(json!({ "a": "y" }))));
+        assert!(!state.needs_read(now));
+    }
+
+    #[test]
+    fn an_unfolded_wide_value_wraps_by_display_width() {
+        let mut state = State::new();
+        state.apply(
+            Instant::now(),
+            Ok(answer(json!({ "a": "漢字漢字漢字漢字" }))),
+        );
+        state.set_view(10, 20);
+        state.on_action(Action::Expand);
+        for line in state.visible_lines() {
+            assert!(
+                ratatui::text::Span::raw(line.text.as_str()).width() <= 10,
+                "{:?}",
+                line.text
+            );
+        }
+    }
+
+    #[test]
+    fn an_unfolded_row_with_a_path_wider_than_the_view_still_shows_its_value() {
+        let long = "a_very_long_variable_name_here";
+        let mut state = shown(json!({ long: "VALUE" }), 20, 10);
+        state.on_action(Action::Expand);
+        let all = texts(&state);
+        assert!(all.iter().any(|t| t.trim() == "VALUE"), "{all:?}");
+
+        let tall = (1..=6).map(|n| format!("l{n}")).collect::<Vec<_>>().join("\n");
+        let mut state = shown(json!({ long: tall }), 20, 4);
+        state.on_action(Action::Expand);
+        for _ in 0..12 {
+            state.on_action(Action::Down);
+        }
+        let all = texts(&state);
+        assert!(all.iter().any(|t| t == "  l6"), "{all:?}");
+    }
 
     fn running(revision: u64) -> TaskSummary {
         let mut task = with_runner(

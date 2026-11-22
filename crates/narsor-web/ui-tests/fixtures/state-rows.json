@@ -1,7 +1,7 @@
 {
   "cases": [
     {
-      "name": "variables come out sorted by key: scalars raw, array of scalars as one compact row (acceptance example)",
+      "name": "variables come out sorted by key: scalars raw, array of scalars as one compact row (AE1)",
       "state": {
         "context": { "status": "available", "value": { "variables": { "branch": "feat/x", "pr": 12, "files": ["a", "b"] } } },
         "locals": { "status": "available", "value": {} },

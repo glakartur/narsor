@@ -6,14 +6,10 @@
 use narsor_protocol::controller::{ExecutionState, StateSection};
 use serde_json::Value;
 
-/// One line item of the state view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateRow {
-    /// Keys and array indexes joined with `:`, starting with the section name.
     pub path: String,
-    /// The value as text: a string is raw, everything else is compact JSON.
     pub value: String,
-    /// Number of display lines of `value`.
     pub lines: usize,
 }
 

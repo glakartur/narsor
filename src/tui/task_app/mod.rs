@@ -1034,8 +1034,6 @@ impl TaskApp {
                 view.info_mut().invalidate_drift();
             }
         }
-        // Opening *Stan* reads the state afresh; nothing else does but the
-        // refresh key.
         if tab == DetailTab::State && self.detail.tab != DetailTab::State {
             if let Some(view) = self
                 .list

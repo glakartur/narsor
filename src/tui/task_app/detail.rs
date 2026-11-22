@@ -53,6 +53,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU16;
+use std::time::Instant;
 
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
@@ -64,8 +65,8 @@ use ratatui::Frame;
 use crate::api::ClientError;
 pub use crate::cli::task_text::short_age;
 use crate::controller_protocol::{
-    ConductorReadResponse, ExecutionEventsQuery, ExecutionEventsResponse, TaskSummary,
-    TimelineResponse,
+    ConductorReadResponse, ExecutionEventsQuery, ExecutionEventsResponse, ExecutionStateResponse,
+    TaskSummary, TimelineResponse,
 };
 use crate::task_usage_text::{self, TaskUsage};
 use narsor_protocol::api::{ConversationState, Position};
@@ -73,7 +74,7 @@ use narsor_protocol::controller::{
     ExecutionCursor, QueueReason, TaskState, STORAGE_DELETED_AT_ARCHIVE,
 };
 
-use super::super::keymap::Action;
+use super::super::keymap::{key_of, Action, Context};
 use super::super::scroll::one_line;
 use super::super::style::{PanelEdge, Role, Styles};
 use super::actions::{self, ActionPanel};
@@ -733,7 +734,6 @@ impl TaskApp {
         if unopened || !started {
             return;
         }
-        // The state is read on its own: it needs nothing the timeline says.
         if tab == DetailTab::State {
             self.start_state_read(&id);
         }
@@ -848,14 +848,8 @@ impl TaskApp {
             .apply_drift(generation, outcome);
     }
 
-    /// Starts the read of the execution state when *Stan* wants it.
     fn start_state_read(&mut self, id: &str) {
-        if !self
-            .detail
-            .view_mut(id)
-            .state
-            .needs_read(std::time::Instant::now())
-        {
+        if !self.detail.view_mut(id).state.needs_read(Instant::now()) {
             return;
         }
         let client = self.client.clone();
@@ -874,13 +868,10 @@ impl TaskApp {
         }
     }
 
-    /// Takes the answer of a read of `task_id`'s execution state in. A
-    /// failure stays in the tab; only an unreachable server counts against
-    /// the connection.
     pub fn on_state_read(
         &mut self,
         task_id: &str,
-        result: Result<crate::controller_protocol::ExecutionStateResponse, ClientError>,
+        result: Result<ExecutionStateResponse, ClientError>,
     ) {
         if !self
             .list
@@ -894,21 +885,15 @@ impl TaskApp {
         self.detail
             .view_mut(task_id)
             .state
-            .apply(std::time::Instant::now(), result);
+            .apply(Instant::now(), result);
     }
 
-    /// `Ctrl+R`: *Stan* reads the state again. On another tab it says where
-    /// the key works.
     pub(super) fn reread_state(&mut self) {
         let Some(id) = self.list.selected_id().map(str::to_string) else {
             return;
         };
         if self.detail.tab != DetailTab::State {
-            let key = super::super::keymap::key_of(
-                super::super::keymap::Context::Details,
-                Action::RereadState,
-            )
-            .unwrap_or_default();
+            let key = key_of(Context::Details, Action::RereadState).unwrap_or_default();
             self.notify(
                 Severity::Warning,
                 format!("{key}: to działa w zakładce Stan"),

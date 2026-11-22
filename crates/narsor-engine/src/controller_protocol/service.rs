@@ -91,7 +91,6 @@ type ConductorRelay = Relay<ConductorReadRequest, crate::conductor::ConductorVie
 /// Execution-details requests owners are waiting on, relayed the same way.
 type DetailsRelay = Relay<ExecutionDetailsRequest, ExecutionDetails>;
 
-/// Execution-state requests owners are waiting on, relayed the same way.
 type StateRelay = Relay<ExecutionStateRequest, ExecutionState>;
 
 /// Timing policy of the protocol.

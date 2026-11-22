@@ -294,7 +294,9 @@ where
         )
         .route(
             "/runner/v1/execution-states/{request_id}",
-            post(post_execution_state),
+            post(post_execution_state).layer(DefaultBodyLimit::max(
+                narsor_protocol::controller::MAX_EXECUTION_STATE_BODY,
+            )),
         )
         .route(
             "/runner/v1/relay-failures/{request_id}",
@@ -1330,6 +1332,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_execution_state_over_the_limit_is_refused_with_413() {
+        let router = Router::new().route(
+            "/",
+            post(|_: axum::body::Bytes| async { StatusCode::NO_CONTENT }).layer(
+                DefaultBodyLimit::max(narsor_protocol::controller::MAX_EXECUTION_STATE_BODY),
+            ),
+        );
+        let post_of = |len: usize| {
+            Request::post("/")
+                .body(Body::from(vec![b'x'; len]))
+                .unwrap()
+        };
+        let limit = narsor_protocol::controller::MAX_EXECUTION_STATE_BODY;
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(post_of(limit + 1))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            router.oneshot(post_of(limit)).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+    }
     #[tokio::test]
     async fn a_usage_report_of_a_normal_size_passes_the_limit() {
         assert_eq!(

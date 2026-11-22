@@ -397,6 +397,13 @@ pub(super) async fn serve_state(
             return;
         }
     };
+    let too_large = serde_json::to_vec(&state)
+        .map(|body| body.len() > narsor_protocol::controller::MAX_EXECUTION_STATE_BODY)
+        .unwrap_or(false);
+    if too_large {
+        fail_read(link, timing, &request.request_id, "state too large to send").await;
+        return;
+    }
     match client
         .upload_execution_state(&request.request_id, &state)
         .await
@@ -409,8 +416,6 @@ pub(super) async fn serve_state(
     }
 }
 
-/// Why the control plane will never take a state upload it refused, or
-/// `None` when the refusal is the link's and sending again may work.
 fn refused_state_reason(error: &ClientError) -> Option<&'static str> {
     match error {
         ClientError::Request { code, .. } if code == STATE_TOO_LARGE => {
@@ -692,9 +697,6 @@ mod tests {
         assert!(view.chat.is_empty());
     }
 
-    /// A poll answer an older control plane sends has no state reads, and
-    /// one with them hands their ids out beside the other kinds: a reader
-    /// without an execution fails each of them.
     #[test]
     fn a_reader_without_an_execution_fails_state_reads_like_the_other_kinds() {
         let response = |extra: serde_json::Value| -> RunnerPollResponse {
@@ -726,8 +728,6 @@ mod tests {
         );
     }
 
-    /// Only a state the control plane refuses as too large ends the read;
-    /// any other failure is the link's, and the upload is tried again.
     #[test]
     fn only_a_state_refused_as_too_large_ends_the_read() {
         let cases = [

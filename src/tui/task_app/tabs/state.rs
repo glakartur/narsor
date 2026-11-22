@@ -40,7 +40,7 @@ use ratatui::Frame;
 use crate::controller_protocol::{ConversationUnavailableReason, ExecutionStateResponse};
 use crate::state_rows::{state_rows, StateRow};
 use crate::tui::keymap::{key_of, Action, Context};
-use crate::tui::scroll::{one_line, sanitize, wrap_line, ScrollState};
+use crate::tui::scroll::{one_line, sanitize, ScrollState};
 use crate::tui::selection::{bar_prefix, PREFIX_WIDTH};
 use crate::tui::style::{Role, Styles};
 use crate::tui::transcript::{FOLDED_MARKER, UNFOLDABLE_MARKER, UNFOLDED_MARKER};
@@ -48,29 +48,20 @@ use crate::tui::transcript::{FOLDED_MARKER, UNFOLDABLE_MARKER, UNFOLDED_MARKER};
 use super::super::detail::{cells, fit_cells};
 use super::READER_RETRY;
 
-/// The width the rows are measured at before the tab is first drawn.
 const DEFAULT_WIDTH: usize = 80;
 
-/// How far the lines of an unfolded value are indented under its path.
 const VALUE_INDENT: &str = "  ";
 
-/// What the tab remembers per task.
 #[derive(Debug, Clone)]
 pub struct State {
     rows: Vec<StateRow>,
-    /// When the control plane received the rows shown.
     read_at: Option<DateTime<Utc>>,
-    /// Why there is no state, in the server's words.
     note: Option<String>,
-    /// Why the last read failed.
     failure: Option<String>,
-    /// The last answer was "the reader is starting".
     starting: bool,
-    /// The operator opened the tab or asked again, and no answer came since.
     wanted: bool,
-    /// A read was started and its answer has not come.
     reading: bool,
-    /// When the last answer came.
+    requested_while_reading: bool,
     answered_at: Option<Instant>,
     unfolded: BTreeSet<String>,
     cursor: usize,
@@ -78,12 +69,9 @@ pub struct State {
     width: usize,
 }
 
-/// One line of the list as it is shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateLine {
-    /// The text, with the marker on the first line of a row.
     pub text: String,
-    /// The line belongs to the row under the cursor.
     pub selected: bool,
 }
 
@@ -94,7 +82,6 @@ impl Default for State {
 }
 
 impl State {
-    /// A tab that has read nothing yet and wants a read.
     pub fn new() -> Self {
         Self {
             rows: Vec::new(),
@@ -104,6 +91,7 @@ impl State {
             starting: false,
             wanted: true,
             reading: false,
+            requested_while_reading: false,
             answered_at: None,
             unfolded: BTreeSet::new(),
             cursor: 0,
@@ -112,37 +100,30 @@ impl State {
         }
     }
 
-    /// The rows shown.
     pub fn rows(&self) -> &[StateRow] {
         &self.rows
     }
 
-    /// When the control plane received the rows shown.
     pub fn read_at(&self) -> Option<DateTime<Utc>> {
         self.read_at
     }
 
-    /// Why there is no state, in the server's words.
     pub fn note(&self) -> Option<&str> {
         self.note.as_deref()
     }
 
-    /// Why the last read failed.
     pub fn failure(&self) -> Option<&str> {
         self.failure.as_deref()
     }
 
-    /// Whether the last answer was "the reader is starting".
     pub fn is_starting(&self) -> bool {
         self.starting
     }
 
-    /// The path of the row under the cursor.
     pub fn selected_path(&self) -> Option<&str> {
         self.rows.get(self.cursor).map(|row| row.path.as_str())
     }
 
-    /// Whether the row at `path` shows every line of its value.
     pub fn is_unfolded(&self, path: &str) -> bool {
         self.rows
             .iter()
@@ -150,8 +131,6 @@ impl State {
             .is_some_and(|index| self.open(index))
     }
 
-    /// Whether the tab must be read: the operator opened it or asked again,
-    /// or the reader was starting and a pause has passed since.
     pub fn needs_read(&self, now: Instant) -> bool {
         if self.wanted {
             return true;
@@ -162,20 +141,17 @@ impl State {
                 .is_none_or(|at| now.saturating_duration_since(at) >= READER_RETRY)
     }
 
-    /// Asks for a new read, keeping what is shown.
     pub fn request_read(&mut self) {
         self.wanted = true;
+        self.requested_while_reading = self.reading;
     }
 
-    /// A read was started.
-    pub(in crate::tui::task_app) fn begin_read(&mut self) {
+    pub fn begin_read(&mut self) {
         self.reading = true;
     }
 
-    /// Takes an answer in. The state replaces the rows; "the reader is
-    /// starting" and a failure keep them; any other reason clears them.
     pub fn apply(&mut self, now: Instant, result: Result<ExecutionStateResponse, String>) {
-        self.wanted = false;
+        self.wanted = std::mem::take(&mut self.requested_while_reading);
         self.reading = false;
         self.answered_at = Some(now);
         self.starting = false;
@@ -203,9 +179,6 @@ impl State {
         }
     }
 
-    /// Puts `rows` in place of the ones shown. What is unfolded stays when
-    /// its path is still there; the cursor stays on its path, or goes to the
-    /// next row that is still there when its path is gone.
     fn replace_rows(&mut self, rows: Vec<StateRow>) {
         let rows: Vec<StateRow> = rows
             .into_iter()
@@ -235,15 +208,12 @@ impl State {
         self.keep_cursor_in_view();
     }
 
-    /// Sets the size the list is drawn at: `width` columns for the text of a
-    /// row, `height` lines.
     pub fn set_view(&mut self, width: usize, height: usize) {
         self.width = width.max(1);
         self.scroll.set_viewport(height);
         self.keep_cursor_in_view();
     }
 
-    /// What a key does.
     pub fn on_action(&mut self, action: Action) {
         if self.rows.is_empty() {
             return;
@@ -253,7 +223,6 @@ impl State {
         let total = spans[last].1;
         let (start, end) = spans[self.cursor];
         let (offset, viewport) = (self.scroll.offset(), self.scroll.viewport());
-        // Lines of the row under the cursor out of view, below and above.
         let below = end > offset + viewport;
         let above = start < offset;
         match action {
@@ -291,8 +260,6 @@ impl State {
         }
     }
 
-    /// Puts the cursor on the row at `index` and scrolls the least that
-    /// shows it: from above, its first lines; from below, its last ones.
     fn select(&mut self, index: usize) {
         self.cursor = index;
         let spans = self.spans();
@@ -318,35 +285,29 @@ impl State {
         }
     }
 
-    // -- layout -------------------------------------------------------------
-
-    /// Whether the row hides part of its value when folded.
     fn foldable(&self, row: &StateRow) -> bool {
         row.lines > 1
             || cells(&format!("{UNFOLDABLE_MARKER} {}: {}", row.path, row.value)) > self.width
     }
 
-    /// Whether the row at `index` shows every line of its value.
     fn open(&self, index: usize) -> bool {
         let row = &self.rows[index];
         self.unfolded.contains(&row.path) && self.foldable(row)
     }
 
-    /// The value of an unfolded row, line by line, wrapped and indented.
     fn value_lines(&self, row: &StateRow) -> Vec<String> {
         let width = self.width.saturating_sub(VALUE_INDENT.len()).max(1);
         row.value
             .split('\n')
-            .flat_map(|line| wrap_line(line, width))
+            .flat_map(|line| wrap_cells(line, width))
             .map(|chunk| format!("{VALUE_INDENT}{chunk}"))
             .collect()
     }
 
-    /// The lines the row at `index` takes.
     fn row_lines(&self, index: usize) -> Vec<String> {
         let row = &self.rows[index];
         if self.open(index) {
-            let mut lines = vec![format!("{UNFOLDED_MARKER} {}:", row.path)];
+            let mut lines = wrap_cells(&format!("{UNFOLDED_MARKER} {}:", row.path), self.width);
             lines.extend(self.value_lines(row));
             lines
         } else if self.foldable(row) {
@@ -361,14 +322,9 @@ impl State {
     }
 
     fn row_height(&self, index: usize) -> usize {
-        if self.open(index) {
-            1 + self.value_lines(&self.rows[index]).len()
-        } else {
-            1
-        }
+        self.row_lines(index).len()
     }
 
-    /// Where each row starts and ends, in lines from the top of the list.
     fn spans(&self) -> Vec<(usize, usize)> {
         let mut start = 0;
         (0..self.rows.len())
@@ -381,8 +337,6 @@ impl State {
             .collect()
     }
 
-    /// Scrolls the least that shows the cursor's row, when no line of it is
-    /// in view.
     fn keep_cursor_in_view(&mut self) {
         let spans = self.spans();
         let total = spans.last().map_or(0, |span| span.1);
@@ -399,7 +353,6 @@ impl State {
         }
     }
 
-    /// The lines in view, top to bottom.
     pub fn visible_lines(&self) -> Vec<StateLine> {
         let (offset, viewport) = (self.scroll.offset(), self.scroll.viewport());
         let mut shown = Vec::new();
@@ -430,7 +383,6 @@ impl State {
     }
 }
 
-/// The row that takes `line`, from where the rows start and end.
 fn row_at(spans: &[(usize, usize)], line: usize) -> usize {
     spans
         .iter()
@@ -438,12 +390,6 @@ fn row_at(spans: &[(usize, usize)], line: usize) -> usize {
         .unwrap_or(spans.len().saturating_sub(1))
 }
 
-// ---------------------------------------------------------------------
-// Drawing
-// ---------------------------------------------------------------------
-
-/// Draws the tab: a line that says when the state was read (or why there is
-/// none), a failure of the last read when there is one, then the rows.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -546,4 +492,21 @@ pub fn render(
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), list);
+}
+
+/// Wraps `line` into chunks of at most `width` display cells.
+fn wrap_cells(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut chunks = vec![String::new()];
+    let mut used = 0;
+    for ch in line.chars() {
+        let w = cells(ch.encode_utf8(&mut [0; 4]));
+        if used + w > width && used > 0 {
+            chunks.push(String::new());
+            used = 0;
+        }
+        chunks.last_mut().expect("one chunk").push(ch);
+        used += w;
+    }
+    chunks
 }

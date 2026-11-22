@@ -218,8 +218,6 @@ pub(crate) fn step_locals(
     Ok(locals.remove(state_id).unwrap_or_default())
 }
 
-/// The local values of every step, keyed by step id, then by the declared
-/// name.
 pub(crate) fn all_step_locals(
     execution: &WorkflowExecution,
 ) -> Result<BTreeMap<StateId, Map<String, Value>>, EngineError> {

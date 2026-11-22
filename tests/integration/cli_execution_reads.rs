@@ -80,6 +80,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_page_timeout(ProtocolConfig::default().conversation_page_timeout).await
+    }
+
+    async fn with_page_timeout(page_timeout: Duration) -> Self {
         let root = std::env::temp_dir().join(format!("narsor-cli-reads-{}", uuid::Uuid::new_v4()));
         let state = root.join("state");
         fs::create_dir_all(&state).unwrap();
@@ -88,6 +92,7 @@ impl Fixture {
             crate::environment_support::seeded_resolver(&state),
             ProtocolConfig {
                 reader_connect_wait: Duration::from_millis(100),
+                conversation_page_timeout: page_timeout,
                 ..ProtocolConfig::default()
             },
         ));
@@ -316,8 +321,8 @@ impl Drop for Fixture {
     }
 }
 
-/// A runner's side of the relayed reads: answers every events, state,
-/// conversation and details read of its task from `store`, as
+/// A runner's side of the relayed reads: answers every events,
+/// conversation, details and state read of its task from `store`, as
 /// `narsor-runner` does, until it is told to go.
 async fn serve_reads(
     service: Arc<ProtocolService>,
@@ -926,8 +931,6 @@ fn the_server_sources_never_name_task_storage() {
     }
 }
 
-/// Gives the execution in `store` a multi-line context variable, the local
-/// values of a step, and a conductor that diagnoses a failed step.
 fn give_the_execution_state(store: &ExecutionStore, execution: &str) {
     let mut record = store.load_execution(execution).unwrap();
     record
@@ -996,8 +999,6 @@ async fn task_state_prints_every_value_the_workflow_sees_of_a_running_or_stopped
         );
         assert!(at("context:variables:branch: feat/x") < plan, "{lines:#?}");
         assert!(lines.contains(&"locals:review:NOTE: keep it short".to_string()));
-        // The conductor waits on the failed step: what it concluded and
-        // what it works on.
         assert!(lines.contains(&"conductor:failure:reason: the tests do not compile".to_string()));
         assert!(lines.contains(&"conductor:pending:invocation_id: inv-1".to_string()));
         assert!(at("context:") < at("locals:") && at("locals:") < at("conductor:"));
@@ -1056,9 +1057,8 @@ async fn the_state_reaches_the_owner_without_terminal_controls_and_with_its_line
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// AE4: an archived task says its storage was deleted and prints no rows.
 async fn task_state_says_why_when_the_state_cannot_be_read() {
-    // A runner whose execution record does not load fails the read: the
-    // owner hears it at once, as a retryable refusal.
     let fx = Fixture::new().await;
     fx.running_task("task-1", LOCAL_OWNER, "local");
     fs::remove_file(fx.storage("task-1").paths().state_file(EXECUTION)).unwrap();
@@ -1076,7 +1076,6 @@ async fn task_state_says_why_when_the_state_cannot_be_read() {
         error.message
     );
 
-    // An archived task has no storage left to read.
     let fx = Fixture::new().await;
     fx.running_task("task-1", LOCAL_OWNER, "local");
     fx.stop("task-1", "local");
@@ -1094,7 +1093,6 @@ async fn task_state_says_why_when_the_state_cannot_be_read() {
         "The task's state cannot be read: the task is archived: its storage was deleted"
     );
 
-    // A task without an execution has no state yet.
     let fx = Fixture::new().await;
     fx.service
         .control_plane()
@@ -1111,5 +1109,51 @@ async fn task_state_says_why_when_the_state_cannot_be_read() {
     assert_eq!(
         error.message,
         "The task's state cannot be read: the task has no execution yet"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_state_request_is_answered_only_by_the_runner_of_its_task_and_times_out_without_it() {
+    let fx = Fixture::with_page_timeout(Duration::from_millis(600)).await;
+    fx.running_task("task-a", LOCAL_OWNER, "local");
+    fx.running_task("task-b", LOCAL_OWNER, "local");
+    // Neither runner answers by itself: the test plays them.
+    for (_, runner) in fx.runners.lock().unwrap().drain() {
+        runner.abort();
+    }
+    let owner = OwnerRef::new(LOCAL_OWNER);
+    let service = Arc::clone(&fx.service);
+    let read = tokio::spawn(async move { service.execution_state(&owner, "task-a").await });
+
+    let runner_a = fx.credential("task-a", &BackendId::parse("local").unwrap(), false);
+    let polled = fx
+        .service
+        .runner_poll(
+            &runner_a,
+            RunnerPollQuery {
+                wait_secs: Some(1),
+                defer_materials: true,
+                ..RunnerPollQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    let request_id = polled.execution_states[0].request_id.clone();
+
+    let runner_b = fx.credential("task-b", &BackendId::parse("local").unwrap(), false);
+    let state_of_b = execution_state(&fx.storage("task-b"), &execution_of("task-b")).unwrap();
+    let accepted = fx
+        .service
+        .runner_execution_state(&runner_b, &request_id, state_of_b)
+        .unwrap();
+    assert!(
+        !accepted.delivered,
+        "a runner answers only requests of its own task"
+    );
+
+    let error = read.await.unwrap().unwrap_err();
+    assert!(
+        format!("{error:?}").contains("runner_timeout"),
+        "the owner waits for task A's runner until the timeout: {error:?}"
     );
 }

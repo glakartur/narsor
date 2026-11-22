@@ -2,9 +2,6 @@
 //! its context, the step locals, the conductor's state — from the runner
 //! through the relay: the task's own while it runs, a read-only runner's
 //! while it is stopped (D63).
-//!
-//! The same shape as the execution details (see [`super::details`]); only
-//! the payload differs. Nothing is kept: every request asks the runner.
 
 use narsor_protocol::display::{without_unsafe_chars_json, without_unsafe_chars_multiline};
 
@@ -64,14 +61,12 @@ impl ProtocolService {
         }
     }
 
-    /// Asks the live runner and waits for its upload.
     async fn relayed_state(&self, task_id: &TaskId) -> ProtocolResult<ExecutionStateResponse> {
         let (request_id, answer) =
             self.lock_state_reads()
                 .open("state", task_id.clone(), |request_id| {
                     ExecutionStateRequest { request_id }
                 });
-        // Wakes the runner's long-poll, which then sees the request.
         let guard = RelayGuard::new(&self.state_reads, request_id);
         self.notify(task_id);
         let state = tokio::time::timeout(self.config.conversation_page_timeout, answer).await;

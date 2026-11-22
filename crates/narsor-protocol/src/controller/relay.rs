@@ -117,14 +117,11 @@ pub enum ExecutionStateResponse {
     /// The state, read from the task's storage.
     Available {
         state: Box<ExecutionState>,
-        /// Where it was read from.
         source: ExecutionEventsSource,
-        /// When the control plane received it.
         read_at: DateTime<Utc>,
     },
     /// Not readable right now.
     Unavailable {
-        /// Why the state cannot be read.
         reason: ConversationUnavailableReason,
         /// Human-readable explanation.
         message: String,
@@ -262,6 +259,11 @@ pub enum ExecutionEventsSource {
     Runner,
     Storage,
 }
+
+/// Largest execution state body the control plane takes from a runner. The
+/// runner checks the size before it sends, so an oversized state never meets
+/// a closed connection.
+pub const MAX_EXECUTION_STATE_BODY: usize = 4 * 1024 * 1024;
 
 pub const CONVERSATION_UNAVAILABLE: &str = "conversation_unavailable";
 

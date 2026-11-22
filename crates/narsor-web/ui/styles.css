@@ -383,7 +383,6 @@ button.queue-mark { cursor: pointer; text-decoration: none; padding: 0 2px; }
 }
 .more { margin: 6px 0; }
 
-/* State tab: one row per path, folded to its first line */
 .state-tab { padding: 8px 14px; }
 .state-head { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
 .state-row { font-family: var(--mono); font-size: 12px; border-bottom: 1px solid var(--border); }

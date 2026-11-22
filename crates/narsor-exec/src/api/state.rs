@@ -9,7 +9,6 @@ use crate::conductor::ConductorStore;
 use crate::engine::runner::all_step_locals;
 use crate::persistence::{ExecutionStore, PersistenceError};
 
-/// What the conductor section says when the execution has no conductor.
 pub const NO_CONDUCTOR_STATE: &str = "no conductor state";
 
 /// Every value the workflow of `execution_id` sees now, read from `store`.
@@ -37,7 +36,6 @@ pub fn execution_state(
     })
 }
 
-/// The conductor's state with its generated title under `title`.
 fn conductor_section(conductor: &ConductorStore) -> StateSection {
     if !conductor.exists() {
         return StateSection::Absent {
@@ -156,6 +154,7 @@ mod tests {
     }
 
     #[test]
+    // AE5.
     fn reads_context_step_locals_and_conductor_waiting_on_a_failed_step() {
         let root = TempRoot::new();
         let store = ExecutionStore::new(&root.0);

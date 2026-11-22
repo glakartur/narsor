@@ -320,7 +320,6 @@ pub enum Action {
     UndoDecision,
     /// Read the next page of the conductor's chat.
     LoadMore,
-    /// Read the execution state again (the *Stan* tab).
     RereadState,
     /// Choose the installation's default agent harness (the header says
     /// which one is in force).
@@ -780,7 +779,6 @@ pub static BINDINGS: &[Binding] = &[
         "",
         "zakładka Dyrygent: wczytaj dalsze wpisy czatu",
     ),
-    // The *Stan* tab. Help only: the tab names it in its own line.
     bind(
         Context::Details,
         Key::ctrl('r'),

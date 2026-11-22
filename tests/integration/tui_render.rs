@@ -9356,7 +9356,6 @@ mod task_app_state_render {
         )
     }
 
-    /// The *Stan* tab of the running task `a`, nothing read yet.
     fn opened() -> TaskApp {
         let mut app = new_app();
         let running = with_runner(
@@ -9387,6 +9386,7 @@ mod task_app_state_render {
     }
 
     #[test]
+    // AE2.
     fn a_multi_line_value_shows_folded_with_the_read_time_and_enter_unfolds_it() {
         let mut app = opened();
         app.on_state_read("a", Ok(plan_state()));
