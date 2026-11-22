@@ -175,6 +175,10 @@ where
             get(get_execution_details),
         )
         .route(
+            "/control/v1/tasks/{task_id}/execution-state",
+            get(get_execution_state),
+        )
+        .route(
             "/control/v1/tasks/{task_id}/conversation",
             get(get_conversation),
         )
@@ -287,6 +291,10 @@ where
         .route(
             "/runner/v1/execution-details/{request_id}",
             post(post_execution_details),
+        )
+        .route(
+            "/runner/v1/execution-states/{request_id}",
+            post(post_execution_state),
         )
         .route(
             "/runner/v1/relay-failures/{request_id}",
@@ -584,6 +592,14 @@ async fn get_execution_details(
     Path(task_id): Path<String>,
 ) -> ProtocolResult<Json<ExecutionDetailsResponse>> {
     Ok(Json(service.execution_details(&owner, &task_id).await?))
+}
+
+async fn get_execution_state(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(task_id): Path<String>,
+) -> ProtocolResult<Json<ExecutionStateResponse>> {
+    Ok(Json(service.execution_state(&owner, &task_id).await?))
 }
 
 async fn get_conversation(
@@ -1076,6 +1092,20 @@ async fn post_execution_details(
     Ok(Json(
         blocking(&service, move |s| {
             s.runner_execution_details(&identity, &request_id, details)
+        })
+        .await?,
+    ))
+}
+
+async fn post_execution_state(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Path(request_id): Path<String>,
+    Json(state): Json<ExecutionState>,
+) -> ProtocolResult<Json<ConversationPageAccepted>> {
+    Ok(Json(
+        blocking(&service, move |s| {
+            s.runner_execution_state(&identity, &request_id, state)
         })
         .await?,
     ))
