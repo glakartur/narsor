@@ -100,8 +100,9 @@ pub fn initialize(
         // An initialization that copied the old spec and stopped before its
         // marker: nothing ran yet, so the refreshed spec simply takes over.
         store.replace_task_launch_spec(task_id, spec)?;
+    } else {
+        store.initialize_task_launch_spec(task_id, spec)?;
     }
-    store.initialize_task_launch_spec(task_id, spec)?;
 
     let workspace = storage.workspace_dir();
     // The marker keeps the commit of the primary repository, the first one.
@@ -807,14 +808,9 @@ terminal_states: [completed]
     fn a_replacement_is_refused_on_a_marker_of_another_task_or_launch() {
         let base = temp("replace-foreign");
         let old = spec(TaskWorkspace::none());
-        let new = TaskLaunchSpec {
-            environment: ResolvedEnvironment::harness_only("codex").sealed(),
-            ..old.clone()
-        };
-        let new = TaskLaunchSpec {
-            digest: new.compute_digest(),
-            ..new
-        };
+        let new = old
+            .clone()
+            .with_environment(ResolvedEnvironment::harness_only("codex"));
         let replacement = AcceptedReplacement {
             replaced_digest: old.digest.clone(),
         };

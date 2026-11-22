@@ -1,7 +1,8 @@
 // *Info*: the sealed inputs, the workflow, the workspace, the runner and the
 // controller of the task (labels from `src/tui/task_app/tabs/info.rs`). The
 // task is read once more, with its environment compared with the catalogue,
-// when the tab opens and when the task's generation moves (a refresh).
+// once per generation (a refresh moves it): reopening the tab for the same
+// generation shows the comparison already read. A failed read is not kept.
 
 import { html } from '../../lib.js';
 import { secondsBetween, shortAge } from '../../model.js';
@@ -43,8 +44,19 @@ function Sheet({ title, rows }) {
   </section>`;
 }
 
+/** The task read with its drift, by task id: `{ generation, read }`, the latest generation only. */
+const driftReads = new Map();
+
+async function taskWithDrift(api, task, signal) {
+  const cached = driftReads.get(task.task_id);
+  if (cached?.generation === task.generation) return cached.read;
+  const read = await api.taskWithDrift(task.task_id, signal);
+  driftReads.set(task.task_id, { generation: task.generation, read });
+  return read;
+}
+
 export function Info({ api, task }) {
-  const driftRead = useRead((signal) => api.taskWithDrift(task.task_id, signal), `${task.task_id}:${task.generation}`);
+  const driftRead = useRead((signal) => taskWithDrift(api, task, signal), `${task.task_id}:${task.generation}`);
   const drift = driftRow(driftRead);
   const runner = task.runner;
   const observation = task.observation;

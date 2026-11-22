@@ -9,13 +9,14 @@ use narsor_engine::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
 use narsor_engine::orchestration::scheduler::{BackendLoad, LimitStopDecision};
 use narsor_engine::orchestration::{
     exhaustion_loss, loss_state, BackendAvailability, BackendLease, Clock, CommandActor,
-    CommandRequest, ControlPlane, ControllerReport, EnvironmentRefreshOutcome, LossState,
-    MoveTarget, NewTask, Observation, ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef,
-    QueueReason, ResourceIdentity, ResumeExhaustion, ResumePolicy, ResumeState, RunnerSnapshot,
-    RunnerState, SchedulingPolicy, TaskEventKind, TaskRecord, WorkloadLoss,
+    CommandRequest, ControlPlane, ControllerReport, LossState, MoveTarget, NewTask, Observation,
+    ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity,
+    ResumeExhaustion, ResumePolicy, ResumeState, RunnerSnapshot, RunnerState, SchedulingPolicy,
+    TaskEventKind, TaskRecord, WorkloadLoss,
 };
 use narsor_engine::persistence::paths::{temp_path_for, ServerStatePaths};
 use narsor_engine::persistence::ExecutionStore;
+use narsor_protocol::controller::EnvironmentRefreshResult;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -5907,7 +5908,7 @@ fn refresh(
     fx: &Fixture,
     id: &str,
     expected_generation: Option<u64>,
-) -> Result<(TaskRecord, EnvironmentRefreshOutcome), OrchestrationError> {
+) -> Result<(TaskRecord, EnvironmentRefreshResult), OrchestrationError> {
     let environment = environment_with_task_image(fx, id);
     fx.control
         .refresh_environment(&task(id), environment, owner(), expected_generation)
@@ -5921,10 +5922,26 @@ fn refreshing_a_stopped_task_reseals_its_spec_under_a_new_generation_the_control
 
     let (record, outcome) = refresh(&fx, "task-1", Some(before.generation)).expect("refreshed");
 
-    let EnvironmentRefreshOutcome::Refreshed(diff) = outcome else {
+    let EnvironmentRefreshResult::Refreshed {
+        old_identity,
+        new_identity,
+        generation,
+        change_count,
+        diff,
+    } = outcome
+    else {
         panic!("the environment changed: {outcome:?}");
     };
     assert_eq!(diff.task_image_components.added, vec!["glab".to_string()]);
+    assert_eq!(change_count, diff.change_count());
+    assert_eq!(
+        (old_identity.as_str(), new_identity.as_str(), generation),
+        (
+            before.launch_spec.environment.identity.as_str(),
+            record.launch_spec.environment.identity.as_str(),
+            record.generation
+        )
+    );
     assert_eq!(record.generation, before.generation + 1);
     assert_eq!(record.runner_state, RunnerState::Stopped);
     assert_eq!(record.resume, before.resume);
@@ -6003,7 +6020,12 @@ fn an_unchanged_environment_writes_nothing_and_a_stale_generation_is_refused() {
         .refresh_environment(&task("task-1"), same, owner(), Some(before.generation))
         .expect("an unchanged environment is no error");
 
-    assert_eq!(outcome, EnvironmentRefreshOutcome::Unchanged);
+    assert_eq!(
+        outcome,
+        EnvironmentRefreshResult::Unchanged {
+            identity: before.launch_spec.environment.identity.clone()
+        }
+    );
     assert_eq!(
         (record.generation, record.revision),
         (before.generation, before.revision)
@@ -6199,7 +6221,7 @@ fn a_queued_or_interrupted_task_is_refreshed_in_place_and_old_policy_commands_go
             .unwrap_or_else(|error| panic!("{case}: {error}"));
 
         assert!(
-            matches!(outcome, EnvironmentRefreshOutcome::Refreshed(_)),
+            matches!(outcome, EnvironmentRefreshResult::Refreshed { .. }),
             "{case}"
         );
         assert_eq!(record.runner_state, state, "{case}");

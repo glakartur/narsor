@@ -1411,12 +1411,13 @@ pub fn refresh_outcome_lines(task_id: &str, outcome: &EnvironmentRefreshResult) 
             old_identity,
             new_identity,
             generation,
+            change_count,
             diff,
         } => {
             let mut lines = vec![
                 format!(
-                    "Environment of {task_id} refreshed: {} change(s), now generation {generation}.",
-                    diff.change_count()
+                    "Environment of {task_id} refreshed: {change_count} change(s), now generation \
+                     {generation}."
                 ),
                 format!("  identity: {old_identity} → {new_identity}"),
             ];

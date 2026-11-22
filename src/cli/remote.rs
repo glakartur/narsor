@@ -842,6 +842,16 @@ pub(super) fn print_created(task: &TaskSummary) {
 /// Refuses unless the control plane is a trusted local daemon: the only one
 /// that reads workflow files of its own disk for its owner. Any other
 /// server is refused with the reason it gives.
+/// The task's current generation, for a request that must not apply to a
+/// task that moved on meanwhile.
+async fn current_generation(client: &ApiClient, task_id: &str) -> Result<u64> {
+    let task = client
+        .control_task(task_id)
+        .await
+        .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
+    Ok(task.generation)
+}
+
 pub(super) async fn require_local_daemon(client: &ApiClient, what: &str) -> Result<()> {
     let capabilities = client
         .control_capabilities()
@@ -1086,10 +1096,14 @@ pub async fn task(
             Ok(())
         }
         TaskCommand::Show { task_id, json } => {
-            let task = client
-                .control_task_with_drift(&task_id)
-                .await
-                .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
+            // The comparison with the catalogue makes the server read it, so
+            // only the human-readable view, which shows it, asks for it.
+            let task = if json {
+                client.control_task(&task_id).await
+            } else {
+                client.control_task_with_drift(&task_id).await
+            }
+            .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
             if json {
                 println!("{}", json_output(&task)?);
                 return Ok(());
@@ -1122,16 +1136,13 @@ pub async fn task(
             bottom,
         } => {
             let target = move_target(before, after, top, bottom)?;
-            let current = client
-                .control_task(&task_id)
-                .await
-                .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
+            let generation = current_generation(&client, &task_id).await?;
             let task = client
                 .control_move_task(
                     &task_id,
                     &MoveTaskRequest {
                         target,
-                        expected_generation: Some(current.generation),
+                        expected_generation: Some(generation),
                     },
                 )
                 .await
@@ -1143,15 +1154,12 @@ pub async fn task(
             Ok(())
         }
         TaskCommand::RefreshEnv { task_id } => {
-            let current = client
-                .control_task(&task_id)
-                .await
-                .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
+            let generation = current_generation(&client, &task_id).await?;
             let response = client
                 .control_refresh_environment(
                     &task_id,
                     &RefreshEnvironmentRequest {
-                        expected_generation: Some(current.generation),
+                        expected_generation: Some(generation),
                     },
                 )
                 .await

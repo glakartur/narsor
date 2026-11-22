@@ -368,12 +368,17 @@ export function branchText(workspace) {
   return branch || base || '';
 }
 
-/** The Polish word for `count` tasks. */
-export function tasksWord(count) {
-  if (count === 1) return 'zadanie';
+/** The Polish form of a noun after `count`: `[one, few, many]`. */
+export function pluralPl(count, [one, few, many]) {
+  if (count === 1) return one;
   const lastTwo = count % 100;
   const last = count % 10;
-  return last >= 2 && last <= 4 && !(lastTwo >= 12 && lastTwo <= 14) ? 'zadania' : 'zadań';
+  return last >= 2 && last <= 4 && !(lastTwo >= 12 && lastTwo <= 14) ? few : many;
+}
+
+/** The Polish word for `count` tasks. */
+export function tasksWord(count) {
+  return pluralPl(count, ['zadanie', 'zadania', 'zadań']);
 }
 
 // ---------------------------------------------------------------------------

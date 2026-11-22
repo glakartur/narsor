@@ -4,6 +4,8 @@
 // (`crates/narsor-protocol/src/panel/mod.rs`) and the TUI's field checks
 // (`src/tui/chooser.rs`). Pure functions, tested in Node.
 
+import { pluralPl } from './model.js';
+
 export const MESSAGE_FIELD = 'Wiadomość dla agenta';
 export const COMMENT_TO_AGENT = 'Komentarz dla agenta';
 export const COMMENT_FIELD = 'komentarz';
@@ -237,34 +239,13 @@ export function resolveSend(send, texts) {
   }
 }
 
-const DIFF_VALUES = ['task_image_base', 'base_image', 'runtime_bundle', 'profile'];
-const DIFF_NAMES = ['task_image_components', 'task_image_secrets', 'secrets', 'step_images', 'tools'];
-
-/** How many single changes an `EnvironmentDiff` holds (`EnvironmentDiff::change_count`). */
-export function diffChangeCount(diff) {
-  if (!diff || typeof diff !== 'object') return 0;
-  const values = DIFF_VALUES.filter((key) => diff[key]).length;
-  const names = DIFF_NAMES.reduce((sum, key) => {
-    const part = diff[key] ?? {};
-    return sum + ['added', 'removed', 'changed'].reduce((n, side) => n + (part[side]?.length ?? 0), 0);
-  }, 0);
-  return values + names;
-}
-
-function changesWord(count) {
-  if (count === 1) return 'zmiana';
-  const ones = count % 10;
-  const tens = count % 100;
-  return ones >= 2 && ones <= 4 && !(tens >= 12 && tens <= 14) ? 'zmiany' : 'zmian';
-}
-
 /** What the notice says of an environment refresh (`EnvironmentRefreshResult`), as the TUI's bar. */
 export function refreshOutcomeText(outcome) {
   switch (outcome?.type) {
     case 'refreshed': {
-      const count = diffChangeCount(outcome.diff);
+      const count = outcome.change_count ?? 0;
       if (count === 0) return 'środowisko odświeżone';
-      return `środowisko odświeżone — ${count} ${changesWord(count)}; zadanie dostanie je przy następnym uruchomieniu`;
+      return `środowisko odświeżone — ${count} ${pluralPl(count, ['zmiana', 'zmiany', 'zmian'])}; zadanie dostanie je przy następnym uruchomieniu`;
     }
     case 'unchanged':
       return 'środowisko bez zmian — katalog daje to samo środowisko';

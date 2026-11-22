@@ -9,9 +9,7 @@ use crate::domain::human_input::HumanInputDelivery;
 pub use crate::domain::runner_snapshot::{
     PendingInputRef, RunnerSnapshot, RETIRED_CONDUCTOR_HARNESS,
 };
-use crate::domain::{
-    BackendId, EnvironmentDiff, ExecutionStatus, TaskId, TaskLaunchSpec, WorkspaceHeader,
-};
+use crate::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec, WorkspaceHeader};
 use chrono::{DateTime, Utc};
 use narsor_protocol::api::{ConversationState, Timeline};
 use narsor_protocol::controller::{MoveTaskTarget, STORAGE_DELETED_AT_ARCHIVE};
@@ -159,13 +157,9 @@ pub fn environment_refresh_refusal(
     task_state: TaskState,
     holds_slot: bool,
 ) -> Option<String> {
-    if runner_state.is_archival() {
-        return Some("zadanie jest archiwizowane".to_string());
-    }
-    if task_state == TaskState::Finished {
-        return Some("zadanie jest zakończone".to_string());
-    }
     let reason = match runner_state {
+        RunnerState::Archiving | RunnerState::Archived => "zadanie jest archiwizowane",
+        _ if task_state == TaskState::Finished => "zadanie jest zakończone",
         RunnerState::Stopped | RunnerState::Interrupted => return None,
         RunnerState::Queued if !holds_slot => return None,
         RunnerState::Queued => {
@@ -182,20 +176,8 @@ pub fn environment_refresh_refusal(
             "nie wiadomo, czy zadanie jeszcze działa — poczekaj, aż kontroler to ustali, \
              a potem odśwież środowisko"
         }
-        RunnerState::Archiving | RunnerState::Archived => "zadanie jest archiwizowane",
     };
     Some(reason.to_string())
-}
-
-/// What [`super::ControlPlane::refresh_environment`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EnvironmentRefreshOutcome {
-    /// The task's launch spec carries the new environment under a new
-    /// generation; this is what changed.
-    Refreshed(Box<EnvironmentDiff>),
-    /// The new environment has the identity of the stored one: nothing was
-    /// written and nothing announced (R8).
-    Unchanged,
 }
 
 /// Current schema version of [`BackendLease`].
@@ -752,6 +734,30 @@ impl TaskRecord {
     /// [`environment_refresh_refusal`].
     pub fn environment_refresh_refusal(&self) -> Option<String> {
         environment_refresh_refusal(self.runner_state, self.task_state(), self.holds_capacity())
+    }
+
+    /// Refuses an environment refresh of this task: with `StaleGeneration`
+    /// when it moved past `expected_generation`, then with
+    /// `EnvironmentRefreshRefused` when [`Self::environment_refresh_refusal`]
+    /// names a reason. The one guard the protocol service (before reading
+    /// the catalogue) and the control plane's mutation (under the task lock)
+    /// both run.
+    pub fn check_environment_refresh(
+        &self,
+        expected_generation: Option<u64>,
+    ) -> super::error::Result<()> {
+        if let Some(expected) = expected_generation {
+            self.check_generation(expected)?;
+        }
+        match self.environment_refresh_refusal() {
+            Some(reason) => Err(
+                super::error::OrchestrationError::EnvironmentRefreshRefused {
+                    task_id: self.task_id.clone(),
+                    reason,
+                },
+            ),
+            None => Ok(()),
+        }
     }
 
     /// Whether the task can take no more answers: finished, archived (or

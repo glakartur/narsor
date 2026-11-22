@@ -685,18 +685,17 @@ impl CatalogLaunchResolver {
         // without any profile file, but a profile someone *named* and nobody
         // defined is a mistake worth reporting.
         let absent_is_empty = intent.profile.is_none() && profile_id == DEFAULT_PROFILE;
-        let environment = self.environment(
-            EnvironmentRequest {
-                definition: &definition,
-                backend_id: &backend_id,
-                backend: &backend,
-                repository: repository.as_ref(),
-                profile_id,
-                absent_is_empty,
-                secrets,
-            },
-            |profile| self.harness(intent, profile, &definition, &backend_id, &backend),
-        )?;
+        let (mut environment, profile) = self.environment(EnvironmentRequest {
+            definition: &definition,
+            backend_id: &backend_id,
+            backend: &backend,
+            repository: repository.as_ref(),
+            profile_id,
+            absent_is_empty,
+            secrets,
+        })?;
+        environment.harness = self.harness(intent, &profile, &definition, &backend_id, &backend)?;
+        let environment = environment.sealed();
         let resources = self.resources(intent, &backend_id, &backend)?;
         let inputs = match &intent.inputs {
             Value::Null => Value::Object(Default::default()),
@@ -766,30 +765,31 @@ impl CatalogLaunchResolver {
         // The default profile without a profile file is the empty profile,
         // as the implicit default is at creation; any other id must exist.
         let absent_is_empty = profile_id == DEFAULT_PROFILE;
-        self.environment(
-            EnvironmentRequest {
-                definition: &definition,
-                backend_id,
-                backend: &backend,
-                repository: repository.as_ref(),
-                profile_id,
-                absent_is_empty,
-                secrets,
-            },
-            |_| Ok(spec.environment.harness.clone()),
-        )
+        let (mut environment, _) = self.environment(EnvironmentRequest {
+            definition: &definition,
+            backend_id,
+            backend: &backend,
+            repository: repository.as_ref(),
+            profile_id,
+            absent_is_empty,
+            secrets,
+        })?;
+        environment.harness = spec.environment.harness.clone();
+        Ok(environment.sealed())
     }
 
     /// The catalogue-derived environment of a task, sealed: base and step
     /// images, the task image, the runtime bundle, the profile with its tools
     /// and secret references. Shared by creation and refresh, so an unchanged
-    /// catalogue yields the same identity on both paths. `harness` picks the
-    /// fallback harness once the profile is known.
+    /// catalogue yields the same identity on both paths.
+    ///
+    /// Returned unsealed and without a harness, beside the profile it was
+    /// resolved with: the caller picks the fallback harness (creation from
+    /// the profile, a refresh keeps the stored one), then seals it.
     fn environment(
         &self,
         request: EnvironmentRequest<'_>,
-        harness: impl FnOnce(&ProfileRecord) -> Result<String, LaunchError>,
-    ) -> Result<ResolvedEnvironment, LaunchError> {
+    ) -> Result<(ResolvedEnvironment, ProfileRecord), LaunchError> {
         let EnvironmentRequest {
             definition,
             backend_id,
@@ -922,19 +922,18 @@ impl CatalogLaunchResolver {
             )?;
         }
 
-        let harness = harness(&profile)?;
-        Ok(ResolvedEnvironment {
+        let environment = ResolvedEnvironment {
             base_image,
             step_images,
             runtime_bundle,
             tools,
             profile: profile.resolve(),
-            harness,
+            harness: String::new(),
             secrets: secrets.0.into_values().collect(),
             task_image: sealed_task_image,
             identity: String::new(),
-        }
-        .sealed())
+        };
+        Ok((environment, profile))
     }
 }
 

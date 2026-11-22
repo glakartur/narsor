@@ -1017,30 +1017,12 @@ impl ResolvedEnvironment {
     /// base and step images, the runtime bundle, the tools and the profile.
     /// The harness is kept by a refresh and is not compared.
     pub fn diff(&self, newer: &Self) -> EnvironmentDiff {
-        let no_components = Vec::new();
-        let no_secrets = Vec::new();
-        let (old_components, old_image_secrets) = self
-            .task_image
-            .as_ref()
-            .map_or((&no_components, &no_secrets), |image| {
-                (&image.components, &image.secrets)
-            });
-        let (new_components, new_image_secrets) = newer
-            .task_image
-            .as_ref()
-            .map_or((&no_components, &no_secrets), |image| {
-                (&image.components, &image.secrets)
-            });
+        let (old_components, old_image_secrets) = task_image_parts(&self.task_image);
+        let (new_components, new_image_secrets) = task_image_parts(&newer.task_image);
+        let base =
+            |image: &Option<TaskImage>| image.as_ref().map(|image| image.base.reference.clone());
         EnvironmentDiff {
-            task_image_base: value_change(
-                self.task_image
-                    .as_ref()
-                    .map(|image| image.base.reference.clone()),
-                newer
-                    .task_image
-                    .as_ref()
-                    .map(|image| image.base.reference.clone()),
-            ),
+            task_image_base: value_change(base(&self.task_image), base(&newer.task_image)),
             task_image_components: named_changes(
                 by_name(old_components, |component| &component.name),
                 by_name(new_components, |component| &component.name),
@@ -1066,6 +1048,13 @@ impl ResolvedEnvironment {
             profile: profile_change(&self.profile, &newer.profile),
         }
     }
+}
+
+/// The components and image-level secrets of `image`; none without one.
+fn task_image_parts(image: &Option<TaskImage>) -> (&[TaskImageComponent], &[ComponentSecret]) {
+    image.as_ref().map_or((&[][..], &[][..]), |image| {
+        (&image.components[..], &image.secrets[..])
+    })
 }
 
 /// `items` keyed by the name `name` gives each.

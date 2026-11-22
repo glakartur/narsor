@@ -105,7 +105,7 @@ test('panel actions: only the panel surface, in order; none from an old server',
 
 test('the notice of an environment refresh counts the changes, or says nothing changed', () => {
   const refreshed = refreshOutcomeText({
-    type: 'refreshed', old_identity: 'a', new_identity: 'b', generation: 2,
+    type: 'refreshed', old_identity: 'a', new_identity: 'b', generation: 2, change_count: 3,
     diff: { profile: { before: 'small', after: 'large' }, tools: { added: ['glab'], removed: ['jq'] } },
   });
   assert.match(refreshed, /^środowisko odświeżone — 3 zmiany/);

@@ -706,30 +706,24 @@ impl TaskApp {
         let Some(task) = self.list.selected() else {
             return;
         };
-        // Before the runner's reads: the comparison with the catalogue is
-        // the control plane's, and matters most for a task that is stopped.
-        if self.detail.tab() == DetailTab::Info {
-            let (id, generation) = (task.task_id.to_string(), task.generation);
-            self.start_drift_read(&id, generation);
-        }
-        let Some(task) = self.list.selected() else {
-            return;
-        };
-        if requires_explicit_open(task)
+        let id = task.task_id.to_string();
+        let (generation, revision) = (task.generation, task.revision);
+        let unopened = requires_explicit_open(task)
             && !self
                 .detail
                 .views
-                .get(task.task_id.as_str())
-                .is_some_and(|view| view.details_opened)
-        {
-            return;
-        }
-        if readiness(task) != Readiness::Started {
-            return;
-        }
-        let id = task.task_id.to_string();
-        let revision = task.revision;
+                .get(&id)
+                .is_some_and(|view| view.details_opened);
+        let started = readiness(task) == Readiness::Started;
         let tab = self.detail.tab();
+        // Before the runner's reads: the comparison with the catalogue is
+        // the control plane's, and matters most for a task that is stopped.
+        if tab == DetailTab::Info {
+            self.start_drift_read(&id, generation);
+        }
+        if unopened || !started {
+            return;
+        }
 
         // The timeline first: the other reads are made of what it says.
         if self.detail.view_mut(&id).progress.needs_read(revision) {
@@ -791,7 +785,11 @@ impl TaskApp {
     /// Starts the comparison of the task's environment with the catalogue
     /// when it is due (*Info*).
     fn start_drift_read(&mut self, id: &str, generation: u64) {
-        if !self.detail.view_mut(id).info.needs_drift_read(generation) {
+        if self
+            .detail
+            .view(id)
+            .is_some_and(|view| !view.info.needs_drift_read(generation))
+        {
             return;
         }
         let client = self.client.clone();

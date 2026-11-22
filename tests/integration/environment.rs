@@ -287,14 +287,7 @@ fn a_tag_without_a_digest_is_refused_unless_the_resolver_pins_it() {
 #[test]
 fn a_local_backend_needs_no_image_and_no_runtime_bundle() {
     let root = TempRoot::new();
-    let mut local = BackendRecord::new(
-        "local",
-        BackendKind::Local,
-        TrustScope::Workstation,
-        backend("x").limits,
-    );
-    local.harnesses = Vec::new();
-    root.catalog().save_backend(&local).unwrap();
+    environment_support::local_backend(root.path(), "local");
     root.write_workflow("bare", &workflow_yaml("bare", None));
 
     let launch = root
@@ -1828,17 +1821,6 @@ fn refresh(root: &TempRoot, launch: &ResolvedLaunch) -> Result<ResolvedEnvironme
     resolver(root.path()).resolve_environment(&launch.backend_id, &launch.spec)
 }
 
-fn local_backend(root: &TempRoot) {
-    let mut local = BackendRecord::new(
-        "local",
-        BackendKind::Local,
-        TrustScope::Workstation,
-        backend("x").limits,
-    );
-    local.harnesses = Vec::new();
-    root.catalog().save_backend(&local).unwrap();
-}
-
 /// A profile `dev` with the seeded tool and no secret, so a task's only
 /// secret reference can come from its workspace.
 fn dev_profile() -> ProfileRecord {
@@ -1883,7 +1865,7 @@ fn an_unchanged_catalogue_refreshes_to_the_identity_sealed_at_creation() {
             }
         }),
         ("task image sealed on the local backend", |root| {
-            local_backend(root);
+            environment_support::local_backend(root.path(), "local");
             root.write_workflow("bare", &workflow_yaml("bare", None));
             write_task_image(
                 root,
@@ -1904,7 +1886,7 @@ fn an_unchanged_catalogue_refreshes_to_the_identity_sealed_at_creation() {
 #[test]
 fn a_refresh_seals_a_task_image_added_to_the_catalogue_since_creation() {
     let root = TempRoot::new();
-    local_backend(&root);
+    environment_support::local_backend(root.path(), "local");
     root.write_workflow("bare", &workflow_yaml("bare", None));
     let launch = root.resolve(&on_local("bare")).unwrap();
     assert!(launch.spec.environment.task_image.is_none());

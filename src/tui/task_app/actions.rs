@@ -1356,27 +1356,18 @@ impl TaskApp {
 /// What the bar says of the outcome of an environment refresh.
 pub fn environment_refresh_notice(outcome: &EnvironmentRefreshResult) -> String {
     match outcome {
-        EnvironmentRefreshResult::Refreshed { diff, .. } => match diff.change_count() {
+        EnvironmentRefreshResult::Refreshed { change_count, .. } => match *change_count {
             0 => "środowisko odświeżone".to_string(),
             count => format!(
                 "środowisko odświeżone — {count} {}; zadanie dostanie je przy następnym \
                  uruchomieniu",
-                changes_word(count)
+                crate::tui::plural(count, ["zmiana", "zmiany", "zmian"])
             ),
         },
         EnvironmentRefreshResult::Unchanged { .. } => {
             "środowisko bez zmian — katalog daje to samo środowisko".to_string()
         }
         EnvironmentRefreshResult::Unrecognized => "odświeżenie środowiska przyjęte".to_string(),
-    }
-}
-
-/// "zmiana", "zmiany" or "zmian", as Polish says it after `count`.
-fn changes_word(count: usize) -> &'static str {
-    match (count, count % 10, count % 100) {
-        (1, _, _) => "zmiana",
-        (_, 2..=4, tens) if !(12..=14).contains(&tens) => "zmiany",
-        _ => "zmian",
     }
 }
 

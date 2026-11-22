@@ -4,6 +4,8 @@
 //! snapshot must pass validation and `crate::domain` does not depend on
 //! `crate::workflow`.
 
+use serde::Deserialize;
+
 use crate::domain::{LaunchDefinitionError, TaskLaunchSpec, WorkflowDefinition};
 
 impl TaskLaunchSpec {
@@ -17,13 +19,14 @@ impl TaskLaunchSpec {
     pub fn definition(&self) -> Result<WorkflowDefinition, LaunchDefinitionError> {
         let value = self
             .definition
-            .clone()
+            .as_ref()
             .ok_or_else(|| LaunchDefinitionError::Missing(self.workflow_id.clone()))?;
-        let definition: WorkflowDefinition =
-            serde_json::from_value(value).map_err(|source| LaunchDefinitionError::Unreadable {
+        let definition = WorkflowDefinition::deserialize(value).map_err(|source| {
+            LaunchDefinitionError::Unreadable {
                 workflow: self.workflow_id.clone(),
                 source,
-            })?;
+            }
+        })?;
         if definition.id != self.workflow_id || definition.version != self.workflow_version {
             return Err(LaunchDefinitionError::Mismatch {
                 expected: self.workflow_id.clone(),

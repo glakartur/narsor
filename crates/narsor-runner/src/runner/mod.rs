@@ -647,7 +647,7 @@ async fn load_spec(
             return Ok(unchanged(stored));
         };
         let served = fetch_pinned_spec(link, &config.timing, pinned).await?;
-        if !same_task_launch(&stored, &served) {
+        if !served.is_environment_refresh_of(&stored) {
             return Err(RunnerError::LaunchSpec(format!(
                 "the storage's copy: {problem}"
             )));
@@ -671,20 +671,6 @@ async fn load_spec(
         spec,
         replacement: None,
     })
-}
-
-/// Whether `served` launches the same task as `stored`: everything but the
-/// environment (and the schema version and digest that follow the reseal)
-/// is equal. A refresh re-resolves the environment and nothing else.
-fn same_task_launch(stored: &TaskLaunchSpec, served: &TaskLaunchSpec) -> bool {
-    stored.workflow_id == served.workflow_id
-        && stored.workflow_version == served.workflow_version
-        && stored.definition == served.definition
-        && stored.inputs == served.inputs
-        && stored.workspace == served.workspace
-        && stored.resources == served.resources
-        && stored.ticket == served.ticket
-        && stored.title == served.title
 }
 
 /// The spec the control plane serves, accepted only when it recomputes to

@@ -60,6 +60,19 @@ pub fn backend(id: &str) -> BackendRecord {
 }
 
 /// A workflow with one script step and a pinned image.
+/// Saves a local workstation backend `id` that names no harnesses into the
+/// catalogue at `root`: a task on it needs no image and no runtime bundle.
+pub fn local_backend(root: &Path, id: &str) {
+    let mut local = BackendRecord::new(
+        id,
+        BackendKind::Local,
+        TrustScope::Workstation,
+        backend("x").limits,
+    );
+    local.harnesses = Vec::new();
+    EnvironmentCatalog::new(root).save_backend(&local).unwrap();
+}
+
 pub fn workflow_yaml(name: &str, image: Option<&str>) -> String {
     let globals = image
         .map(|image| format!("globals:\n  image: \"{image}\"\n"))

@@ -110,6 +110,10 @@ pub enum EnvironmentRefreshResult {
         new_identity: String,
         /// The task's desired generation after the refresh.
         generation: u64,
+        /// How many parts changed: [`EnvironmentDiff::change_count`], so a
+        /// client need not count the diff itself.
+        #[serde(default)]
+        change_count: usize,
         /// What changed, part by part.
         #[serde(default)]
         diff: Box<EnvironmentDiff>,

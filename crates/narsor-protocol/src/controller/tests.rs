@@ -1093,18 +1093,22 @@ fn an_environment_refresh_outcome_decodes_from_raw_json_and_tolerates_newer_kind
         "old_identity": "env-old",
         "new_identity": "env-new",
         "generation": 4,
+        "change_count": 1,
         "diff": { "task_image_components": { "added": ["glab"] } },
     }))
     .unwrap();
     let EnvironmentRefreshResult::Refreshed {
-        generation, diff, ..
+        generation,
+        change_count,
+        diff,
+        ..
     } = refreshed
     else {
         panic!("refreshed: {refreshed:?}");
     };
     assert_eq!(
-        (generation, diff.task_image_components.added),
-        (4, vec!["glab".to_string()])
+        (generation, change_count, diff.task_image_components.added),
+        (4, 1, vec!["glab".to_string()])
     );
 
     // A client that predates an outcome reads it as `Unrecognized`.

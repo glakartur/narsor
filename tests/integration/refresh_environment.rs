@@ -15,7 +15,6 @@ use narsor_engine::controller_protocol::{
     RefreshEnvironmentResponse,
 };
 use narsor_engine::domain::{BackendId, TaskId};
-use narsor_engine::environment::{BackendKind, BackendRecord, EnvironmentCatalog, TrustScope};
 use narsor_engine::orchestration::{
     ControlPlane, ControllerReport, LeaseToken, Observation, ObservedSummary, OwnerCommand,
     OwnerRef, RunnerState, TaskEventKind, TaskRecord,
@@ -57,16 +56,7 @@ impl Fixture {
         fs::create_dir_all(&state).unwrap();
         fs::create_dir_all(&catalog).unwrap();
         let resolver = crate::environment_support::seeded_resolver(&state);
-        let mut local = BackendRecord::new(
-            BACKEND,
-            BackendKind::Local,
-            TrustScope::Workstation,
-            crate::environment_support::backend("x").limits,
-        );
-        local.harnesses = Vec::new();
-        EnvironmentCatalog::new(&state)
-            .save_backend(&local)
-            .unwrap();
+        crate::environment_support::local_backend(&state, BACKEND);
         let service = Arc::new(ProtocolService::new(
             ControlPlane::new(ServerStatePaths::new(&state)),
             resolver,
@@ -253,12 +243,14 @@ async fn a_refresh_seals_the_new_task_image_for_the_next_start_and_names_the_aut
         old_identity,
         new_identity,
         generation,
+        change_count,
         diff,
     } = response.outcome
     else {
         panic!("the environment changed: {:?}", response.outcome);
     };
     assert_eq!(diff.task_image_components.added, vec!["glab".to_string()]);
+    assert_eq!(change_count, diff.change_count());
     assert_eq!(old_identity, before.launch_spec.environment.identity);
     assert_eq!(new_identity, after.launch_spec.environment.identity);
     assert_eq!(generation, before.generation + 1);

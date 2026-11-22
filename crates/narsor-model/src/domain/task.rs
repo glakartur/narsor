@@ -313,6 +313,14 @@ impl TaskLaunchSpec {
         self
     }
 
+    /// Whether `self` is `stored` with only its environment refreshed: the
+    /// spec [`Self::with_environment`] makes of `stored` with this
+    /// environment. Defined through that reseal, so a field added to the spec
+    /// is compared by default.
+    pub fn is_environment_refresh_of(&self, stored: &TaskLaunchSpec) -> bool {
+        stored.clone().with_environment(self.environment.clone()) == *self
+    }
+
     /// Recomputes the digest from the content fields.
     ///
     /// SHA-256 over the canonical JSON rendering (see
@@ -363,5 +371,38 @@ impl TaskLaunchSpec {
     /// identity matches the environment.
     pub fn digest_is_valid(&self) -> bool {
         self.digest == self.compute_digest() && self.environment.identity_is_valid()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> TaskLaunchSpec {
+        TaskLaunchSpec::new(
+            "wf",
+            1,
+            serde_json::json!({"ticket": "A-1"}),
+            TaskWorkspace::none(),
+            ResolvedEnvironment::harness_only("claude"),
+            ResourceProfile::new(1000, 1024),
+        )
+    }
+
+    #[test]
+    fn only_an_environment_change_counts_as_a_refresh() {
+        let stored = spec();
+        let refreshed = stored
+            .clone()
+            .with_environment(ResolvedEnvironment::harness_only("codex"));
+        assert!(refreshed.is_environment_refresh_of(&stored));
+
+        let mut other_inputs = refreshed.clone();
+        other_inputs.inputs = serde_json::json!({"ticket": "A-2"});
+        let other_inputs = other_inputs.with_environment(refreshed.environment.clone());
+        let other_title = refreshed.clone().with_labels(None, Some("Other".into()));
+        for changed in [other_inputs, other_title] {
+            assert!(!changed.is_environment_refresh_of(&stored));
+        }
     }
 }

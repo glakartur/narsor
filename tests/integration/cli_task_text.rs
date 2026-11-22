@@ -581,6 +581,7 @@ fn a_refresh_shows_what_changed_and_both_identities() {
             old_identity: "sha256:aaaa".into(),
             new_identity: "sha256:bbbb".into(),
             generation: 8,
+            change_count: 4,
             diff: refresh_diff(),
         },
     );

@@ -7744,11 +7744,15 @@ mod task_app_actions {
         #[test]
         fn the_bar_says_what_the_environment_refresh_found() {
             use narsor_protocol::controller::{EnvironmentDiff, EnvironmentRefreshResult};
-            let refreshed = |diff: serde_json::Value| EnvironmentRefreshResult::Refreshed {
-                old_identity: "a".to_string(),
-                new_identity: "b".to_string(),
-                generation: 2,
-                diff: Box::new(serde_json::from_value::<EnvironmentDiff>(diff).unwrap()),
+            let refreshed = |diff: serde_json::Value| {
+                let diff = Box::new(serde_json::from_value::<EnvironmentDiff>(diff).unwrap());
+                EnvironmentRefreshResult::Refreshed {
+                    old_identity: "a".to_string(),
+                    new_identity: "b".to_string(),
+                    generation: 2,
+                    change_count: diff.change_count(),
+                    diff,
+                }
             };
             let two = refreshed(serde_json::json!({
                 "profile": {"before": "small", "after": "large"},
