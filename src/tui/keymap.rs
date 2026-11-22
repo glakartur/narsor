@@ -269,6 +269,8 @@ pub enum Action {
     /// Follow the step that is running; in a reader, to the end and after
     /// what comes.
     Follow,
+    /// Switch the axis of *Przebieg* between one row per step and full rows.
+    ToggleAxisRows,
     /// Enter the conversation of the step picked on the timeline.
     EnterStep,
     /// Leave the step's conversation for the timeline, on the same step.
@@ -1330,6 +1332,13 @@ pub static BINDINGS: &[Binding] = &[
         "podążaj",
         "włącz albo wyłącz podążanie za bieżącym krokiem",
     ),
+    bind(
+        Context::Axis,
+        Key::char('v'),
+        Action::ToggleAxisRows,
+        "widok",
+        "jedno- albo wieloliniowa lista kroków",
+    ),
     // The timeline of *Przebieg* in the history: a closed run, nothing to
     // follow, and its steps are header rows only, so there is no step to pick
     // or open.
@@ -1339,6 +1348,13 @@ pub static BINDINGS: &[Binding] = &[
         Action::Back,
         "lista",
         "wróć na listę historii",
+    ),
+    bind(
+        Context::HistoryAxis,
+        Key::char('v'),
+        Action::ToggleAxisRows,
+        "widok",
+        "jedno- albo wieloliniowa lista kroków",
     ),
     // The conversation of the step picked on the timeline.
     bind(

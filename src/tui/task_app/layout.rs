@@ -225,6 +225,7 @@ fn render_view(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles
     let place = app.list.next_queue_place();
     let focused = app.focus == Focus::Details;
     let hyperlinks = app.detail.hyperlinks();
+    let axis_rows = app.detail.axis_rows();
     let glyph = app.loading_glyph();
     let loading = app.loading_label("loading…");
     if let View::Opening(kind) = app.view {
@@ -246,6 +247,7 @@ fn render_view(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles
                 stale,
                 hyperlinks,
                 glyph,
+                axis_rows,
             };
             history::render_details(frame, area, open, styles, look);
         }

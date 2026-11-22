@@ -395,6 +395,28 @@ pub(super) fn status_look(status: PositionStatus) -> (&'static str, Role) {
     }
 }
 
+/// How many rows each step takes on the axis. The operator switches it with
+/// `v` on the steps; it holds for the whole session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AxisRows {
+    /// Only the first row: status, label, times and usage.
+    #[default]
+    One,
+    /// The first row, and under it the model, effort and harness of a step
+    /// that has them.
+    Full,
+}
+
+impl AxisRows {
+    /// The other view.
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::One => Self::Full,
+            Self::Full => Self::One,
+        }
+    }
+}
+
 /// The axis: its width and the lines of each step. The first row of a step is
 /// a table — status, label, when it started, how long it ran, then the cost,
 /// the tokens in and out and the subagents while a step reports usage — whose
@@ -484,9 +506,12 @@ impl AxisLayout {
         now: chrono::DateTime<chrono::Utc>,
         styles: &Styles,
         stale: bool,
+        rows: AxisRows,
     ) -> Self {
         let mut layout = Self::usage(positions, area_width, now, styles, stale);
-        layout.add_details(positions, area_width, styles);
+        if rows == AxisRows::Full {
+            layout.add_details(positions, area_width, styles);
+        }
         layout
     }
 
@@ -765,6 +790,7 @@ pub fn render(
     stale: bool,
     keys: Option<StepFocus>,
     glyph: &str,
+    axis_rows: AxisRows,
 ) {
     let axis_focused = keys == Some(StepFocus::Axis);
     let conversation_focused = keys == Some(StepFocus::Conversation);
@@ -806,7 +832,7 @@ pub fn render(
         .and_then(|response| response.observed_at)
         .unwrap_or_else(chrono::Utc::now);
     let positions = super::gate::overlay(progress.positions(), gate);
-    let layout = AxisLayout::new(&positions, area.width, now, styles, stale);
+    let layout = AxisLayout::new(&positions, area.width, now, styles, stale, axis_rows);
     let axis_width = layout.width.min(area.width);
     let axis = Rect::new(area.x, area.y, axis_width, area.height);
     let content = Rect::new(
@@ -1017,6 +1043,7 @@ mod tests {
             chrono::Utc::now(),
             &Styles::new(false),
             false,
+            AxisRows::Full,
         )
     }
 
@@ -1169,6 +1196,26 @@ mod tests {
     }
 
     #[test]
+    fn the_one_row_view_drops_the_agent_row_and_its_width() {
+        let mut steps = vec![step("a", None), step("b", None)];
+        steps[0].model = Some("a-very-long-model-name".into());
+        steps[0].effort = Some("high".into());
+        steps[0].harness = Some("claude-code".into());
+        steps[1].harness = Some("codex".into());
+        let now = chrono::Utc::now();
+        let build = |rows| AxisLayout::new(&steps, 200, now, &Styles::new(false), false, rows);
+        let one = build(AxisRows::One);
+        let full = build(AxisRows::Full);
+        for lines in &one.rows {
+            assert_eq!(lines.len(), 1);
+            let row = text(&lines[0]);
+            assert!(!row.contains("sonnet") && !row.contains("codex"), "{row:?}");
+        }
+        assert_eq!(text(&one.rows[0][0]), text(&full.rows[0][0]));
+        assert!(one.width < full.width, "{} < {}", one.width, full.width);
+    }
+
+    #[test]
     fn a_step_without_a_start_has_empty_time_fields_and_no_trailing_separator() {
         let mut steps = [step("lint", None), step("review", None)];
         steps[1].started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
@@ -1207,7 +1254,7 @@ mod tests {
         let mut steps = [step("run", None)];
         steps[0].status = PositionStatus::InProgress;
         steps[0].started_at = Some(now - chrono::Duration::seconds(120));
-        let axis = AxisLayout::new(&steps, 200, now, &Styles::new(false), false);
+        let axis = AxisLayout::new(&steps, 200, now, &Styles::new(false), false, AxisRows::Full);
         let row = text(&axis.rows[0][0]);
         assert!(row.starts_with("● run"), "{row:?}");
         assert!(row.ends_with("2m"), "{row:?}");
@@ -1247,7 +1294,14 @@ mod tests {
         let start = clock(steps[0].started_at);
         let mut seen = (false, false, false);
         for width in (0..=200u16).rev() {
-            let axis = AxisLayout::new(&steps, width, now, &Styles::new(false), false);
+            let axis = AxisLayout::new(
+                &steps,
+                width,
+                now,
+                &Styles::new(false),
+                false,
+                AxisRows::Full,
+            );
             let row = text(&axis.rows[0][0]);
             assert!(row.contains("✓ "), "{width}: {row:?}");
             let (cut, has_start, has_duration) = (

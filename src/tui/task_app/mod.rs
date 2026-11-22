@@ -229,6 +229,7 @@ pub struct DetailState {
     drafts: BTreeMap<String, String>,
     views: BTreeMap<String, TaskDetail>,
     hyperlinks: bool,
+    axis_rows: tabs::progress::AxisRows,
 }
 
 impl DetailState {
@@ -238,6 +239,7 @@ impl DetailState {
             drafts: BTreeMap::new(),
             views: BTreeMap::new(),
             hyperlinks: false,
+            axis_rows: tabs::progress::AxisRows::default(),
         }
     }
 
@@ -265,6 +267,17 @@ impl DetailState {
     /// ([`detail::hyperlinks_supported`]).
     pub fn set_hyperlinks(&mut self, enabled: bool) {
         self.hyperlinks = enabled;
+    }
+
+    /// How many rows a step takes on the axis of *Przebieg*, in the task
+    /// details and in the history alike.
+    pub fn axis_rows(&self) -> tabs::progress::AxisRows {
+        self.axis_rows
+    }
+
+    /// Switches the axis between one row per step and the full rows.
+    pub fn toggle_axis_rows(&mut self) {
+        self.axis_rows = self.axis_rows.toggled();
     }
 
     /// Makes the details of every task due for a new read, keeping what is
@@ -911,6 +924,7 @@ impl TaskApp {
             {
                 self.on_detail_action(action)
             }
+            Action::ToggleAxisRows => self.detail.toggle_axis_rows(),
             Action::EnterStep if context == Context::Details => self.enter_step(),
             Action::LeaveStep if context == Context::Details => self.back_to_axis(),
             Action::Compose | Action::UndoDecision | Action::LoadMore
