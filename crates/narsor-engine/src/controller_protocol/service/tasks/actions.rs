@@ -2039,7 +2039,7 @@ terminal_states: { completed: completed, cancelled: cancelled }
     }
 
     #[test]
-    fn a_comment_on_a_finished_task_is_refused_with_the_reason_of_the_offer() {
+    fn covers_ae5_a_comment_on_a_finished_task_is_refused_with_the_reason_of_the_offer() {
         let root = temp_root();
         let (service, record) = service_and_record(&root, RunnerState::Stopped);
         let record = saved(&service, reported(record, "completed", "completed"));
