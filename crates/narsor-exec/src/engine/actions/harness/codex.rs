@@ -255,6 +255,10 @@ impl CodexStreamParser {
 }
 
 impl HarnessStreamParser for CodexStreamParser {
+    fn session_id(&self) -> Option<&str> {
+        self.thread_id.as_deref()
+    }
+
     /// codex output is not classified yet (R15): every line is one
     /// unclassified element.
     fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement> {

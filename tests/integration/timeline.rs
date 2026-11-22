@@ -912,3 +912,48 @@ fn a_timeline_file_in_the_wrong_state_is_made_again() {
         .unwrap()
         .contains("\"positions\""));
 }
+
+/// An attempt cut after its harness said its session, before the session
+/// ended: only the timeline file knows the session, and the position shows
+/// it, also once the log moves on and the timeline is built again.
+#[test]
+fn the_session_an_attempt_reported_while_it_ran_is_on_its_position() {
+    use narsor_engine::engine::timeline_file::{record_session, reported_sessions, ReportedSession};
+
+    let store = scratch("in-flight-session");
+    let mut log = Log::new();
+    log.push(state_entered("plan"));
+    log.push(action_started("a1", "plan", "agent"));
+    log.push(EventData::AgentSessionStarted {
+        session_id: "narsor-a1".to_string(),
+        harness: "claude-code".to_string(),
+        action_execution_id: Some("a1".to_string()),
+        resumed_session: None,
+        model: None,
+        effort: None,
+    });
+    let none = HashSet::new();
+    // A file of a version without sessions: it reads, and has none.
+    narsor_engine::engine::timeline_file::record_reading(&store, EXEC, "a1", increment(1, 1, 0.1))
+        .unwrap();
+    let before = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Running, &none);
+    assert_eq!(before.positions[0].harness_session_id, None);
+    assert!(reported_sessions(&store, EXEC).is_empty());
+
+    let session = ReportedSession {
+        harness: "claude-code".to_string(),
+        harness_session_id: "hs-cut".to_string(),
+    };
+    record_session(&store, EXEC, "a1", session.clone()).unwrap();
+
+    let during = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Running, &none);
+    assert_eq!(during.positions[0].harness_session_id.as_deref(), Some("hs-cut"));
+    assert_eq!(during.positions[0].usage.unwrap().cost_usd, Some(0.1));
+
+    log.push(EventData::WorkflowPaused {
+        reason: "the workload was lost".to_string(),
+    });
+    let rebuilt = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Unknown, &none);
+    assert_eq!(rebuilt.positions[0].harness_session_id.as_deref(), Some("hs-cut"));
+    assert_eq!(reported_sessions(&store, EXEC).get("a1"), Some(&session));
+}

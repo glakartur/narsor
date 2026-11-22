@@ -223,6 +223,10 @@ impl OpenCodeStreamParser {
 }
 
 impl HarnessStreamParser for OpenCodeStreamParser {
+    fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
     /// opencode output is not classified yet (R15): every line is one
     /// unclassified element.
     fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement> {

@@ -496,6 +496,10 @@ impl GitHubCopilotStreamParser {
 }
 
 impl HarnessStreamParser for GitHubCopilotStreamParser {
+    fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
     fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement> {
         let Ok(text) = std::str::from_utf8(line) else {
             self.malformed_json = true;

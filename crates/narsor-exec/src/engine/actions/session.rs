@@ -543,12 +543,12 @@ impl SessionRunner {
         };
         sink.append_narsor(&entry, &[element]);
         match (&self.readings, request.execution_id) {
-            (Some(readings), Some(execution_id)) => sink.with_readings(ReadingTap {
-                sink: Arc::clone(readings),
-                execution_id: execution_id.to_string(),
-                attempt_id: request.action_execution_id.to_string(),
-                harness: harness.to_string(),
-            }),
+            (Some(readings), Some(execution_id)) => sink.with_readings(ReadingTap::new(
+                Arc::clone(readings),
+                execution_id.to_string(),
+                request.action_execution_id.to_string(),
+                harness.to_string(),
+            )),
             _ => sink,
         }
     }
