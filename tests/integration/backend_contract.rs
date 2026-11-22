@@ -88,8 +88,9 @@ async fn a_lost_workload_is_reported_at_the_platform_event_not_at_the_idle_pace(
     h.wait_runner_state("task-1", RunnerState::Interrupted)
         .await;
 
+    // Generous for a loaded machine, and still far below the 40 s pace.
     assert!(
-        killed.elapsed() < Duration::from_secs(5),
+        killed.elapsed() < Duration::from_secs(20),
         "reported after {:?}",
         killed.elapsed()
     );
@@ -410,6 +411,8 @@ mod incremental_reads {
         runner_reports(&h, "task-1", 1, 1, false);
         c.read(0).await;
 
+        // A long-poll that ended at a heartbeat or a snapshot would answer
+        // before its one second: time only lengthens it under load.
         let polled = Instant::now();
         let client = &c.client;
         let (response, ()) = tokio::join!(client.commands(1, c.cursor), async {
@@ -426,17 +429,15 @@ mod incremental_reads {
 
         h.lease_reader("task-2", 1);
         assert!(c.changed("task-2").await.reader_needed);
-        let polled = Instant::now();
-        let response = c.read(20).await;
-        let expired = polled.elapsed();
+        // The poll would wait a minute; only the lease's expiry, a second
+        // away, ends it within the generous bound.
+        let response = tokio::time::timeout(Duration::from_secs(30), c.read(60))
+            .await
+            .expect("answered at the expiry, not at the end of the wait");
 
         let [command] = <[DesiredCommand; 1]>::try_from(response.commands).expect("one");
         assert_eq!(command.task_id.as_str(), "task-2");
         assert!(!command.reader_needed);
-        assert!(
-            expired < Duration::from_secs(5),
-            "answered at the expiry, not the wait: {expired:?}"
-        );
     }
 
     /// D58: the resume policy's commands reach the controller once each, in
@@ -450,7 +451,7 @@ mod incremental_reads {
         let mut c = Reader::new(&h).await;
         c.read(0).await;
         let mut delivered = Vec::new();
-        for attempt in 0..2 {
+        for _ in 0..2 {
             c.report(&h, "task-1", Observation::StartAccepted).await;
             c.report(
                 &h,
@@ -460,8 +461,9 @@ mod incremental_reads {
             .await;
             assert_eq!(h.runner_state("task-1"), RunnerState::Interrupted);
             assert_eq!(c.changed("task-1").await.action, DesiredAction::Hold);
-            // The second loss waits out its backoff.
-            tokio::time::sleep(Duration::from_millis(150 * attempt)).await;
+            // Past any attempt's backoff (at most 400 ms in the contract's
+            // policy), on the control plane's clock.
+            h.advance_clock(chrono::Duration::seconds(1));
             h.service.auto_resume_pass();
             h.service.auto_resume_pass();
             let resumed = c.changed("task-1").await;

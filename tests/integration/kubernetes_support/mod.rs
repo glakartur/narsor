@@ -112,8 +112,11 @@ struct ClusterState {
     /// Bumped to end every open watch.
     watch_ends: u64,
     forbid_pod_watch: bool,
-    pod_lists: usize,
-    pod_watches: usize,
+    /// When the Pods were listed, on the tokio clock (paused in a test
+    /// that drives time).
+    pod_lists: Vec<tokio::time::Instant>,
+    /// When a Pod watch was opened, on the tokio clock.
+    pod_watches: Vec<tokio::time::Instant>,
 }
 
 struct Runner {
@@ -443,12 +446,22 @@ impl MockCluster {
 
     /// How often the Pods were listed.
     pub fn pod_lists(&self) -> usize {
-        self.lock().pod_lists
+        self.lock().pod_lists.len()
+    }
+
+    /// When the Pods were listed, in order.
+    pub fn pod_list_times(&self) -> Vec<tokio::time::Instant> {
+        self.lock().pod_lists.clone()
     }
 
     /// How often a Pod watch was opened.
     pub fn pod_watches(&self) -> usize {
-        self.lock().pod_watches
+        self.lock().pod_watches.len()
+    }
+
+    /// When a Pod watch was opened, in order.
+    pub fn pod_watch_times(&self) -> Vec<tokio::time::Instant> {
+        self.lock().pod_watches.clone()
     }
 
     /// The Pod's node stops reporting (a partition): the Pod's phase turns
@@ -520,7 +533,7 @@ impl MockCluster {
 
     fn open_watch(&self, path: &str) -> WatchAnswer<'_> {
         let mut state = self.lock();
-        state.pod_watches += 1;
+        state.pod_watches.push(tokio::time::Instant::now());
         let forbidden = state.forbid_pod_watch
             || parse(path).map(|(_, plural, name)| (plural, name)) != Some(("pods", None))
             || query(path, "watch").as_deref() != Some("true");
@@ -567,7 +580,7 @@ impl MockCluster {
         let forbidden = || status(StatusCode::FORBIDDEN, "Forbidden", "RBAC: not granted");
         match (plural, method.clone(), name) {
             ("pods", Method::GET, None) => {
-                state.pod_lists += 1;
+                state.pod_lists.push(tokio::time::Instant::now());
                 if state.forbid_pod_watch {
                     return forbidden();
                 }

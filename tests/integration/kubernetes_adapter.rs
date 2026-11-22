@@ -1676,7 +1676,9 @@ async fn observation_is_normalized_and_foreign_objects_are_refused() {
 // ---------------------------------------------------------------------------
 
 /// A provisioned task, with the adapter already following its Pods
-/// (nothing changed since it listed them).
+/// (nothing changed since it listed them). The watch tests run on paused
+/// tokio time: a wait for a wake that does not come ends only once the
+/// follower has nothing left to do, so "not woken" is not a race.
 async fn watched(quiet: &Quiet) -> TaskResources {
     let task = task_resources(&quiet.backend, "task-1");
     quiet
@@ -1692,7 +1694,7 @@ async fn watched(quiet: &Quiet) -> TaskResources {
 
 /// A Pod whose runner fails wakes the controller at once, and its
 /// observation then sees the exit.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_pod_that_fails_wakes_the_controller_whose_observation_sees_it() {
     let quiet = Quiet::new();
     let task = watched(&quiet).await;
@@ -1712,7 +1714,7 @@ async fn a_pod_that_fails_wakes_the_controller_whose_observation_sees_it() {
 /// A change made while the watch ended and its version expired (410 Gone)
 /// reaches no watch: the adapter lists again and wakes the controller
 /// anyway, then follows the Pods from the new list.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_expired_pod_watch_lists_again_without_missing_a_wake() {
     let quiet = Quiet::new();
     let task = watched(&quiet).await;
@@ -1737,7 +1739,7 @@ async fn an_expired_pod_watch_lists_again_without_missing_a_wake() {
 /// With a Role from before the watch (no list or watch on pods) nothing
 /// wakes the controller and the adapter keeps working: the follower retries
 /// with a growing pause instead of hammering the API server.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_role_without_the_pod_watch_leaves_the_controller_at_its_periodic_pace() {
     let quiet = Quiet::new();
     quiet.cluster.forbid_pod_watch(true);
@@ -1748,16 +1750,46 @@ async fn a_role_without_the_pod_watch_leaves_the_controller_at_its_periodic_pace
         .await
         .unwrap();
 
-    let woken = tokio::time::timeout(Duration::from_secs(2), quiet.backend.changed()).await;
+    let woken = tokio::time::timeout(Duration::from_secs(60), quiet.backend.changed()).await;
 
     assert!(woken.is_err(), "nothing wakes it");
-    let attempts = quiet.cluster.pod_lists();
+    let lists = quiet.cluster.pod_list_times();
+    let pauses: Vec<Duration> = lists.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    assert!(pauses.len() >= 2, "retried: {pauses:?}");
     assert!(
-        (2..=12).contains(&attempts),
-        "retried with a growing pause, not in a loop: {attempts} lists"
+        pauses.windows(2).all(|pair| pair[0] <= pair[1]) && pauses[0] < pauses[pauses.len() - 1],
+        "a growing pause, not a loop: {pauses:?}"
     );
     let observed = quiet.backend.observe(&task).await.unwrap().workload;
     assert_eq!(observed.unwrap().phase, WorkloadPhase::Starting);
+}
+
+/// A watch the server closes after a healthy round (its `timeoutSeconds`
+/// on a quiet namespace) is opened again at once; one the server closes
+/// right after opening it is opened again only after a pause, like a
+/// failure, so a server that keeps doing so is not hammered.
+#[tokio::test(start_paused = true)]
+async fn a_watch_ended_after_a_long_quiet_round_is_reopened_at_once_and_a_quick_end_after_a_pause()
+{
+    for (open_for, at_once) in [(Duration::from_secs(60), true), (Duration::ZERO, false)] {
+        let quiet = Quiet::new();
+        watched(&quiet).await;
+        tokio::time::sleep(open_for).await;
+
+        let ended = tokio::time::Instant::now();
+        quiet.cluster.end_pod_watches();
+        wait_until("the watch opened again", async || {
+            quiet.cluster.pod_watches() == 2
+        })
+        .await;
+
+        let reopened_after = quiet.cluster.pod_watch_times()[1] - ended;
+        assert_eq!(
+            reopened_after.is_zero(),
+            at_once,
+            "open for {open_for:?}: reopened after {reopened_after:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

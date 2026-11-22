@@ -65,6 +65,10 @@ pub struct FakeDocker {
     /// The events and stream ends emitted and not yet delivered.
     feed: Mutex<VecDeque<FeedItem>>,
     fed: Condvar,
+    /// How many emitted events the follower has handled (its callback
+    /// returned), so a test knows an event was seen before it checks what
+    /// the event did not do.
+    handled: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -254,6 +258,11 @@ impl FakeDocker {
             .unwrap_or_else(PoisonError::into_inner)
             .push_back(item);
         self.fed.notify_all();
+    }
+
+    /// How many emitted events the follower has handled.
+    pub fn events_handled(&self) -> usize {
+        self.handled.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// How many times the event stream was followed.
@@ -532,7 +541,12 @@ impl DockerTransport for FakeDocker {
             drop(feed);
             let wanted = match item {
                 Some(FeedItem::End) => return Ok(()),
-                Some(FeedItem::Event(event)) => on_event(Some(event)),
+                Some(FeedItem::Event(event)) => {
+                    let wanted = on_event(Some(event));
+                    self.handled
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    wanted
+                }
                 None => on_event(None),
             };
             if !wanted {

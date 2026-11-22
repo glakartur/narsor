@@ -91,6 +91,8 @@ bytes = "1"
 
 
 [dev-dependencies]
+# Paused tokio time for the tests that drive retry pacing (test-util).
+tokio = { version = "1", features = ["full", "test-util"] }
 axum = { version = "0.8", features = ["macros"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls"] }
 narsor-server = { path = "crates/narsor-server" }
