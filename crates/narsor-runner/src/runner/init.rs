@@ -21,6 +21,11 @@
 //! commit and adopted, repository by repository. Anything that is neither ours nor the filesystem's
 //! means the storage was not empty, which is refused rather than cloned
 //! into.
+//!
+//! The one change a resumed storage takes is a refreshed environment of the
+//! same task ([`AcceptedReplacement`]): the marker moves to the new launch
+//! digest, keeping its task and workspace commit, and then the spec copy is
+//! replaced. Nothing is cloned again.
 
 use std::fs;
 use std::path::Path;
@@ -32,7 +37,7 @@ use crate::workspace::{checked_out_commit, clone_pinned_commit, clone_resolving_
 
 use super::secrets::MountedSecrets;
 use super::storage::{InitializationMarker, TaskStorage};
-use super::RunnerError;
+use super::{AcceptedReplacement, RunnerError};
 
 /// What [`initialize`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,21 +49,39 @@ pub enum Initialization {
 }
 
 /// Initializes `storage` for `task_id` from `spec`, once; a Git workspace
-/// is cloned with `git`'s access to the user's own git setup.
+/// is cloned with `git`'s access to the user's own git setup. With a
+/// `replacement`, `spec` replaces the storage's copy of the same task.
 pub fn initialize(
     storage: &TaskStorage,
     store: &ExecutionStore,
     task_id: &TaskId,
     spec: &TaskLaunchSpec,
+    replacement: Option<&AcceptedReplacement>,
     secrets: &MountedSecrets,
     git: &GitAccess,
 ) -> Result<Initialization, RunnerError> {
+    let replaced = replacement.map(|replacement| replacement.replaced_digest.as_str());
     if let Some(marker) = storage.marker()? {
-        if marker.task_id != task_id.as_str() || marker.launch_digest != spec.digest {
+        // A refresh may meet the marker before or after it was moved to the
+        // new launch: a runner that died between the two writes left it
+        // moved and the old copy in place.
+        let known_launch =
+            marker.launch_digest == spec.digest || Some(marker.launch_digest.as_str()) == replaced;
+        if marker.task_id != task_id.as_str() || !known_launch {
             return Err(RunnerError::ForeignStorage(format!(
                 "it was initialized for task '{}' with launch {}, not task '{}' with launch {}",
                 marker.task_id, marker.launch_digest, task_id, spec.digest
             )));
+        }
+        if replacement.is_some() {
+            // The marker first, then the copy: the two cannot be written
+            // together, and an old copy beside a moved marker sends the
+            // next start down this path again.
+            if marker.launch_digest != spec.digest {
+                storage.write_marker(&marker.for_launch(&spec.digest))?;
+            }
+            store.replace_task_launch_spec(task_id, spec)?;
+            return Ok(Initialization::Resumed);
         }
         // Still checked: a spec file replaced on the storage is a conflict.
         store.initialize_task_launch_spec(task_id, spec)?;
@@ -73,6 +96,11 @@ pub fn initialize(
         )));
     }
     storage.prepare()?;
+    if replacement.is_some() {
+        // An initialization that copied the old spec and stopped before its
+        // marker: nothing ran yet, so the refreshed spec simply takes over.
+        store.replace_task_launch_spec(task_id, spec)?;
+    }
     store.initialize_task_launch_spec(task_id, spec)?;
 
     let workspace = storage.workspace_dir();
@@ -483,6 +511,7 @@ terminal_states: [completed]
             &storage.store(),
             &task(),
             &spec,
+            None,
             &MountedSecrets::new(None),
             &GitAccess::User,
         )
@@ -581,6 +610,7 @@ terminal_states: [completed]
                 &storage.store(),
                 &task(),
                 &spec(workspace),
+                None,
                 &MountedSecrets::new(None),
                 &GitAccess::User,
             )
@@ -624,6 +654,7 @@ terminal_states: [completed]
                 &storage.store(),
                 &task(),
                 &spec,
+                None,
                 &MountedSecrets::new(None),
                 &GitAccess::User,
             )
@@ -657,6 +688,7 @@ terminal_states: [completed]
             &storage.store(),
             &task(),
             &spec,
+            None,
             &MountedSecrets::new(None),
             &GitAccess::User,
         )
@@ -698,6 +730,7 @@ terminal_states: [completed]
             &storage.store(),
             &task(),
             &spec,
+            None,
             &MountedSecrets::new(None),
             &GitAccess::User,
         )
@@ -751,6 +784,7 @@ terminal_states: [completed]
             &storage.store(),
             &task(),
             &spec,
+            None,
             &MountedSecrets::new(None),
             &GitAccess::User,
         )
@@ -763,6 +797,69 @@ terminal_states: [completed]
             );
         }
         assert!(!storage.partial_clone_dir().exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A replacement only moves a marker that belongs to this task and to
+    /// the launch it replaces (or already to the new one); any other marker
+    /// is a foreign storage, and neither the marker nor the copy changes.
+    #[test]
+    fn a_replacement_is_refused_on_a_marker_of_another_task_or_launch() {
+        let base = temp("replace-foreign");
+        let old = spec(TaskWorkspace::none());
+        let new = TaskLaunchSpec {
+            environment: ResolvedEnvironment::harness_only("codex").sealed(),
+            ..old.clone()
+        };
+        let new = TaskLaunchSpec {
+            digest: new.compute_digest(),
+            ..new
+        };
+        let replacement = AcceptedReplacement {
+            replaced_digest: old.digest.clone(),
+        };
+        let cases = [
+            (
+                "another task",
+                InitializationMarker::new("task-2", &old.digest, None),
+            ),
+            (
+                "another launch",
+                InitializationMarker::new("task-1", "sha256:other", None),
+            ),
+        ];
+        for (name, marker) in cases {
+            let storage = TaskStorage::new(base.join(name.replace(' ', "-")));
+            fs::create_dir_all(storage.root()).unwrap();
+            storage.prepare().unwrap();
+            storage
+                .store()
+                .initialize_task_launch_spec(&task(), &old)
+                .unwrap();
+            storage.write_marker(&marker).unwrap();
+
+            let error = initialize(
+                &storage,
+                &storage.store(),
+                &task(),
+                &new,
+                Some(&replacement),
+                &MountedSecrets::new(None),
+                &GitAccess::User,
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(error, RunnerError::ForeignStorage(_)),
+                "{name}: {error}"
+            );
+            assert_eq!(storage.marker().unwrap().unwrap(), marker, "{name}");
+            assert_eq!(
+                storage.store().load_task_launch_spec(&task()).unwrap(),
+                Some(old.clone()),
+                "{name}"
+            );
+        }
         let _ = fs::remove_dir_all(base);
     }
 
@@ -783,6 +880,7 @@ terminal_states: [completed]
                 &storage.store(),
                 &task(),
                 &spec,
+                None,
                 &MountedSecrets::new(None),
                 &GitAccess::User,
             )

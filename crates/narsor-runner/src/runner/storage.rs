@@ -479,6 +479,16 @@ impl InitializationMarker {
             initialized_at: Utc::now(),
         }
     }
+
+    /// The same storage — task, workspace commit and initialization time —
+    /// now holding the launch spec of `launch_digest`, after an
+    /// environment refresh replaced the copy.
+    pub fn for_launch(&self, launch_digest: &str) -> Self {
+        Self {
+            launch_digest: launch_digest.to_string(),
+            ..self.clone()
+        }
+    }
 }
 
 /// Which incarnation worked on the storage last, and how it stopped.
