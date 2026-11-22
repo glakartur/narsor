@@ -284,6 +284,9 @@ fn times(metadata: &fs::Metadata) -> (FileTime, FileTime) {
     )
 }
 
+/// The permission bits a copy keeps: read, write and execute only.
+const COPIED_MODE_BITS: u32 = 0o777;
+
 /// Copies `source` to `target`: files with their contents, links as links,
 /// directories recursively, then every original mode and access and
 /// modification time applied again (a directory's last, so a read-only one
@@ -293,7 +296,9 @@ fn times(metadata: &fs::Metadata) -> (FileTime, FileTime) {
 fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source).map_err(|error| at(source, error))?;
     let file_type = metadata.file_type();
-    let mode = metadata.permissions().mode() & 0o7777;
+    // Without the set-id and sticky bits: a copy belongs to whoever runs
+    // the tool, so a set-id bit kept on it would grant that user's rights.
+    let mode = metadata.permissions().mode() & COPIED_MODE_BITS;
     let (atime, mtime) = times(&metadata);
     if file_type.is_symlink() {
         let link = fs::read_link(source).map_err(|error| at(source, error))?;
@@ -347,7 +352,8 @@ fn same_tree(source: &Path, copy: &Path) -> Result<(), String> {
             _ => Err(differs("link")),
         };
     }
-    if left.permissions().mode() & 0o7777 != right.permissions().mode() & 0o7777 {
+    if left.permissions().mode() & COPIED_MODE_BITS != right.permissions().mode() & COPIED_MODE_BITS
+    {
         return Err(differs("mode"));
     }
     if left.is_dir() {
@@ -530,6 +536,25 @@ mod tests {
                 _ => assert!(!target.join(name).exists(), "{name} is not copied"),
             }
         }
+    }
+
+    /// A copy belongs to whoever runs the tool: a set-id bit kept on it
+    /// would grant that user's rights to the file.
+    #[test]
+    fn a_copy_drops_the_set_id_bits() {
+        let temp = Temp::new();
+        let source = private_tree(&temp.0);
+        fs::write(source.join("tool"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(source.join("tool"), fs::Permissions::from_mode(0o6755)).unwrap();
+        let target = temp.0.join("new").join("secrets");
+
+        Mover::copying().move_entry(&source, &target).unwrap();
+
+        let mode = fs::metadata(target.join("tool"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755);
     }
 
     #[test]

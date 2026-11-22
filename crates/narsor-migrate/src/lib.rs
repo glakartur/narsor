@@ -20,6 +20,7 @@
 //!
 //! A repeat finishes what a crash left.
 
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -482,6 +483,18 @@ pub fn run(
     } else {
         writeln!(out, "Backup: none (--no-backup)").map_err(failed)?;
     }
+    let foreign = owned_by_someone_else(&plan);
+    if !foreign.is_empty() {
+        refusals.push(format!(
+            "these entries belong to another user; run narsor-migrate as their owner, \
+             not as root: {}",
+            foreign
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     let locks = refusal::check(&target.checks(), probe, options.assume_containers_stopped);
     if let Err(reason) = &locks {
         refusals.push(reason.clone());
@@ -509,6 +522,22 @@ pub fn run(
     migrate(target, options.mover, &mut summary).map_err(Failure::Failed)?;
     print_summary(&summary, &plan, out).map_err(failed)?;
     Ok(Outcome::Migrated(summary))
+}
+
+/// The old entries whose owner is not the user running the tool. The
+/// migration copies modes and rewrites files inside task storage that tasks
+/// wrote: run by root over another user's files it would act with more
+/// rights than the owner has, so it runs only as the owner.
+fn owned_by_someone_else(plan: &Plan) -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    plan.moves
+        .iter()
+        .map(|(source, _)| source)
+        .filter(|source| fs::symlink_metadata(source).is_ok_and(|meta| meta.uid() != me))
+        .cloned()
+        .collect()
 }
 
 /// The moves themselves, after the checks and the backup.

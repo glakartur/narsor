@@ -467,12 +467,18 @@ pub fn seed_controller_id(paths: &ControllerStatePaths, old_dir: &Path) -> io::R
         .recursive(true)
         .mode(0o700)
         .create(paths.dir())?;
+    // A stale temporary file (or a link put in its place) is removed, not
+    // followed; the new one must be created here and now.
     let temporary = mover::with_suffix(&file, ".tmp");
+    match fs::remove_file(&temporary) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
     let mut out = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&temporary)?;
     io::Write::write_all(
         &mut out,
@@ -499,6 +505,31 @@ mod tests {
     use super::*;
     use crate::test_support::Temp;
     use std::os::unix::fs::PermissionsExt as _;
+
+    /// A link planted where the temporary id file goes is removed, never
+    /// written through.
+    #[test]
+    fn seeding_the_controller_id_does_not_write_through_a_planted_link() {
+        let temp = Temp::new();
+        let paths = ControllerStatePaths::new(temp.0.join("state"));
+        fs::create_dir_all(paths.dir()).unwrap();
+        let victim = temp.0.join("victim");
+        fs::write(&victim, "keep").unwrap();
+        let planted = crate::mover::with_suffix(&paths.controller_id_file(), ".tmp");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let old = temp.0.join("old/local-controller");
+        fs::create_dir_all(&old).unwrap();
+
+        seed_controller_id(&paths, &old).unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(
+            fs::read_to_string(paths.controller_id_file())
+                .unwrap()
+                .trim(),
+            id_of_directory(&old)
+        );
+    }
 
     #[test]
     fn a_claude_key_replaces_every_other_character_with_a_dash() {
