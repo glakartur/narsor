@@ -772,14 +772,26 @@ mod foundations {
                 lookup(axis, &press(KeyCode::Char('f'))),
                 Some(Action::Follow)
             );
-            for code in [
-                KeyCode::PageDown,
-                KeyCode::PageUp,
-                KeyCode::Char(' '),
-                KeyCode::Char('v'),
-            ] {
+            for code in [KeyCode::PageDown, KeyCode::PageUp, KeyCode::Char(' ')] {
                 assert_eq!(lookup(axis, &press(code)), None, "{code:?} reads a step");
             }
+            // `v` switches the axis rows here and, in the history, too; in a
+            // step's conversation it stays the next conversation view.
+            assert_eq!(
+                lookup(axis, &press(KeyCode::Char('v'))),
+                Some(Action::ToggleAxisRows)
+            );
+            assert_eq!(
+                lookup(
+                    Stack::layered(Context::HistoryAxis, Context::HistoryDetails),
+                    &press(KeyCode::Char('v'))
+                ),
+                Some(Action::ToggleAxisRows)
+            );
+            assert_eq!(
+                lookup(step_conversation(), &press(KeyCode::Char('v'))),
+                Some(Action::NextConversationView)
+            );
         }
 
         #[test]

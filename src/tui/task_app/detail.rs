@@ -87,7 +87,7 @@ use super::tabs::conversation::{
 };
 use super::tabs::events::{self, Events};
 use super::tabs::info::{self, DriftOutcome, Info};
-use super::tabs::progress::{self, Progress, StepView};
+use super::tabs::progress::{self, AxisRows, Progress, StepView};
 use super::workspace_rows::{self, Part, Piece};
 use super::{failure_reason, DetailTab, DetailView, StepFocus, TaskApp};
 
@@ -1116,6 +1116,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         (true, false) => KeysAt::Content(app.step_focus()),
     };
     let hyperlinks = app.detail().hyperlinks();
+    let axis_rows = app.detail().axis_rows();
     let glyph = app.loading_glyph();
     let loading = app.detail_loading();
     // A task created here that the server has not confirmed has no summary
@@ -1170,6 +1171,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         loading,
         title_cut: title_is_cut(view.task, &edge),
         closed_run: false,
+        axis_rows,
     };
     render_view(frame, inner, view, styles, options, panel.as_deref_mut());
     app.restore_action_panel(panel);
@@ -1210,6 +1212,8 @@ pub(super) struct ViewOptions {
     /// A history entry: *Przebieg* shows the run the archive kept, with
     /// nothing to follow and no step to open.
     pub(super) closed_run: bool,
+    /// How many rows a step takes on the axis of *Przebieg*.
+    pub(super) axis_rows: AxisRows,
 }
 
 /// Draws `view` — the details of a task, or of an entry of the history —
@@ -1233,6 +1237,7 @@ pub(super) fn render_view(
         loading,
         title_cut,
         closed_run,
+        axis_rows,
     } = options;
     let content_keys = match keys {
         KeysAt::Content(step) => Some(step),
@@ -1405,6 +1410,7 @@ pub(super) fn render_view(
                 stale,
                 content_keys,
                 glyph,
+                axis_rows,
             )
         }
         (DetailTab::Conversation, None) => {

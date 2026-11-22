@@ -7053,6 +7053,7 @@ mod task_app_create_render {
             )),
         );
         press(&mut app, KeyCode::Enter);
+        keys(&mut app, "v");
         let screen = draw_app(&mut app, 130, 30, false);
         for expected in [
             "razem $1.20",

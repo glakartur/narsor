@@ -269,6 +269,7 @@ impl TaskApp {
             }
             Action::Open => self.focus = Focus::Details,
             Action::ChooseHarness => return Request::OpenHarness,
+            Action::ToggleAxisRows => self.detail.toggle_axis_rows(),
             Action::PrevTab => self.with_history(|history| history.shift_tab(-1)),
             Action::NextTab => self.with_history(|history| history.shift_tab(1)),
             Action::Down | Action::Up | Action::Top | Action::Bottom
@@ -428,6 +429,7 @@ pub struct DetailsLook {
     pub stale: bool,
     pub hyperlinks: bool,
     pub glyph: &'static str,
+    pub axis_rows: super::tabs::progress::AxisRows,
 }
 
 /// Draws the details of the selected entry into `area`: the header and the
@@ -444,6 +446,7 @@ pub fn render_details(
         stale,
         hyperlinks,
         glyph,
+        axis_rows,
     } = look;
     let tab = history.tab;
     let keys = if focused {
@@ -489,6 +492,7 @@ pub fn render_details(
         loading: false,
         title_cut: title_is_cut(task, &edge),
         closed_run: true,
+        axis_rows,
     };
     render_view(frame, inner, view, styles, options, None);
 }
