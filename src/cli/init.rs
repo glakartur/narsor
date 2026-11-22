@@ -606,7 +606,11 @@ const OPTIONAL_SETTINGS: &[(SettingKey, &str, &str)] = &[
     (
         SettingKey::AgentArgs,
         "{}",
-        "Extra arguments by harness, e.g. { claude: [--dangerously-skip-permissions] }; they win over Narsor's own.",
+        "Extra arguments by harness; one list item is one argument; they win over Narsor's own. Example:\n\
+         \x20 claude:\n\
+         \x20   - --dangerously-skip-permissions\n\
+         \x20   - --extra_param\n\
+         \x20   - extra param value",
     ),
     (
         SettingKey::MaxConcurrentTasks,
@@ -787,8 +791,15 @@ struct Entry {
 }
 
 enum EntryLine {
-    Written(String),
+    Written(WrittenValue),
     Default(&'static str),
+}
+
+/// A written value: a scalar or an empty collection on the key line, or a
+/// block whose lines go under the key, one level deeper.
+enum WrittenValue {
+    Inline(String),
+    Block(Vec<String>),
 }
 
 impl Entry {
@@ -825,7 +836,7 @@ fn render_config(config: &Value) -> String {
 
 fn entry_of(mapping: &Mapping, setting: SettingKey) -> Option<Entry> {
     let line = match setting_in(mapping, setting) {
-        Some(value) => EntryLine::Written(inline_yaml(value)),
+        Some(value) => EntryLine::Written(written_value(value)),
         None => EntryLine::Default(default_of(mapping, setting)?),
     };
     Some(Entry {
@@ -863,9 +874,20 @@ fn render_group(text: &mut String, entries: &[Entry], depth: usize) {
             .count();
         let (group, next) = rest.split_at(size);
         if first.segments.len() == depth + 1 {
-            text.push_str(&format!("{indent}# {}\n", comment_of(first.setting)));
+            for line in description_of(first.setting).lines() {
+                text.push_str(&format!("{indent}# {line}\n"));
+            }
+            text.push_str(&format!("{indent}# Env: {}\n", first.setting.env_var()));
             match &first.line {
-                EntryLine::Written(value) => text.push_str(&format!("{indent}{name}: {value}\n")),
+                EntryLine::Written(WrittenValue::Inline(value)) => {
+                    text.push_str(&format!("{indent}{name}: {value}\n"))
+                }
+                EntryLine::Written(WrittenValue::Block(lines)) => {
+                    text.push_str(&format!("{indent}{name}:\n"));
+                    for line in lines {
+                        text.push_str(&format!("{indent}  {line}\n"));
+                    }
+                }
                 EntryLine::Default(default) => {
                     text.push_str(&format!("{indent}# {name}: {default}\n"))
                 }
@@ -883,9 +905,9 @@ fn render_group(text: &mut String, entries: &[Entry], depth: usize) {
     }
 }
 
-/// The description of a setting followed by the flat key it replaces (R19).
-fn comment_of(setting: SettingKey) -> String {
-    let description = OPTIONAL_SETTINGS
+/// The description of a setting; it may span several lines.
+fn description_of(setting: SettingKey) -> &'static str {
+    OPTIONAL_SETTINGS
         .iter()
         .find(|(key, _, _)| *key == setting)
         .map(|(_, _, description)| *description)
@@ -895,35 +917,60 @@ fn comment_of(setting: SettingKey) -> String {
                 .find(|(key, _)| *key == setting)
                 .map(|(_, description)| *description)
         })
-        .unwrap_or_default();
-    match setting.former_key() {
-        Some(former) => format!("{description} Formerly `{former}`.")
-            .trim_start()
-            .to_string(),
-        None => description.to_string(),
+        .unwrap_or_default()
+}
+
+/// A value in YAML block style: lists and maps one item per line, so an
+/// operator can extend them by hand.
+fn written_value(value: &Value) -> WrittenValue {
+    match value {
+        Value::Sequence(items) if !items.is_empty() => {
+            WrittenValue::Block(items.iter().flat_map(sequence_item_lines).collect())
+        }
+        Value::Mapping(entries) if !entries.is_empty() => WrittenValue::Block(
+            entries
+                .iter()
+                .flat_map(|(key, value)| mapping_entry_lines(key, value))
+                .collect(),
+        ),
+        Value::Sequence(_) => WrittenValue::Inline("[]".to_string()),
+        Value::Mapping(_) => WrittenValue::Inline("{}".to_string()),
+        scalar => WrittenValue::Inline(scalar_yaml(scalar)),
     }
 }
 
-/// A value on one line, in YAML flow style.
-fn inline_yaml(value: &Value) -> String {
-    match value {
-        Value::Sequence(items) => format!(
-            "[{}]",
-            items.iter().map(inline_yaml).collect::<Vec<_>>().join(", ")
-        ),
-        Value::Mapping(entries) if entries.is_empty() => "{}".to_string(),
-        Value::Mapping(entries) => format!(
-            "{{ {} }}",
-            entries
-                .iter()
-                .map(|(key, value)| format!("{}: {}", inline_yaml(key), inline_yaml(value)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        scalar => serde_yaml::to_string(scalar)
-            .map(|text| text.trim_end().to_string())
-            .unwrap_or_default(),
+/// `- item`; a compound item continues on the following lines, aligned
+/// under its first line.
+fn sequence_item_lines(item: &Value) -> Vec<String> {
+    match written_value(item) {
+        WrittenValue::Inline(text) => vec![format!("- {text}")],
+        WrittenValue::Block(lines) => lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| match index {
+                0 => format!("- {line}"),
+                _ => format!("  {line}"),
+            })
+            .collect(),
     }
+}
+
+/// `key: value`, or `key:` with the compound value one level deeper.
+fn mapping_entry_lines(key: &Value, value: &Value) -> Vec<String> {
+    let key = scalar_yaml(key);
+    match written_value(value) {
+        WrittenValue::Inline(text) => vec![format!("{key}: {text}")],
+        WrittenValue::Block(lines) => std::iter::once(format!("{key}:"))
+            .chain(lines.into_iter().map(|line| format!("  {line}")))
+            .collect(),
+    }
+}
+
+/// A scalar as YAML, quoted only where YAML needs it.
+fn scalar_yaml(scalar: &Value) -> String {
+    serde_yaml::to_string(scalar)
+        .map(|text| text.trim_end().to_string())
+        .unwrap_or_default()
 }
 
 /// Writes `global.root` and the three server directories relative to it,
@@ -1699,6 +1746,27 @@ mod tests {
         );
         assert!(written.get(SettingKey::AgentHarness).is_none());
 
+        let lines: Vec<&str> = text.lines().collect();
+        let home = lines
+            .iter()
+            .position(|line| line.trim_start() == "# home: host")
+            .expect("local home listed");
+        assert_eq!(
+            lines[home - 1].trim_start(),
+            "# Env: NARSOR_CONTROLLER__LOCAL__HOME"
+        );
+        for (setting, _, _) in OPTIONAL_SETTINGS {
+            let env_line = format!("# Env: {}", setting.env_var());
+            let count = lines
+                .iter()
+                .filter(|line| line.trim_start() == env_line)
+                .count();
+            assert_eq!(count, 1, "{setting}: {count} Env lines\n{text}");
+        }
+        assert!(!text.contains("Formerly"), "{text}");
+        assert!(text.contains("#   claude:\n"), "{text}");
+        assert!(!text.contains("{ claude:"), "{text}");
+
         let uncommented = uncomment_all(&text);
         for scope in [
             Scope::SERVER,
@@ -1734,7 +1802,7 @@ mod tests {
             server_bind: Some("10.0.0.5:8080".to_string()),
             oidc_issuer: Some("https://id.example.com".to_string()),
             oidc_audience: Some("narsor".to_string()),
-            trusted_proxies: vec!["10.0.0.1".to_string()],
+            trusted_proxies: vec!["127.0.0.1".to_string(), "10.0.0.12".to_string()],
             backend_id: Some("workstation".to_string()),
             ..InitOptions::default()
         };
@@ -1758,7 +1826,78 @@ mod tests {
             .iter()
             .position(|line| line.trim_start().starts_with("issuer: "))
             .expect("issuer written");
-        assert!(lines[issuer - 1].contains("`oidc_issuer`"), "{text}");
+        assert_eq!(
+            lines[issuer - 1].trim_start(),
+            "# Env: NARSOR_SERVER__OIDC__ISSUER",
+            "{text}"
+        );
+        assert!(
+            text.contains("    trusted_proxies:\n      - 127.0.0.1\n      - 10.0.0.12\n"),
+            "{text}"
+        );
+        assert_eq!(
+            written.get(SettingKey::TrustedProxies),
+            Some(&SettingValue::Text("127.0.0.1,10.0.0.12".to_string()))
+        );
+    }
+
+    #[test]
+    fn written_lists_and_maps_use_block_yaml_and_keep_every_token() {
+        let plain = [
+            "--dangerously-skip-permissions",
+            "--extra_param",
+            "extra param value",
+        ];
+        let needs_quotes = ["key: value", "#not-a-comment", ""];
+        for tokens in [&plain[..], &needs_quotes[..]] {
+            let mut config = Mapping::new();
+            let mut harnesses = Mapping::new();
+            harnesses.insert(
+                Value::String("claude".to_string()),
+                Value::Sequence(
+                    tokens
+                        .iter()
+                        .map(|t| Value::String(t.to_string()))
+                        .collect(),
+                ),
+            );
+            insert_setting(
+                &mut config,
+                SettingKey::AgentArgs,
+                Value::Mapping(harnesses.clone()),
+            );
+            insert_setting(
+                &mut config,
+                SettingKey::LocalWorkspaceRoots,
+                Value::Sequence(vec![]),
+            );
+
+            let (text, written) =
+                validate_config(Path::new(PATH), &Value::Mapping(config)).unwrap();
+
+            let reread: Value = serde_yaml::from_str(&text).unwrap();
+            assert_eq!(
+                reread["runner"]["agent_args"],
+                Value::Mapping(harnesses),
+                "{text}"
+            );
+            assert!(written.get(SettingKey::AgentArgs).is_some());
+            assert!(text.contains("  local_workspace_roots: []\n"), "{text}");
+            assert_eq!(
+                written.get(SettingKey::LocalWorkspaceRoots),
+                Some(&SettingValue::Text(String::new()))
+            );
+            if tokens == plain {
+                assert!(
+                    text.contains(
+                        "  # Env: NARSOR_RUNNER__AGENT_ARGS\n  agent_args:\n    claude:\n      \
+                         - --dangerously-skip-permissions\n      - --extra_param\n      \
+                         - extra param value\n"
+                    ),
+                    "{text}"
+                );
+            }
+        }
     }
 
     /// A scratch installation: the data and the configuration file under
