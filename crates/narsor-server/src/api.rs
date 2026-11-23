@@ -22,10 +22,13 @@
 //! results (the plan's plan-local scope: "we do not filter secrets from tool
 //! results"). `127.0.0.1` keeps the socket off any network interface, but a
 //! loopback port is still visible to every other local user on a shared
-//! machine — hence the bearer token, generated fresh per process with no
-//! persistence and no configuration surface. There is nothing to leak if the
-//! process never writes the token to disk, and nothing to guess since it is
-//! a random UUID valid only for this process's lifetime.
+//! machine — hence the bearer token: a random UUID, generated fresh per
+//! process, with no configuration surface and valid only for this process's
+//! lifetime. The daemon hands it to its local clients through the discovery
+//! file, which is written `0600` from the first byte; a client trusts that
+//! file only when it is a regular file owned by the same user with no group
+//! or other permission bits (`narsor_api_client::api::discovery`). The token
+//! is therefore only as private as that file.
 //!
 //! # Reads go through the runner
 //!
