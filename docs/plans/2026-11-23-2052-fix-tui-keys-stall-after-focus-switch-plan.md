@@ -16,7 +16,7 @@ execution: code
 - **Product authority:** The report from the operator (2026-11-23). Assumptions taken without the operator are listed in "Assumptions to confirm".
 - **Means:** First find where the loop or the screen stops (diagnosis with a reproduction and the TUI log). Then remove that cause. Then add a guard so that a slow terminal or a slow call cannot stop key handling again (KTD1).
 - **Open blockers:** None. The root cause is not known yet; finding it is U2. The questions in "Pytania otwarte dla użytkownika" have recommended defaults that the plan uses; they do not block the start.
-- **Execution profile:** One PR, Standard. U1 (stall log) and U2 (diagnosis, `ce-debug`) come first; U3 and U4 ship in every case; U5 only when U2 shows H2, or when U3 and U4 together do not remove the stall in the reproduction (KTD1). Merge gate: question 1 in "Pytania otwarte dla użytkownika" must be answered (or its default confirmed) before the PR merges; building U3 with the default does not wait for it.
+- **Execution profile:** One PR, Standard. U1 (stall log) and U2 (diagnosis, `ce-debug`) come first; U3 and U4 ship unless U2 finds one different cause (H4 or a regression) that removes the stall alone; they guard against H1 and H3; U5 only when U2 shows H2, or when U3 and U4 together do not remove the stall in the reproduction (KTD1). Merge gate: question 1 in "Pytania otwarte dla użytkownika" must be answered (or its default confirmed) before the PR merges; building U3 with the default does not wait for it.
 - **Stop conditions:** Stop and report when the cause is in the terminal emulator or the compositor and no in-app mitigation (including the redraw on focus gain from assumption 6) removes it; the result is then the documented workaround from "Scope Boundaries". Stop and ask when the fix needs a change in key behavior (for example, dropping keys pressed during a stall). The one such change this plan foresees (KTD3: a second write for a target that already has a write in flight) is already asked as question 1; it does not stop U3, it gates the merge.
 - **Who finishes:** `ce-work` builds U1–U5 from this plan and verifies with the Verification Contract.
 
@@ -43,6 +43,7 @@ Because a focus switch sends nothing to Narsor, the "unblock" on the second retu
 
 - **H1. The draw blocks on output.** The terminal does not read the pty while its window is unfocused or hidden. The write of a large frame (the new "waiting" content) fills the pty buffer, `draw` blocks, and the keys queue up in the channel. When the terminal reads again, the loop runs and applies all queued keys at once. This matches the symptom best.
 - **H2. The screen does not repaint.** Narsor handles the keys and writes the frames, but the terminal shows an old image until a later focus change (a terminal or compositor repaint problem, or terminal state broken by an escape sequence such as an OSC 8 link).
+- **H4. Other work on the UI thread.** The operator doubts that keys cause the stall, and suggests that reading task state on the UI thread, or another reason for a blocked UI thread, hangs the loop. The diagnosis must not assume that keys cause it. Candidates: a synchronous read or a long computation in `sync_waiting`, `sync_overlay` or `on_stream`, a lock held across the draw, or a full-state rebuild on each control-plane event. A recent change may have introduced it (assumption 7).
 - **H3. The loop awaits a slow call.** A call awaited in the loop (`dispatch`, `retry_outgoing_if_due`) waits for the server without a time limit. The focus switch only coincides with the end of the wait.
 
 ### Requirements
@@ -85,19 +86,20 @@ Because a focus switch sends nothing to Narsor, the "unblock" on the second retu
 3. **Focus on the task list is not a necessary condition.** The report says "focus on the task list". The fix covers every panel of the TUI; the task list is the reproduction case.
 4. **Keys pressed during a short stall are kept (R3).** A stall shorter than one frame period stays invisible to the operator. Keys are not dropped after a long stall either; the fix aims at no long stall at all.
 5. **Threshold of R5.** The log threshold is a fixed value chosen in planning (for example 500 ms), not a setting. It must not write log entries during normal work.
+7. **The stall is probably a regression, seen in a terminal in a web browser (operator, PR thread on question 2).** The operator saw it in a terminal in a browser and did not see it before the most recent changes. So U2 starts with a bisect over the recent TUI commits (for example #126, #134, #135, #137 and the changes to the task state read) and tries a browser terminal first. A browser terminal can throttle a tab without focus, which fits H1/H2.
 6. **Enabling focus reporting is allowed as a tool.** When the diagnosis shows that a redraw on focus return fixes H2, the TUI may enable terminal focus events and force a full redraw on focus gain. This is an internal change, the operator sees no new behavior except a correct screen.
 
 ## Pytania otwarte dla użytkownika
 
 None of these questions blocks the start. The plan uses the recommended option (the first one) until the operator answers.
 
-1. **A second write while the first is still in flight, for writes that have no guard today (KTD3, U3).** Today the loop waits for each write, so a second key waits behind the first and is handled on the state that the first write produced. After U3 the keys work while a write is in flight. Answers and comments (notice "Zapis trwa."), new tasks ("wysyłanie trwa") and the harness change already refuse a repeat and keep that behavior. A move, a panel action, the limit and a repository change have no such guard. What does a second write of that kind for the same target do while the first runs? This is a change in key behavior, so it gates the merge (see "Stop conditions").
+1. **A second write while the first is still in flight, for writes that have no guard today (KTD3, U3).** Today the loop waits for each write, so a second key waits behind the first and is handled on the state that the first write produced. After U3 the keys work while a write is in flight. Answers and comments (notice "Zapis trwa."), new tasks ("wysyłanie trwa") and the harness change already refuse a repeat and keep that behavior. A move, a panel action, the limit and a repository change have no such guard. What does a second write of that kind for the same target do while the first runs? This is a change in key behavior, so it gates the merge (see "Stop conditions"). The operator doubts that keys cause the stall (PR thread). If U2 finds a different cause, U3 and this question drop out, and U2 reports that before U3 starts.
    - (a) **Recommended:** it is refused with a short notice in the style of "wysyłanie trwa", and nothing is sent; all other keys work as usual. No request is built on a state that the first write is about to change.
    - (b) It waits in a queue and is sent when the first write ends (built on the state at the time of the key).
    - (c) It is sent at once, in parallel with the first.
-2. **The operator's terminal (assumption 1, U2).** Which terminal emulator and which window manager or compositor (Wayland or X11) shows the stall? The answer makes the reproduction in U2 faster.
-   - (a) **Recommended:** no answer needed; U2 tries one common Wayland terminal and one X11 terminal.
-   - (b) The operator names the terminal and compositor; U2 starts with that pair.
+2. **The operator's terminal (assumption 1, U2).** Answered by the operator in the PR thread: a terminal in a web browser, and no stall before the most recent changes. U2 uses this (assumption 7). The thread stays open for the operator to close. The browser and the web terminal product are still unknown; this does not block.
+   - (a) **Recommended:** U2 uses a browser terminal first.
+   - (b) The operator also names the browser and the web terminal product.
 
 ---
 
@@ -188,7 +190,7 @@ flowchart LR
 - No production code. When the cause is fully outside Narsor (stop condition), `docs/user/tui.md` gets the workaround.
 
 **Approach:**
-1. Use `ce-debug`. Reproduce with focus on the task list: switch away, let a task go to "waiting for a human decision", come back, press `j` then `Enter`. Try at least one Wayland terminal and one X11 terminal, or the operator's pair from question 2.
+1. Use `ce-debug`. Start with the operator's facts (assumption 7): a terminal in a web browser, and a stall that began with recent changes. Bisect the TUI commits since 2026-11-20 with the reproduction below, and check each UI-thread read of task state (H4) before you accept H1. Reproduce with focus on the task list: switch away, let a task go to "waiting for a human decision", come back, press `j` then `Enter`. Try a browser terminal first, then at least one native terminal.
 2. Read the U1 log for the stalled period. A long "draw" entry points to H1, a long named call to H3, and no entry while the screen is stale points to H2.
 3. For H1, confirm separately: run the TUI in a pty whose master is not read for some seconds and see the draw block.
 4. For H2, check whether a forced full repaint (resize the window) shows the correct state; if yes, U5 applies (KTD1, KTD7). Also check whether the OSC 8 links of `src/tui/task_app/detail.rs` were on screen at the stall.
