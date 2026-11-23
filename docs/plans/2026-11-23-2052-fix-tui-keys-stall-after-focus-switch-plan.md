@@ -16,9 +16,9 @@ execution: code
 - **Product authority:** The report from the operator (2026-11-23). Assumptions taken without the operator are listed in "Assumptions to confirm".
 - **Means:** First find where the loop or the screen stops (diagnosis with a reproduction and the TUI log). Then remove that cause. Then add a guard so that a slow terminal or a slow call cannot stop key handling again (KTD1).
 - **Open blockers:** None. The root cause is not known yet; finding it is U2. The questions in "Pytania otwarte dla użytkownika" have recommended defaults that the plan uses; they do not block the start.
-- **Execution profile:** One PR, Standard. U1 (stall log) and U2 (diagnosis, `ce-debug`) come first; U3 and U4 ship unless U2 finds one different cause (H4 or a regression) that removes the stall alone; they guard against H1 and H3; U5 only when U2 shows H2, or when U3 and U4 together do not remove the stall in the reproduction (KTD1). Merge gate: question 1 in "Pytania otwarte dla użytkownika" must be answered (or its default confirmed) before the PR merges; building U3 with the default does not wait for it.
+- **Execution profile:** One PR, Standard. U1 (stall log) and U2 (diagnosis, `ce-debug`) come first; U3 and U4 ship in every case, because R2 and AE2 require them whatever the cause is (KTD1). U6 is built when U2 names H4 or a regressing commit. U5 is built only when U2 shows H2, or when the other units do not remove the stall in the reproduction (KTD1). Question 3 asks whether U3 and U4 may move to a second PR when U6 alone removes the stall; until it is answered, all units stay in one PR. Merge gate: question 1 in "Pytania otwarte dla użytkownika" must be answered (or its default confirmed) before the PR merges; building U3 with the default does not wait for it.
 - **Stop conditions:** Stop and report when the cause is in the terminal emulator or the compositor and no in-app mitigation (including the redraw on focus gain from assumption 6) removes it; the result is then the documented workaround from "Scope Boundaries". Stop and ask when the fix needs a change in key behavior (for example, dropping keys pressed during a stall). The one such change this plan foresees (KTD3: a second write for a target that already has a write in flight) is already asked as question 1; it does not stop U3, it gates the merge.
-- **Who finishes:** `ce-work` builds U1–U5 from this plan and verifies with the Verification Contract.
+- **Who finishes:** `ce-work` builds U1–U6 from this plan and verifies with the Verification Contract.
 
 ---
 
@@ -43,8 +43,8 @@ Because a focus switch sends nothing to Narsor, the "unblock" on the second retu
 
 - **H1. The draw blocks on output.** The terminal does not read the pty while its window is unfocused or hidden. The write of a large frame (the new "waiting" content) fills the pty buffer, `draw` blocks, and the keys queue up in the channel. When the terminal reads again, the loop runs and applies all queued keys at once. This matches the symptom best.
 - **H2. The screen does not repaint.** Narsor handles the keys and writes the frames, but the terminal shows an old image until a later focus change (a terminal or compositor repaint problem, or terminal state broken by an escape sequence such as an OSC 8 link).
-- **H4. Other work on the UI thread.** The operator doubts that keys cause the stall, and suggests that reading task state on the UI thread, or another reason for a blocked UI thread, hangs the loop. The diagnosis must not assume that keys cause it. Candidates: a synchronous read or a long computation in `sync_waiting`, `sync_overlay` or `on_stream`, a lock held across the draw, or a full-state rebuild on each control-plane event. A recent change may have introduced it (assumption 7).
 - **H3. The loop awaits a slow call.** A call awaited in the loop (`dispatch`, `retry_outgoing_if_due`) waits for the server without a time limit. The focus switch only coincides with the end of the wait.
+- **H4. Other work on the UI thread.** The operator doubts that keys cause the stall, and suggests that reading task state on the UI thread, or another reason for a blocked UI thread, hangs the loop. The diagnosis must not assume that keys cause it. Candidates: a long computation in `sync_waiting`, `sync_overlay` or `on_stream`, a slow frame computation in `layout::render` (for example the step axis or the transcript grouping changed in #126, #134, #135), or a full-state rebuild on each control-plane event. A recent change may have introduced it (assumption 7).
 
 ### Requirements
 
@@ -74,7 +74,7 @@ Because a focus switch sends nothing to Narsor, the "unblock" on the second retu
 
 ### Key Decisions
 
-- **Diagnose before the fix.** The root cause is not known; three causes (H1–H3) give the same symptom and need different fixes. The first unit reproduces the stall and finds the step where the loop stops (R5 helps here and stays as a permanent tool).
+- **Diagnose before the fix.** The root cause is not known; four causes (H1–H4) give the same symptom and need different fixes. The first unit reproduces the stall and finds the step where the loop stops (R5 helps here and stays as a permanent tool).
 - **Keys pressed during a stall are applied, not dropped (R3).** Dropping keys would hide the symptom but lose operator input. The fix removes the stall itself, so that no burst occurs.
 
 ---
@@ -86,35 +86,38 @@ Because a focus switch sends nothing to Narsor, the "unblock" on the second retu
 3. **Focus on the task list is not a necessary condition.** The report says "focus on the task list". The fix covers every panel of the TUI; the task list is the reproduction case.
 4. **Keys pressed during a short stall are kept (R3).** A stall shorter than one frame period stays invisible to the operator. Keys are not dropped after a long stall either; the fix aims at no long stall at all.
 5. **Threshold of R5.** The log threshold is a fixed value chosen in planning (for example 500 ms), not a setting. It must not write log entries during normal work.
-7. **The stall is probably a regression, seen in a terminal in a web browser (operator, PR thread on question 2).** The operator saw it in a terminal in a browser and did not see it before the most recent changes. So U2 starts with a bisect over the recent TUI commits (for example #126, #134, #135, #137 and the changes to the task state read) and tries a browser terminal first. A browser terminal can throttle a tab without focus, which fits H1/H2.
 6. **Enabling focus reporting is allowed as a tool.** When the diagnosis shows that a redraw on focus return fixes H2, the TUI may enable terminal focus events and force a full redraw on focus gain. This is an internal change, the operator sees no new behavior except a correct screen.
+7. **The stall is probably a regression, seen in a terminal in a web browser (operator, PR thread on question 2).** The operator saw it in a terminal in a browser and did not see it before the most recent changes. So U2 starts with a bisect over the recent TUI commits (for example #126, #134, #135, #137 and the changes to the task state read) and tries a browser terminal first. A browser terminal can throttle a tab without focus, which fits H1/H2.
 
 ## Pytania otwarte dla użytkownika
 
 None of these questions blocks the start. The plan uses the recommended option (the first one) until the operator answers.
 
-1. **A second write while the first is still in flight, for writes that have no guard today (KTD3, U3).** Today the loop waits for each write, so a second key waits behind the first and is handled on the state that the first write produced. After U3 the keys work while a write is in flight. Answers and comments (notice "Zapis trwa."), new tasks ("wysyłanie trwa") and the harness change already refuse a repeat and keep that behavior. A move, a panel action, the limit and a repository change have no such guard. What does a second write of that kind for the same target do while the first runs? This is a change in key behavior, so it gates the merge (see "Stop conditions"). The operator doubts that keys cause the stall (PR thread). If U2 finds a different cause, U3 and this question drop out, and U2 reports that before U3 starts.
+1. **A second write while the first is still in flight, for writes that have no guard today (KTD3, U3).** Today the loop waits for each write, so a second key waits behind the first and is handled on the state that the first write produced. After U3 the keys work while a write is in flight. Answers and comments (notice "Zapis trwa."), new tasks ("wysyłanie trwa") and the harness change already refuse a repeat and keep that behavior. A move, a panel action, the limit and a repository change have no such guard. What does a second write of that kind for the same target do while the first runs? This is a change in key behavior, so it gates the merge (see "Stop conditions"). The operator doubts that keys cause the stall (PR thread). That does not remove this question: U3 ships for R2 and AE2 whatever U2 finds (KTD1).
    - (a) **Recommended:** it is refused with a short notice in the style of "wysyłanie trwa", and nothing is sent; all other keys work as usual. No request is built on a state that the first write is about to change.
    - (b) It waits in a queue and is sent when the first write ends (built on the state at the time of the key).
    - (c) It is sent at once, in parallel with the first.
 2. **The operator's terminal (assumption 1, U2).** Answered by the operator in the PR thread: a terminal in a web browser, and no stall before the most recent changes. U2 uses this (assumption 7). The thread stays open for the operator to close. The browser and the web terminal product are still unknown; this does not block.
    - (a) **Recommended:** U2 uses a browser terminal first.
    - (b) The operator also names the browser and the web terminal product.
+3. **Scope of the PR when U2 finds H4 or a regression (KTD1, U6).** The operator doubts that keys or slow writes cause the stall. If U6 alone removes the stall in the reproduction, U3 (writes off the loop) and U4 (output off the loop) are still required by R2 and AE2. But they are larger changes, and the operator may want to review them apart from the fix. The answer changes only the PR split, not what is built.
+   - (a) **Recommended:** one PR with U1–U4 and U6, as the Execution profile says. R2 and AE2 hold when the PR merges.
+   - (b) Two PRs: the first with U1, U2 and U6 (the fix that the operator sees), the second with U3 and U4. R2 and AE2 stay open until the second PR merges.
 
 ---
 
 ## Planning Contract
 
-Product Contract preservation: Product Contract unchanged. The Goal Capsule lines "Means", "Open blockers", "Execution profile" and "Who finishes" are updated for the planned units; the former "Open questions for the user: None." is replaced by "Pytania otwarte dla użytkownika".
+Product Contract preservation: requirements, acceptance examples and scope are unchanged. From the operator's PR feedback, the Problem Frame gains H4, the Key Decisions name four causes, and assumption 7 is added. The Goal Capsule lines "Means", "Open blockers", "Execution profile" and "Who finishes" are updated for the planned units; the former "Open questions for the user: None." is replaced by "Pytania otwarte dla użytkownika".
 
 ### Key Technical Decisions
 
-- KTD1. **Two guards ship whatever the diagnosis finds; the focus redraw ships only on evidence.** R2 and AE2 require keys to work during a slow server call and during a large redraw, independent of which of H1–H3 the operator hits. So U3 (writes off the loop) and U4 (output off the loop) are always built. Under H1, U4 removes the key backlog (keys and quit work, no burst of old keys), but no in-app change can update the screen while the terminal does not read its pty. If U2 confirms H1 and the screen still lags after U4, the stop condition for a terminal-side cause applies (documented workaround). U5 (focus events, assumption 6) is built only when U2 shows H2, or when U3 and U4 together do not remove the stall in the reproduction.
+- KTD1. **Two guards ship whatever the diagnosis finds; the cause fix and the focus redraw ship only on evidence.** R2 and AE2 require keys to work during a slow server call and during a large redraw, independent of which of H1–H4 the operator hits. So U3 (writes off the loop) and U4 (output off the loop) are always built. Under H1, U4 removes the key backlog (keys and quit work, no burst of old keys), but no in-app change can update the screen while the terminal does not read its pty. If U2 confirms H1 and the screen still lags after U4, the stop condition for a terminal-side cause applies (documented workaround). U3 and U4 do not help against H4: work that is slow on the loop itself still holds every key. So when U2 names H4 or a regressing commit, U6 makes that work fast. U5 (focus events, assumption 6) is built only when U2 shows H2, or when U3, U4 and U6 (when built) together do not remove the stall in the reproduction.
 - KTD2. **Writes become keyed background jobs, like reads; quit gives running writes a short grace period.** Today `TaskApp::dispatch` awaits every write (`send_task`, `answer`, `act`, `move_task`, `change_limit`, `change_harness`, `add_repository`, `remove_repository`, `validate_path`) and the loop awaits `retry_outgoing_if_due`. The client timeout bounds each call at 800 ms locally and at 10 s for a remote control plane (`crates/narsor-api-client/src/api/client.rs`, `REQUEST_TIMEOUT`, `REMOTE_REQUEST_TIMEOUT`), so a remote write can hold every key for up to 10 s, which breaks AE2. Each write follows `docs/solutions/design-patterns/tui-reads-as-keyed-background-jobs-with-loading-marker-2026-10-22.md`: the job owns an `ApiClient` clone and the request data, returns an `Outcome`, and the existing result handling runs inside that outcome on the loop. This supersedes "writes stay awaited" from `docs/plans/2026-10-21-001-feat-tui-asynchroniczne-operacje-i-wskaznik-ladowania-plan.md`, which was a scope choice of that work; R2 of this plan now requires the change. The idempotency key and the generation the operator saw at the choice stay in the request exactly as today (`docs/solutions/ui-bugs/tui-action-panel-refresh-stale-generation-and-lost-action-lock-2026-11-13.md`). Read jobs are aborted at quit as today, because an aborted read changed nothing. A write may already have reached the server, so on quit the TUI waits for running write jobs for a bounded time (planned value: 1 s) before it drops the app. A write still running after that time is aborted; after the terminal is restored, one line per such write goes to stderr with its target and the note that it may not have reached the server. The idempotency key makes a resend safe. This keeps AE2 (`q` quits) and never loses an answer without a notice.
-- KTD3. **Existing in-flight guards stay the refusal path; a new guard only where none exists.** The answer and comment guard (`entry.sending`, notice "Zapis trwa." in `src/tui/task_app/panel/state.rs`), the new-task guard (`PendingState::Sending`, "wysyłanie trwa") and `harness_pending` keep their behavior unchanged. Each write job gets a `JobKey` that is unique per request (for example the waiting id plus the submit for `answer`, the outgoing task id for `send_task`), so `Background::start` never drops a different write without a notice. For `move`, `act`, the limit and repository changes, which have no guard, a second write for the same target while the first runs is refused with a notice and sends nothing. This is the recommended default of question 1; the other options change only this last rule and its U3 test.
+- KTD3. **Existing in-flight guards stay the refusal path; a new guard only where none exists.** The answer and comment guard (`entry.sending`, notice "Zapis trwa." in `src/tui/task_app/panel/state.rs`), the new-task guard (`PendingState::Sending`, "wysyłanie trwa") and `harness_pending` keep their behavior unchanged. Writes that have a guard get a `JobKey` that is unique per request (for example the waiting id plus the submit for `answer`, the outgoing task id for `send_task`). `Background::start` returns `false` without a notice when the key already runs, so a per-request key makes sure that it never drops a different write. For `move`, `act`, the limit and repository changes, which have no guard, the `JobKey` is per target (the task, the panel, the limit, the repository). A second write for the same target while the first runs is refused with a notice and sends nothing: the starter shows the notice when `start` returns `false`. This is the recommended default of question 1; the other options change only this last rule and its U3 test.
 - KTD4. **The loop never writes to the terminal itself.** The ratatui `Terminal` draws through `CrosstermBackend` over an in-memory sink. On flush, the sink hands the frame bytes to a dedicated writer thread, which owns `Stdout` and does the blocking write. `Terminal::draw` therefore returns at once even when the terminal does not read the pty (H1). Rejected: `O_NONBLOCK` on stdout, because the flag is on the shared tty file description and also affects the shell after exit and the key reader; an async stdout, because ratatui's backend is synchronous.
 - KTD5. **Back-pressure drops output, never keys.** When the bytes waiting for the writer thread pass a cap (planned value: 1 MiB, several full frames on a large screen), the unsent chunks are discarded and the next draw is a full repaint (`Terminal::clear` before the draw). A chunk that the writer thread already started is always finished, so no escape sequence is cut. The terminal then gets the latest full frame when it reads again, which satisfies R4.
-- KTD6. **The stall log measures loop steps and key age.** A loop step (draw, each handled event kind, each remaining direct call) that takes 500 ms or longer writes one `warn` entry, target `narsor::tui`, with the duration and the step name. The key reader stamps each event with the read instant; when the loop handles a key 500 ms old or older and no single step explains it, the entry names the step "waiting for events". 500 ms is above a normal frame (the `TICK` is 250 ms) and far above a normal draw, so normal work writes nothing (assumption 5). `warn` passes any `RUST_LOG` value from `warn` to `trace`.
+- KTD6. **The stall log measures loop steps and key age.** A loop step (draw, each handled event kind, each remaining direct call) that takes 500 ms or longer writes one `warn` entry. For the draw, the entry also gives the part that was slow: "render" for the `layout::render` closure and "write" for the rest of `Terminal::draw`, so H4 and H1 give different entries. Each entry has target `narsor::tui`, the duration and the step name. The key reader stamps each event with the read instant; when the loop handles a key 500 ms old or older and no single step explains it, the entry names the step "waiting for events". 500 ms is above a normal frame (the `TICK` is 250 ms) and far above a normal draw, so normal work writes nothing (assumption 5). `warn` passes any `RUST_LOG` value from `warn` to `trace`.
 - KTD7. **Focus events stay off unless U2 asks for them.** When U5 is built, focus reporting is armed and disarmed like bracketed paste (`PASTE_ARMED` pattern in `src/tui/mod.rs`), and `FocusGained` forces one full repaint. No other behavior depends on focus.
 
 ### High-Level Technical Design
@@ -171,7 +174,7 @@ flowchart LR
 **Patterns to follow:** `src/tui/refresh.rs` (time as data, no sleeping in tests).
 
 **Test scenarios:**
-- Covers AE3. A draw step from t to t+700 ms gives one report with step "draw" and duration 700 ms.
+- Covers AE3. A draw from t to t+700 ms whose write part takes 650 ms gives one report with step "draw", part "write" and duration 700 ms; a draw whose render part takes 650 ms gives part "render".
 - A step of 499 ms gives no report; a step of 500 ms or more gives one.
 - A key stamped at t and handled at t+800 ms, with no step report in that turn, gives a report with step "waiting for events".
 - A key that waited behind a 700 ms draw gives only the "draw" report, not a second one.
@@ -180,9 +183,9 @@ flowchart LR
 
 ### U2. Diagnosis: reproduce the stall and name the cause
 
-**Goal:** Know which of H1–H3 (or which other cause) stops the keys, with evidence from the U1 log.
+**Goal:** Know which of H1–H4 (or which other cause) stops the keys, with evidence from the U1 log.
 
-**Requirements:** R1, R5; assumptions 1–3, 6.
+**Requirements:** R1, R5; assumptions 1–3, 6, 7.
 
 **Dependencies:** U1.
 
@@ -191,16 +194,17 @@ flowchart LR
 
 **Approach:**
 1. Use `ce-debug`. Start with the operator's facts (assumption 7): a terminal in a web browser, and a stall that began with recent changes. Bisect the TUI commits since 2026-11-20 with the reproduction below, and check each UI-thread read of task state (H4) before you accept H1. Reproduce with focus on the task list: switch away, let a task go to "waiting for a human decision", come back, press `j` then `Enter`. Try a browser terminal first, then at least one native terminal.
-2. Read the U1 log for the stalled period. A long "draw" entry points to H1, a long named call to H3, and no entry while the screen is stale points to H2.
+2. Read the U1 log for the stalled period. A long "draw" entry with part "write" points to H1. A long "draw" entry with part "render", or a long event step (for example the control-plane event that runs `on_stream`), points to H4. A long named call points to H3. No entry while the screen is stale points to H2.
 3. For H1, confirm separately: run the TUI in a pty whose master is not read for some seconds and see the draw block.
 4. For H2, check whether a forced full repaint (resize the window) shows the correct state; if yes, U5 applies (KTD1, KTD7). Also check whether the OSC 8 links of `src/tui/task_app/detail.rs` were on screen at the stall.
-5. Record the finding (cause, terminal, log excerpt) in the PR description.
+5. For H4 or a regression, name the slow function and the commit that made it slow (from the bisect). Measure the function with the state of the reproduction (number of tasks, steps and transcript entries). This is the input of U6.
+6. Record the finding (cause, terminal, log excerpt, and the commit when there is one) in the PR description.
 
-**Execution note:** Diagnose before you change the loop; the result decides U5 and may add a cause the plan does not cover, which is then a stop-and-report.
+**Execution note:** Diagnose before you change the loop; the result decides U5 and U6 and may add a cause the plan does not cover, which is then a stop-and-report.
 
 **Test expectation:** none -- diagnosis only; U1, U3 and U4 carry the tests.
 
-**Verification:** The PR description names the cause and the evidence, and says whether U5 is needed.
+**Verification:** The PR description names the cause and the evidence, and says whether U5 and U6 are needed.
 
 ### U3. Writes run as background jobs
 
@@ -221,7 +225,7 @@ flowchart LR
 
 **Approach:**
 1. For each write, split the method into a part that runs on the loop before the call (checks, the pending state shown at once, for example "wysyłanie…"), the job (the client call only), and the outcome (today's result handling, unchanged in content).
-2. Give each write a `JobKey` per target (KTD3). A start with a running key notifies and sends nothing.
+2. Give each write its `JobKey` as KTD3 says: per request for writes with a guard, per target for `move`, `act`, the limit and repository changes. When `start` returns `false` for a per-target key, show the notice and send nothing.
 3. Keep `perform` as dispatch plus `drain_jobs`, so tests and callers without a loop still see the result of a write after one call.
 4. On quit, wait for running write jobs for the grace period of KTD2, then abort them and keep the list of aborted writes for the stderr line after restore.
 5. Each outcome checks that its target still exists before it changes view state, following the ticket checks of the read outcomes (for example `on_opened`).
@@ -266,7 +270,7 @@ flowchart LR
 - A chunk already started by the writer is written in full even when the cap drops the rest.
 - Quit with the inner writer blocked: shutdown returns within its bounded wait and the restore path still runs (`restore_count` increases).
 
-**Verification:** In the U2 reproduction for H1 (pty not read), keys keep changing the app state, `q` quits, and the stall meter shows no long "draw" entries. Then check the visible screen with AE1 (one return to the window); if the screen still lags because the terminal does not read, apply the stop condition for a terminal-side cause (KTD1).
+**Verification:** In the U2 reproduction for H1 (pty not read), keys keep changing the app state, `q` quits, and the stall meter shows no long "draw" entries with part "write". Then check the visible screen with AE1 (one return to the window); if the screen still lags because the terminal does not read, apply the stop condition for a terminal-side cause (KTD1).
 
 ### U5. Full repaint on focus gain (conditional)
 
@@ -289,19 +293,43 @@ flowchart LR
 
 **Verification:** In the U2 reproduction for H2, the screen is correct after one return to the window.
 
+### U6. Make the slow loop work that U2 found fast (conditional)
+
+**Goal:** When U2 names H4 or a regressing commit, the step that held the loop is fast again, so a control-plane event or a draw never keeps a key waiting.
+
+**Requirements:** R1, R2; KTD1; assumption 7.
+
+**Dependencies:** U2 (build only when U2 names H4 or a regressing commit), U1.
+
+**Files:**
+- The module that U2 names. Candidates in the code today: `src/tui/task_app/mod.rs` (`on_stream`), `src/tui/task_app/panel/app.rs` (`sync_waiting`), `src/tui/task_app/actions.rs` (`sync_overlay`), `src/tui/task_app/tabs/progress.rs`, `src/tui/transcript/state.rs`, `src/tui/transcript/grouping.rs`.
+- The tests next to that module, or `tests/integration/` for loop-level behavior.
+
+**Approach:**
+1. Keep what the regressing commit shows; change only how much work it does per event or per frame. Use one of: compute the derived view once per state change and keep it until the next change, not once per frame; update only the changed task, not the full state; for a read that waits on I/O, move it to a keyed background job as in `docs/solutions/design-patterns/tui-reads-as-keyed-background-jobs-with-loading-marker-2026-10-22.md`.
+2. Do not revert the regressing commit as the fix: that removes a feature the operator uses. When no change of this kind makes the step fast, stop and report.
+
+**Execution note:** Test first: build the state of the U2 reproduction and show that the slow step is slow before the change.
+
+**Test scenarios:**
+- With the state of the U2 reproduction (the numbers U2 measured), the control-plane event that moves a task to "waiting" and the next frame together take less than one `TICK` (250 ms), with margin for a slow CI machine. The test asserts on elapsed time and on the result, not on internal call counts.
+- For the same state, the frame after the change shows the same content as before the change (the view that the regressing commit added stays correct).
+
+**Verification:** In the U2 reproduction, AE1 passes with one return to the window, and the U1 log has no "render" part and no event-step entries.
+
 ---
 
 ## Verification Contract
 
 - `cargo build --workspace --bins` and `cargo test --workspace` pass (CI runs the tests with `--locked`).
-- The new and extended tests of U1, U3, U4 (and U5 when built) pass; they need no real terminal and no server.
-- Manual check, repeated after U3 and U4 in the terminals used in U2: AE1 passes with one return to the window; with `RUST_LOG=warn`, the log has no stall entries during the check.
+- The new and extended tests of U1, U3, U4 (and U5 and U6 when built) pass; they need no real terminal and no server.
+- Manual check, repeated after U3, U4 and U6 (when built) in the terminals used in U2: AE1 passes with one return to the window; with `RUST_LOG=warn`, the log has no stall entries during the check.
 - No `#[ignore]`d test is needed for this change.
 
 ## Definition of Done
 
 - R1–R5 hold and AE1–AE3 pass as described in the Verification Contract.
-- The PR description records the U2 finding and whether U5 was built and why.
+- The PR description records the U2 finding and whether U5 and U6 were built and why.
 - `docs/user/tui.md` "Logging" tells the operator how to capture a stall; a workaround is documented only if U2 found a cause outside Narsor.
 - No awaited server call and no direct terminal write remain in the event loop.
 - Code from abandoned diagnosis experiments (temporary logging, test harnesses that are not kept as tests) is removed from the diff.
