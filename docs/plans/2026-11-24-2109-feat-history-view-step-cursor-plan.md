@@ -15,7 +15,7 @@ execution: code
 - **Objective:** An operator who reads an archived task in the history sees only tabs that can hold content, and can move along every step of the archived run and read each step, however long the run and whatever the terminal height.
 - **Means:** A history-only tab list, a step cursor on the history axis that reuses the live axis model without follow and without step conversations, and a closed-run mode for the right side of *Przebieg* (KTD1-KTD4).
 - **Product authority:** This plan covers the TUI history (`H`) and the matching check of the Web UI history and `narsor-cli`. The live task details are not active scope. On product behavior the Requirements (R-IDs) win; on mechanism the KTDs win.
-- **Open blockers:** None. One product question is open (*Stan* in the history, see "Pytania otwarte dla użytkownika"). It does not block the work: the plan follows R1 as written, and the answer changes one constant, its tests, and the Product Contract and documentation lines that Q3 lists.
+- **Open blockers:** None. Q3 is answered: the history also drops *Stan* (history tabs: *Przebieg*, *Info*).
 - **Execution profile:** One pull request. All changes are in the `narsor` TUI crate (`src/tui/`), its integration tests and `docs/user/tui.md`. No server, protocol, Web UI or CLI change.
 - **Stop conditions:** Stop and ask if the implementation needs a change to the protocol, the archive snapshot, the live details, the Web UI or the CLI.
 - **Who finishes:** The implementer runs `cargo test --workspace` and hands the branch for review; commit and push only when asked (AGENTS.md).
@@ -24,11 +24,11 @@ execution: code
 
 ## Product Contract
 
-Product Contract preservation: Product Contract unchanged. The review item about *Stan* moved from "Deferred / Open Questions" into "Pytania otwarte dla użytkownika" as an open question.
+Product Contract preservation: Product Contract changed by the answer to Q3 (option 1): *Stan* is removed from the history tabs in Summary, R1, A1, AE5 and R12.
 
 ### Summary
 
-The TUI history drops the *Rozmowa*, *Zdarzenia* and *Dyrygent* tabs, because archiving deletes the conversations, the events and the conductor data. It keeps only *Przebieg*, *Stan* and *Info*.
+The TUI history drops the *Rozmowa*, *Zdarzenia*, *Dyrygent* and *Stan* tabs, because archiving deletes the conversations, the events, the conductor data and the state. It keeps only *Przebieg* and *Info*.
 *Przebieg* in the history gets a step cursor: `j`/`k`, arrows, `g`/`G` move it, the axis scrolls to keep it in view in both the one-row and the full (`v`) layout, and the right side shows the facts of the selected step.
 The Web UI and the CLI are checked for the same two points and change only where they show the same gap.
 
@@ -52,7 +52,7 @@ The full layout (`v`) uses two rows per step, so the problem shows sooner there.
 
 **TUI: tabs in the history**
 
-- R1. The tab strip of the history details does not show *Rozmowa*, *Zdarzenia* or *Dyrygent*, and `[` / `]` skip them.
+- R1. The tab strip of the history details does not show *Rozmowa*, *Zdarzenia*, *Dyrygent* or *Stan*, and `[` / `]` skip them.
 - R2. The tabs of the live task details do not change.
 
 **TUI: the step cursor on *Przebieg* in the history**
@@ -80,7 +80,7 @@ The full layout (`v`) uses two rows per step, so the problem shows sooner there.
 - AE2. **Covers R5.** **Given** the selected step is the 10th in the one-row layout and in view, **when** the operator presses `v`, **then** the 10th step stays selected and is still in view.
 - AE3. **Covers R7.** **Given** a selected step that failed, **when** the right side draws, **then** it shows the error line and the "conversation deleted at archiving" line, and no conversation read starts.
 - AE4. **Covers R3.** **Given** the read of the archived timeline failed or returned no timeline, **when** *Przebieg* draws, **then** it shows the existing error or "storage deleted" text and there is no cursor.
-- AE5. **Covers R1.** **Given** the history details are on *Przebieg*, **when** the operator presses `[` repeatedly, **then** the tabs go round *Info*, *Stan*, *Przebieg*, and never show *Rozmowa*, *Zdarzenia* or *Dyrygent*.
+- AE5. **Covers R1.** **Given** the history details are on *Przebieg*, **when** the operator presses `[` repeatedly, **then** the tabs go round *Info*, *Przebieg*, and never show *Rozmowa*, *Zdarzenia*, *Dyrygent* or *Stan*.
 
 ### Scope Boundaries
 
@@ -91,7 +91,7 @@ The full layout (`v`) uses two rows per step, so the problem shows sooner there.
 
 ### Założenia do potwierdzenia
 
-- A1. *Rozmowa*, *Zdarzenia* and *Dyrygent* are removed from the TUI history. They all show only the "storage deleted" text (decision Q1).
+- A1. *Rozmowa*, *Zdarzenia*, *Dyrygent* and *Stan* are removed from the TUI history. They all show only the "storage deleted" text (decisions Q1 and Q3).
 - A2. The Web UI history already has no *Rozmowa* tab: it is a dialog with the *Przebieg* step list, the header and *Info* (`crates/narsor-web/ui/js/ui/settings.js`, `ArchivedTask`). Its step rows already show all step facts, and the browser scrolls the dialog. So the Web UI needs no change for this request.
 - A3. The CLI has no *Rozmowa* equivalent for archived tasks. `task show` prints the step lines and one conversation availability line; `task conversation` reports "the task is archived". These lines tell the truth and stay.
 - A4. The first step is the initial selection, because a closed run has no running step to follow.
@@ -100,11 +100,7 @@ The full layout (`v`) uses two rows per step, so the problem shows sooner there.
 
 ### Pytania otwarte dla użytkownika
 
-- Q3. **Product Contract: Summary, R1, AE5, R12. Does the history also drop the *Stan* tab?**
-  For an archived task *Stan* shows only `storage usunięty przy archiwizacji` (`unstarted_message` in `src/tui/task_app/detail.rs`; `docs/user/tui.md` says the same). So keeping it conflicts with the Objective "sees only tabs that can hold content". Answer Q1 named only *Rozmowa*, *Zdarzenia* and *Dyrygent*.
-  Options:
-  1. (Recommended) Drop *Stan* too. The history has *Przebieg* and *Info*; update Summary, R1, A1, AE5 and R12. In the code it is one entry less in the history tab list (KTD1) and the matching test and doc lines.
-  2. Keep *Stan*, as R1 says now. The plan is written for this option until the person answers.
+- Q3 (answered: option 1). The history also drops *Stan*, because it shows only `storage usunięty przy archiwizacji` for an archived task. The history has *Przebieg* and *Info*.
 
 ### Outstanding Questions
 
@@ -136,11 +132,11 @@ The full layout (`v`) uses two rows per step, so the problem shows sooner there.
 
 ### Key Technical Decisions
 
-- KTD1. **The history uses its own tab list.** Add a history tab list (*Przebieg*, *Stan*, *Info*, in the order of `DetailTab::ALL`) next to `DetailTab::ALL`, and a shift that takes the tab list. `History::shift_tab` and the history tab strip use it; the live details keep `DetailTab::ALL` (R1, R2). `tab_bar` gets the tab list as an input, and `render_view` picks it from its `closed_run` option, which only the history sets. Rationale: one list owns the history tabs, so the strip and `[`/`]` cannot drift apart.
+- KTD1. **The history uses its own tab list.** Add a history tab list (*Przebieg*, *Info*, in the order of `DetailTab::ALL`) next to `DetailTab::ALL`, and a shift that takes the tab list. `History::shift_tab` and the history tab strip use it; the live details keep `DetailTab::ALL` (R1, R2). `tab_bar` gets the tab list as an input, and `render_view` picks it from its `closed_run` option, which only the history sets. Rationale: one list owns the history tabs, so the strip and `[`/`]` cannot drift apart.
 - KTD2. **A closed run keeps its selection by label across reads.** Replace `Progress::drop_selection` with one `Progress` operation for a closed run's read: it turns follow off, applies the read, then keeps the selected step when its label is still in the timeline, and else selects the first step. A failed read keeps what was shown, including the selection (R3, R8). `on_history_timeline` calls it instead of `apply` + `drop_selection`. Rationale: `Progress::apply` alone moves a lost selection to the timeline's default position, not to the first step, so the history needs its own rule. The scroll position (`top`) already lives in the entry's `Progress`, so R8 needs no new state.
 - KTD3. **`Context::HistoryAxis` gets its own move bindings.** Add `j`, `↓`, `k`, `↑`, `g`, `G` rows to `Context::HistoryAxis` with the same actions, hint and descriptions as `Context::Axis`. `Enter`, `→` and `f` stay unbound. Rationale: the key map has no inheritance between layers, rows are per context, and the bar and help read the same rows (R9). `on_history_key` needs no change, because it already routes these actions to the axis.
 - KTD4. **The right side of a closed-run step is facts plus one fixed line.** `progress::render` gets the closed-run flag. In that mode `render_step` draws `step_lines` and the gate lines as now, then the fixed line `rozmowa usunięta przy archiwizacji` in the `Done` role directly below them, and never looks up or builds a step view. When the facts do not fit, they are clipped so that the fixed line keeps the last row of the right side. `render_view` does not call `ensure_step_built` for a closed run (R7). Rationale: no code path in the history can then build or read a step conversation.
-- KTD5. **Remove the unreachable `AgentConversation` over `HistoryDetails` stack from `Stack::LAYERED`.** After KTD1 the history cannot show *Rozmowa*, so that stack lists keys for a state that does not exist. Keep `Reading` over `HistoryDetails`: *Stan* and *Info* use it.
+- KTD5. **Remove the unreachable `AgentConversation` over `HistoryDetails` stack from `Stack::LAYERED`.** After KTD1 the history cannot show *Rozmowa*, so that stack lists keys for a state that does not exist. Keep `Reading` over `HistoryDetails`: *Info* uses it.
 
 ### High-Level Technical Design
 
@@ -168,7 +164,7 @@ stateDiagram-v2
 
 ### U1. History tab list
 
-- **Goal:** The history details show and cycle only *Przebieg*, *Stan* and *Info*.
+- **Goal:** The history details show and cycle only *Przebieg* and *Info*.
 - **Requirements:** R1, R2, AE5.
 - **Dependencies:** None.
 - **Files:** `src/tui/task_app/mod.rs`, `src/tui/task_app/detail.rs`, `src/tui/task_app/history.rs`, `src/tui/keymap.rs`, `tests/integration/tui_state.rs`, `tests/integration/tui_render.rs`.
@@ -177,16 +173,16 @@ stateDiagram-v2
   2. `History::shift_tab` uses the history list.
   3. `tab_bar` takes the tab list; `render_view` passes the history list when `closed_run` is set.
   4. Remove the unreachable stack from `Stack::LAYERED` (KTD5) and drop it from the loop in `the_history_has_the_same_layers_without_the_tasks_actions_or_following`.
-  5. Update the test `an_archived_task_shows_its_kept_run_and_says_the_rest_of_its_storage_is_gone`, which now walks to *Rozmowa* and *Zdarzenia*: it checks *Przebieg* and *Stan* instead.
-  6. Rewrite `brackets_switch_the_tabs_from_the_history_list_and_its_details` in `tests/integration/tui_state.rs`: it now expects `]` from *Przebieg* to reach *Zdarzenia* and *Dyrygent*; it must expect *Stan*, then *Info*, and `[` back to *Przebieg*.
+  5. Update the test `an_archived_task_shows_its_kept_run_and_says_the_rest_of_its_storage_is_gone`, which now walks to *Rozmowa* and *Zdarzenia*: it checks *Przebieg* and *Info* instead.
+  6. Rewrite `brackets_switch_the_tabs_from_the_history_list_and_its_details` in `tests/integration/tui_state.rs`: it now expects `]` from *Przebieg* to reach *Zdarzenia* and *Dyrygent*; it must expect *Info*, then *Przebieg* again, and `[` back to *Info*.
   7. Remove `an_archived_task_says_its_storage_went_with_the_archiving` from the conductor tests in `tests/integration/tui_state.rs`. Its `]` loop waits for *Dyrygent*, which the history no longer has, so the test would hang `cargo test` instead of failing.
 - **Patterns to follow:** `DetailTab::ALL` and `shifted` in `src/tui/task_app/mod.rs`.
 - **Test scenarios:**
-  - Covers AE5. History details on *Przebieg*, press `[` four times: the tab goes *Info*, *Stan*, *Przebieg*, *Info*; press `]` from *Info*: *Przebieg*. Never *Rozmowa*, *Zdarzenia* or *Dyrygent*.
-  - Render the history details at 130x30: the tab strip contains `Przebieg`, `Stan`, `Info` and not `Rozmowa`, `Zdarzenia`, `Dyrygent`.
+  - Covers AE5. History details on *Przebieg*, press `[` three times: the tab goes *Info*, *Przebieg*, *Info*; press `]` from *Info*: *Przebieg*. Never *Rozmowa*, *Zdarzenia*, *Dyrygent* or *Stan*.
+  - Render the history details at 130x30: the tab strip contains `Przebieg`, `Info` and not `Rozmowa`, `Zdarzenia`, `Dyrygent`, `Stan`.
   - Live details (R2): `]` from *Przebieg* still reaches *Zdarzenia*, and the live tab strip still shows all six names.
 - **Test seam:** `tests/integration/tui_state.rs` drives keys through `TaskApp` and catches a wrong cycle; `tui_render.rs` catches a strip that draws a tab the keys skip. Neither checks colours.
-- **Verification:** The new and updated history tests pass, no test walks the history tabs toward *Rozmowa*, *Zdarzenia* or *Dyrygent*, and the existing live-tab tests pass unchanged.
+- **Verification:** The new and updated history tests pass, no test walks the history tabs toward *Rozmowa*, *Zdarzenia*, *Dyrygent* or *Stan*, and the existing live-tab tests pass unchanged.
 
 ### U2. Step cursor on the history axis
 
@@ -238,9 +234,9 @@ stateDiagram-v2
 - **Dependencies:** U1, U2, U3.
 - **Files:** `docs/user/tui.md`.
 - **Approach:**
-  1. The paragraph "The history's details" (`H`): the history has *Przebieg*, *Stan* and *Info*; the steps can be picked with `j`/`k`, arrows, `g`/`G`, not opened or followed; the right side shows the step's facts and that its conversation was deleted at archiving.
+  1. The paragraph "The history's details" (`H`): the history has *Przebieg* and *Info*; the steps can be picked with `j`/`k`, arrows, `g`/`G`, not opened or followed; the right side shows the step's facts and that its conversation was deleted at archiving.
   2. The keys table row "*Przebieg* in the history": add `j` / `k` (`↓` / `↑`), `g` / `G`, and drop "cannot be picked".
-  3. The *Stan* paragraph stays as it is unless Q3 is answered with option 1.
+  3. Remove the sentence that says the history *Stan* tab shows "storage deleted" (Q3).
 - **Test expectation:** none -- documentation only.
 - **Verification:** The doc matches the behavior of U1-U3 and names no removed tab as present in the history.
 
@@ -266,4 +262,4 @@ No `#[ignore]`d tests are needed: the change has no process lifecycle, `claude` 
 - `cargo test --workspace` passes.
 - `drop_selection` is gone, and no comment in `history.rs`, `progress.rs` or `keymap.rs` still says that history steps cannot be picked.
 - No dead code or experiment code from abandoned approaches stays in the diff.
-- Q3 is either answered and applied, or still listed in "Pytania otwarte dla użytkownika".
+- Q3 (drop *Stan*) is applied in R1, A1, AE5, R12, KTD1 and U1.
