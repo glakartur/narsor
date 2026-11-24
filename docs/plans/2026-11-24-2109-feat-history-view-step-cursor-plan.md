@@ -1,5 +1,5 @@
 ---
-title: History View - Step Cursor and No Conversation Tab - Plan
+title: History View - Step Cursor and Reduced Tabs - Plan
 type: feat
 date: 2026-11-24
 topic: history-view-step-cursor
@@ -8,7 +8,7 @@ product_contract_source: ce-brainstorm
 execution: code
 ---
 
-# History View - Step Cursor and No Conversation Tab - Plan
+# History View - Step Cursor and Reduced Tabs - Plan
 
 ## Goal Capsule
 
@@ -22,7 +22,7 @@ execution: code
 
 ### Summary
 
-The TUI history drops the *Rozmowa* tab, because archiving deletes the conversations.
+The TUI history drops the *Rozmowa*, *Zdarzenia* and *Dyrygent* tabs, because archiving deletes the conversations, the events and the conductor data. It keeps only *Przebieg*, *Stan* and *Info*.
 *Przebieg* in the history gets a step cursor: `j`/`k`, arrows, `g`/`G` move it, the axis scrolls to keep it in view in both the one-row and the full (`v`) layout, and the right side shows the facts of the selected step.
 The Web UI and the CLI are checked for the same two points and change only where they show the same gap.
 
@@ -30,7 +30,7 @@ The Web UI and the CLI are checked for the same two points and change only where
 
 An archived task keeps only the step header rows of its run (see `docs/plans/2026-11-20-002-feat-archive-task-run-snapshot-plan.md`).
 The conversation, the events and the conductor go away with the storage.
-The TUI history still shows the *Rozmowa* tab, and it can only say "storage deleted".
+The TUI history still shows the *Rozmowa*, *Zdarzenia* and *Dyrygent* tabs, and each can only say "storage deleted".
 The earlier plan also made *Przebieg* in the history a list without a cursor ("Step rows render without a selection cursor").
 The axis draws from the first step down and has nothing to scroll by.
 When the run has more steps than the tab has rows, the operator cannot see the later steps.
@@ -39,14 +39,14 @@ The full layout (`v`) uses two rows per step, so the problem shows sooner there.
 ### Key Decisions
 
 - **The history keeps the cursor model of the live *Przebieg*, without the parts that need a live run.** No follow (`f`), no step conversation, no `Enter`/`→` into a step. Governs R3, R4, R6.
-- **Only *Rozmowa* is removed now.** The request names only that tab. *Zdarzenia* and *Dyrygent* stay as they are until the person answers Q1. Governs R1.
+- **The history drops *Rozmowa*, *Zdarzenia* and *Dyrygent*.** Decision Q1: the person chose to remove all three, because each shows only "storage deleted". Governs R1.
 - **The CLI does not change.** `narsor-cli task show` and `task conversation` for an archived task print one availability line ("the task is archived"), not a conversation view. Governs R9.
 
 ### Requirements
 
 **TUI: tabs in the history**
 
-- R1. The tab strip of the history details does not show *Rozmowa*, and `[` / `]` skip it.
+- R1. The tab strip of the history details does not show *Rozmowa*, *Zdarzenia* or *Dyrygent*, and `[` / `]` skip them.
 - R2. The tabs of the live task details do not change.
 
 **TUI: the step cursor on *Przebieg* in the history**
@@ -61,7 +61,7 @@ The full layout (`v`) uses two rows per step, so the problem shows sooner there.
 
 **Web UI and CLI**
 
-- R10. The Web UI history keeps its current form (a dialog without a *Rozmowa* tab, with all step rows and their facts in a page that the browser scrolls); it does not change unless the person answers Q2 otherwise.
+- R10. The Web UI history keeps its current form (a dialog without a *Rozmowa* tab, with all step rows and their facts in a page that the browser scrolls); it does not change (decision Q2: the person chose no step selection in the Web UI).
 - R11. The CLI does not change (per Key Decisions).
 
 **Documentation**
@@ -74,18 +74,17 @@ The full layout (`v`) uses two rows per step, so the problem shows sooner there.
 - AE2. **Covers R5.** **Given** the selected step is the 10th in the one-row layout and in view, **when** the operator presses `v`, **then** the 10th step stays selected and is still in view.
 - AE3. **Covers R7.** **Given** a selected step that failed, **when** the right side draws, **then** it shows the error line and the "conversation deleted at archiving" line, and no conversation read starts.
 - AE4. **Covers R3.** **Given** the read of the archived timeline failed or returned no timeline, **when** *Przebieg* draws, **then** it shows the existing error or "storage deleted" text and there is no cursor.
-- AE5. **Covers R1.** **Given** the history details are on *Przebieg*, **when** the operator presses `[` repeatedly, **then** the tabs go round *Info*, *Stan*, *Dyrygent*, *Zdarzenia*, *Przebieg*, and never show *Rozmowa*.
+- AE5. **Covers R1.** **Given** the history details are on *Przebieg*, **when** the operator presses `[` repeatedly, **then** the tabs go round *Info*, *Stan*, *Przebieg*, and never show *Rozmowa*, *Zdarzenia* or *Dyrygent*.
 
 ### Scope Boundaries
 
 - Not in scope: a change to what the archive keeps (the snapshot stays step header rows only).
-- Not in scope: the removal of *Zdarzenia* and *Dyrygent* from the history (Q1).
-- Not in scope: keyboard selection of steps in the Web UI history (Q2).
+- Not in scope: keyboard selection of steps in the Web UI history (decision Q2).
 - Not in scope: any change to the live task details or the live *Przebieg*.
 
 ### Założenia do potwierdzenia
 
-- A1. Only *Rozmowa* is removed from the TUI history. *Zdarzenia* and *Dyrygent* show the same "storage deleted" text, but the request names only *Rozmowa*; the safest choice is the smallest change.
+- A1. *Rozmowa*, *Zdarzenia* and *Dyrygent* are removed from the TUI history. They all show only the "storage deleted" text (decision Q1).
 - A2. The Web UI history already has no *Rozmowa* tab: it is a dialog with the *Przebieg* step list, the header and *Info* (`crates/narsor-web/ui/js/ui/settings.js`, `ArchivedTask`). Its step rows already show all step facts, and the browser scrolls the dialog. So the Web UI needs no change for this request.
 - A3. The CLI has no *Rozmowa* equivalent for archived tasks. `task show` prints the step lines and one conversation availability line; `task conversation` reports "the task is archived". These lines tell the truth and stay.
 - A4. The first step is the initial selection, because a closed run has no running step to follow.
@@ -94,18 +93,13 @@ The full layout (`v`) uses two rows per step, so the problem shows sooner there.
 
 ### Pytania otwarte dla użytkownika
 
-- Q1. (Scope Boundaries, A1) Must the TUI history also drop *Zdarzenia* and *Dyrygent*? These tabs also only say that the storage was deleted.
-  - Recommended: yes, remove them too, so the history shows only *Przebieg*, *Stan* and *Info*.
-  - No, remove only *Rozmowa* (this plan's current scope).
-- Q2. (Requirements R10, A2) Must the Web UI history also get a selectable step (click or keyboard) with a step detail panel, for parity with the TUI cursor?
-  - Recommended: no, the Web UI dialog already shows all step facts in the rows and scrolls in the browser.
-  - Yes, add a selectable step and a detail panel like in the live Web UI *Przebieg*.
+- None. Q1 (remove *Zdarzenia* and *Dyrygent* too) and Q2 (no Web UI change) were answered by the person; the plan follows both.
 
 ### Outstanding Questions
 
 **Resolve Before Planning**
 
-- None. Q1 and Q2 have a recommended default; planning can use the current scope and add the extra tabs or the Web UI change after the answers.
+- None.
 
 **Deferred to Planning**
 
