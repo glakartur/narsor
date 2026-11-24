@@ -13,14 +13,21 @@
 //! * **claude-code, codex** enforce it themselves: the conductor runs in the
 //!   task's workspace with read-only access, which the adapters turn into
 //!   `--permission-mode plan` and `--sandbox read-only`;
-//! * **opencode** (and any harness this list does not name) has no such
-//!   mode, so the conductor runs in an empty scratch directory,
-//!   `tasks/{id}/conductor/scratch/` of the work tree, and knows the task
-//!   only from its snapshot — which then also carries the workflow's
-//!   artifact files, within its budget. On opencode, read-only means
-//!   isolation from the workspace, not a sandbox.
+//! * **opencode, github-copilot** (and any harness this list does not
+//!   name) have no such mode, so the conductor runs in the scratch
+//!   directory `tasks/{id}/conductor/scratch/` of the work tree, emptied at
+//!   every invocation, and knows the task only from its snapshot — which
+//!   then also carries the workflow's artifact files. There, read-only
+//!   means isolation from the workspace, not a sandbox.
 //!
 //! A workspace that no longer exists is treated like the second case.
+//!
+//! # Context files
+//!
+//! The prompt carries the snapshot's core; the rest of the snapshot goes,
+//! uncut, to context files in `tasks/{id}/conductor/scratch/context/`, for
+//! both kinds of access ([`crate::conductor::snapshot`]). Every invocation
+//! replaces them, and the harness makes them readable and lists them.
 //!
 //! # One try, no bookkeeping
 //!
@@ -52,14 +59,14 @@ use crate::conductor::actor::{ConductorAnswer, ConductorInvoker, Invocation, Inv
 use crate::conductor::autopilot::Autopilot;
 use crate::conductor::prompt::{answer_schema, conductor_prompt_for, ConductorRepository};
 use crate::conductor::response::ConductorResponse;
-use crate::conductor::snapshot::{render, SnapshotBudget, SnapshotInput};
+use crate::conductor::snapshot::{render, SnapshotInput};
 use crate::conductor::store::ConductorStore;
 use crate::config::{agent_args_for, AgentArgs};
 use crate::domain::{ChoiceDefinition, WorkflowDefinition, WorkflowExecution, WorkspaceAccess};
 use crate::engine::actions::agent::{DefaultHarnessSource, BUILT_IN_HARNESS};
 use crate::engine::actions::answer::AnswerShape;
 use crate::engine::actions::harness::{
-    AgentRequest, AgentRunEnding, HarnessRegistry, RunObservers, CLAUDE_CODE, CODEX,
+    AgentRequest, AgentRunEnding, ContextFiles, HarnessRegistry, RunObservers, CLAUDE_CODE, CODEX,
 };
 use crate::engine::actions::session::{ConversationSink, ReadingTap};
 use crate::engine::timeline_file::{ReadingSink, UsageReading};
@@ -67,6 +74,9 @@ use crate::persistence::{ExecutionStore, WorkPaths};
 
 /// The time limit of an invocation when no `agent_timeout` is configured.
 pub const DEFAULT_CONDUCTOR_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// The name of the context directory inside the scratch directory.
+const CONTEXT_DIR: &str = "context";
 
 /// The harnesses that enforce read-only access themselves (KTD5).
 const SANDBOXED_HARNESSES: &[&str] = &[CLAUDE_CODE, CODEX];
@@ -138,7 +148,6 @@ pub struct HarnessInvoker {
     default_harness: Arc<dyn DefaultHarnessSource>,
     pinned_definition: Option<Arc<WorkflowDefinition>>,
     timeout: Duration,
-    budget: SnapshotBudget,
     extra_args: AgentArgs,
     readings: Option<Arc<dyn ReadingSink>>,
 }
@@ -187,7 +196,6 @@ impl HarnessInvoker {
             default_harness: Arc::new(BUILT_IN_HARNESS.to_string()),
             pinned_definition: None,
             timeout: DEFAULT_CONDUCTOR_TIMEOUT,
-            budget: SnapshotBudget::default(),
             extra_args: AgentArgs::new(),
             profile: ConductorProfile::default(),
             readings: None,
@@ -251,18 +259,21 @@ impl HarnessInvoker {
         self
     }
 
-    /// Returns the invoker with another snapshot budget.
-    pub fn with_budget(mut self, budget: SnapshotBudget) -> Self {
-        self.budget = budget;
-        self
-    }
-
-    /// The scratch directory of `execution_id`'s isolated conductor.
+    /// The scratch directory of `execution_id`'s conductor: the working
+    /// directory of an isolated conductor, and the parent of every
+    /// conductor's context directory.
     pub fn scratch_dir(&self, execution_id: &str) -> PathBuf {
         self.work
             .task_dir(execution_id)
             .join("conductor")
             .join("scratch")
+    }
+
+    /// The context directory of `execution_id`'s conductor, which every
+    /// invocation empties and fills with its own context files (R13). The
+    /// conductor actor runs one invocation at a time, so two never share it.
+    pub fn context_dir(&self, execution_id: &str) -> PathBuf {
+        self.scratch_dir(execution_id).join(CONTEXT_DIR)
     }
 
     /// Runs the conductor once for `invocation`.
@@ -309,12 +320,11 @@ impl HarnessInvoker {
             &ConductorStore::new(self.store.paths(), &execution.id),
             &execution,
             self.definition(&execution),
-            &self.budget,
             access == ConductorAccess::Isolated,
         );
         input.request = Some(invocation.request.clone());
         input.chat_message = invocation.chat_message.clone();
-        let snapshot = render(&input, &self.budget);
+        let snapshot = render(&input);
         let descriptions = self.repository_descriptions(&execution);
         let listed: Vec<ConductorRepository> = repositories
             .iter()
@@ -326,12 +336,16 @@ impl HarnessInvoker {
         let prompt = conductor_prompt_for(
             invocation.request.purpose,
             access,
-            &snapshot.text,
+            &snapshot.core,
             &listed,
             Autopilot::of_payload(&invocation.request.payload),
         );
 
         let request = AgentRequest {
+            context: Some(ContextFiles {
+                dir: self.context_dir(&execution.id),
+                files: snapshot.files,
+            }),
             read_only_dirs: repositories
                 .iter()
                 .map(|repository| PathBuf::from(&repository.path))

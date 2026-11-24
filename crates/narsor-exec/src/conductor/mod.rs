@@ -85,7 +85,7 @@ pub use response::{
     allowed_decisions, proposals_allowed, ConductorResponse, Decision, DecisionKind, ProposalKind,
     ProposedAction, ResponseError,
 };
-pub use snapshot::{Snapshot, SnapshotBudget, SnapshotInput};
+pub use snapshot::{Snapshot, SnapshotInput};
 pub use store::{
     Annotation, ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore,
     FailureOutcome, FailureReport, PendingInvocation, QueuedRequest, SavedDecision,

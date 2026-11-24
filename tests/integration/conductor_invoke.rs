@@ -16,10 +16,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use engine_support::{fixtures, workflow, Harness};
-use narsor_engine::conductor::snapshot::{render, ConversationTail, SnapshotBudget, SnapshotInput};
+use narsor_engine::conductor::snapshot::{render, AttemptConversation, SnapshotInput};
 use narsor_engine::conductor::{
     prompt::{conductor_prompt, conductor_prompt_for},
-    Autopilot, ChatAuthor, ChatEntry, ChatEntryKind, ConductorAccess, ConductorRegistry,
+    Autopilot, ChatEntryKind, ConductorAccess, ConductorRegistry,
     ConductorResponse, ConductorStore, Decision, DecisionKind, HarnessInvoker, Invocation,
     InvocationOutcome, LiveHarness, QueuedRequest, ResponseError,
 };
@@ -383,7 +383,44 @@ async fn claude_runs_read_only_in_the_workspace_without_an_action_attempt() {
         recorded.is_empty(),
         "no conversation is written: {recorded:?}"
     );
-    assert!(!fixture.work_dir().exists(), "no scratch directory is made");
+    let invoker = fixture.invoker("claude-code");
+    let scratch = invoker.scratch_dir(&fixture.execution_id);
+    let made: Vec<_> = fs::read_dir(&scratch)
+        .expect("the scratch directory holds the context files")
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(made, ["context"], "only the context directory is made");
+    let context = invoker.context_dir(&fixture.execution_id);
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "--add-dir" && Path::new(&pair[1]) == context),
+        "claude may read its context files: {args:?}"
+    );
+}
+
+/// AE4: every invocation replaces the context files of the one before.
+#[tokio::test]
+async fn an_invocation_replaces_the_context_files_of_the_one_before() {
+    let fixture = Fixture::new();
+    fixture.claude.answers(&claude_answer(CHOOSE_DONE));
+    let invoker = fixture.invoker("claude-code");
+    let context = invoker.context_dir(&fixture.execution_id);
+    fs::create_dir_all(context.join("conversations")).unwrap();
+    fs::write(context.join("conversations/001-old-attempt.md"), "old").unwrap();
+
+    answered(
+        invoker.invoke_once(&fixture.rescue()).await,
+        ConductorPurpose::ChooseOutput,
+    );
+
+    assert!(!context.join("conversations").exists());
+    let workflow = fs::read_to_string(context.join("workflow.yaml")).unwrap();
+    assert!(workflow.contains("name: two-steps"), "{workflow}");
+    let prompt = fixture.claude.args(1).last().cloned().unwrap();
+    assert!(
+        prompt.contains(&format!("`{}`", context.join("workflow.yaml").display())),
+        "{prompt}"
+    );
 }
 
 /// NARSOR-1124-001: Linux refuses a single argument over 128 KiB
@@ -519,8 +556,14 @@ async fn opencode_runs_in_an_empty_scratch_directory_and_is_shown_the_artifacts(
     let args = fixture.opencode.args(1);
     assert!(!args.contains(&"--auto".to_string()), "never auto-approved");
     let prompt = args.last().expect("the prompt");
-    assert!(prompt.contains("Unit 1: write the parser."), "{prompt}");
-    assert!(prompt.contains("empty scratch directory"));
+    let plan = invoker
+        .context_dir(&fixture.execution_id)
+        .join("artifacts/plan");
+    assert!(prompt.contains(&format!("`{}`", plan.display())), "{prompt}");
+    assert!(prompt.contains("a scratch directory"), "{prompt}");
+    assert!(fs::read_to_string(plan)
+        .unwrap()
+        .contains("Unit 1: write the parser."));
 }
 
 #[tokio::test]
@@ -552,8 +595,9 @@ async fn a_sandboxed_conductor_is_not_shown_the_artifact_files() {
 
     let prompt = fixture.claude.args(1).last().cloned().unwrap();
     assert!(!prompt.contains("Unit 1: write the parser."));
+    assert!(!prompt.contains("artifacts/plan"), "{prompt}");
     assert!(prompt.contains("opened read-only"));
-    assert!(prompt.contains("name: two-steps"), "the pinned definition");
+    assert!(prompt.contains("workflow.yaml"), "the pinned definition");
 }
 
 #[tokio::test]
@@ -1186,49 +1230,30 @@ fn event(sequence: u64, data: EventData) -> Event {
     event
 }
 
-#[test]
-fn a_long_tasks_snapshot_fits_its_budget_with_the_definition_and_pending_input_whole() {
-    let definition = format!(
-        "name: long\nstates:\n{}",
-        "  # a comment line\n".repeat(200)
-    );
-    let pending = json!({
-        "execution_id": "execution-1",
-        "state_id": "implement",
-        "instruction": "Settle the output. ".repeat(100),
-        "continuation": "resolve_output",
-    });
-    let events = (1..=5_000)
+/// A task with several states, long conversations and many events.
+fn long_task(purpose: ConductorPurpose) -> SnapshotInput {
+    let definition = "name: long\nstates:\n  implement:\n    prompt: Write the parser.\n  \
+                      review:\n    prompt: Review it.\n";
+    let events = (1..=500)
         .map(|sequence| {
             event(
                 sequence,
                 EventData::Error {
-                    message: "x".repeat(2_000),
+                    message: format!("event {sequence} {}", "x".repeat(2_000)),
                     context: Value::Null,
                 },
             )
         })
         .collect();
-    let conversations = (0..20)
-        .map(|index| ConversationTail {
-            state_id: format!("state-{}", index % 7),
+    let conversations = (0..4)
+        .map(|index| AttemptConversation {
+            state_id: if index < 2 { "review" } else { "implement" }.to_string(),
             attempt_id: format!("attempt-{index}"),
-            current: index < 3,
-            text: "[stdout] a long line of tool output\n".repeat(5_000),
+            current: index >= 2,
+            text: format!("[stdout] attempt {index}\n{}", "tool output\n".repeat(20_000)),
         })
         .collect();
-    let chat = (1..=500)
-        .map(|sequence| {
-            let mut entry = ChatEntry::new(
-                ChatAuthor::Operator,
-                ChatEntryKind::Message,
-                "y".repeat(5_000),
-            );
-            entry.sequence = sequence;
-            entry
-        })
-        .collect();
-    let input = SnapshotInput {
+    SnapshotInput {
         execution_id: "execution-1".to_string(),
         workflow_id: "long".to_string(),
         status: "input_needed".to_string(),
@@ -1243,62 +1268,78 @@ fn a_long_tasks_snapshot_fits_its_budget_with_the_definition_and_pending_input_w
             exit: false,
             set: Default::default(),
         }],
-        definition: Ok(definition.clone()),
-        pending_input: Some(pending.clone()),
+        definition: Ok(definition.to_string()),
+        request: Some(QueuedRequest::new(ConductorTrigger::Annotation, purpose)),
+        pending_input: Some(json!({ "instruction": "Approve the parser." })),
         variables: json!({ "big": "z".repeat(100_000) }),
         events,
+        last_agent_answer: Some("The parser is written.".to_string()),
         conversations,
-        chat,
         ..SnapshotInput::default()
-    };
-    let budget = SnapshotBudget {
-        total_bytes: 64 * 1024,
-        ..SnapshotBudget::default()
-    };
-
-    let snapshot = render(&input, &budget);
-
-    assert!(
-        snapshot.text.len() <= budget.total_bytes,
-        "{} bytes",
-        snapshot.text.len()
-    );
-    assert!(snapshot.level.is_some(), "shortened, not left out");
-    assert!(snapshot.text.contains(definition.trim_end()));
-    assert!(snapshot
-        .text
-        .contains(&serde_json::to_string_pretty(&pending).unwrap()));
-    assert!(snapshot
-        .text
-        .contains("- `implemented` — The work is done."));
-    assert!(snapshot.text.contains("#5000"), "the latest event is shown");
-    assert!(snapshot.text.contains("## Agent conversations"));
-    assert!(snapshot.text.contains("## Recent chat"));
+    }
 }
 
+/// AE3: a gate summary is prompted with the core alone; every conversation
+/// is a context file of its own, whole, and so is every event.
 #[test]
-fn whole_sections_over_the_budget_leave_the_rest_out_rather_than_being_cut() {
-    let definition = "d".repeat(10_000);
-    let input = SnapshotInput {
-        definition: Ok(definition.clone()),
-        events: vec![event(
-            1,
-            EventData::Error {
-                message: "boom".to_string(),
-                context: Value::Null,
-            },
-        )],
-        ..SnapshotInput::default()
-    };
-    let budget = SnapshotBudget {
-        total_bytes: 1_000,
-        ..SnapshotBudget::default()
-    };
+fn a_gate_summary_keeps_conversations_and_events_out_of_the_prompt_and_uncut() {
+    let input = long_task(ConductorPurpose::SummarizeGate);
 
-    let snapshot = render(&input, &budget);
-    assert_eq!(snapshot.level, None);
-    assert!(snapshot.text.contains(&definition));
-    assert!(!snapshot.text.contains("boom"));
+    let snapshot = render(&input);
+
+    assert!(!snapshot.core.contains("## Agent conversations"));
+    assert!(!snapshot.core.contains("tool output"));
+    assert!(!snapshot.core.contains("event 500"));
+    assert!(!snapshot.core.contains("The parser is written."));
+    assert!(snapshot.core.contains("- `implemented` — The work is done."));
+    assert!(snapshot.core.contains("Approve the parser."));
+    assert!(snapshot.core.contains("## Definition of the current state"));
+    assert!(snapshot.core.contains("Write the parser."));
+    assert!(!snapshot.core.contains("Review it."), "only the current state");
+
+    let file = |name: &str| {
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.name == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let conversations: Vec<_> = snapshot
+        .files
+        .iter()
+        .filter(|file| file.name.starts_with("conversations/"))
+        .collect();
+    assert_eq!(conversations.len(), 4, "one file per attempt");
+    assert_eq!(
+        conversations[3].name,
+        "conversations/004-implement-attempt-3.md"
+    );
+    assert_eq!(conversations[3].content, input.conversations[3].text);
+    assert!(conversations[3].description.contains("current state"));
+    assert!(file("events.md").content.contains(&format!("event 500 {}", "x".repeat(2_000))));
+    assert!(file("workflow.yaml").content.contains("Review it."));
+    assert!(file("variables.json").content.contains(&"z".repeat(100_000)));
+}
+
+/// The purposes that analyse the agent's answer find it in the core.
+#[test]
+fn an_output_choice_sees_the_agents_last_answer_in_the_prompt() {
+    let snapshot = render(&long_task(ConductorPurpose::ChooseOutput));
+    assert!(snapshot
+        .core
+        .contains("## The agent's last answer in the current state"));
+    assert!(snapshot.core.contains("The parser is written."));
+}
+
+/// A section with nothing in it has no file to list.
+#[test]
+fn an_execution_without_history_has_only_its_definition_as_a_context_file() {
+    let snapshot = render(&SnapshotInput {
+        definition: Ok("name: empty\n".to_string()),
+        ..SnapshotInput::default()
+    });
+    let names: Vec<_> = snapshot.files.iter().map(|file| file.name.as_str()).collect();
+    assert_eq!(names, ["workflow.yaml"]);
 }
 
 // ---------------------------------------------------------------------------
