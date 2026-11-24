@@ -22,7 +22,7 @@ use narsor_engine::domain::{
 };
 use narsor_engine::engine::{
     owed_output_rescue, resumable_agent_session, step_failure, ActionKind, Engine, EngineError,
-    OwnerMessage, PendingHumanInput, PendingStep, Recovery, StepFailure,
+    OwnerMessage, PendingHumanInput, PendingStep, Recovery, StepFailure, StepSelection,
 };
 use narsor_engine::engine::{reconcile, ReconciliationOutcome};
 use serde_json::json;
@@ -1328,6 +1328,191 @@ async fn a_comment_is_refused_by_an_execution_that_is_not_to_run_on() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// A step the owner chose, with a comment
+// ---------------------------------------------------------------------------
+
+fn chosen(target: &str, note: Option<&str>, message: Option<&str>) -> StepSelection {
+    StepSelection {
+        target: target.to_string(),
+        requested_by: "owner".to_string(),
+        note: note.map(str::to_string),
+        owner_message: message.map(|text| OwnerMessage {
+            key: "c-1".to_string(),
+            text: text.to_string(),
+        }),
+    }
+}
+
+/// `step_history` run up to its second entry into `plan`, whose first
+/// attempt reported a session; the engine and the paused execution.
+async fn back_at_plan(harness: &Harness) -> (Engine, WorkflowExecution) {
+    let before = Arc::new(ScriptedAgentExecutor::new(vec![
+        AgentTurn::Label {
+            label: "needs_requirements_revision",
+            reason: "no API named",
+            variables: json!({}),
+            artifacts: json!({}),
+            reply: None,
+            session: true,
+        },
+        AgentTurn::label("drafted", "drafted"),
+    ]));
+    let engine = harness.engine().with_executor(ActionKind::Agent, before);
+    let started = engine
+        .start(&workflow("step_history"), json!({}), harness.workspace())
+        .expect("start");
+    let paused = engine
+        .run_steps(&workflow("step_history"), &started.id, 2)
+        .await
+        .expect("run up to plan");
+    assert_eq!(paused.current_state.as_deref(), Some("plan"));
+    (engine, paused)
+}
+
+/// Resumes `execution_id` with an agent answering `turns`; its prompts.
+async fn resumed_with(
+    harness: &Harness,
+    execution_id: &str,
+    turns: Vec<AgentTurn>,
+) -> Vec<engine_support::AgentCall> {
+    let agent = Arc::new(ScriptedAgentExecutor::new(turns));
+    let finished = Arc::new(
+        harness
+            .engine()
+            .with_executor(ActionKind::Agent, agent.clone()),
+    )
+    .try_begin_resume(execution_id)
+    .expect("resume")
+    .run_to_completion(&workflow("step_history"))
+    .await
+    .expect("run on");
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+    agent.calls()
+}
+
+/// The comment for the chosen step, and the comment left on the pause after
+/// it, reach the first attempt of that step only, in a prompt of its own
+/// rather than the session the step reported before; a later entry into the
+/// same step gets neither. The comment on the pause is given once.
+#[tokio::test]
+async fn a_chosen_steps_comment_reaches_its_first_attempt_only() {
+    let harness = Harness::new();
+    let (engine, paused) = back_at_plan(&harness).await;
+
+    engine
+        .select_step(
+            &workflow("step_history"),
+            &paused.id,
+            &chosen("plan", Some("use the new API"), Some("mind the flaky test")),
+        )
+        .expect("choose the step");
+    let selected = engine.store().load_execution(&paused.id).unwrap();
+    let again = engine
+        .leave_resume_message(&paused.id, "c-1", "mind the flaky test")
+        .expect("the same comment again");
+    assert_eq!(again.metadata, selected.metadata, "given once");
+
+    let calls = resumed_with(
+        &harness,
+        &paused.id,
+        vec![
+            AgentTurn::label("needs_requirements_revision", "again"),
+            AgentTurn::label("drafted", "drafted"),
+            AgentTurn::label("plan_ready", "planned"),
+        ],
+    )
+    .await;
+
+    assert_eq!(calls.len(), 3);
+    let first = &calls[0].prompt;
+    let note = first.find("use the new API").expect("the note");
+    let comment = first.find("mind the flaky test").expect("the comment");
+    assert!(note < comment, "{first}");
+    assert!(calls[0].resume_session.is_none(), "{:?}", calls[0]);
+    for later in &calls[1..] {
+        assert!(
+            !later.prompt.contains("use the new API")
+                && !later.prompt.contains("mind the flaky test"),
+            "{}",
+            later.prompt
+        );
+    }
+}
+
+/// A comment kept for the chosen step is dropped when the owner moves the
+/// execution to another step before any attempt: no step gets it.
+#[tokio::test]
+async fn a_chosen_steps_comment_does_not_follow_the_execution_elsewhere() {
+    let harness = Harness::new();
+    let (engine, paused) = back_at_plan(&harness).await;
+    let definition = workflow("step_history");
+    engine
+        .select_step(
+            &definition,
+            &paused.id,
+            &chosen("plan", Some("use the new API"), None),
+        )
+        .expect("choose plan");
+    engine
+        .select_step(&definition, &paused.id, &chosen("brainstorm", None, None))
+        .expect("choose brainstorm");
+
+    let calls = resumed_with(
+        &harness,
+        &paused.id,
+        vec![
+            AgentTurn::label("drafted", "drafted"),
+            AgentTurn::label("plan_ready", "planned"),
+        ],
+    )
+    .await;
+
+    assert_eq!(calls.len(), 2);
+    assert!(calls
+        .iter()
+        .all(|call| !call.prompt.contains("use the new API")));
+}
+
+/// A comment for a step that runs no agent is refused before anything is
+/// written; the same step without a comment can be chosen.
+#[tokio::test]
+async fn a_comment_for_a_step_that_runs_no_agent_is_refused() {
+    let harness = Harness::new();
+    let definition = workflow("script_gate");
+    let started = harness
+        .engine()
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    let engine = harness.engine();
+    let events_before = harness.events(&started.id).len();
+
+    let error = engine
+        .select_step(
+            &definition,
+            &started.id,
+            &chosen("finalize", Some("x"), None),
+        )
+        .expect_err("no agent takes the comment");
+
+    assert!(
+        matches!(error, EngineError::InvalidTransition { .. }),
+        "{error:?}"
+    );
+    let stored = harness.store().load_execution(&started.id).unwrap();
+    assert_eq!(stored.current_state, started.current_state);
+    assert_eq!(stored.status, started.status);
+    assert_eq!(stored.metadata, started.metadata);
+    assert_eq!(harness.events(&started.id).len(), events_before);
+    engine
+        .select_step(
+            &definition,
+            &started.id,
+            &chosen("finalize", Some("  "), None),
+        )
+        .expect("a blank comment is no comment");
+}
+
 fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -1559,7 +1744,11 @@ async fn a_failed_step_is_continued_in_the_session_it_failed_in() {
             .expect("read the record")
             .expect("the failure is recorded");
         assert_eq!(failure.harness.as_deref(), Some("claude-code"), "{case}");
-        assert_eq!(failure.harness_session_id.as_deref(), Some(session), "{case}");
+        assert_eq!(
+            failure.harness_session_id.as_deref(),
+            Some(session),
+            "{case}"
+        );
         let events = harness.events(&failed.id);
         let resumable = resumable_agent_session(&harness.store(), &failed, &events)
             .unwrap_or_else(|| panic!("{case}: a session to continue"));
@@ -1567,7 +1756,10 @@ async fn a_failed_step_is_continued_in_the_session_it_failed_in() {
 
         // The timeline file is lost: the failure record still names the
         // session, and the earlier one of the state stays out of it.
-        let timeline = harness.store().execution_dir(&failed.id).join("timeline.json");
+        let timeline = harness
+            .store()
+            .execution_dir(&failed.id)
+            .join("timeline.json");
         std::fs::remove_file(timeline).expect("drop the timeline file");
         let resumable = resumable_agent_session(&harness.store(), &failed, &events)
             .unwrap_or_else(|| panic!("{case}: the failure's session without the file"));
@@ -1673,7 +1865,12 @@ async fn the_session_to_continue_follows_the_steps_latest_attempt() {
             .expect("append");
         } else {
             let reconciliation = reconcile(&harness.store(), &execution.id).expect("reconcile");
-            assert_eq!(reconciliation.status, ExecutionStatus::Unknown, "{}", case.name);
+            assert_eq!(
+                reconciliation.status,
+                ExecutionStatus::Unknown,
+                "{}",
+                case.name
+            );
         }
 
         let execution = harness.store().load_execution(&execution.id).expect("load");

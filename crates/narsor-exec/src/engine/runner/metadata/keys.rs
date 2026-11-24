@@ -20,6 +20,10 @@ pub const METADATA_OUTPUT_RESCUE_KEY: &str = "output_rescue";
 /// A one-shot operator note to attach to the next recovered agent attempt.
 pub(crate) const METADATA_OPERATOR_RECOVERY_NOTE_KEY: &str = "operator_recovery_note";
 
+/// A one-shot note for the first agent attempt of the step the owner chose,
+/// bound to that step: `{ "state": <state id>, "text": <note> }`.
+pub(crate) const METADATA_SELECTED_STEP_NOTE_KEY: &str = "selected_step_note";
+
 pub(crate) const METADATA_AGENT_INPUT_KEY: &str = "agent_input";
 
 /// Set once the execution recorded that its step profile file could not be

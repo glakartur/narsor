@@ -2083,7 +2083,8 @@ async fn a_chosen_step_reopens_a_finished_workflow_and_carries_the_note() {
 }
 
 /// The owner chooses a step only for a runner that has no pass: one that
-/// is running a step must be stopped first.
+/// is running a step must be stopped first. A choice that arrives late —
+/// the runner went on before it could read it — says which step runs.
 #[tokio::test]
 async fn a_step_cannot_be_chosen_while_a_pass_is_active() {
     let root = TempRoot::new();
@@ -2100,7 +2101,11 @@ async fn a_step_cannot_be_chosen_while_a_pass_is_active() {
         )
         .await;
 
-    assert!(busy.contains("a step is running"), "{busy}");
+    assert!(
+        busy.contains("step 'think' is already running")
+            && busy.contains("stop the task and choose the step again"),
+        "{busy}"
+    );
     assert!(fixture.session.pass_active(), "the pass was left alone");
     assert_eq!(fixture.agent.calls().len(), 1, "nothing was started");
 }
@@ -3282,6 +3287,202 @@ async fn a_comment_on_an_unknown_execution_goes_with_its_recovery() {
         calls[0].prompt
     );
     assert_eq!(fixture.session.untaken_resume_message().unwrap(), None);
+}
+
+fn select_step(target: &str, note: Option<&str>) -> OperatorCommand {
+    OperatorCommand::SelectStep {
+        target: target.to_string(),
+        note: note.map(str::to_string),
+    }
+}
+
+/// `command`, queued by the owner for the next launch, as the first answer
+/// of the control plane carries it.
+fn queued(id: &str, command: OperatorCommand) -> DeliveredOperatorCommand {
+    DeliveredOperatorCommand {
+        command_id: id.to_string(),
+        requested_by: OWNER.to_string(),
+        command,
+    }
+}
+
+fn launch_without_comment() -> RunnerLaunchView {
+    RunnerLaunchView {
+        resume_message: None,
+        ..launch_with_comment("pod-2")
+    }
+}
+
+/// A runner on `TWO_STEPS` stopped by the owner in the middle of its second
+/// step, which left the execution `Unknown`; the storage it leaves.
+async fn stopped_mid_step(root: &TempRoot) -> PathBuf {
+    let storage = paused_between_steps(root).await;
+    let store = TaskStorage::new(&storage).store();
+    let execution_id = store.list_execution_ids().unwrap().remove(0);
+    let mut execution = store.load_execution(&execution_id).unwrap();
+    execution.status = ExecutionStatus::Unknown;
+    store.save_execution(&execution).unwrap();
+    storage
+}
+
+/// A runner on `TWO_STEPS` that finished the workflow and closed its
+/// session; the storage it leaves.
+async fn finished(root: &TempRoot) -> PathBuf {
+    let storage = root.dir("storage");
+    let mut fixture = Fixture::new(
+        root,
+        &storage,
+        "pod-1",
+        &spec(TWO_STEPS, "claude-code"),
+        Agent::new(vec![], Reply::Label("done")),
+        Conductor::silent(),
+        &harness_path(root, &[]),
+    );
+    fixture.begin().await;
+    fixture.settled().await;
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+    fixture.session.close_session("finished").unwrap();
+    storage
+}
+
+/// The owner stopped the task between its steps and chose the first step
+/// with a comment: that step runs first, once, with the comment ahead of
+/// the one left on the pause, and the step the task stopped before does not
+/// run before it. The next poll delivers the choice again; it is answered
+/// from the verdict and moves nothing.
+#[tokio::test]
+async fn a_step_chosen_after_a_stop_runs_first_with_the_owners_comment() {
+    let root = TempRoot::new();
+    let storage = paused_between_steps(&root).await;
+    let mut fixture = resumed(&root, &storage, Some(launch_with_comment("pod-2")));
+    let choice = select_step("one", Some("Use the new API."));
+    fixture.session.startup_commands = vec![queued("select-1", choice.clone())];
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+
+    let calls = fixture.agent.calls();
+    assert_eq!(calls.len(), 2, "the chosen step, then the one after it");
+    let first = &calls[0].prompt;
+    assert!(
+        first.contains("First.") && !first.contains("Second."),
+        "{first}"
+    );
+    let note = first.find("Use the new API.").expect("the note");
+    let comment = first.find("Mind the flaky test.").expect("the comment");
+    assert!(note < comment, "the note comes first: {first}");
+    assert!(
+        !calls[1].prompt.contains("Use the new API.")
+            && !calls[1].prompt.contains("Mind the flaky test."),
+        "{}",
+        calls[1].prompt
+    );
+    assert_eq!(fixture.session.untaken_resume_message().unwrap(), None);
+
+    fixture.applied("select-1", choice).await;
+    assert_eq!(fixture.agent.calls().len(), 2);
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+}
+
+/// A task stopped in the middle of a step (`Unknown`), after a clean stop or
+/// an unexpected loss, runs the step the owner chose with the comment.
+#[tokio::test]
+async fn a_step_chosen_after_a_stop_mid_step_gets_the_owners_comment() {
+    for lost in [false, true] {
+        let root = TempRoot::new();
+        let storage = if lost {
+            lost_unknown_between_steps(&root).await
+        } else {
+            stopped_mid_step(&root).await
+        };
+        let mut fixture = resumed(&root, &storage, Some(launch_with_comment("pod-2")));
+        fixture.session.startup_commands = vec![queued(
+            "select-1",
+            select_step("one", Some("Use the new API.")),
+        )];
+
+        assert_eq!(fixture.begin().await, None);
+        fixture.settled().await;
+
+        let calls = fixture.agent.calls();
+        assert!(!calls.is_empty(), "lost: {lost}");
+        assert!(
+            calls[0].prompt.contains("First.") && calls[0].prompt.contains("Use the new API."),
+            "lost: {lost}: {}",
+            calls[0].prompt
+        );
+    }
+}
+
+/// A finished workflow opens again at the step the owner chose, whose
+/// prompt carries the comment.
+#[tokio::test]
+async fn a_step_chosen_after_the_workflow_finished_gets_the_owners_comment() {
+    let root = TempRoot::new();
+    let storage = finished(&root).await;
+    let mut fixture = resumed(&root, &storage, Some(launch_without_comment()));
+    fixture.session.startup_commands = vec![queued(
+        "select-1",
+        select_step("two", Some("Use the new API.")),
+    )];
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+
+    let calls = fixture.agent.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].prompt.contains("Second.") && calls[0].prompt.contains("Use the new API."),
+        "{}",
+        calls[0].prompt
+    );
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+}
+
+/// A transition queued for the launch is taken before any step runs: the
+/// step the task stopped before never starts.
+#[tokio::test]
+async fn a_transition_queued_for_the_launch_is_taken_before_any_step_runs() {
+    let root = TempRoot::new();
+    let storage = paused_between_steps(&root).await;
+    let mut fixture = resumed(&root, &storage, Some(launch_without_comment()));
+    fixture.session.startup_commands = vec![queued(
+        "transition-1",
+        OperatorCommand::Transition {
+            target: "completed".to_string(),
+            forced: false,
+            reason: None,
+        },
+    )];
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+
+    assert!(fixture.agent.calls().is_empty());
+    assert_eq!(fixture.status(), ExecutionStatus::Completed);
+}
+
+/// A step choice the runner refuses at the launch starts no step: the
+/// execution stays where it stopped, and the refusal is recorded for the
+/// owner.
+#[tokio::test]
+async fn a_step_choice_refused_at_the_launch_starts_no_step() {
+    let root = TempRoot::new();
+    let storage = paused_between_steps(&root).await;
+    let mut fixture = resumed(&root, &storage, Some(launch_without_comment()));
+    let choice = select_step("no-such-step", Some("Use the new API."));
+    fixture.session.startup_commands = vec![queued("select-1", choice.clone())];
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+
+    assert!(fixture.agent.calls().is_empty());
+    assert!(!fixture.session.pass_active());
+    let execution = fixture.execution();
+    assert_eq!(execution.status, ExecutionStatus::Paused);
+    assert_eq!(execution.current_state.as_deref(), Some("two"));
+    let reason = fixture.rejected("select-1", choice).await;
+    assert!(reason.contains("no state"), "{reason}");
 }
 
 /// A runner lost while the step after its pause ran, without closing its

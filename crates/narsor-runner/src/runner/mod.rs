@@ -118,9 +118,9 @@ use tokio::time::Instant;
 use crate::api::ClientError;
 use crate::conductor::LiveHarness;
 use crate::controller_client::{
-    ConversationPageRequest, DeliveredInput, ExecutionDetailsRequest, ExecutionEventsRequest,
-    ExecutionStateRequest, RunnerClient, RunnerDirective, RunnerLaunchView, RunnerPollQuery,
-    RunnerPollResponse, RunnerSnapshotResponse, TaskDefaultHarness,
+    ConversationPageRequest, DeliveredInput, DeliveredOperatorCommand, ExecutionDetailsRequest,
+    ExecutionEventsRequest, ExecutionStateRequest, RunnerClient, RunnerDirective, RunnerLaunchView,
+    RunnerPollQuery, RunnerPollResponse, RunnerSnapshotResponse, TaskDefaultHarness,
 };
 use crate::domain::runner_snapshot::RunnerSnapshot;
 use crate::domain::{
@@ -567,6 +567,8 @@ fn assemble_session(
         material_failures: 0,
         material_retry_at: None,
         title_wanted: spec.title.is_none(),
+        startup_commands: Vec::new(),
+        launching: false,
     }
 }
 
@@ -1047,6 +1049,13 @@ struct Session {
     /// The operator typed no title and the conductor has not been asked for
     /// one yet in this incarnation.
     title_wanted: bool,
+    /// The operator commands the first answer of the control plane carried:
+    /// one that moves the execution to another step is carried out before
+    /// any pass starts, so the step it leaves never runs first.
+    startup_commands: Vec<DeliveredOperatorCommand>,
+    /// The commands carried out now come before the launch's first pass:
+    /// they start none of their own.
+    launching: bool,
 }
 
 /// How the work on this storage continues.
@@ -1193,9 +1202,11 @@ impl Session {
                 // without the comment, which stays in the record.
                 let _ =
                     tokio::time::timeout(self.timing.clean_launch_wait, self.await_launch()).await;
-                self.go_on()?;
+                if !self.take_startup_moves().await? {
+                    self.go_on()?;
+                }
             }
-            Continuation::Recover(decision) => self.recover(decision)?,
+            Continuation::Recover(decision) => self.recover(decision).await?,
         }
         // After the runner's own recovery, like the daemon's startup hook.
         self.conductor.restore_at_startup();
@@ -1282,10 +1293,12 @@ impl Session {
         match client.poll_with(&self.poll_query(pending, 0)).await {
             // What else the answer carries — answers, commands, reads — is
             // offered again by the next poll until settled: drive picks it
-            // up there.
+            // up there. The commands are kept, so a step move the owner
+            // queued is carried out before any pass starts.
             Ok(response) => {
                 self.take_answer_header(response.default_harness, response.launch)?;
                 self.link.expires_at = Some(response.credential_expires_at);
+                self.startup_commands = response.commands;
             }
             Err(error) => self.link.failed(&error, &self.timing),
         }
@@ -1401,6 +1414,7 @@ impl Session {
                     Ok(response) => {
                         self.link.succeeded();
                         self.link.launch = Some(response.launch.clone());
+                        self.startup_commands = response.commands;
                         continue;
                     }
                     Err(error) => self.link.failed(&error, &self.timing),
@@ -1464,10 +1478,14 @@ impl Session {
     /// Runs reconciliation the owner or the resume policy authorized and,
     /// when it finds an action that was in flight (or an execution an earlier
     /// attempt already left `Unknown`), starts that action again.
-    fn recover(&mut self, decision: Decision) -> Result<(), RunnerError> {
+    async fn recover(&mut self, decision: Decision) -> Result<(), RunnerError> {
         let execution_id = self.execution_id.clone().unwrap_or_default();
         let reconciliation = reconcile(self.engine.store(), &execution_id)?;
         tracing::info!(?decision, outcome = ?reconciliation.outcome, "recovering after an unexpected stop");
+        // A step the owner chose replaces the recovery of the one in flight.
+        if self.take_startup_moves().await? {
+            return Ok(());
+        }
         // An execution an earlier attempt already turned `Unknown` is not
         // examined again, but it is still waiting for this explicit recovery,
         // and it takes no comment on its own.
@@ -1486,6 +1504,49 @@ impl Session {
             return Ok(());
         }
         self.go_on()
+    }
+
+    /// Carries out the step moves the owner queued for this launch — a
+    /// chosen step, a transition — before any pass starts, so the step the
+    /// task stopped at does not run first. Whether there were any.
+    ///
+    /// The control plane is not told here: the next poll delivers them
+    /// again, and the verdict recorded now answers it. When one is refused,
+    /// no step starts: the owner reads why and decides again.
+    async fn take_startup_moves(&mut self) -> Result<bool, RunnerError> {
+        let moves: Vec<DeliveredOperatorCommand> = std::mem::take(&mut self.startup_commands)
+            .into_iter()
+            .filter(|delivered| {
+                matches!(
+                    delivered.command,
+                    narsor_protocol::controller::OperatorCommand::SelectStep { .. }
+                        | narsor_protocol::controller::OperatorCommand::Transition { .. }
+                )
+            })
+            .collect();
+        if moves.is_empty() {
+            return Ok(false);
+        }
+        self.launching = true;
+        let mut refused = false;
+        for delivered in moves {
+            refused |= !self.settle_command(delivered).await?.applied;
+        }
+        self.launching = false;
+        if refused {
+            tracing::warn!("a step move queued for this launch was refused; no step starts");
+            return Ok(true);
+        }
+        let execution_id = self.execution_id.clone().unwrap_or_default();
+        let status = self.engine.store().load_execution(&execution_id)?.status;
+        if matches!(status, ExecutionStatus::Running | ExecutionStatus::Paused) {
+            // Given with the chosen step's own comment already, or — for a
+            // step that runs no agent — as the comment of the work that
+            // goes on.
+            self.take_resume_message()?;
+        }
+        self.resume_pass()?;
+        Ok(true)
     }
 
     /// Goes on after a stop with nothing to reconcile. A step that failed
