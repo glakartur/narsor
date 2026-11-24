@@ -79,7 +79,7 @@ pub(crate) async fn run(
     parser: Box<dyn HarnessStreamParser>,
     observers: &RunObservers<'_>,
 ) -> Result<AgentRunEnding, ActionError> {
-    let prompt = request.prompt_with_context(prompt)?;
+    let prompt = request.prompt_with_context(prompt).await?;
     apply_extra_args(&mut command.args, &request.extra_args);
     let started = with_extra_args_overrides(started, &request.extra_args);
     let stdin = place_prompt(harness, &mut command, prompt);

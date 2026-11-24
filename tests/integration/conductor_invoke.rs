@@ -31,7 +31,7 @@ use narsor_engine::engine::actions::harness::{
     ClaudeCodeAdapter, CodexAdapter, HarnessRegistry, OpenCodeAdapter,
 };
 use narsor_engine::engine::{DefaultHarnessSource, Engine, ReadingSink, UsageReading};
-use narsor_engine::persistence::DefaultHarnessSelector;
+use narsor_engine::persistence::{ConversationSource, DefaultHarnessSelector};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -420,6 +420,59 @@ async fn an_invocation_replaces_the_context_files_of_the_one_before() {
     assert!(
         prompt.contains(&format!("`{}`", context.join("workflow.yaml").display())),
         "{prompt}"
+    );
+}
+
+/// Each attempt's conversation is copied from its record into a file of its
+/// own when the files are written; an attempt without a record has no file.
+#[tokio::test]
+async fn a_recorded_conversation_reaches_its_context_file_whole() {
+    let fixture = Fixture::new();
+    fixture.claude.answers(&claude_answer(CHOOSE_DONE));
+    let store = fixture.harness.store();
+    for attempt in ["attempt-recorded", "attempt-unrecorded"] {
+        store
+            .event_log(&fixture.execution_id)
+            .append_next(
+                &fixture.execution_id,
+                EventData::ActionStarted {
+                    action_execution_id: attempt.to_string(),
+                    state_id: "first".to_string(),
+                    action_type: "agent".to_string(),
+                    decision_by: None,
+                },
+            )
+            .unwrap();
+    }
+    let mut writer = store
+        .conversation_store(&fixture.execution_id)
+        .writer("attempt-recorded")
+        .unwrap();
+    writer.append_narsor("prompt: write the parser", &[]).unwrap();
+    let long_line = "tool output ".repeat(50_000);
+    writer
+        .append(ConversationSource::Stdout, long_line.as_bytes(), &[])
+        .unwrap();
+    writer.finish().unwrap();
+    let invoker = fixture.invoker("claude-code");
+
+    answered(
+        invoker.invoke_once(&fixture.rescue()).await,
+        ConductorPurpose::ChooseOutput,
+    );
+
+    let conversations = invoker
+        .context_dir(&fixture.execution_id)
+        .join("conversations");
+    let names: Vec<_> = fs::read_dir(&conversations)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, ["001-first-attempt-recorded.md"]);
+    let text = fs::read_to_string(conversations.join(&names[0])).unwrap();
+    assert_eq!(
+        text,
+        format!("[narsor] prompt: write the parser\n[stdout] {long_line}\n")
     );
 }
 
@@ -1250,7 +1303,8 @@ fn long_task(purpose: ConductorPurpose) -> SnapshotInput {
             state_id: if index < 2 { "review" } else { "implement" }.to_string(),
             attempt_id: format!("attempt-{index}"),
             current: index >= 2,
-            text: format!("[stdout] attempt {index}\n{}", "tool output\n".repeat(20_000)),
+            content: format!("[stdout] attempt {index}\n{}", "tool output\n".repeat(20_000))
+                .into(),
         })
         .collect();
     SnapshotInput {
@@ -1303,6 +1357,9 @@ fn a_gate_summary_keeps_conversations_and_events_out_of_the_prompt_and_uncut() {
             .iter()
             .find(|file| file.name == name)
             .unwrap_or_else(|| panic!("no {name}"))
+            .content
+            .read_to_string()
+            .unwrap()
     };
     let conversations: Vec<_> = snapshot
         .files
@@ -1314,11 +1371,11 @@ fn a_gate_summary_keeps_conversations_and_events_out_of_the_prompt_and_uncut() {
         conversations[3].name,
         "conversations/004-implement-attempt-3.md"
     );
-    assert_eq!(conversations[3].content, input.conversations[3].text);
+    assert_eq!(conversations[3].content, input.conversations[3].content);
     assert!(conversations[3].description.contains("current state"));
-    assert!(file("events.md").content.contains(&format!("event 500 {}", "x".repeat(2_000))));
-    assert!(file("workflow.yaml").content.contains("Review it."));
-    assert!(file("variables.json").content.contains(&"z".repeat(100_000)));
+    assert!(file("events.md").contains(&format!("event 500 {}", "x".repeat(2_000))));
+    assert!(file("workflow.yaml").contains("Review it."));
+    assert!(file("variables.json").contains(&"z".repeat(100_000)));
 }
 
 /// The purposes that analyse the agent's answer find it in the core.

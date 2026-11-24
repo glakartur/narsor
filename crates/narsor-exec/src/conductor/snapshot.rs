@@ -20,18 +20,24 @@
 //!
 //! [`SnapshotInput`] is plain data, gathered from disk once by
 //! [`SnapshotInput::collect`], so [`render`] is a pure function that can be
-//! tested without an execution. Context files are untrusted agent text: the
+//! tested without an execution. The two contents that grow with the task —
+//! the attempt conversations and the artifact files — are collected as
+//! sources, not read: each is copied straight into its context file when the
+//! harness writes the files, so one invocation never holds them all in
+//! memory at once. Context files are untrusted agent text: the
 //! conductor only reads them, and answers with a checked JSON object.
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::conductor::store::{Annotation, ChatEntry, ConductorStore, QueuedRequest};
 use crate::domain::{ChoiceDefinition, ConductorPurpose, Event, EventData, WorkflowExecution};
-use crate::engine::actions::harness::ContextFile;
+use crate::engine::actions::harness::{ContextContent, ContextFile, ContextSource};
 use crate::engine::actions::human::PendingHumanInput;
 use crate::engine::{METADATA_ENGINE_KEY, METADATA_STEP_LOCALS_KEY};
 use crate::persistence::{ConversationSource, ConversationStore, ExecutionStore};
@@ -46,7 +52,7 @@ pub struct AttemptConversation {
     /// Whether it ran in the execution's current state.
     pub current: bool,
     /// Its lines, oldest first, each prefixed with its source.
-    pub text: String,
+    pub content: ContextContent,
 }
 
 /// An artifact file of the workflow.
@@ -57,7 +63,7 @@ pub struct ArtifactFile {
     /// Where it is.
     pub location: String,
     /// Its content, or why it could not be read.
-    pub content: String,
+    pub content: ContextContent,
 }
 
 /// Everything a snapshot is made of.
@@ -417,7 +423,7 @@ fn context_files(input: SnapshotInput) -> Vec<ContextFile> {
                 "The agent conversation of attempt {} in the {when} state `{}`.",
                 conversation.attempt_id, conversation.state_id
             ),
-            conversation.text,
+            conversation.content,
         ));
     }
 
@@ -492,8 +498,9 @@ fn attempts(events: &[Event]) -> Vec<(&str, &str)> {
         .collect()
 }
 
-/// The conversation of every attempt that has one, oldest first, read
-/// whole.
+/// The conversation of every attempt, oldest first, as sources: a record is
+/// read only when its context file is written, and an attempt without one
+/// has no file.
 fn conversations(
     store: &ConversationStore,
     current_state: Option<&str>,
@@ -501,25 +508,43 @@ fn conversations(
 ) -> Vec<AttemptConversation> {
     attempts(events)
         .into_iter()
-        .filter_map(|(state_id, attempt_id)| {
-            let snapshot = store.read(attempt_id, 0, usize::MAX).ok().flatten()?;
-            let mut text = String::new();
-            for entry in &snapshot.entries {
-                let source = match entry.source {
-                    ConversationSource::Narsor => "narsor",
-                    ConversationSource::Stdout => "stdout",
-                    ConversationSource::Stderr => "stderr",
-                };
-                let _ = writeln!(text, "[{source}] {}", String::from_utf8_lossy(&entry.raw));
-            }
-            Some(AttemptConversation {
-                state_id: state_id.to_string(),
+        .map(|(state_id, attempt_id)| AttemptConversation {
+            state_id: state_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            current: Some(state_id) == current_state,
+            content: ContextContent::Source(Arc::new(StoredConversation {
+                store: store.clone(),
                 attempt_id: attempt_id.to_string(),
-                current: Some(state_id) == current_state,
-                text,
-            })
+            })),
         })
         .collect()
+}
+
+/// The record of one attempt's conversation, written line by line, each
+/// line prefixed with its source.
+#[derive(Debug)]
+struct StoredConversation {
+    store: ConversationStore,
+    attempt_id: String,
+}
+
+impl ContextSource for StoredConversation {
+    fn write_to(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        let snapshot = match self.store.read(&self.attempt_id, 0, usize::MAX) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return Ok(()),
+            Err(error) => return writeln!(out, "(the conversation could not be read: {error})"),
+        };
+        for entry in &snapshot.entries {
+            let source = match entry.source {
+                ConversationSource::Narsor => "narsor",
+                ConversationSource::Stdout => "stdout",
+                ConversationSource::Stderr => "stderr",
+            };
+            writeln!(out, "[{source}] {}", String::from_utf8_lossy(&entry.raw))?;
+        }
+        Ok(())
+    }
 }
 
 /// The final text of the current state's latest attempt, as the step read
@@ -540,7 +565,7 @@ fn last_agent_answer(current_state: Option<&str>, events: &[Event]) -> Option<St
     })
 }
 
-/// The workflow's artifact files, read whole.
+/// The workflow's artifact files, as sources copied when written.
 fn artifact_files(execution: &WorkflowExecution) -> Vec<ArtifactFile> {
     // Artifacts live in the primary repository, which `path` is.
     let workspace = Path::new(&execution.workspace.path);
@@ -558,17 +583,28 @@ fn artifact_files(execution: &WorkflowExecution) -> Vec<ArtifactFile> {
         if !path.is_file() {
             continue;
         }
-        let content = match fs::read(&path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(error) => format!("(unreadable: {error})"),
-        };
         files.push(ArtifactFile {
             name: name.clone(),
             location: artifact.location.clone(),
-            content,
+            content: ContextContent::Source(Arc::new(StoredArtifact { path })),
         });
     }
     files
+}
+
+/// An artifact file, copied as it is.
+#[derive(Debug)]
+struct StoredArtifact {
+    path: PathBuf,
+}
+
+impl ContextSource for StoredArtifact {
+    fn write_to(&self, out: &mut dyn io::Write) -> io::Result<()> {
+        match fs::File::open(&self.path) {
+            Ok(mut file) => io::copy(&mut file, out).map(|_| ()),
+            Err(error) => writeln!(out, "(unreadable: {error})"),
+        }
+    }
 }
 
 fn pretty(value: &Value) -> String {

@@ -48,8 +48,9 @@ pub use timeline_file::{
 
 pub use actions::{
     ActionExecutor, ActionOutcome, ActionRequest, AgentEventSink, AgentExecutor, AgentRequest,
-    AgentRunEnding, ChoiceAnswer, ClaudeCodeAdapter, CodexAdapter, ConductorAnalysis, ContextFile,
-    ContextFiles, DefaultHarnessSource, FinishedRun, HarnessAdapter, HarnessRegistry, HarnessRun,
+    AgentRunEnding, ChoiceAnswer, ClaudeCodeAdapter, CodexAdapter, ConductorAnalysis, ContextContent,
+    ContextFile,
+    ContextFiles, ContextSource, DefaultHarnessSource, FinishedRun, HarnessAdapter, HarnessRegistry, HarnessRun,
     HumanActionError, HumanExecutor, HumanInputDelivery, HumanInputRequest, InputContinuation,
     LoggingEventSink, OpenCodeAdapter, OutputProblem, OutputRequirement, PendingHumanInput,
     PermissionDecision, PermissionDecisionKind, PermissionGrantScope, ProfileExecutor,

@@ -56,7 +56,8 @@ use crate::persistence::ConversationStore;
 pub use agent::{AgentExecutor, DefaultHarnessSource};
 pub use answer::ChoiceAnswer;
 pub use harness::{
-    AgentRequest, AgentRunEnding, ClaudeCodeAdapter, CodexAdapter, ContextFile, ContextFiles,
+    AgentRequest, AgentRunEnding, ClaudeCodeAdapter, CodexAdapter, ContextContent, ContextFile,
+    ContextFiles, ContextSource,
     FinishedRun, HarnessAdapter, HarnessRegistry, HarnessRun, OpenCodeAdapter, RunObservers,
     RunStarted,
 };

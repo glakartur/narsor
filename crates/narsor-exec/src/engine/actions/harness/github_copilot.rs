@@ -179,7 +179,7 @@ impl HarnessAdapter for GitHubCopilotAdapter {
             let (mut sdk_request, started) = self.sdk_request(request)?;
             // The session approves every permission, so the agent reads the
             // context directory wherever it is.
-            sdk_request.prompt = request.prompt_with_context(sdk_request.prompt)?;
+            sdk_request.prompt = request.prompt_with_context(sdk_request.prompt).await?;
             if request.workspace_access == Some(WorkspaceAccess::ReadOnly) {
                 observers.conversation.append_outcome(
                     "github-copilot does not enforce read-only workspace access; \

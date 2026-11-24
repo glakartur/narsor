@@ -9,9 +9,11 @@
 //! made readable. No caller reads a command line back.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -136,7 +138,7 @@ pub struct ContextFile {
     /// What the file holds, in one line, for the prompt's list.
     pub description: String,
     /// The whole content, uncut.
-    pub content: String,
+    pub content: ContextContent,
 }
 
 impl ContextFile {
@@ -144,7 +146,7 @@ impl ContextFile {
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
-        content: impl Into<String>,
+        content: impl Into<ContextContent>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -153,6 +155,65 @@ impl ContextFile {
         }
     }
 }
+
+/// Where a context file's content comes from. A large content that already
+/// lives somewhere (a conversation record, an artifact) is a source: it is
+/// written straight to the file, so it is never held whole in memory next
+/// to every other file.
+#[derive(Clone)]
+pub enum ContextContent {
+    /// Text in memory.
+    Text(Arc<str>),
+    /// Content written to the file when the context is prepared.
+    Source(Arc<dyn ContextSource>),
+}
+
+/// Content a context file copies from somewhere else when it is written.
+pub trait ContextSource: Send + Sync + fmt::Debug {
+    /// Writes the whole content to `out`; nothing written means no file.
+    fn write_to(&self, out: &mut dyn io::Write) -> io::Result<()>;
+}
+
+impl ContextContent {
+    /// The whole content as text, read from the source when it is one.
+    pub fn read_to_string(&self) -> io::Result<String> {
+        match self {
+            Self::Text(text) => Ok(text.to_string()),
+            Self::Source(source) => {
+                let mut bytes = Vec::new();
+                source.write_to(&mut bytes)?;
+                Ok(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        }
+    }
+}
+
+impl<T: Into<String>> From<T> for ContextContent {
+    fn from(text: T) -> Self {
+        Self::Text(Arc::from(text.into()))
+    }
+}
+
+impl fmt::Debug for ContextContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => f.debug_tuple("Text").field(&text.len()).finish(),
+            Self::Source(source) => f.debug_tuple("Source").field(source).finish(),
+        }
+    }
+}
+
+impl PartialEq for ContextContent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Text(a), Self::Text(b)) => a == b,
+            (Self::Source(a), Self::Source(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ContextContent {}
 
 /// The context files of one run and the directory they are written to. The
 /// directory belongs to the run: whatever it held before is removed (R13).
@@ -173,48 +234,67 @@ impl ContextFiles {
     /// block that lists them for the agent; an empty string when there is
     /// no file to list. Every stock harness can read the directory (R6).
     fn prepare(&self) -> Result<String, ActionError> {
-        let files: Vec<&ContextFile> = self
-            .files
-            .iter()
-            .filter(|file| !file.content.is_empty())
-            .collect();
-        for file in &files {
+        for file in &self.files {
             check_name(&file.name)?;
         }
         remove_dir_if_present(&self.dir)
             .and_then(|()| create_private_dir(&self.dir))
             .map_err(|error| context_io_error(&self.dir, "emptied", &error))?;
-        if files.is_empty() {
-            return Ok(String::new());
-        }
 
-        let mut block = format!(
-            "{CONTEXT_FILES_HEADING}\n\nThese files hold more context for this run. They are \
-             not part of the prompt: read a file only when you need what it holds.\n\n"
-        );
-        for file in files {
+        let mut listed = String::new();
+        for file in &self.files {
+            if matches!(&file.content, ContextContent::Text(text) if text.is_empty()) {
+                continue;
+            }
             let path = self.dir.join(&file.name);
-            write_file(&path, &file.content)?;
+            let bytes = write_file(&path, &file.content)?;
+            if bytes == 0 {
+                // A source with nothing to copy has no file, like empty text.
+                fs::remove_file(&path)
+                    .map_err(|error| context_io_error(&path, "removed", &error))?;
+                continue;
+            }
             let _ = writeln!(
-                block,
-                "- `{}` ({} bytes): {}",
+                listed,
+                "- `{}` ({bytes} bytes): {}",
                 path.display(),
-                file.content.len(),
                 file.description
             );
         }
-        Ok(block)
+        if listed.is_empty() {
+            return Ok(String::new());
+        }
+        Ok(format!(
+            "{CONTEXT_FILES_HEADING}\n\nThese files hold more context for this run. They are \
+             not part of the prompt: read a file only when you need what it holds.\n\n{listed}"
+        ))
     }
 }
 
 impl AgentRequest {
     /// `prompt` as the agent receives it: the context files written, and
     /// the block listing them appended after a blank line.
-    pub(crate) fn prompt_with_context(&self, mut prompt: String) -> Result<String, ActionError> {
-        let Some(context) = &self.context else {
+    ///
+    /// The files are written on a blocking thread: a source can copy a
+    /// large record, which must not hold up the async runtime.
+    pub(crate) async fn prompt_with_context(
+        &self,
+        mut prompt: String,
+    ) -> Result<String, ActionError> {
+        let Some(context) = self.context.clone() else {
             return Ok(prompt);
         };
-        let block = context.prepare()?;
+        let dir = context.dir.clone();
+        let block = tokio::task::spawn_blocking(move || context.prepare())
+            .await
+            .map_err(|error| ActionError {
+                message: format!(
+                    "the context files at {} could not be written: {error}",
+                    dir.display()
+                ),
+                error_type: Some("context_files_failed".to_string()),
+                details: Some(serde_json::json!({ "path": dir.display().to_string() })),
+            })??;
         if !block.is_empty() {
             prompt.truncate(prompt.trim_end().len());
             prompt.push_str("\n\n");
@@ -255,7 +335,8 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-fn write_private_file(path: &Path, content: &str) -> std::io::Result<()> {
+/// Writes `content` to `path` and returns how many bytes it holds.
+fn write_private_file(path: &Path, content: &ContextContent) -> io::Result<u64> {
     use std::io::Write as _;
 
     let mut options = fs::OpenOptions::new();
@@ -265,7 +346,34 @@ fn write_private_file(path: &Path, content: &str) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)?.write_all(content.as_bytes())
+    let mut out = CountingWriter {
+        inner: io::BufWriter::new(options.open(path)?),
+        written: 0,
+    };
+    match content {
+        ContextContent::Text(text) => out.write_all(text.as_bytes())?,
+        ContextContent::Source(source) => source.write_to(&mut out)?,
+    }
+    out.flush()?;
+    Ok(out.written)
+}
+
+/// A writer that counts the bytes it passes on.
+struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: io::Write> io::Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// A context file name must stay inside its directory.
@@ -285,7 +393,7 @@ fn check_name(name: &str) -> Result<(), ActionError> {
     })
 }
 
-fn write_file(path: &Path, content: &str) -> Result<(), ActionError> {
+fn write_file(path: &Path, content: &ContextContent) -> Result<u64, ActionError> {
     if let Some(parent) = path.parent() {
         create_private_dir(parent).map_err(|error| context_io_error(parent, "created", &error))?;
     }
