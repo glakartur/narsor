@@ -85,6 +85,12 @@ use narsor_protocol::controller::UsageLimit;
 /// The `harness:` value this adapter answers to.
 pub use narsor_protocol::harness::CLAUDE_CODE;
 
+/// The longest prompt passed as a command-line argument; a longer one goes
+/// on stdin. Linux refuses any single argument over `MAX_ARG_STRLEN`
+/// (128 KiB) with E2BIG, and the conductor's snapshot alone may grow past
+/// that (NARSOR-1124-001). The margin leaves room below the limit.
+const LONGEST_PROMPT_ARGUMENT: usize = 96 * 1024;
+
 /// The binary the adapter runs unless it is built with another one.
 pub const DEFAULT_PROGRAM: &str = "claude";
 
@@ -242,12 +248,18 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             args.push(mode.to_string());
         }
 
-        args.push(request.prompt.to_string());
+        // `--print` without a prompt argument reads the prompt from stdin.
+        let stdin = if request.prompt.len() > LONGEST_PROMPT_ARGUMENT {
+            Some(request.prompt.to_string())
+        } else {
+            args.push(request.prompt.to_string());
+            None
+        };
 
         Ok(HarnessInvocation {
             program: self.program.clone(),
             args,
-            stdin: None,
+            stdin,
         })
     }
 

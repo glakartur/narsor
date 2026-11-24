@@ -97,6 +97,11 @@ impl FakeHarness {
             .collect()
     }
 
+    fn stdin(&self, nth: usize) -> String {
+        fs::read_to_string(self.dir.join(format!("stdin.{nth}")))
+            .expect("the harness recorded its stdin")
+    }
+
     fn cwd(&self, nth: usize) -> PathBuf {
         PathBuf::from(read_line(&self.dir.join(format!("cwd.{nth}"))))
     }
@@ -379,6 +384,32 @@ async fn claude_runs_read_only_in_the_workspace_without_an_action_attempt() {
         "no conversation is written: {recorded:?}"
     );
     assert!(!fixture.work_dir().exists(), "no scratch directory is made");
+}
+
+/// NARSOR-1124-001: Linux refuses a single argument over 128 KiB
+/// (`MAX_ARG_STRLEN`, E2BIG), and a long task's snapshot grows past that.
+/// The prompt then travels on stdin, and the conductor still answers.
+#[tokio::test]
+async fn a_prompt_too_long_for_one_argument_reaches_claude_on_stdin() {
+    let fixture = Fixture::new();
+    fixture.claude.answers(&claude_answer(CHOOSE_DONE));
+    let marker = "x".repeat(200 * 1024);
+    let invocation = Invocation {
+        request: fixture
+            .rescue()
+            .request
+            .with_payload(json!({ "outputs": marker })),
+        ..fixture.rescue()
+    };
+
+    let outcome = fixture.invoker("claude-code").invoke_once(&invocation).await;
+
+    answered(outcome, ConductorPurpose::ChooseOutput);
+    assert!(fixture.claude.stdin(1).contains(&marker));
+    assert!(
+        fixture.claude.args(1).iter().all(|arg| arg.len() < 128 * 1024),
+        "no argument may reach the kernel's per-argument limit"
+    );
 }
 
 /// AE6: with two repositories the conductor starts in the directory holding

@@ -45,11 +45,13 @@ pub(crate) enum SpawnEnding {
 /// the spawning (through [`spawn_retrying_text_busy`]), the pipe draining and
 /// the stream parsing of an agent step without being one. The elements the
 /// parser returns are discarded with the lines: there is nowhere to record
-/// them. So are the usage limits: the conductor has no reporter. The tokens
+/// them. So are the usage limits: the conductor has no reporter. A prompt
+/// too long for the command line comes as `stdin_content`. The tokens
 /// and cost a run reports are handed to `readings`, when there is a tap.
 pub(crate) async fn run_harness_process(
     program: &str,
     args: &[String],
+    stdin_content: Option<&str>,
     working_dir: &Path,
     limit: Option<Duration>,
     parser: Box<dyn HarnessStreamParser>,
@@ -62,7 +64,7 @@ pub(crate) async fn run_harness_process(
     run_harness_invocation(
         program,
         args,
-        None,
+        stdin_content,
         working_dir,
         None,
         limit,
