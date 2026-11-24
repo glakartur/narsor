@@ -3,12 +3,25 @@
 //! Narsor deliberately uses `exec`, never the interactive TUI.  The CLI owns
 //! its operator-provided authentication and profile; this adapter only fixes
 //! the non-interactive approval and sandbox boundary for an action.
+//!
+//! # Prompt and context files
+//!
+//! The prompt is the last argument up to
+//! [`cli::LONGEST_PROMPT_ARGUMENT`]; a longer one is replaced by `-`, which
+//! makes `codex exec` (and `codex exec resume <id>`) read it from stdin
+//! (recorded in `tests/fixtures/codex/`). Context files need no flag: both
+//! sandboxes let the agent read the whole disk, and `--add-dir` would make
+//! the directory writable.
 
+use futures::future::BoxFuture;
 use serde_json::Value;
 
+use super::cli::{self, CommandLine};
+use super::request::RunStarted;
 use super::{
     model_for_tier, not_classified, reject_option_like, resolve_read_only_path, string_parameter,
-    tail, HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
+    tail, AgentRequest, AgentRunEnding, HarnessAdapter, HarnessRun, HarnessStreamParser,
+    RunObservers,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
@@ -47,6 +60,66 @@ impl CodexAdapter {
     }
 }
 
+impl CodexAdapter {
+    /// The command line of `request`, without the prompt, and the model and
+    /// effort it runs with.
+    fn command_line(
+        &self,
+        request: &AgentRequest,
+    ) -> Result<(CommandLine, RunStarted), ActionError> {
+        validate_parameters(request)?;
+        let sandbox = sandbox(request)?;
+        let mut started = RunStarted::default();
+        let mut common = Vec::new();
+
+        if let Some(tier) = &request.model {
+            let model = model_for_tier(self, tier)?;
+            reject_option_like(&model, "model", CODEX)?;
+            common.extend(["--model".to_string(), model.clone()]);
+            started.model = Some(model);
+        }
+        if let Some(effort) = &request.effort {
+            reject_option_like(effort, "effort", CODEX)?;
+            // Codex names its strongest level `xhigh`.
+            let level = if effort == "max" { "xhigh" } else { effort };
+            common.extend([
+                "-c".to_string(),
+                format!("model_reasoning_effort=\"{level}\""),
+            ]);
+            started.effort = Some(level.to_string());
+        }
+        if let Some(sandbox) = sandbox {
+            common.extend(["--sandbox".to_string(), sandbox]);
+        }
+        // The sandbox makes only the working directory and these writable,
+        // so a read-only repository outside it is protected by the sandbox.
+        // A read-only repository that is the working directory (`root: "."`)
+        // is writable to the sandbox and is protected by the prompt only.
+        for dir in request.outside_working_dir(&request.writable_dirs) {
+            common.extend(["--add-dir".to_string(), dir.to_string_lossy().into_owned()]);
+        }
+        common.extend([
+            "--config".to_string(),
+            format!("approval_policy={APPROVAL_POLICY}"),
+        ]);
+
+        // These are intentionally separate grammars.  In particular `resume`
+        // is a subcommand, not a fresh-run option, and `--json` belongs to the
+        // exec invocation before that subcommand.
+        let mut args = vec!["exec".to_string()];
+        args.extend(common);
+        args.push("--json".to_string());
+        if let Some(session) = &request.resume_session {
+            reject_option_like(session, "resume_session", CODEX)?;
+            args.extend(["resume".to_string(), session.to_string()]);
+        }
+
+        let mut command = CommandLine::new(&self.program, args);
+        command.stdin_marker = Some("-");
+        Ok((command, started))
+    }
+}
+
 impl Default for CodexAdapter {
     fn default() -> Self {
         Self::new()
@@ -75,57 +148,15 @@ impl HarnessAdapter for CodexAdapter {
         &self.program
     }
 
-    fn invocation(&self, request: &HarnessRequest<'_>) -> Result<HarnessInvocation, ActionError> {
-        validate_parameters(request)?;
-        let sandbox = sandbox(request)?;
-        let prompt = message(request);
-        let mut common = Vec::new();
-
-        if let Some(tier) = &request.config.model {
-            let model = model_for_tier(self, tier)?;
-            reject_option_like(&model, "model", CODEX)?;
-            common.extend(["--model".to_string(), model]);
-        }
-        if let Some(effort) = &request.config.effort {
-            reject_option_like(effort, "effort", CODEX)?;
-            // Codex names its strongest level `xhigh`.
-            let level = if effort == "max" { "xhigh" } else { effort };
-            common.extend([
-                "-c".to_string(),
-                format!("model_reasoning_effort=\"{level}\""),
-            ]);
-        }
-        if let Some(sandbox) = sandbox {
-            common.extend(["--sandbox".to_string(), sandbox]);
-        }
-        // The sandbox makes only the working directory and these writable,
-        // so a read-only repository outside it is protected by the sandbox.
-        // A read-only repository that is the working directory (`root: "."`)
-        // is writable to the sandbox and is protected by the prompt only.
-        for dir in request.outside_workspace(request.writable_dirs) {
-            common.extend(["--add-dir".to_string(), dir.to_string_lossy().into_owned()]);
-        }
-        common.extend([
-            "--config".to_string(),
-            format!("approval_policy={APPROVAL_POLICY}"),
-        ]);
-
-        // These are intentionally separate grammars.  In particular `resume`
-        // is a subcommand, not a fresh-run option, and `--json` belongs to the
-        // exec invocation before that subcommand.
-        let mut args = vec!["exec".to_string()];
-        args.extend(common);
-        args.push("--json".to_string());
-        if let Some(session) = request.resume_session {
-            reject_option_like(session, "resume_session", CODEX)?;
-            args.extend(["resume".to_string(), session.to_string()]);
-        }
-        args.push(prompt);
-
-        Ok(HarnessInvocation {
-            program: self.program.clone(),
-            args,
-            stdin: None,
+    fn run<'a>(
+        &'a self,
+        request: &'a AgentRequest,
+        observers: RunObservers<'a>,
+    ) -> BoxFuture<'a, Result<AgentRunEnding, ActionError>> {
+        Box::pin(async move {
+            let (command, started) = self.command_line(request)?;
+            let parser = self.stream_parser(request.answer_shape);
+            cli::run(CODEX, command, started, message(request), request, parser, &observers).await
         })
     }
 
@@ -134,8 +165,8 @@ impl HarnessAdapter for CodexAdapter {
     }
 }
 
-fn validate_parameters(request: &HarnessRequest<'_>) -> Result<(), ActionError> {
-    for key in request.config.parameters.keys() {
+fn validate_parameters(request: &AgentRequest) -> Result<(), ActionError> {
+    for key in request.parameters.keys() {
         if matches!(key.as_str(), "approval_policy" | "resume_session") {
             continue;
         }
@@ -145,7 +176,7 @@ fn validate_parameters(request: &HarnessRequest<'_>) -> Result<(), ActionError> 
             details: Some(serde_json::json!({ "harness": CODEX, "parameter": key })),
         });
     }
-    if let Some(policy) = string_parameter(request.config, "approval_policy", CODEX)? {
+    if let Some(policy) = string_parameter(&request.parameters, "approval_policy", CODEX)? {
         if policy != APPROVAL_POLICY {
             return Err(ActionError {
                 message: format!(
@@ -161,8 +192,8 @@ fn validate_parameters(request: &HarnessRequest<'_>) -> Result<(), ActionError> 
     Ok(())
 }
 
-fn sandbox(request: &HarnessRequest<'_>) -> Result<Option<String>, ActionError> {
-    if request.config.parameters.contains_key("sandbox") {
+fn sandbox(request: &AgentRequest) -> Result<Option<String>, ActionError> {
+    if request.parameters.contains_key("sandbox") {
         return Err(ActionError {
             message: "parameter 'sandbox' is no longer supported for harness 'codex'; use workflow-level 'workspace_access'".to_string(),
             error_type: Some("invalid_parameter".to_string()),
@@ -180,18 +211,17 @@ fn sandbox(request: &HarnessRequest<'_>) -> Result<Option<String>, ActionError> 
 
 /// Codex's `--add-dir` grants workspace access, so it must not be used for
 /// Narsor `read_only_paths`.  Name those paths in the prompt instead.
-fn message(request: &HarnessRequest<'_>) -> String {
-    if request.config.read_only_paths.is_empty() {
+fn message(request: &AgentRequest) -> String {
+    if request.read_only_paths.is_empty() {
         return request.prompt.to_string();
     }
     let paths = request
-        .config
         .read_only_paths
         .iter()
         .map(|path| {
             format!(
                 "- {}",
-                resolve_read_only_path(request.workspace, path).display()
+                resolve_read_only_path(&request.working_dir, path).display()
             )
         })
         .collect::<Vec<_>>()

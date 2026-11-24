@@ -13,14 +13,21 @@
 //! * **claude-code, codex** enforce it themselves: the conductor runs in the
 //!   task's workspace with read-only access, which the adapters turn into
 //!   `--permission-mode plan` and `--sandbox read-only`;
-//! * **opencode** (and any harness this list does not name) has no such
-//!   mode, so the conductor runs in an empty scratch directory,
-//!   `tasks/{id}/conductor/scratch/` of the work tree, and knows the task
-//!   only from its snapshot — which then also carries the workflow's
-//!   artifact files, within its budget. On opencode, read-only means
-//!   isolation from the workspace, not a sandbox.
+//! * **opencode, github-copilot** (and any harness this list does not
+//!   name) have no such mode, so the conductor runs in the scratch
+//!   directory `tasks/{id}/conductor/scratch/` of the work tree, emptied at
+//!   every invocation, and knows the task only from its snapshot — which
+//!   then also carries the workflow's artifact files. There, read-only
+//!   means isolation from the workspace, not a sandbox.
 //!
 //! A workspace that no longer exists is treated like the second case.
+//!
+//! # Context files
+//!
+//! The prompt carries the snapshot's core; the rest of the snapshot goes,
+//! uncut, to context files in `tasks/{id}/conductor/scratch/context/`, for
+//! both kinds of access ([`crate::conductor::snapshot`]). Every invocation
+//! replaces them, and the harness makes them readable and lists them.
 //!
 //! # One try, no bookkeeping
 //!
@@ -41,7 +48,6 @@
 //! [`DEFAULT_CONDUCTOR_TIMEOUT`]. Unlike an agent step it is never
 //! unbounded: the label rescue runs inline, under the pass's claim.
 
-use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -52,23 +58,25 @@ use crate::conductor::actor::{ConductorAnswer, ConductorInvoker, Invocation, Inv
 use crate::conductor::autopilot::Autopilot;
 use crate::conductor::prompt::{answer_schema, conductor_prompt_for, ConductorRepository};
 use crate::conductor::response::ConductorResponse;
-use crate::conductor::snapshot::{render, SnapshotBudget, SnapshotInput};
+use crate::conductor::snapshot::{render, SnapshotInput};
 use crate::conductor::store::ConductorStore;
 use crate::config::{agent_args_for, AgentArgs};
-use crate::domain::{
-    ChoiceDefinition, HarnessStepConfig, WorkflowDefinition, WorkflowExecution, WorkspaceAccess,
-};
+use crate::domain::{ChoiceDefinition, WorkflowDefinition, WorkflowExecution, WorkspaceAccess};
 use crate::engine::actions::agent::{DefaultHarnessSource, BUILT_IN_HARNESS};
 use crate::engine::actions::answer::AnswerShape;
 use crate::engine::actions::harness::{
-    apply_extra_args, HarnessRegistry, HarnessRequest, CLAUDE_CODE, CODEX,
+    AgentRequest, AgentRunEnding, ContextFiles, HarnessRegistry, RunObservers, CLAUDE_CODE, CODEX,
 };
-use crate::engine::actions::session::{run_harness_process, ReadingTap, SpawnEnding};
+use crate::engine::actions::harness::request::empty_dir;
+use crate::engine::actions::session::{ConversationSink, ReadingTap};
 use crate::engine::timeline_file::{ReadingSink, UsageReading};
 use crate::persistence::{ExecutionStore, WorkPaths};
 
 /// The time limit of an invocation when no `agent_timeout` is configured.
 pub const DEFAULT_CONDUCTOR_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// The name of the context directory inside the scratch directory.
+const CONTEXT_DIR: &str = "context";
 
 /// The harnesses that enforce read-only access themselves (KTD5).
 const SANDBOXED_HARNESSES: &[&str] = &[CLAUDE_CODE, CODEX];
@@ -140,7 +148,6 @@ pub struct HarnessInvoker {
     default_harness: Arc<dyn DefaultHarnessSource>,
     pinned_definition: Option<Arc<WorkflowDefinition>>,
     timeout: Duration,
-    budget: SnapshotBudget,
     extra_args: AgentArgs,
     readings: Option<Arc<dyn ReadingSink>>,
 }
@@ -189,7 +196,6 @@ impl HarnessInvoker {
             default_harness: Arc::new(BUILT_IN_HARNESS.to_string()),
             pinned_definition: None,
             timeout: DEFAULT_CONDUCTOR_TIMEOUT,
-            budget: SnapshotBudget::default(),
             extra_args: AgentArgs::new(),
             profile: ConductorProfile::default(),
             readings: None,
@@ -253,18 +259,21 @@ impl HarnessInvoker {
         self
     }
 
-    /// Returns the invoker with another snapshot budget.
-    pub fn with_budget(mut self, budget: SnapshotBudget) -> Self {
-        self.budget = budget;
-        self
-    }
-
-    /// The scratch directory of `execution_id`'s isolated conductor.
+    /// The scratch directory of `execution_id`'s conductor: the working
+    /// directory of an isolated conductor, and the parent of every
+    /// conductor's context directory.
     pub fn scratch_dir(&self, execution_id: &str) -> PathBuf {
         self.work
             .task_dir(execution_id)
             .join("conductor")
             .join("scratch")
+    }
+
+    /// The context directory of `execution_id`'s conductor, which every
+    /// invocation empties and fills with its own context files (R13). The
+    /// conductor actor runs one invocation at a time, so two never share it.
+    pub fn context_dir(&self, execution_id: &str) -> PathBuf {
+        self.scratch_dir(execution_id).join(CONTEXT_DIR)
     }
 
     /// Runs the conductor once for `invocation`.
@@ -311,12 +320,11 @@ impl HarnessInvoker {
             &ConductorStore::new(self.store.paths(), &execution.id),
             &execution,
             self.definition(&execution),
-            &self.budget,
             access == ConductorAccess::Isolated,
         );
         input.request = Some(invocation.request.clone());
         input.chat_message = invocation.chat_message.clone();
-        let snapshot = render(&input, &self.budget);
+        let snapshot = render(input);
         let descriptions = self.repository_descriptions(&execution);
         let listed: Vec<ConductorRepository> = repositories
             .iter()
@@ -328,50 +336,38 @@ impl HarnessInvoker {
         let prompt = conductor_prompt_for(
             invocation.request.purpose,
             access,
-            &snapshot.text,
+            &snapshot.core,
             &listed,
             Autopilot::of_payload(&invocation.request.payload),
         );
 
-        let read_only_dirs: Vec<PathBuf> = repositories
-            .iter()
-            .map(|repository| PathBuf::from(&repository.path))
-            .collect();
-        let config = conductor_config(&self.profile);
-        let schema = answer_schema(invocation.request.purpose);
-        let mut command = adapter
-            .invocation(&HarnessRequest {
-                config: &config,
-                workspace_access: Some(WorkspaceAccess::ReadOnly),
-                prompt: &prompt,
-                workspace: &working_dir,
-                writable_dirs: &[],
-                read_only_dirs: &read_only_dirs,
-                resume_session: None,
-                output_schema: Some(&schema),
-            })
+        let request = AgentRequest {
+            context: Some(ContextFiles {
+                dir: self.context_dir(&execution.id),
+                files: snapshot.files,
+            }),
+            read_only_dirs: repositories
+                .iter()
+                .map(|repository| PathBuf::from(&repository.path))
+                .collect(),
+            answer_schema: Some(answer_schema(invocation.request.purpose)),
+            timeout: Some(self.timeout),
+            extra_args: agent_args_for(&self.extra_args, &harness).to_vec(),
+            ..conductor_request(&self.profile, prompt, working_dir)
+        };
+        let conversation = self
+            .reading_tap(invocation, &harness)
+            .map_or_else(ConversationSink::none, |tap| {
+                ConversationSink::none().with_readings(tap)
+            });
+        let ending = adapter
+            .run(&request, RunObservers::conversation(&conversation))
+            .await
             .map_err(|error| error.message)?;
-        apply_extra_args(
-            &mut command,
-            &prompt,
-            agent_args_for(&self.extra_args, &harness),
-        );
-
-        let ending = run_harness_process(
-            &command.program,
-            &command.args,
-            command.stdin.as_deref(),
-            &working_dir,
-            Some(self.timeout),
-            adapter.stream_parser(AnswerShape::Choice),
-            self.reading_tap(invocation, &harness),
-        )
-        .await
-        .map_err(|error| error.message)?;
 
         let finished = match ending {
-            SpawnEnding::Finished(finished) => finished,
-            SpawnEnding::TimedOut => {
+            AgentRunEnding::Finished(finished) => finished,
+            AgentRunEnding::TimedOut => {
                 return Err(format!(
                     "the conductor's harness '{harness}' was still running after {}s and was \
                      killed",
@@ -453,19 +449,9 @@ impl HarnessInvoker {
     /// conductor starts from nothing every time.
     fn empty_scratch_dir(&self, execution_id: &str) -> Result<PathBuf, String> {
         let dir = self.scratch_dir(execution_id);
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "the conductor's scratch directory {} could not be emptied: {error}",
-                    dir.display()
-                ))
-            }
-        }
-        fs::create_dir_all(&dir).map_err(|error| {
+        empty_dir(&dir).map_err(|error| {
             format!(
-                "the conductor's scratch directory {} could not be created: {error}",
+                "the conductor's scratch directory {} could not be emptied: {error}",
                 dir.display()
             )
         })?;
@@ -500,15 +486,19 @@ fn pinned_source(
     (source, outputs)
 }
 
-/// The harness session the adapters build the conductor's command line from:
-/// the configured model tier and effort (none means the harness's default),
-/// no parameters, read-only.
-fn conductor_config(profile: &ConductorProfile) -> HarnessStepConfig {
-    HarnessStepConfig {
+/// The run of the conductor in `working_dir`: the configured model tier and
+/// effort (none means the harness's default), read-only, answering a choice.
+fn conductor_request(
+    profile: &ConductorProfile,
+    prompt: String,
+    working_dir: PathBuf,
+) -> AgentRequest {
+    AgentRequest {
         model: profile.model.clone(),
         effort: profile.effort.clone(),
         workspace_access: Some(WorkspaceAccess::ReadOnly),
-        ..HarnessStepConfig::default()
+        answer_shape: AnswerShape::Choice,
+        ..AgentRequest::new(prompt, working_dir)
     }
 }
 
@@ -517,19 +507,17 @@ mod conductor_profile_tests {
     use super::*;
 
     #[test]
-    fn the_conductor_runs_on_the_configured_tier_and_effort() {
+    fn the_conductor_runs_read_only_on_the_configured_tier_and_effort() {
         let profile = ConductorProfile {
             model: Some("small".into()),
             effort: Some("low".into()),
         };
-        let config = conductor_config(&profile);
-        assert_eq!(config.model.as_deref(), Some("small"));
-        assert_eq!(config.effort.as_deref(), Some("low"));
-    }
+        let request = conductor_request(&profile, "p".into(), PathBuf::from("/w"));
+        assert_eq!(request.model.as_deref(), Some("small"));
+        assert_eq!(request.effort.as_deref(), Some("low"));
+        assert_eq!(request.workspace_access, Some(WorkspaceAccess::ReadOnly));
 
-    #[test]
-    fn an_empty_profile_leaves_the_choice_to_the_harness() {
-        let config = conductor_config(&ConductorProfile::default());
-        assert!(config.model.is_none() && config.effort.is_none());
+        let request = conductor_request(&ConductorProfile::default(), "p".into(), "/w".into());
+        assert!(request.model.is_none() && request.effort.is_none());
     }
 }

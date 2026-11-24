@@ -68,7 +68,18 @@ undone, and never on a cancelled execution.
 
 **Read-only, per harness.** On `claude-code` and `codex` the conductor runs in
 the task's workspace in the harness's own read-only mode (`plan`,
-`--sandbox read-only`). `opencode` has no such mode, so there the conductor
-runs in an empty scratch directory and knows the task only from the snapshot
-it is given: on opencode, read-only means **isolation from the workspace
-directory, not a sandbox**.
+`--sandbox read-only`). `opencode` and `github-copilot` have no such mode, so
+there the conductor runs in a scratch directory and knows the task only from
+the snapshot it is given: on these harnesses, read-only means **isolation from
+the workspace directory, not a sandbox**.
+
+**What the conductor is shown.** Its prompt holds the core of the task: the
+status, the current state with its definition and outputs, why it is asked,
+your message, the pending input and its annotation, the step's local values
+and, when it judges the agent's work, the agent's last answer. Everything
+else — the whole workflow, the variables, every event, the conversation of
+every agent attempt, the chat and, when isolated, the workflow's artifacts —
+is written uncut to context files in
+`tasks/<id>/conductor/scratch/context/` of the work tree, which the conductor
+reads only when the core does not settle its decision. Every invocation
+replaces these files.

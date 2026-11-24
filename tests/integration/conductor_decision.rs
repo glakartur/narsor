@@ -17,7 +17,7 @@ use engine_support::{workflow_file, AgentTurn, Harness, ScriptedAgentExecutor};
 use narsor_engine::conductor::assembly::assemble;
 use narsor_engine::conductor::{
     ConductorAnswer, ConductorInvoker, ConductorRegistry, ConductorStore, Invocation,
-    InvocationOutcome, SnapshotBudget, SnapshotInput,
+    InvocationOutcome, SnapshotInput,
 };
 use narsor_engine::domain::{
     ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Confidence, EventData,
@@ -456,7 +456,6 @@ async fn the_snapshot_carries_the_local_values_of_the_current_step() {
         &ConductorStore::new(store.paths(), &execution.id),
         &execution,
         Err("not needed".to_string()),
-        &SnapshotBudget::default(),
         false,
     );
 

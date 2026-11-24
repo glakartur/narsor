@@ -1,18 +1,26 @@
-//! Harness adapters: one implementation per AI coding CLI (D17).
+//! Harness adapters: one implementation per AI coding CLI or SDK (D17).
 //!
-//! A [`HarnessStepConfig`] says *what* session the step runs in; a
-//! [`HarnessAdapter`] says *how* a particular command-line harness is asked to
-//! do it. Two things are harness-specific and nothing else is:
+//! Every caller — the agent step, the profile step, the conductor — asks for
+//! a run the same way: one [`AgentRequest`], one [`HarnessAdapter::run`],
+//! one [`AgentRunEnding`], with the live output on [`RunObservers`]. What is
+//! harness-specific stays behind `run` and nowhere else:
 //!
-//! * the **argv** — which flags carry the model, the extra directories, the
-//!   permission mode, the session to resume, and where the prompt goes;
+//! * the **translation** — which flags (or SDK fields) carry the model, the
+//!   effort, the extra directories, the permission mode, the session to
+//!   resume;
+//! * the **prompt transport** — on the command line, on stdin, or through an
+//!   SDK call, so a prompt of any size reaches the agent (R5);
+//! * the **context files** — written to the request's context directory and
+//!   made readable (`--add-dir` for `claude`), or inlined into the prompt for
+//!   a harness that cannot reach them (R6);
 //! * the **output** — what the harness prints, where inside it the agent's
 //!   final text and the session id are, and which harness-independent
 //!   [`ChatElement`]s each printed line stands for.
 //!
-//! Everything above that — the output-label contract, the session bookkeeping,
-//! the process handling, the timeout — lives once in
-//! [`super::agent`] and never has to be written again for a third harness.
+//! The CLI harnesses (`claude-code`, `codex`, `opencode`) share the process
+//! mechanics in [`cli`]; `github-copilot` runs its SDK in-process
+//! ([`copilot_sdk`]). Everything above a run — the output-label contract, the
+//! session bookkeeping, the conversation file — lives once in the callers.
 //!
 //! # Why the program name is part of the adapter
 //!
@@ -24,153 +32,34 @@
 //! suite never spends money and never needs credentials.
 
 pub mod claude_code;
+pub(crate) mod cli;
 pub mod codex;
 pub(crate) mod copilot_sdk;
 pub mod github_copilot;
 pub mod opencode;
+pub mod request;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use futures::future::BoxFuture;
 
 use narsor_protocol::chat::{ChatElement, SubagentRef, UnclassifiedReason};
 use narsor_protocol::controller::UsageLimit;
 use serde_json::Value;
 
 use super::answer::AnswerShape;
-use crate::domain::{ActionError, HarnessStepConfig, WorkspaceAccess};
+use crate::domain::ActionError;
 
 pub use claude_code::{ClaudeCodeAdapter, CLAUDE_CODE};
 pub use codex::{CodexAdapter, CODEX};
 pub use github_copilot::{GitHubCopilotAdapter, GITHUB_COPILOT};
 pub use opencode::{OpenCodeAdapter, OPENCODE};
-
-/// Everything an adapter needs to build one invocation.
-#[derive(Debug, Clone, Copy)]
-pub struct HarnessRequest<'a> {
-    /// The action configuration, templates already expanded.
-    pub config: &'a HarnessStepConfig,
-
-    /// Workflow-level workspace access, already parsed independently of the
-    /// selected harness.
-    pub workspace_access: Option<WorkspaceAccess>,
-
-    /// The prompt as the harness will receive it: the state's prompt with the
-    /// output-label contract appended.
-    pub prompt: &'a str,
-
-    /// The directory the harness runs in — the execution's workspace.
-    pub workspace: &'a Path,
-
-    /// Repositories the step may change, by absolute path. Includes the
-    /// directory in `workspace` when it is one of them.
-    pub writable_dirs: &'a [PathBuf],
-
-    /// Repositories the step may only read, by absolute path. Adapters that
-    /// cannot enforce it rely on the prompt block (R14).
-    pub read_only_dirs: &'a [PathBuf],
-
-    /// A harness session to continue instead of starting a fresh one (D18).
-    pub resume_session: Option<&'a str>,
-
-    /// The JSON Schema of the answer, for a harness that can enforce one.
-    ///
-    /// An addition to the text contract in `prompt`, never a replacement:
-    /// `claude-code` passes it as `--json-schema`, and every other adapter
-    /// ignores it. The conductor sets it; the agent step does not.
-    pub output_schema: Option<&'a Value>,
-}
-
-impl HarnessRequest<'_> {
-    /// Directories to hand the harness besides its working directory:
-    /// those of `dirs` that lie outside it.
-    pub(crate) fn outside_workspace<'d>(&self, dirs: &'d [PathBuf]) -> Vec<&'d Path> {
-        dirs.iter()
-            .map(PathBuf::as_path)
-            .filter(|dir| !dir.starts_with(self.workspace))
-            .collect()
-    }
-}
-
-/// The command line an adapter decided on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HarnessInvocation {
-    /// The binary to run; looked up on `PATH` unless it is a path.
-    pub program: String,
-
-    /// Its arguments, each one separately — never a shell string.
-    pub args: Vec<String>,
-
-    /// Optional content to write to stdin; avoids argument length limits.
-    pub stdin: Option<String>,
-}
-
-/// Puts the operator's extra arguments into an invocation, ahead of the
-/// prompt. An extra flag replaces the same flag (and the values it takes)
-/// that the adapter chose, so the operator's word wins on a conflict.
-///
-/// A flag is a token starting with `-`; the tokens after it, up to the next
-/// flag, are its values. Avoid flags that take a variable number of values:
-/// they would swallow the prompt.
-pub fn apply_extra_args(invocation: &mut HarnessInvocation, prompt: &str, extra: &[String]) {
-    if extra.is_empty() {
-        return;
-    }
-    let mut groups: Vec<(&str, usize)> = Vec::new();
-    for token in extra {
-        if token.starts_with('-') {
-            let (name, values) = match token.split_once('=') {
-                Some((name, _)) => (name, 1),
-                None => (token.as_str(), 0),
-            };
-            groups.push((name, values));
-        } else if let Some(last) = groups.last_mut() {
-            if !last.0.is_empty() && !extra_group_has_inline_value(extra, last.0) {
-                last.1 += 1;
-            }
-        }
-    }
-
-    let prompt_at = invocation.args.iter().rposition(|arg| arg == prompt);
-    let mut kept: Vec<String> = Vec::with_capacity(invocation.args.len() + extra.len());
-    let mut skip = 0usize;
-    for (index, arg) in invocation.args.drain(..).enumerate() {
-        if Some(index) == prompt_at {
-            skip = 0;
-            kept.push(arg);
-            continue;
-        }
-        if skip > 0 && !arg.starts_with('-') {
-            skip -= 1;
-            continue;
-        }
-        skip = 0;
-        if arg.starts_with('-') {
-            let (name, inline) = match arg.split_once('=') {
-                Some((name, _)) => (name, true),
-                None => (arg.as_str(), false),
-            };
-            if let Some((_, values)) = groups.iter().find(|(flag, _)| *flag == name) {
-                skip = if inline { 0 } else { *values };
-                continue;
-            }
-        }
-        kept.push(arg);
-    }
-
-    let at = kept
-        .iter()
-        .rposition(|arg| arg == prompt)
-        .unwrap_or(kept.len());
-    kept.splice(at..at, extra.iter().cloned());
-    invocation.args = kept;
-}
-
-/// Whether `flag` was written as `flag=value` in `extra`.
-fn extra_group_has_inline_value(extra: &[String], flag: &str) -> bool {
-    extra
-        .iter()
-        .any(|token| token.split_once('=').is_some_and(|(name, _)| name == flag))
-}
+pub use request::{
+    AgentRequest, AgentRunEnding, ContextFile, ContextFiles, FinishedRun, RunObservers, RunStarted,
+    FINAL_ANSWER_GRACE,
+};
 
 /// What an adapter read out of a finished harness run.
 #[derive(Debug, Clone, Default)]
@@ -189,7 +78,7 @@ pub struct HarnessRun {
     pub failure: Option<String>,
 
     /// The final answer as the harness validated it against
-    /// [`HarnessRequest::output_schema`], or the object that closes the text of
+    /// [`AgentRequest::answer_schema`], or the object that closes the text of
     /// an agent's final message. A later line without an answer never
     /// replaces it. The caller still checks it, and falls back to `text` when
     /// it is absent or unusable.
@@ -304,18 +193,30 @@ pub(crate) fn not_classified() -> Vec<ChatElement> {
     }]
 }
 
-/// Runs a [`HarnessStepConfig`] session on one particular harness CLI.
+/// Runs an [`AgentRequest`] on one particular harness (R2).
 ///
 /// Implementors are stateless value types and are shared behind an [`Arc`].
 pub trait HarnessAdapter: Send + Sync + std::fmt::Debug {
     /// The name used in `harness:` in the YAML — e.g. `claude-code`.
     fn name(&self) -> &str;
 
-    /// The binary this adapter runs.
+    /// The binary this harness needs on the machine: the CLI it runs, or
+    /// the CLI its SDK starts.
     fn program(&self) -> &str;
 
-    /// Builds the command line for one run.
-    fn invocation(&self, request: &HarnessRequest<'_>) -> Result<HarnessInvocation, ActionError>;
+    /// Runs `request` to its end: translates it, starts the harness, hands
+    /// the prompt over however the harness takes one, makes the context
+    /// files readable, and parses the output as it streams, reporting to
+    /// `observers` on the way.
+    ///
+    /// An error before [`RunObservers::notify_started`] was called means
+    /// the harness never started (a bad parameter, unwritable context
+    /// files); an error after it, that the run broke off.
+    fn run<'a>(
+        &'a self,
+        request: &'a AgentRequest,
+        observers: RunObservers<'a>,
+    ) -> BoxFuture<'a, Result<AgentRunEnding, ActionError>>;
 
     /// The model names of the four model tiers (`small`, `medium`, `large`,
     /// `max`), as this harness takes them. A workflow and the conductor name
@@ -452,11 +353,11 @@ impl Default for HarnessRegistry {
 /// A parameter of the wrong JSON type is an error rather than a silent default:
 /// `max_turns: true` is a mistake the author wants to be told about.
 pub(crate) fn string_parameter<'a>(
-    config: &'a HarnessStepConfig,
+    parameters: &'a HashMap<String, Value>,
     key: &str,
     harness: &str,
 ) -> Result<Option<&'a str>, ActionError> {
-    match config.parameters.get(key) {
+    match parameters.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.as_str())),
         Some(other) => Err(parameter_type_error(key, harness, "a string", other)),
@@ -465,11 +366,11 @@ pub(crate) fn string_parameter<'a>(
 
 /// Reads a boolean `parameters` entry.
 pub(crate) fn bool_parameter(
-    config: &HarnessStepConfig,
+    parameters: &HashMap<String, Value>,
     key: &str,
     harness: &str,
 ) -> Result<Option<bool>, ActionError> {
-    match config.parameters.get(key) {
+    match parameters.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(other) => Err(parameter_type_error(key, harness, "a boolean", other)),
@@ -478,11 +379,11 @@ pub(crate) fn bool_parameter(
 
 /// Reads an integer `parameters` entry.
 pub(crate) fn integer_parameter(
-    config: &HarnessStepConfig,
+    parameters: &HashMap<String, Value>,
     key: &str,
     harness: &str,
 ) -> Result<Option<i64>, ActionError> {
-    match config.parameters.get(key) {
+    match parameters.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(number)) if number.is_i64() => Ok(number.as_i64()),
         Some(other) => Err(parameter_type_error(key, harness, "an integer", other)),
@@ -584,50 +485,6 @@ pub(crate) fn tail(text: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
-mod extra_args_tests {
-    use super::*;
-
-    fn invocation(args: &[&str]) -> HarnessInvocation {
-        HarnessInvocation {
-            program: "claude".into(),
-            args: args.iter().map(ToString::to_string).collect(),
-            stdin: None,
-        }
-    }
-
-    fn extra(args: &[&str]) -> Vec<String> {
-        args.iter().map(ToString::to_string).collect()
-    }
-
-    #[test]
-    fn an_extra_flag_replaces_the_same_flag_and_its_value() {
-        let mut run = invocation(&["--print", "--effort", "low", "--model", "m", "prompt"]);
-        apply_extra_args(&mut run, "prompt", &extra(&["--effort", "high"]));
-        assert_eq!(
-            run.args,
-            ["--print", "--model", "m", "--effort", "high", "prompt"]
-        );
-    }
-
-    #[test]
-    fn a_new_flag_goes_before_the_prompt() {
-        let mut run = invocation(&["--print", "-p"]);
-        apply_extra_args(&mut run, "-p", &extra(&["--dangerously-skip-permissions"]));
-        assert_eq!(
-            run.args,
-            ["--print", "--dangerously-skip-permissions", "-p"]
-        );
-    }
-
-    #[test]
-    fn the_inline_form_replaces_too_and_no_prompt_means_append() {
-        let mut run = invocation(&["--effort", "low"]);
-        apply_extra_args(&mut run, "x", &extra(&["--effort=high"]));
-        assert_eq!(run.args, ["--effort=high"]);
-    }
-}
-
-#[cfg(test)]
 mod model_tier_tests {
     use super::*;
 
@@ -648,7 +505,11 @@ mod model_tier_tests {
         fn program(&self) -> &str {
             "partial"
         }
-        fn invocation(&self, _: &HarnessRequest<'_>) -> Result<HarnessInvocation, ActionError> {
+        fn run<'a>(
+            &'a self,
+            _: &'a AgentRequest,
+            _: RunObservers<'a>,
+        ) -> BoxFuture<'a, Result<AgentRunEnding, ActionError>> {
             unreachable!("not run")
         }
         fn model_tiers(&self) -> &'static [(&'static str, &'static str)] {

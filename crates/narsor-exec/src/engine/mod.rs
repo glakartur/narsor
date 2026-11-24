@@ -47,12 +47,12 @@ pub use timeline_file::{
 };
 
 pub use actions::{
-    ActionExecutor, ActionOutcome, ActionRequest, AgentEventSink, AgentExecutor, ChoiceAnswer,
-    ClaudeCodeAdapter, CodexAdapter, ConductorAnalysis, DefaultHarnessSource, HarnessAdapter,
-    HarnessInvocation, HarnessRegistry, HarnessRequest, HarnessRun, HumanActionError,
-    HumanExecutor, HumanInputDelivery, HumanInputRequest, InputContinuation, LoggingEventSink,
-    OpenCodeAdapter, OutputProblem, OutputRequirement, PendingHumanInput, PermissionDecision,
-    PermissionDecisionKind, PermissionGrantScope, ProfileExecutor, RejectedAnswer,
-    ResumedHumanAction, ScriptExecutor, StepContract, StepInWorkflow, StepScope, SuspendedAction,
-    TimedOutAction, UsageReporter, ACTION_ID_ENV_VAR,
+    ActionExecutor, ActionOutcome, ActionRequest, AgentEventSink, AgentExecutor, AgentRequest,
+    AgentRunEnding, ChoiceAnswer, ClaudeCodeAdapter, CodexAdapter, ConductorAnalysis, ContextFile,
+    ContextFiles, DefaultHarnessSource, FinishedRun, HarnessAdapter, HarnessRegistry, HarnessRun,
+    HumanActionError, HumanExecutor, HumanInputDelivery, HumanInputRequest, InputContinuation,
+    LoggingEventSink, OpenCodeAdapter, OutputProblem, OutputRequirement, PendingHumanInput,
+    PermissionDecision, PermissionDecisionKind, PermissionGrantScope, ProfileExecutor,
+    RejectedAnswer, ResumedHumanAction, RunObservers, RunStarted, ScriptExecutor, StepContract,
+    StepInWorkflow, StepScope, SuspendedAction, TimedOutAction, UsageReporter, ACTION_ID_ENV_VAR,
 };

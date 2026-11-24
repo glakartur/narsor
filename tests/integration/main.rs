@@ -54,6 +54,7 @@ mod engine_recovery;
 mod engine_step_context;
 mod engine_unified_schema;
 mod environment;
+mod harness_run;
 mod kubernetes_adapter;
 mod launch_spec_contract;
 mod layout_migration;

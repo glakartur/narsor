@@ -49,7 +49,7 @@ use super::harness::{FinalAnswer, HarnessRegistry, HarnessRun};
 use super::human::HumanInputRequest;
 use super::script::truncate;
 use super::session::{
-    resume_session, ConversationSink, FinishedRun, SessionEnd, SessionRunner, SessionStart,
+    resume_session, ConversationSink, SessionEnd, SessionRunner, SessionStart,
 };
 use super::{ActionExecutor, ActionOutcome, ActionRequest, StepContract, SuspendedAction};
 use crate::domain::{
@@ -59,6 +59,7 @@ use crate::domain::{
 mod contract;
 mod response;
 
+use super::harness::FinishedRun;
 use super::session::{AgentEventSink, UsageReporter};
 pub use super::session::{
     BUILT_IN_HARNESS, PARSE_LINE_LIMIT, RESUME_SESSION_PARAMETER, RESUME_SESSION_REJECTED,

@@ -1499,17 +1499,22 @@ async fn a_harness_with_effort_support_does_not_warn() {
     assert!(effort_warnings(&sink).is_empty());
 }
 
+/// The effort reaches codex as `-c`, and the session start reports the model
+/// and the effort codex runs with (R4) — not read back from its argv.
 #[tokio::test]
 async fn the_effort_reaches_the_codex_argv_and_max_is_xhigh() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&codex_stream("thread-7", r#"{"choice":"ready"}"#));
+    let sink = Arc::new(RecordingSink::default());
     let executor = AgentExecutor::with_harnesses(
         HarnessRegistry::defaults()
             .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
-    );
+    )
+    .with_event_sink(sink.clone());
     let mut config = agent_action("look around");
     config.harness_step.harness = Some("codex".to_string());
+    config.harness_step.model = Some("small".to_string());
     config.harness_step.effort = Some("max".to_string());
     complete(&executor, config, &root.workspace()).await;
     let args = fake.args(1);
@@ -1518,6 +1523,13 @@ async fn the_effort_reaches_the_codex_argv_and_max_is_xhigh() {
             .any(|pair| pair == ["-c", "model_reasoning_effort=\"xhigh\""]),
         "{args:?}"
     );
+
+    let (_, started) = &sink.events()[0];
+    let EventData::AgentSessionStarted { model, effort, .. } = started else {
+        panic!("the first event is the session start: {started:?}");
+    };
+    assert_eq!(model.as_deref(), Some("gpt-5.1-codex-mini"));
+    assert_eq!(effort.as_deref(), Some("xhigh"));
 }
 
 #[tokio::test]
@@ -2236,15 +2248,27 @@ async fn a_question_does_not_start_the_grace_period() {
 }
 
 #[tokio::test]
-async fn a_missing_harness_binary_names_it_and_says_it_must_be_on_path() {
+async fn a_missing_harness_binary_names_it_and_starts_no_session() {
     let root = TempRoot::new();
+    let sink = Arc::new(RecordingSink::default());
 
     let executor =
         AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(Arc::new(
             ClaudeCodeAdapter::with_program("claude-that-is-not-installed"),
-        )));
+        )))
+        .with_event_sink(sink.clone());
 
     let error = fail(&executor, agent_action("look around"), &root.workspace()).await;
+
+    // A harness that never ran is not a session: no started, no failed.
+    assert!(
+        !sink
+            .types()
+            .iter()
+            .any(|kind| kind.starts_with("agent_session")),
+        "{:?}",
+        sink.types()
+    );
 
     assert_eq!(error.error_type.as_deref(), Some("harness_not_found"));
     assert!(
@@ -5278,40 +5302,39 @@ async fn a_forced_read_only_run_lists_every_repository_as_read_only() {
 
 /// Codex's sandbox protects what it is not given: only writable repositories
 /// outside the working directory are added. OpenCode cannot restrict, so it
-/// builds its command without error and the prompt carries the rule.
-#[test]
-fn adapters_map_scope_dirs_to_what_they_can_enforce() {
-    use narsor_engine::engine::HarnessRequest;
-    use std::path::PathBuf;
+/// runs without `--add-dir` and the prompt carries the rule.
+#[tokio::test]
+async fn adapters_map_scope_dirs_to_what_they_can_enforce() {
+    use narsor_engine::engine::{AgentRequest, HarnessAdapter, RunObservers};
 
-    let config = agent_action("go");
-    let start = PathBuf::from("/task/workspace/docs");
-    let writable = [start.clone(), PathBuf::from("/task/workspace/notes")];
-    let read_only = [PathBuf::from("/task/workspace/code")];
-    let request = HarnessRequest {
-        config: &config.harness_step,
+    let root = TempRoot::new();
+    let start = root.path().join("docs");
+    fs::create_dir_all(&start).unwrap();
+    let notes = root.path().join("notes");
+    let request = AgentRequest {
         workspace_access: Some(WorkspaceAccess::ReadWrite),
-        prompt: "go",
-        workspace: &start,
-        writable_dirs: &writable,
-        read_only_dirs: &read_only,
-        resume_session: None,
-        output_schema: None,
+        writable_dirs: vec![start.clone(), notes.clone()],
+        read_only_dirs: vec![root.path().join("code")],
+        ..AgentRequest::new("go", &start)
     };
 
-    let codex = CodexAdapter::with_program("codex")
-        .invocation(&request)
+    let codex = FakeHarness::install(root.path().join("codex"));
+    CodexAdapter::with_program(codex.program())
+        .run(&request, RunObservers::none())
+        .await
         .unwrap();
-    let add_dirs: Vec<_> = codex
-        .args
+    let args = codex.args(1);
+    let add_dirs: Vec<_> = args
         .windows(2)
         .filter(|pair| pair[0] == "--add-dir")
-        .map(|pair| pair[1].as_str())
+        .map(|pair| pair[1].clone())
         .collect();
-    assert_eq!(add_dirs, ["/task/workspace/notes"]);
+    assert_eq!(add_dirs, [notes.to_string_lossy()]);
 
-    let opencode = OpenCodeAdapter::with_program("opencode")
-        .invocation(&request)
+    let opencode = FakeHarness::install(root.path().join("opencode"));
+    OpenCodeAdapter::with_program(opencode.program())
+        .run(&request, RunObservers::none())
+        .await
         .unwrap();
-    assert!(!opencode.args.iter().any(|arg| arg == "--add-dir"));
+    assert!(!opencode.args(1).iter().any(|arg| arg == "--add-dir"));
 }

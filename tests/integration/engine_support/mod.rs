@@ -980,6 +980,11 @@ impl FakeHarness {
             .collect()
     }
 
+    /// What the `nth` call read on stdin.
+    pub fn stdin(&self, nth: usize) -> String {
+        fs::read_to_string(self.dir.join(format!("stdin.{nth}"))).expect("the harness read stdin")
+    }
+
     /// The working directory of the `nth` call.
     pub fn cwd(&self, nth: usize) -> String {
         read_line(&self.dir.join(format!("cwd.{nth}")))
@@ -1025,4 +1030,28 @@ pub fn envelope(text: &str) -> String {
 /// The `exit` label of a step with one way out.
 pub fn exit() -> AgentTurn {
     AgentTurn::label("exit", "done")
+}
+
+/// A fresh directory under the system temp dir, removed when dropped.
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    pub fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("narsor-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create a temp dir");
+        Self(dir)
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }

@@ -1,32 +1,28 @@
 //! What the conductor is shown of an execution, rebuilt at every invocation
-//! (R27), within a byte budget.
+//! (R27): a core in the prompt and the rest as context files.
 //!
-//! # Priorities
+//! # Core and context files
 //!
-//! A long task has more history than any prompt should carry, so the
-//! snapshot is built by priority (the plan's "Migawka przy długich
-//! taskach"):
+//! The prompt carries only what every decision needs (R9), whole (R10):
+//! the execution's status and current state with its definition and
+//! outputs, why the conductor is invoked (the request with its payload, the
+//! chat message it answers), the pending input, its annotation and the
+//! current step's local values — and, for a purpose that analyses the
+//! agent's answer, the last answer of the current state's latest attempt.
 //!
-//! * **whole, always**: the execution's status and current state, why the
-//!   conductor is invoked (the request, the chat message it answers), the
-//!   pending input with its problem record, its annotation, and the pinned
-//!   workflow definition (D48);
-//! * **shortened**: the context's variables, the last events with their
-//!   payloads cut short, the tails of the agent conversations — the current
-//!   state's attempts up to their limit, only the last attempt of each
-//!   earlier state — the last chat entries, and, for a conductor isolated
-//!   from the workspace (KTD5), the workflow's artifact files.
-//!
-//! Going over the budget is not an error. Every limit of the shortened
-//! sections is halved until the snapshot fits, and past the last halving
-//! they are left out; the whole sections are never cut, even when they
-//! alone exceed the budget.
+//! Everything else goes to a context file, uncut (R11): the whole workflow
+//! definition, the context's variables, every event with its payload, the
+//! conversation of every agent attempt (one file each, so the conductor
+//! reads only the ones it needs), the chat, and — for a conductor isolated
+//! from the workspace (KTD5) — the workflow's artifact files. The harness
+//! writes them to the invocation's context directory and lists them at the
+//! end of the prompt (R12, R13).
 //!
 //! [`SnapshotInput`] is plain data, gathered from disk once by
-//! [`SnapshotInput::collect`], so the budgeting ([`render`]) is a pure
-//! function that can be tested without an execution.
+//! [`SnapshotInput::collect`], so [`render`] is a pure function that can be
+//! tested without an execution. Context files are untrusted agent text: the
+//! conductor only reads them, and answers with a checked JSON object.
 
-use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -34,89 +30,15 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::conductor::store::{Annotation, ChatEntry, ConductorStore, QueuedRequest};
-use crate::domain::{ChoiceDefinition, Event, EventData, WorkflowExecution};
+use crate::domain::{ChoiceDefinition, ConductorPurpose, Event, EventData, WorkflowExecution};
+use crate::engine::actions::harness::ContextFile;
 use crate::engine::actions::human::PendingHumanInput;
 use crate::engine::{METADATA_ENGINE_KEY, METADATA_STEP_LOCALS_KEY};
 use crate::persistence::{ConversationSource, ConversationStore, ExecutionStore};
 
-/// The limits of one snapshot. The numbers are the starting point, not a
-/// contract: they are halved as often as it takes to fit `total_bytes`.
+/// The conversation of one agent attempt, whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotBudget {
-    /// The most the whole snapshot should take.
-    pub total_bytes: usize,
-    /// How many of the last events are shown.
-    pub events: usize,
-    /// How much of one event's payload is shown.
-    pub event_payload_bytes: usize,
-    /// How much of the current state's conversations is shown, all its
-    /// attempts together, the latest first.
-    pub current_conversation_bytes: usize,
-    /// How much of the last attempt of each earlier state is shown.
-    pub earlier_conversation_bytes: usize,
-    /// How many earlier states have their last attempt shown.
-    pub earlier_states: usize,
-    /// How many of the last chat entries are shown.
-    pub chat_entries: usize,
-    /// How much of one chat entry is shown.
-    pub chat_entry_bytes: usize,
-    /// How much of the context's variables is shown.
-    pub variables_bytes: usize,
-    /// How much of the workflow's artifact files is shown, all together
-    /// (only for a conductor isolated from the workspace).
-    pub artifact_bytes: usize,
-}
-
-impl Default for SnapshotBudget {
-    fn default() -> Self {
-        Self {
-            total_bytes: 160 * 1024,
-            events: 60,
-            event_payload_bytes: 600,
-            current_conversation_bytes: 48 * 1024,
-            earlier_conversation_bytes: 6 * 1024,
-            earlier_states: 6,
-            chat_entries: 20,
-            chat_entry_bytes: 2 * 1024,
-            variables_bytes: 8 * 1024,
-            artifact_bytes: 32 * 1024,
-        }
-    }
-}
-
-impl SnapshotBudget {
-    /// The budget with every shortened limit divided by `2^level`; `None`
-    /// past the last level, where the shortened sections are left out.
-    fn at_level(&self, level: u32) -> Option<Self> {
-        if level > MAX_LEVEL {
-            return None;
-        }
-        let bytes = |value: usize| value >> level;
-        let count = |value: usize| value >> level;
-        Some(Self {
-            total_bytes: self.total_bytes,
-            events: count(self.events),
-            event_payload_bytes: bytes(self.event_payload_bytes).max(80),
-            current_conversation_bytes: bytes(self.current_conversation_bytes),
-            earlier_conversation_bytes: bytes(self.earlier_conversation_bytes),
-            earlier_states: count(self.earlier_states),
-            chat_entries: count(self.chat_entries),
-            chat_entry_bytes: bytes(self.chat_entry_bytes).max(80),
-            variables_bytes: bytes(self.variables_bytes),
-            artifact_bytes: bytes(self.artifact_bytes),
-        })
-    }
-}
-
-/// The most of the current step's local values the snapshot shows.
-const STEP_LOCALS_BYTES: usize = 2048;
-
-/// How many times the shortened limits are halved before they are left out.
-const MAX_LEVEL: u32 = 8;
-
-/// The conversation of one attempt, as far as it was read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConversationTail {
+pub struct AttemptConversation {
     /// The state the attempt ran in.
     pub state_id: String,
     /// The attempt.
@@ -127,7 +49,7 @@ pub struct ConversationTail {
     pub text: String,
 }
 
-/// An artifact file of the workflow, as far as it was read.
+/// An artifact file of the workflow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactFile {
     /// Its name in the context.
@@ -167,8 +89,10 @@ pub struct SnapshotInput {
     pub step_locals: Value,
     /// The execution's events, oldest first.
     pub events: Vec<Event>,
-    /// The conversations, the current state's first, latest first within.
-    pub conversations: Vec<ConversationTail>,
+    /// The final answer of the current state's latest agent attempt.
+    pub last_agent_answer: Option<String>,
+    /// The conversation of every agent attempt, oldest first.
+    pub conversations: Vec<AttemptConversation>,
     /// The chat, oldest first.
     pub chat: Vec<ChatEntry>,
     /// The workflow's artifact files; empty unless the conductor is
@@ -192,6 +116,7 @@ impl Default for SnapshotInput {
             variables: Value::Null,
             step_locals: Value::Null,
             events: Vec::new(),
+            last_agent_answer: None,
             conversations: Vec::new(),
             chat: Vec::new(),
             artifacts: Vec::new(),
@@ -202,25 +127,23 @@ impl Default for SnapshotInput {
 /// A snapshot, rendered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
-    /// The text the conductor is shown.
-    pub text: String,
-    /// How often the shortened limits were halved to fit; `None` when the
-    /// shortened sections had to be left out.
-    pub level: Option<u32>,
+    /// The core the prompt carries.
+    pub core: String,
+    /// Everything else, one file per section (and per agent attempt); a
+    /// section with nothing to show has no file.
+    pub files: Vec<ContextFile>,
 }
 
 impl SnapshotInput {
     /// Gathers what the snapshot of `execution` is made of.
     ///
-    /// Reads the most it could show at the starting `budget` and no more;
-    /// anything that cannot be read becomes a line saying so rather than a
+    /// Anything that cannot be read becomes a line saying so rather than a
     /// failed invocation — a partial snapshot is still worth showing.
     pub fn collect(
         store: &ExecutionStore,
         conductor: &ConductorStore,
         execution: &WorkflowExecution,
         definition: Result<(String, Vec<ChoiceDefinition>), String>,
-        budget: &SnapshotBudget,
         with_artifacts: bool,
     ) -> Self {
         let (definition, state_outputs) = match definition {
@@ -249,19 +172,16 @@ impl SnapshotInput {
             .event_log(&execution.id)
             .read_all()
             .unwrap_or_default();
-        let conversations = conversation_tails(
+        let current_state = execution.current_state.as_deref();
+        let conversations = conversations(
             &store.conversation_store(&execution.id),
-            execution.current_state.as_deref(),
+            current_state,
             &events,
-            budget,
         );
-
-        let mut chat = conductor.read_chat().unwrap_or_default();
-        let keep_from = chat.len().saturating_sub(budget.chat_entries);
-        chat.drain(..keep_from);
+        let last_agent_answer = last_agent_answer(current_state, &events);
 
         let artifacts = if with_artifacts {
-            artifact_files(execution, budget.artifact_bytes)
+            artifact_files(execution)
         } else {
             Vec::new()
         };
@@ -283,8 +203,9 @@ impl SnapshotInput {
             variables: serde_json::to_value(&execution.context.variables).unwrap_or(Value::Null),
             step_locals: current_step_locals(execution),
             events,
+            last_agent_answer,
             conversations,
-            chat,
+            chat: conductor.read_chat().unwrap_or_default(),
             artifacts,
         }
     }
@@ -304,31 +225,29 @@ fn current_step_locals(execution: &WorkflowExecution) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// Renders `input` within `budget` (see the module documentation).
-pub fn render(input: &SnapshotInput, budget: &SnapshotBudget) -> Snapshot {
-    let whole = render_whole(input);
-    let mut level = 0;
-    while let Some(limits) = budget.at_level(level) {
-        let text = format!("{whole}{}", render_shortened(input, &limits));
-        if text.len() <= budget.total_bytes {
-            return Snapshot {
-                text,
-                level: Some(level),
-            };
-        }
-        level += 1;
-    }
+/// Whether the conductor serving `purpose` analyses what the agent of the
+/// current state answered, so the answer belongs in the core.
+fn analyses_agent_answer(purpose: ConductorPurpose) -> bool {
+    matches!(
+        purpose,
+        ConductorPurpose::ChooseOutput
+            | ConductorPurpose::ChooseOutputAfterReprompt
+            | ConductorPurpose::AnswerAgentQuestion
+            | ConductorPurpose::DiagnoseFailure
+    )
+}
+
+/// Renders `input` into the prompt core and the context files, moving the
+/// uncut texts into the files rather than copying them.
+pub fn render(input: SnapshotInput) -> Snapshot {
     Snapshot {
-        text: format!(
-            "{whole}\n## Omitted\n\nThe events, conversations, chat and artifacts did not fit \
-             the snapshot and were left out.\n"
-        ),
-        level: None,
+        core: render_core(&input),
+        files: context_files(input),
     }
 }
 
-/// The sections shown whole, always.
-fn render_whole(input: &SnapshotInput) -> String {
+/// The core, whole.
+fn render_core(input: &SnapshotInput) -> String {
     let mut text = String::new();
 
     let _ = writeln!(text, "## Execution\n");
@@ -379,11 +298,7 @@ fn render_whole(input: &SnapshotInput) -> String {
 
     if !is_empty_json(&input.step_locals) {
         let _ = writeln!(text, "\n## Local values of the current step\n");
-        let _ = writeln!(
-            text,
-            "```json\n{}\n```",
-            head(&pretty(&input.step_locals), STEP_LOCALS_BYTES)
-        );
+        let _ = writeln!(text, "```json\n{}\n```", pretty(&input.step_locals));
     }
 
     let _ = writeln!(text, "\n## Pending input\n");
@@ -406,138 +321,160 @@ fn render_whole(input: &SnapshotInput) -> String {
         }
     }
 
-    let _ = writeln!(text, "\n## Workflow definition\n");
-    match &input.definition {
-        Ok(source) => {
-            let _ = writeln!(text, "```yaml\n{}\n```", source.trim_end());
-        }
-        Err(error) => {
-            let _ = writeln!(text, "(unavailable: {error})");
-        }
+    if let Some(state) = input
+        .current_state
+        .as_deref()
+        .and_then(|state| state_definition(input.definition.as_deref().ok()?, state))
+    {
+        let _ = writeln!(text, "\n## Definition of the current state\n");
+        let _ = writeln!(text, "```yaml\n{}\n```", state.trim_end());
+    }
+
+    let analyses_answer = input
+        .request
+        .as_ref()
+        .is_some_and(|request| analyses_agent_answer(request.purpose));
+    if let Some(answer) = input
+        .last_agent_answer
+        .as_deref()
+        .filter(|_| analyses_answer)
+    {
+        let _ = writeln!(
+            text,
+            "\n## The agent's last answer in the current state\n\n```\n{}\n```",
+            answer.trim_end()
+        );
     }
 
     text
 }
 
-/// The sections shortened to `limits`.
-fn render_shortened(input: &SnapshotInput, limits: &SnapshotBudget) -> String {
-    let mut text = String::new();
+/// The YAML of `state` in the workflow `source`; `None` when the source
+/// does not parse or has no such state.
+fn state_definition(source: &str, state: &str) -> Option<String> {
+    let workflow: serde_yaml::Value = serde_yaml::from_str(source).ok()?;
+    let definition = workflow.get("states")?.get(state)?;
+    serde_yaml::to_string(definition).ok()
+}
 
-    if limits.variables_bytes > 0 && !is_empty_json(&input.variables) {
-        let _ = writeln!(text, "\n## Context variables\n");
-        let _ = writeln!(
-            text,
-            "```json\n{}\n```",
-            head(&pretty(&input.variables), limits.variables_bytes)
-        );
+/// The context files of `input`: every section outside the core, uncut.
+fn context_files(input: SnapshotInput) -> Vec<ContextFile> {
+    let mut files = Vec::new();
+
+    match input.definition {
+        Ok(source) => files.push(ContextFile::new(
+            "workflow.yaml",
+            "The pinned workflow definition, every state.",
+            source,
+        )),
+        Err(error) => files.push(ContextFile::new(
+            "workflow.yaml",
+            "Why the workflow definition is unavailable.",
+            format!("# unavailable: {error}\n"),
+        )),
     }
 
-    if limits.events > 0 && !input.events.is_empty() {
-        let skipped = input.events.len().saturating_sub(limits.events);
-        let _ = writeln!(text, "\n## Recent events\n");
-        if skipped > 0 {
-            let _ = writeln!(text, "({skipped} earlier events not shown)");
-        }
-        for event in &input.events[skipped..] {
+    if !is_empty_json(&input.variables) {
+        files.push(ContextFile::new(
+            "variables.json",
+            "The context variables of the execution.",
+            pretty(&input.variables),
+        ));
+    }
+
+    if !input.events.is_empty() {
+        let mut text = String::new();
+        for event in &input.events {
             let payload = serde_json::to_string(&event.data).unwrap_or_default();
             let _ = writeln!(
                 text,
-                "- #{} {} {}",
+                "- #{} {} {payload}",
                 event.sequence,
                 event.timestamp.format("%Y-%m-%dT%H:%M:%SZ"),
-                head(&payload, limits.event_payload_bytes)
             );
         }
+        files.push(ContextFile::new(
+            "events.md",
+            "Every event of the execution, oldest first, with its whole payload.",
+            text,
+        ));
     }
 
-    let conversations = render_conversations(&input.conversations, limits);
-    if !conversations.is_empty() {
-        let _ = writeln!(text, "\n## Agent conversations\n");
-        text.push_str(&conversations);
+    for (index, conversation) in input.conversations.into_iter().enumerate() {
+        let when = if conversation.current {
+            "current"
+        } else {
+            "earlier"
+        };
+        files.push(ContextFile::new(
+            format!(
+                "conversations/{:03}-{}-{}.md",
+                index + 1,
+                file_safe(&conversation.state_id),
+                file_safe(&conversation.attempt_id)
+            ),
+            format!(
+                "The agent conversation of attempt {} in the {when} state `{}`.",
+                conversation.attempt_id, conversation.state_id
+            ),
+            conversation.text,
+        ));
     }
 
-    if limits.chat_entries > 0 && !input.chat.is_empty() {
-        let skipped = input.chat.len().saturating_sub(limits.chat_entries);
-        let _ = writeln!(text, "\n## Recent chat\n");
-        for entry in &input.chat[skipped..] {
+    if !input.chat.is_empty() {
+        let mut text = String::new();
+        for entry in &input.chat {
             let author = serde_json::to_value(entry.author)
                 .ok()
                 .and_then(|author| author.as_str().map(str::to_string))
                 .unwrap_or_default();
-            let _ = writeln!(
-                text,
-                "- #{} {author}: {}",
-                entry.sequence,
-                head(&entry.text, limits.chat_entry_bytes)
-            );
+            let _ = writeln!(text, "- #{} {author}: {}", entry.sequence, entry.text);
         }
-    }
-
-    if limits.artifact_bytes > 0 && !input.artifacts.is_empty() {
-        let _ = writeln!(text, "\n## Workflow artifacts\n");
-        let mut room = limits.artifact_bytes;
-        for artifact in &input.artifacts {
-            let content = head(&artifact.content, room);
-            room = room.saturating_sub(content.len());
-            let _ = writeln!(
-                text,
-                "### {} ({})\n\n```\n{}\n```",
-                artifact.name, artifact.location, content
-            );
-            if room == 0 {
-                break;
-            }
-        }
-    }
-
-    text
-}
-
-fn render_conversations(conversations: &[ConversationTail], limits: &SnapshotBudget) -> String {
-    let mut text = String::new();
-
-    let mut room = limits.current_conversation_bytes;
-    for conversation in conversations.iter().filter(|tail| tail.current) {
-        if room == 0 {
-            break;
-        }
-        let shown = tail(&conversation.text, room);
-        room = room.saturating_sub(shown.len());
-        let _ = writeln!(
+        files.push(ContextFile::new(
+            "chat.md",
+            "The chat between the operator and the conductor, oldest first.",
             text,
-            "### {} (current state), attempt {}\n\n```\n{shown}\n```",
-            conversation.state_id, conversation.attempt_id
-        );
+        ));
     }
 
-    if limits.earlier_conversation_bytes > 0 {
-        for conversation in conversations
-            .iter()
-            .filter(|tail| !tail.current)
-            .take(limits.earlier_states)
-        {
-            let shown = tail(&conversation.text, limits.earlier_conversation_bytes);
-            let _ = writeln!(
-                text,
-                "### {}, last attempt {}\n\n```\n{shown}\n```",
-                conversation.state_id, conversation.attempt_id
-            );
-        }
+    for (index, artifact) in input.artifacts.into_iter().enumerate() {
+        files.push(ContextFile::new(
+            format!("artifacts/{:03}-{}", index + 1, file_safe(&artifact.name)),
+            format!(
+                "The workflow artifact `{}` ({}).",
+                artifact.name, artifact.location
+            ),
+            artifact.content,
+        ));
     }
 
-    text
+    files
 }
 
-/// The attempts to show, read from their conversation files: every attempt
-/// of the current state (latest first), then the last attempt of each
-/// earlier state (latest state first).
-fn conversation_tails(
-    store: &ConversationStore,
-    current_state: Option<&str>,
-    events: &[Event],
-    budget: &SnapshotBudget,
-) -> Vec<ConversationTail> {
-    let attempts: Vec<(&str, &str)> = events
+/// `name` as one file-name component: anything but letters, digits, `-`,
+/// `_` and `.` becomes `_`, and it never starts with `.`.
+fn file_safe(name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    match safe.strip_prefix('.') {
+        Some(rest) => format!("_{rest}"),
+        None if safe.is_empty() => "_".to_string(),
+        None => safe,
+    }
+}
+
+/// The agent attempts of the execution, from its events, oldest first:
+/// `(state, attempt)`.
+fn attempts(events: &[Event]) -> Vec<(&str, &str)> {
+    events
         .iter()
         .filter_map(|event| match &event.data {
             EventData::ActionStarted {
@@ -552,73 +489,66 @@ fn conversation_tails(
             } => Some((state_id.as_str(), action_execution_id.as_str())),
             _ => None,
         })
-        .collect();
-
-    let read = |state_id: &str, attempt_id: &str, current: bool, limit: usize| {
-        let snapshot = store.read(attempt_id, 0, usize::MAX).ok().flatten()?;
-        let mut text = String::new();
-        for entry in &snapshot.entries {
-            let source = match entry.source {
-                ConversationSource::Narsor => "narsor",
-                ConversationSource::Stdout => "stdout",
-                ConversationSource::Stderr => "stderr",
-            };
-            let _ = writeln!(text, "[{source}] {}", String::from_utf8_lossy(&entry.raw));
-        }
-        Some(ConversationTail {
-            state_id: state_id.to_string(),
-            attempt_id: attempt_id.to_string(),
-            current,
-            text: tail(&text, limit).to_string(),
-        })
-    };
-
-    let mut tails = Vec::new();
-    let mut room = budget.current_conversation_bytes;
-    for (state_id, attempt_id) in attempts.iter().rev() {
-        if Some(*state_id) != current_state || room == 0 {
-            continue;
-        }
-        if let Some(conversation) = read(state_id, attempt_id, true, room) {
-            room = room.saturating_sub(conversation.text.len());
-            tails.push(conversation);
-        }
-    }
-
-    let mut seen = BTreeSet::new();
-    for (state_id, attempt_id) in attempts.iter().rev() {
-        if Some(*state_id) == current_state || !seen.insert(*state_id) {
-            continue;
-        }
-        if seen.len() > budget.earlier_states {
-            break;
-        }
-        if let Some(conversation) = read(
-            state_id,
-            attempt_id,
-            false,
-            budget.earlier_conversation_bytes,
-        ) {
-            tails.push(conversation);
-        }
-    }
-    tails
+        .collect()
 }
 
-/// The workflow's artifact files, read from the start up to `limit` bytes
-/// in all — a plan is read from its beginning.
-fn artifact_files(execution: &WorkflowExecution, limit: usize) -> Vec<ArtifactFile> {
+/// The conversation of every attempt that has one, oldest first, read
+/// whole.
+fn conversations(
+    store: &ConversationStore,
+    current_state: Option<&str>,
+    events: &[Event],
+) -> Vec<AttemptConversation> {
+    attempts(events)
+        .into_iter()
+        .filter_map(|(state_id, attempt_id)| {
+            let snapshot = store.read(attempt_id, 0, usize::MAX).ok().flatten()?;
+            let mut text = String::new();
+            for entry in &snapshot.entries {
+                let source = match entry.source {
+                    ConversationSource::Narsor => "narsor",
+                    ConversationSource::Stdout => "stdout",
+                    ConversationSource::Stderr => "stderr",
+                };
+                let _ = writeln!(text, "[{source}] {}", String::from_utf8_lossy(&entry.raw));
+            }
+            Some(AttemptConversation {
+                state_id: state_id.to_string(),
+                attempt_id: attempt_id.to_string(),
+                current: Some(state_id) == current_state,
+                text,
+            })
+        })
+        .collect()
+}
+
+/// The final text of the current state's latest attempt, as the step read
+/// it (its `AgentMessage`).
+fn last_agent_answer(current_state: Option<&str>, events: &[Event]) -> Option<String> {
+    let current_state = current_state?;
+    let (_, attempt) = attempts(events)
+        .into_iter()
+        .rev()
+        .find(|(state, _)| *state == current_state)?;
+    events.iter().rev().find_map(|event| match &event.data {
+        EventData::AgentMessage {
+            content,
+            action_execution_id: Some(id),
+            ..
+        } if id == attempt && !content.trim().is_empty() => Some(content.clone()),
+        _ => None,
+    })
+}
+
+/// The workflow's artifact files, read whole.
+fn artifact_files(execution: &WorkflowExecution) -> Vec<ArtifactFile> {
     // Artifacts live in the primary repository, which `path` is.
     let workspace = Path::new(&execution.workspace.path);
     let mut artifacts: Vec<_> = execution.context.artifacts.iter().collect();
     artifacts.sort_by(|a, b| a.0.cmp(b.0));
 
-    let mut room = limit;
     let mut files = Vec::new();
     for (name, artifact) in artifacts {
-        if room == 0 {
-            break;
-        }
         let location = Path::new(&artifact.location);
         let path = if location.is_absolute() {
             location.to_path_buf()
@@ -629,10 +559,9 @@ fn artifact_files(execution: &WorkflowExecution, limit: usize) -> Vec<ArtifactFi
             continue;
         }
         let content = match fs::read(&path) {
-            Ok(bytes) => head(&String::from_utf8_lossy(&bytes), room).to_string(),
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(error) => format!("(unreadable: {error})"),
         };
-        room = room.saturating_sub(content.len());
         files.push(ArtifactFile {
             name: name.clone(),
             location: artifact.location.clone(),
@@ -652,30 +581,4 @@ fn is_empty_json(value: &Value) -> bool {
         Value::Object(map) => map.is_empty(),
         _ => false,
     }
-}
-
-/// The first `max` bytes of `text`, on a character boundary, marked when
-/// cut.
-fn head(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end])
-}
-
-/// The last `max` bytes of `text`, on a character boundary, marked when
-/// cut.
-fn tail(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_string();
-    }
-    let mut start = text.len() - max;
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("…{}", &text[start..])
 }
