@@ -17,9 +17,10 @@ pub(crate) use commands::refuse_reserved_key;
 pub(crate) use create::launch_refusal;
 #[cfg(test)]
 pub(crate) use history::served_timeline;
+pub(crate) use view::step_kind;
 pub use view::task_workspaces;
 #[cfg(test)]
-pub(crate) use view::{step_kind, transition_offer, workflow_steps};
+pub(crate) use view::{transition_offer, workflow_steps};
 
 use crate::controller_protocol::wire::*;
 
