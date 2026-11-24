@@ -31,10 +31,11 @@ Linux limits **one** argv string to `MAX_ARG_STRLEN` (128 KiB), not only the tot
 ## Solution
 The `claude-code` adapter sends a prompt over `LONGEST_PROMPT_ARGUMENT` (96 KiB) on stdin (`claude --print` reads stdin when no prompt argument exists). The conductor runner forwards `command.stdin`. Regression test: `a_prompt_too_long_for_one_argument_reaches_claude_on_stdin` in `tests/integration/conductor_invoke.rs`.
 
-## Still open (PR #143)
-- `codex`, `opencode`, `github_copilot` still put the prompt in argv and can hit the same error. `apply_extra_args` (`harness/mod.rs`) anchors extra args at the prompt, so `codex exec -` needs its own change.
-- The test uses a fake harness. Real `claude` with a stdin prompt needs a check on a host with the CLI.
+## Resolved by the unified harness `run` (2026-11-24)
+- Every CLI harness now gets a long prompt through the shared helper `harness/cli.rs`: above 96 KiB, `claude` and `opencode` read it from stdin, `codex exec` from stdin behind `-` (recorded in `tests/fixtures/codex/` and `tests/fixtures/opencode/`). `github-copilot` sends the prompt as one SDK message.
+- Extra args no longer look for the prompt text in argv: they go after the harness's own flags, right before the prompt.
+- Still to check on a host with the CLI: real `claude` with a stdin prompt (the test uses a fake harness).
 
 ## Prevention
-- Any new adapter: keep the prompt out of argv above a safe threshold, or use stdin/a file.
+- Any new CLI harness: run through `harness/cli.rs` (`cli::run`), which picks the transport; set `CommandLine::stdin_marker` when the CLI needs an argument to read stdin.
 - Keep a prompt budget below the per-argument limit, or ensure the adapter handles larger prompts.

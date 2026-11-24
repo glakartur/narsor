@@ -129,33 +129,75 @@ processes — always in temporary directories, never inside the repository.
 
 ## How each harness is invoked
 
-All three are run non-interactively, in the workspace, with
-`ORCHESTRATOR_ACTION_ID` in the environment (D24), stdin closed, and both pipes
-drained while the agent works.
+Every caller — the agent step, the profile step, the conductor — runs a
+harness the same way: it builds one `AgentRequest` (prompt, context files,
+model tier, effort, session to resume, working directory, workspace access,
+directories, parameters, answer schema and shape, time limit, extra args)
+and calls `HarnessAdapter::run(request, observers)`. The harness translates
+the request, starts its CLI or SDK, hands over the prompt, makes the context
+files readable, and parses the output; the observers receive the conversation
+lines, the usage limits, and the model and effort the harness resolved
+(`AgentSessionStarted` is emitted from them). No caller builds or reads a
+command line.
+
+The CLI harnesses share the process mechanics in
+`crates/narsor-exec/src/engine/actions/harness/cli.rs`: each runs
+non-interactively in its working directory, with `ORCHESTRATOR_ACTION_ID` in
+the environment for an agent step (D24, not for the conductor), as the leader
+of its own process group, with both pipes drained while the agent works.
 
 ```text
-claude   --print --output-format json \
-         [--add-dir <read_only_paths…>] [--model <model>] [--max-turns <n>] \
+claude   --print --verbose --permission-prompts none \
+         [--add-dir <read_only_paths…> <dirs outside cwd…> <context dir>] \
+         [--allowedTools <rule…>] --disallowedTools ScheduleWakeup CronCreate Monitor \
+         [--model <model>] [--effort <effort>] [--max-turns <n>] \
          [--append-system-prompt <text>] [--resume <session-id>] \
-         [--allow-dangerously-skip-permissions] --permission-mode <mode> \
-         <prompt>
+         [--json-schema <schema>] --output-format stream-json \
+         [--permission-mode <mode>] [<extra args…>] [<prompt>]
 
 opencode run [--model <provider/model#variant>] [--agent <agent>] \
          [--session <session-id>] [--fork] [--auto] --format json \
-         <prompt>
+         [<extra args…>] [<prompt>]
 
-codex exec [--model <model>] --sandbox <read-only|workspace-write> \
-          --config approval_policy=never --json [resume <thread-id>] <prompt>
+codex exec [--model <model>] [-c model_reasoning_effort="<level>"] \
+          [--sandbox <read-only|workspace-write>] [--add-dir <writable dir…>] \
+          --config approval_policy=never --json [resume <thread-id>] \
+          [<extra args…>] <prompt | ->
 ```
 
-`github-copilot` is not spawned this way. It runs through the GitHub Copilot
-SDK (`github-copilot-sdk`), which starts the operator's Copilot CLI as
-`copilot --server --stdio` and talks JSON-RPC to it. The runner finds the CLI
-itself: `COPILOT_CLI_PATH` when it is set, else `copilot` on `PATH`. The SDK
-is behind the `copilot-sdk` feature of `narsor-exec`, and only
-`narsor-runner` enables it. The SDK's default feature `bundled-cli` is off,
-because it embeds the whole Copilot CLI runtime (about 200 MB) in every
-binary that links the SDK.
+**Prompt transport.** A prompt up to 96 KiB is the last argument. A longer
+one goes on stdin, because Linux refuses a single argument over 128 KiB
+(E2BIG, NARSOR-1124-001): `claude --print` and `opencode run` read it when no
+prompt argument is given, `codex exec` when the prompt argument is `-`. The
+codex and opencode behaviour is recorded in `tests/fixtures/codex/` and
+`tests/fixtures/opencode/`. Without a long prompt, stdin is closed.
+
+**Extra args** from `agents.<harness>.extra_args` replace the same flags the
+harness chose and go after its own flags, right before the prompt.
+
+**Context files.** A request may carry context files and a directory for them
+(the conductor uses this; agent steps do not yet). The harness empties the
+directory, writes the files, and appends a `## Context files` block to the
+prompt with each file's absolute path, size and one-line description. Read
+access: `claude` gets the directory as one more `--add-dir`; codex's sandboxes
+read the whole disk (checked with `codex sandbox`), and `--add-dir` would make
+the directory writable, so codex gets no flag; opencode and the Copilot SDK
+read outside their working directory. A harness that cannot reach the
+directory would inline the files' content into the block instead.
+
+`github-copilot` is not spawned this way. Its `run` calls the GitHub Copilot
+SDK (`github-copilot-sdk`) in-process; the SDK starts the operator's Copilot
+CLI as `copilot --server --stdio` and talks JSON-RPC to it, and the prompt is
+one SDK message, with no size limit of the command line. The runner finds the
+CLI itself: `COPILOT_CLI_PATH` when it is set, else `copilot` on `PATH` (the
+program the runner's PATH check looks for). The SDK is behind the
+`copilot-sdk` feature of `narsor-exec`, and only `narsor-runner` enables it.
+The SDK's default feature `bundled-cli` is off, because it embeds the whole
+Copilot CLI runtime (about 200 MB) in every binary that links the SDK.
+**`github-copilot` does not enforce `workspace_access`:** the SDK session
+approves every permission, so a read-only step can write. The prompt names the
+read-only paths, and the conversation records that read-only access is not
+enforced; the fix is a separate change with its own security review.
 
 **Which login a harness uses.** A harness keeps its subscription login next
 to its sessions — `codex` in `~/.codex/auth.json`, Claude Code in
@@ -180,10 +222,10 @@ running task's earlier sessions behind. Inherited `ANTHROPIC_API_KEY`,
 switches to API billing behind the subscription's back; a task that should
 use a key gets it as an `env` secret.
 
-`--print` / `run` are what make the run a batch run; `json` output is what
-carries the session id as well as the text. The flag that takes exactly one
-value is always the last one before the prompt, so a prompt can never be read
-as a flag's argument.
+`--print` / `run` / `exec` are what make the run a batch run; the JSON stream
+output is what carries the session id as well as the text. The flag that takes
+exactly one value is always the last one of the harness's own before the
+prompt, so a prompt can never be read as a flag's argument.
 
 `workspace_access` is the portable access policy for the action: `read-write`
 (the default) or `read-only`. It is translated to each harness's native flags,
