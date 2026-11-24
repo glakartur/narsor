@@ -43,7 +43,7 @@ use std::sync::Arc;
 use super::copilot_sdk::{
     run_copilot_sdk, CopilotSdkBackend, CopilotSdkRequest, GitHubCopilotSdkRuntime,
 };
-use super::request::{with_block, ContextAccess, RunStarted};
+use super::request::RunStarted;
 use super::{
     model_for_tier, reject_option_like, resolve_read_only_path, string_parameter, tail,
     AgentRequest, AgentRunEnding, HarnessAdapter, HarnessRun, HarnessStreamParser, RunObservers,
@@ -178,11 +178,7 @@ impl HarnessAdapter for GitHubCopilotAdapter {
             let (mut sdk_request, started) = self.sdk_request(request)?;
             // The session approves every permission, so the agent reads the
             // context directory wherever it is.
-            let block = match &request.context {
-                Some(context) => context.prepare(ContextAccess::Readable)?,
-                None => String::new(),
-            };
-            sdk_request.prompt = with_block(&sdk_request.prompt, &block);
+            sdk_request.prompt = request.prompt_with_context(sdk_request.prompt)?;
             if request.workspace_access == Some(WorkspaceAccess::ReadOnly) {
                 observers.conversation.append_outcome(
                     "github-copilot does not enforce read-only workspace access; \
@@ -190,6 +186,8 @@ impl HarnessAdapter for GitHubCopilotAdapter {
                     serde_json::json!({ "workspace_access": "read_only", "enforced": false }),
                 );
             }
+            // The SDK starts the CLI inside the backend's run, so this is the
+            // last moment before it.
             observers.notify_started(started);
             let parser = self.stream_parser(request.answer_shape);
             run_copilot_sdk(self.backend.as_ref(), sdk_request, parser, &observers).await

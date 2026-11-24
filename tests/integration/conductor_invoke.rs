@@ -1285,7 +1285,7 @@ fn long_task(purpose: ConductorPurpose) -> SnapshotInput {
 fn a_gate_summary_keeps_conversations_and_events_out_of_the_prompt_and_uncut() {
     let input = long_task(ConductorPurpose::SummarizeGate);
 
-    let snapshot = render(&input);
+    let snapshot = render(input.clone());
 
     assert!(!snapshot.core.contains("## Agent conversations"));
     assert!(!snapshot.core.contains("tool output"));
@@ -1324,7 +1324,7 @@ fn a_gate_summary_keeps_conversations_and_events_out_of_the_prompt_and_uncut() {
 /// The purposes that analyse the agent's answer find it in the core.
 #[test]
 fn an_output_choice_sees_the_agents_last_answer_in_the_prompt() {
-    let snapshot = render(&long_task(ConductorPurpose::ChooseOutput));
+    let snapshot = render(long_task(ConductorPurpose::ChooseOutput));
     assert!(snapshot
         .core
         .contains("## The agent's last answer in the current state"));
@@ -1334,7 +1334,7 @@ fn an_output_choice_sees_the_agents_last_answer_in_the_prompt() {
 /// A section with nothing in it has no file to list.
 #[test]
 fn an_execution_without_history_has_only_its_definition_as_a_context_file() {
-    let snapshot = render(&SnapshotInput {
+    let snapshot = render(SnapshotInput {
         definition: Ok("name: empty\n".to_string()),
         ..SnapshotInput::default()
     });

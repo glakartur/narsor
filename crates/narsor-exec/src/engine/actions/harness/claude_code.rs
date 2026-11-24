@@ -77,7 +77,7 @@ use futures::future::BoxFuture;
 use serde_json::{Map, Value};
 
 use super::cli::{self, CommandLine};
-use super::request::{with_block, ContextAccess, RunStarted};
+use super::request::RunStarted;
 use super::{
     integer_parameter, model_for_tier, reject_option_like, resolve_read_only_path,
     string_parameter, tail, AgentRequest, AgentRunEnding, FinalAnswer, HarnessAdapter, HarnessRun,
@@ -276,14 +276,8 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     ) -> BoxFuture<'a, Result<AgentRunEnding, ActionError>> {
         Box::pin(async move {
             let (command, started) = self.command_line(request)?;
-            let block = match &request.context {
-                Some(context) => context.prepare(ContextAccess::Readable)?,
-                None => String::new(),
-            };
-            let prompt = with_block(&request.prompt, &block);
-            observers.notify_started(started);
             let parser = self.stream_parser(request.answer_shape);
-            cli::run(CLAUDE_CODE, command, &prompt, request, parser, &observers).await
+            cli::run(CLAUDE_CODE, command, started, request.prompt.clone(), request, parser, &observers).await
         })
     }
 

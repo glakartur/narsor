@@ -17,7 +17,7 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 
 use super::cli::{self, CommandLine};
-use super::request::{with_block, ContextAccess, RunStarted};
+use super::request::RunStarted;
 use super::{
     model_for_tier, not_classified, reject_option_like, resolve_read_only_path, string_parameter,
     tail, AgentRequest, AgentRunEnding, HarnessAdapter, HarnessRun, HarnessStreamParser,
@@ -155,14 +155,8 @@ impl HarnessAdapter for CodexAdapter {
     ) -> BoxFuture<'a, Result<AgentRunEnding, ActionError>> {
         Box::pin(async move {
             let (command, started) = self.command_line(request)?;
-            let block = match &request.context {
-                Some(context) => context.prepare(ContextAccess::Readable)?,
-                None => String::new(),
-            };
-            let prompt = with_block(&message(request), &block);
-            observers.notify_started(started);
             let parser = self.stream_parser(request.answer_shape);
-            cli::run(CODEX, command, &prompt, request, parser, &observers).await
+            cli::run(CODEX, command, started, message(request), request, parser, &observers).await
         })
     }
 

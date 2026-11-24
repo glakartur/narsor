@@ -1031,3 +1031,27 @@ pub fn envelope(text: &str) -> String {
 pub fn exit() -> AgentTurn {
     AgentTurn::label("exit", "done")
 }
+
+/// A fresh directory under the system temp dir, removed when dropped.
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    pub fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("narsor-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create a temp dir");
+        Self(dir)
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}

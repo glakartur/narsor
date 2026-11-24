@@ -182,8 +182,8 @@ prompt with each file's absolute path, size and one-line description. Read
 access: `claude` gets the directory as one more `--add-dir`; codex's sandboxes
 read the whole disk (checked with `codex sandbox`), and `--add-dir` would make
 the directory writable, so codex gets no flag; opencode and the Copilot SDK
-read outside their working directory. A harness that cannot reach the
-directory would inline the files' content into the block instead.
+read outside their working directory. A future harness that cannot reach
+the directory must inline the files' content into the prompt instead (R6).
 
 `github-copilot` is not spawned this way. Its `run` calls the GitHub Copilot
 SDK (`github-copilot-sdk`) in-process; the SDK starts the operator's Copilot

@@ -27,7 +27,7 @@ use narsor_protocol::chat::{
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 
-use super::request::{AgentRequest, AgentRunEnding, FinishedRun, RunObservers};
+use super::request::{AgentRequest, AgentRunEnding, FinishedRun, RunObservers, RunStarted};
 use super::{FinalAnswer, HarnessStreamParser};
 use crate::domain::ActionError;
 use crate::engine::actions::process_group::{self, GroupGuard};
@@ -66,26 +66,29 @@ impl CommandLine {
     }
 }
 
-/// Runs `command` with `prompt` for `request`: extra arguments, prompt
-/// transport, the process, the parse loop.
+/// Runs `command` with `prompt` for `request`: the context files, extra
+/// arguments, prompt transport, the process and the parse loop. `started`
+/// goes to the observers once the process is running.
 pub(crate) async fn run(
     harness: &str,
     mut command: CommandLine,
-    prompt: &str,
+    started: RunStarted,
+    prompt: String,
     request: &AgentRequest,
     parser: Box<dyn HarnessStreamParser>,
     observers: &RunObservers<'_>,
 ) -> Result<AgentRunEnding, ActionError> {
+    let prompt = request.prompt_with_context(prompt)?;
     apply_extra_args(&mut command.args, &request.extra_args);
     let stdin = place_prompt(harness, &mut command, prompt);
-    spawn_and_wait(&command, stdin, request, parser, observers).await
+    spawn_and_wait(&command, stdin, started, request, parser, observers).await
 }
 
 /// Puts `prompt` on the command line when it fits; otherwise adds the stdin
 /// marker, if the harness has one, and returns the prompt for stdin.
-fn place_prompt<'p>(harness: &str, command: &mut CommandLine, prompt: &'p str) -> Option<&'p str> {
+fn place_prompt(harness: &str, command: &mut CommandLine, prompt: String) -> Option<String> {
     if prompt.len() <= LONGEST_PROMPT_ARGUMENT {
-        command.args.push(prompt.to_string());
+        command.args.push(prompt);
         return None;
     }
     tracing::warn!(
@@ -215,7 +218,8 @@ type Joined = (io::Result<()>, io::Result<()>, io::Result<ExitStatus>);
 /// of file.
 async fn spawn_and_wait(
     command_line: &CommandLine,
-    stdin_content: Option<&str>,
+    stdin_content: Option<String>,
+    started: RunStarted,
     request: &AgentRequest,
     parser: Box<dyn HarnessStreamParser>,
     observers: &RunObservers<'_>,
@@ -245,13 +249,17 @@ async fn spawn_and_wait(
         .await
         .map_err(|error| spawn_error(program, working_dir, &error))?;
     let mut group = GroupGuard::new(child.id());
+    observers.notify_started(started);
 
-    if let Some(content) = stdin_content {
-        if let Some(mut stdin) = child.stdin.take() {
+    // Written alongside the pipe readers, not before them: a harness that
+    // prints much before it has read its whole prompt would otherwise block
+    // on a full stdout pipe while narsor blocks on a full stdin pipe.
+    if let (Some(content), Some(mut stdin)) = (stdin_content, child.stdin.take()) {
+        tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let _ = stdin.write_all(content.as_bytes()).await;
-            let _ = stdin.flush().await;
-        }
+            let _ = stdin.shutdown().await;
+        });
     }
 
     let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
@@ -593,42 +601,18 @@ mod tests {
     }
 
     #[test]
-    fn extra_args_go_right_before_the_prompt_or_last_when_it_is_on_stdin() {
-        let request = AgentRequest {
-            extra_args: strings(&["--foo", "bar"]),
-            ..AgentRequest::new("", ".")
-        };
-        for (prompt, marker, expected_tail) in [
-            ("short", None, vec!["--foo", "bar", "short"]),
-            ("x", Some("-"), vec!["--foo", "bar", "x"]),
+    fn a_short_prompt_is_the_last_argument_and_a_long_one_goes_on_stdin() {
+        let long = "p".repeat(200 * 1024);
+        for (prompt, marker, args, on_stdin) in [
+            ("short", Some("-"), vec!["--json", "short"], false),
+            (long.as_str(), Some("-"), vec!["--json", "-"], true),
+            (long.as_str(), None, vec!["--json"], true),
         ] {
             let mut command = CommandLine::new("h", strings(&["--json"]));
             command.stdin_marker = marker;
-            apply_extra_args(&mut command.args, &request.extra_args);
-            assert_eq!(place_prompt("h", &mut command, prompt), None);
-            assert_eq!(command.args[1..], expected_tail);
+            let stdin = place_prompt("h", &mut command, prompt.to_string());
+            assert_eq!(command.args, args);
+            assert_eq!(stdin.is_some(), on_stdin);
         }
-
-        let long = "p".repeat(200 * 1024);
-        let mut command = CommandLine::new("h", strings(&["--json"]));
-        apply_extra_args(&mut command.args, &request.extra_args);
-        assert_eq!(place_prompt("h", &mut command, &long), Some(long.as_str()));
-        assert_eq!(command.args, ["--json", "--foo", "bar"]);
-    }
-
-    #[test]
-    fn a_long_prompt_goes_on_stdin_behind_the_harness_marker() {
-        let long = "p".repeat(200 * 1024);
-        let mut command = CommandLine::new("codex", strings(&["exec", "--json"]));
-        command.stdin_marker = Some("-");
-
-        let stdin = place_prompt("codex", &mut command, &long);
-
-        assert_eq!(stdin.map(str::len), Some(long.len()));
-        assert_eq!(command.args, ["exec", "--json", "-"]);
-        assert!(command
-            .args
-            .iter()
-            .all(|arg| arg.len() < LONGEST_PROMPT_ARGUMENT));
     }
 }

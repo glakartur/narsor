@@ -9,6 +9,7 @@
 //! made readable. No caller reads a command line back.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -164,26 +165,14 @@ pub struct ContextFiles {
     pub files: Vec<ContextFile>,
 }
 
-/// How a harness gives the agent its context files (R6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ContextAccess {
-    /// The agent can read the context directory: the files are written and
-    /// the prompt lists their paths.
-    Readable,
-    /// The agent cannot reach the directory: the prompt carries each file's
-    /// content instead.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Inline,
-}
-
 /// The heading of the block a harness appends to the prompt.
 pub const CONTEXT_FILES_HEADING: &str = "## Context files";
 
 impl ContextFiles {
-    /// Replaces the directory's content with the files (for
-    /// [`ContextAccess::Readable`]) and returns the block that tells the
-    /// agent about them; an empty string when there is no file to tell of.
-    pub(crate) fn prepare(&self, access: ContextAccess) -> Result<String, ActionError> {
+    /// Replaces the directory's content with the files and returns the
+    /// block that lists them for the agent; an empty string when there is
+    /// no file to list. Every stock harness can read the directory (R6).
+    fn prepare(&self) -> Result<String, ActionError> {
         let files: Vec<&ContextFile> = self
             .files
             .iter()
@@ -192,51 +181,55 @@ impl ContextFiles {
         for file in &files {
             check_name(&file.name)?;
         }
-        replace_dir(&self.dir)?;
+        empty_dir(&self.dir).map_err(|error| context_io_error(&self.dir, "emptied", &error))?;
         if files.is_empty() {
             return Ok(String::new());
         }
 
-        let mut block = format!("{CONTEXT_FILES_HEADING}\n\n");
-        match access {
-            ContextAccess::Readable => {
-                block.push_str(
-                    "These files hold more context for this run. They are not part of the \
-                     prompt: read a file only when you need what it holds.\n\n",
-                );
-                for file in files {
-                    let path = self.dir.join(&file.name);
-                    write_file(&path, &file.content)?;
-                    block.push_str(&format!(
-                        "- `{}` ({} bytes): {}\n",
-                        path.display(),
-                        file.content.len(),
-                        file.description
-                    ));
-                }
-            }
-            ContextAccess::Inline => {
-                block.push_str("The content of each context file of this run follows.\n");
-                for file in files {
-                    block.push_str(&format!(
-                        "\n### {} — {}\n\n<<<CONTEXT FILE\n{}\nCONTEXT FILE>>>\n",
-                        file.name, file.description, file.content
-                    ));
-                }
-            }
+        let mut block = format!(
+            "{CONTEXT_FILES_HEADING}\n\nThese files hold more context for this run. They are \
+             not part of the prompt: read a file only when you need what it holds.\n\n"
+        );
+        for file in files {
+            let path = self.dir.join(&file.name);
+            write_file(&path, &file.content)?;
+            let _ = writeln!(
+                block,
+                "- `{}` ({} bytes): {}",
+                path.display(),
+                file.content.len(),
+                file.description
+            );
         }
         Ok(block)
     }
 }
 
-/// `prompt` with `block` appended after a blank line; `prompt` alone when
-/// the block is empty.
-pub(crate) fn with_block(prompt: &str, block: &str) -> String {
-    if block.is_empty() {
-        prompt.to_string()
-    } else {
-        format!("{}\n\n{}", prompt.trim_end(), block.trim_end())
+impl AgentRequest {
+    /// `prompt` as the agent receives it: the context files written, and
+    /// the block listing them appended after a blank line.
+    pub(crate) fn prompt_with_context(&self, mut prompt: String) -> Result<String, ActionError> {
+        let Some(context) = &self.context else {
+            return Ok(prompt);
+        };
+        let block = context.prepare()?;
+        if !block.is_empty() {
+            prompt.truncate(prompt.trim_end().len());
+            prompt.push_str("\n\n");
+            prompt.push_str(block.trim_end());
+        }
+        Ok(prompt)
     }
+}
+
+/// Empties `dir`, creating it when it does not exist.
+pub(crate) fn empty_dir(dir: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::create_dir_all(dir)
 }
 
 /// A context file name must stay inside its directory.
@@ -254,16 +247,6 @@ fn check_name(name: &str) -> Result<(), ActionError> {
         error_type: Some("invalid_context_file".to_string()),
         details: Some(serde_json::json!({ "name": name })),
     })
-}
-
-/// Empties `dir`, creating it when it does not exist.
-fn replace_dir(dir: &Path) -> Result<(), ActionError> {
-    match fs::remove_dir_all(dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(context_io_error(dir, "emptied", &error)),
-    }
-    fs::create_dir_all(dir).map_err(|error| context_io_error(dir, "created", &error))
 }
 
 fn write_file(path: &Path, content: &str) -> Result<(), ActionError> {
@@ -303,8 +286,7 @@ pub struct RunObservers<'a> {
     pub(crate) started: Option<&'a (dyn Fn(&RunStarted) + Send + Sync)>,
 }
 
-static NO_CONVERSATION: std::sync::LazyLock<ConversationSink> =
-    std::sync::LazyLock::new(ConversationSink::none);
+static NO_CONVERSATION: ConversationSink = ConversationSink::none();
 
 impl<'a> RunObservers<'a> {
     /// Observers that record nothing.
@@ -415,7 +397,7 @@ pub(crate) mod tests {
             &dir,
             &[("events.md", "abc"), ("conversations/a-1.md", "hello")],
         )
-        .prepare(ContextAccess::Readable)
+        .prepare()
         .unwrap();
 
         assert_eq!(fs::read_to_string(dir.join("events.md")).unwrap(), "abc");
@@ -442,11 +424,11 @@ pub(crate) mod tests {
         let root = TestDir::new();
         let dir = root.path().join("context");
         context(&dir, &[("old.md", "old")])
-            .prepare(ContextAccess::Readable)
+            .prepare()
             .unwrap();
 
         let block = context(&dir, &[("new.md", "new"), ("empty.md", "")])
-            .prepare(ContextAccess::Readable)
+            .prepare()
             .unwrap();
 
         let mut names: Vec<_> = fs::read_dir(&dir)
@@ -457,25 +439,9 @@ pub(crate) mod tests {
         assert_eq!(names, ["new.md"]);
         assert!(!block.contains("empty.md"), "{block}");
 
-        let block = context(&dir, &[]).prepare(ContextAccess::Readable).unwrap();
+        let block = context(&dir, &[]).prepare().unwrap();
         assert!(block.is_empty());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn inline_access_writes_nothing_and_carries_the_content() {
-        let root = TestDir::new();
-        let dir = root.path().join("context");
-        let block = context(&dir, &[("workflow.yaml", "states: {}")])
-            .prepare(ContextAccess::Inline)
-            .unwrap();
-
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-        assert!(
-            block.contains("### workflow.yaml — about workflow.yaml"),
-            "{block}"
-        );
-        assert!(block.contains("states: {}"), "{block}");
     }
 
     #[test]
@@ -483,7 +449,7 @@ pub(crate) mod tests {
         let root = TestDir::new();
         for name in ["../escape.md", "/etc/passwd", ""] {
             let error = context(&root.path().join("context"), &[(name, "x")])
-                .prepare(ContextAccess::Readable)
+                .prepare()
                 .expect_err(name);
             assert_eq!(error.error_type.as_deref(), Some("invalid_context_file"));
         }

@@ -48,7 +48,6 @@
 //! [`DEFAULT_CONDUCTOR_TIMEOUT`]. Unlike an agent step it is never
 //! unbounded: the label rescue runs inline, under the pass's claim.
 
-use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -68,6 +67,7 @@ use crate::engine::actions::answer::AnswerShape;
 use crate::engine::actions::harness::{
     AgentRequest, AgentRunEnding, ContextFiles, HarnessRegistry, RunObservers, CLAUDE_CODE, CODEX,
 };
+use crate::engine::actions::harness::request::empty_dir;
 use crate::engine::actions::session::{ConversationSink, ReadingTap};
 use crate::engine::timeline_file::{ReadingSink, UsageReading};
 use crate::persistence::{ExecutionStore, WorkPaths};
@@ -324,7 +324,7 @@ impl HarnessInvoker {
         );
         input.request = Some(invocation.request.clone());
         input.chat_message = invocation.chat_message.clone();
-        let snapshot = render(&input);
+        let snapshot = render(input);
         let descriptions = self.repository_descriptions(&execution);
         let listed: Vec<ConductorRepository> = repositories
             .iter()
@@ -355,10 +355,11 @@ impl HarnessInvoker {
             extra_args: agent_args_for(&self.extra_args, &harness).to_vec(),
             ..conductor_request(&self.profile, prompt, working_dir)
         };
-        let conversation = match self.reading_tap(invocation, &harness) {
-            Some(tap) => ConversationSink::none().with_readings(tap),
-            None => ConversationSink::none(),
-        };
+        let conversation = self
+            .reading_tap(invocation, &harness)
+            .map_or_else(ConversationSink::none, |tap| {
+                ConversationSink::none().with_readings(tap)
+            });
         let ending = adapter
             .run(&request, RunObservers::conversation(&conversation))
             .await
@@ -448,19 +449,9 @@ impl HarnessInvoker {
     /// conductor starts from nothing every time.
     fn empty_scratch_dir(&self, execution_id: &str) -> Result<PathBuf, String> {
         let dir = self.scratch_dir(execution_id);
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "the conductor's scratch directory {} could not be emptied: {error}",
-                    dir.display()
-                ))
-            }
-        }
-        fs::create_dir_all(&dir).map_err(|error| {
+        empty_dir(&dir).map_err(|error| {
             format!(
-                "the conductor's scratch directory {} could not be created: {error}",
+                "the conductor's scratch directory {} could not be emptied: {error}",
                 dir.display()
             )
         })?;

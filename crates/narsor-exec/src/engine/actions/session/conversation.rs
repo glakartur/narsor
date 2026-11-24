@@ -220,7 +220,7 @@ fn without_usage(elements: &[ChatElement]) -> Vec<ChatElement> {
 
 impl ConversationSink {
     /// No file to write to.
-    pub(crate) fn none() -> Self {
+    pub(crate) const fn none() -> Self {
         Self(None, None)
     }
 

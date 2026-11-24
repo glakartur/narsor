@@ -12,34 +12,10 @@ use narsor_engine::engine::{
     OpenCodeAdapter, RunObservers, RunStarted,
 };
 
-use crate::engine_support::FakeHarness;
+use crate::engine_support::{FakeHarness, TempDir};
 
 /// Linux's limit for one command-line argument.
 const MAX_ARG_STRLEN: usize = 128 * 1024;
-
-/// A fresh directory, removed when dropped.
-struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("narsor-harness-run-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl std::ops::Deref for TempDir {
-    type Target = Path;
-    fn deref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn harness(name: &str, program: String) -> Arc<dyn HarnessAdapter> {
     match name {

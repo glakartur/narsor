@@ -43,9 +43,8 @@ use crate::config::{agent_args_for, AgentArgs};
 use crate::engine::timeline_file::ReadingSink;
 
 use super::answer::AnswerShape;
-pub(crate) use super::harness::FinishedRun;
 use super::harness::{
-    AgentRequest, AgentRunEnding, HarnessAdapter, HarnessRegistry, HarnessRun, HarnessStreamParser,
+    AgentRequest, AgentRunEnding, FinishedRun, HarnessAdapter, HarnessRegistry, HarnessRun, HarnessStreamParser,
     RunObservers, RunStarted, FINAL_ANSWER_GRACE,
 };
 use super::human::{HumanInputRequest, PermissionDenialDetails, PermissionRequestDetails};
@@ -64,7 +63,6 @@ mod denials;
 pub(crate) mod process;
 pub(crate) mod response;
 
-pub(crate) use super::harness::cli::stderr_element;
 use conversation::UsageRelay;
 pub use conversation::{AgentEventSink, LoggingEventSink, UsageReporter};
 pub(crate) use conversation::{ConversationSink, ReadingTap};
@@ -288,7 +286,8 @@ impl SessionRunner {
         };
 
         // `AgentSessionStarted` carries the model and the effort the harness
-        // resolved (R4); it is emitted once the harness is about to start.
+        // resolved (R4); it is emitted once the harness has started. An
+        // error before that means the harness never started.
         let started = AtomicBool::new(false);
         let on_started = |run: &RunStarted| {
             started.store(true, Ordering::Relaxed);
@@ -372,16 +371,8 @@ impl SessionRunner {
                 return Err(error);
             }
             Err(error) => {
-                let started = !matches!(
-                    error.error_type.as_deref(),
-                    Some("harness_not_found") | Some("harness_unavailable") | Some("spawn_failed")
-                );
                 conversation.append_outcome(
-                    &if started {
-                        format!("harness run failed: {}", error.message)
-                    } else {
-                        format!("harness did not start: {}", error.message)
-                    },
+                    &format!("harness run failed: {}", error.message),
                     serde_json::json!({ "error_type": error.error_type }),
                 );
                 conversation.finish();

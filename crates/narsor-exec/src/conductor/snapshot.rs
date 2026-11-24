@@ -237,10 +237,11 @@ fn analyses_agent_answer(purpose: ConductorPurpose) -> bool {
     )
 }
 
-/// Renders `input` into the prompt core and the context files.
-pub fn render(input: &SnapshotInput) -> Snapshot {
+/// Renders `input` into the prompt core and the context files, moving the
+/// uncut texts into the files rather than copying them.
+pub fn render(input: SnapshotInput) -> Snapshot {
     Snapshot {
-        core: render_core(input),
+        core: render_core(&input),
         files: context_files(input),
     }
 }
@@ -357,14 +358,14 @@ fn state_definition(source: &str, state: &str) -> Option<String> {
 }
 
 /// The context files of `input`: every section outside the core, uncut.
-fn context_files(input: &SnapshotInput) -> Vec<ContextFile> {
+fn context_files(input: SnapshotInput) -> Vec<ContextFile> {
     let mut files = Vec::new();
 
-    match &input.definition {
+    match input.definition {
         Ok(source) => files.push(ContextFile::new(
             "workflow.yaml",
             "The pinned workflow definition, every state.",
-            source.clone(),
+            source,
         )),
         Err(error) => files.push(ContextFile::new(
             "workflow.yaml",
@@ -399,17 +400,11 @@ fn context_files(input: &SnapshotInput) -> Vec<ContextFile> {
         ));
     }
 
-    for (index, conversation) in input.conversations.iter().enumerate() {
-        let description = if conversation.current {
-            format!(
-                "The agent conversation of attempt {} in the current state `{}`.",
-                conversation.attempt_id, conversation.state_id
-            )
+    for (index, conversation) in input.conversations.into_iter().enumerate() {
+        let when = if conversation.current {
+            "current"
         } else {
-            format!(
-                "The agent conversation of attempt {} in the earlier state `{}`.",
-                conversation.attempt_id, conversation.state_id
-            )
+            "earlier"
         };
         files.push(ContextFile::new(
             format!(
@@ -418,8 +413,11 @@ fn context_files(input: &SnapshotInput) -> Vec<ContextFile> {
                 file_safe(&conversation.state_id),
                 file_safe(&conversation.attempt_id)
             ),
-            description,
-            conversation.text.clone(),
+            format!(
+                "The agent conversation of attempt {} in the {when} state `{}`.",
+                conversation.attempt_id, conversation.state_id
+            ),
+            conversation.text,
         ));
     }
 
@@ -439,14 +437,14 @@ fn context_files(input: &SnapshotInput) -> Vec<ContextFile> {
         ));
     }
 
-    for artifact in &input.artifacts {
+    for artifact in input.artifacts {
         files.push(ContextFile::new(
             format!("artifacts/{}", file_safe(&artifact.name)),
             format!(
                 "The workflow artifact `{}` ({}).",
                 artifact.name, artifact.location
             ),
-            artifact.content.clone(),
+            artifact.content,
         ));
     }
 
