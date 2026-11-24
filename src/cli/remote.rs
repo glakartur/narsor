@@ -385,6 +385,20 @@ pub enum TaskCommand {
         #[arg(long, value_name = "TEXT")]
         reason: Option<String>,
     },
+    /// Chooses the step a stopped task goes on from, with an optional
+    /// comment for the agent.
+    SelectStep {
+        #[command(flatten)]
+        args: OperatorCommandArgs,
+        /// The step to go on from.
+        #[arg(value_name = "STEP")]
+        target: String,
+        /// A comment for the agent. It goes to the end of the prompt of the
+        /// first agent attempt of the chosen step and does not stay for
+        /// later runs.
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
     /// Starts the task's failed or interrupted step again, with a note for
     /// the agent's next attempt.
     RestartStep {
@@ -1205,6 +1219,10 @@ pub async fn task(
                 forced,
                 reason,
             };
+            operator_command(&client, command, args).await
+        }
+        TaskCommand::SelectStep { args, target, note } => {
+            let command = OperatorCommand::SelectStep { target, note };
             operator_command(&client, command, args).await
         }
         TaskCommand::RestartStep {
