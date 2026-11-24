@@ -37,6 +37,11 @@
 //!   [`crate::engine::actions::agent::closing_answer`]). The API refuses
 //!   `anyOf`/`oneOf`/`allOf` at the top level of a schema and requires
 //!   `"type": "object"` there.
+//! * The prompt is the last argument up to
+//!   [`cli::LONGEST_PROMPT_ARGUMENT`]; a longer one goes on stdin, which
+//!   `--print` reads when no prompt argument is given (NARSOR-1124-001).
+//! * The context directory of a run, when it has one, is one more
+//!   `--add-dir`, so the agent can read its context files.
 //! * The flag right before the prompt always takes exactly one value —
 //!   `--permission-mode` when the workflow sets `workspace_access`, else
 //!   `--output-format` — so the prompt can never be read as a flag argument.
@@ -68,12 +73,15 @@ mod usage;
 
 use std::path::Path;
 
+use futures::future::BoxFuture;
 use serde_json::{Map, Value};
 
+use super::cli::{self, CommandLine};
+use super::request::{with_block, ContextAccess, RunStarted};
 use super::{
     integer_parameter, model_for_tier, reject_option_like, resolve_read_only_path,
-    string_parameter, tail, FinalAnswer, HarnessAdapter, HarnessInvocation, HarnessRequest,
-    HarnessRun, HarnessStreamParser, PermissionDenial,
+    string_parameter, tail, AgentRequest, AgentRunEnding, FinalAnswer, HarnessAdapter, HarnessRun,
+    HarnessStreamParser, PermissionDenial, RunObservers,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
@@ -84,12 +92,6 @@ use narsor_protocol::controller::UsageLimit;
 
 /// The `harness:` value this adapter answers to.
 pub use narsor_protocol::harness::CLAUDE_CODE;
-
-/// The longest prompt passed as a command-line argument; a longer one goes
-/// on stdin. Linux refuses any single argument over `MAX_ARG_STRLEN`
-/// (128 KiB) with E2BIG, and the conductor's snapshot alone may grow past
-/// that (NARSOR-1124-001). The margin leaves room below the limit.
-const LONGEST_PROMPT_ARGUMENT: usize = 96 * 1024;
 
 /// The binary the adapter runs unless it is built with another one.
 pub const DEFAULT_PROGRAM: &str = "claude";
@@ -129,6 +131,116 @@ impl ClaudeCodeAdapter {
     }
 }
 
+impl ClaudeCodeAdapter {
+    /// The command line of `request`, without the prompt, and the model and
+    /// effort it runs with.
+    fn command_line(
+        &self,
+        request: &AgentRequest,
+    ) -> Result<(CommandLine, RunStarted), ActionError> {
+        let mode = permission_mode(request)?;
+        let mut started = RunStarted::default();
+
+        let mut args = vec![
+            "--print".to_string(),
+            "--verbose".to_string(),
+            "--permission-prompts".to_string(),
+            "none".to_string(),
+        ];
+
+        // The variadic flags come first: each is followed by another flag,
+        // never by the prompt, which they would swallow.
+        // Repositories of the step outside the working directory need
+        // `--add-dir` to be reachable at all. Claude Code cannot make one of
+        // them read-only, so the prompt block carries that (R14).
+        let mut step_dirs: Vec<String> = request
+            .outside_working_dir(&request.writable_dirs)
+            .into_iter()
+            .chain(request.outside_working_dir(&request.read_only_dirs))
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .collect();
+        if let Some(context) = &request.context {
+            if !context.dir.starts_with(&request.working_dir) {
+                step_dirs.push(context.dir.to_string_lossy().into_owned());
+            }
+        }
+        if !request.read_only_paths.is_empty() || !step_dirs.is_empty() {
+            args.push("--add-dir".to_string());
+            // No option-like guard here: resolve_read_only_path joins a
+            // relative entry onto the workspace and leaves an absolute one
+            // alone, so the result always begins with '/' and can never be
+            // read as a flag. A guard here would never fire, and a guard that
+            // cannot fire reads like protection that is not there.
+            for path in &request.read_only_paths {
+                args.push(read_only_arg(&request.working_dir, path));
+            }
+            args.extend(step_dirs);
+        }
+
+        if !request.permission_grants.is_empty() {
+            args.push("--allowedTools".to_string());
+            args.extend(request.permission_grants.iter().cloned());
+        }
+
+        args.push("--disallowedTools".to_string());
+        args.extend(DEFERRING_TOOLS.iter().map(|tool| tool.to_string()));
+
+        if let Some(tier) = &request.model {
+            let model = model_for_tier(self, tier)?;
+            reject_option_like(&model, "model", CLAUDE_CODE)?;
+            args.push("--model".to_string());
+            args.push(model.clone());
+            started.model = Some(model);
+        }
+
+        if let Some(effort) = &request.effort {
+            reject_option_like(effort, "effort", CLAUDE_CODE)?;
+            args.push("--effort".to_string());
+            args.push(effort.clone());
+            started.effort = Some(effort.clone());
+        }
+
+        if let Some(max_turns) = integer_parameter(&request.parameters, "max_turns", CLAUDE_CODE)? {
+            args.push("--max-turns".to_string());
+            args.push(max_turns.to_string());
+        }
+
+        if let Some(system_prompt) =
+            string_parameter(&request.parameters, "append_system_prompt", CLAUDE_CODE)?
+        {
+            reject_option_like(system_prompt, "append_system_prompt", CLAUDE_CODE)?;
+            args.push("--append-system-prompt".to_string());
+            args.push(system_prompt.to_string());
+        }
+
+        if let Some(session) = &request.resume_session {
+            reject_option_like(session, "resume_session", CLAUDE_CODE)?;
+            args.push("--resume".to_string());
+            args.push(session.to_string());
+        }
+
+        if let Some(schema) = &request.answer_schema {
+            let schema = schema.to_string();
+            reject_option_like(&schema, "output_schema", CLAUDE_CODE)?;
+            args.push("--json-schema".to_string());
+            args.push(schema);
+        }
+
+        // Single-valued flags close the list, so whatever stands right
+        // before the prompt takes exactly one value.
+        args.push("--output-format".to_string());
+        args.push("stream-json".to_string());
+
+        if let Some(mode) = mode {
+            args.push("--permission-mode".to_string());
+            args.push(mode.to_string());
+        }
+
+        // `--print` without a prompt argument reads the prompt from stdin.
+        Ok((CommandLine::new(&self.program, args), started))
+    }
+}
+
 impl Default for ClaudeCodeAdapter {
     fn default() -> Self {
         Self::new()
@@ -157,109 +269,21 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         &self.program
     }
 
-    fn invocation(&self, request: &HarnessRequest<'_>) -> Result<HarnessInvocation, ActionError> {
-        let config = request.config;
-        let mode = permission_mode(request)?;
-
-        let mut args = vec![
-            "--print".to_string(),
-            "--verbose".to_string(),
-            "--permission-prompts".to_string(),
-            "none".to_string(),
-        ];
-
-        // The variadic flags come first: each is followed by another flag,
-        // never by the prompt, which they would swallow.
-        // Repositories of the step outside the working directory need
-        // `--add-dir` to be reachable at all. Claude Code cannot make one of
-        // them read-only, so the prompt block carries that (R14).
-        let step_dirs: Vec<String> = request
-            .outside_workspace(request.writable_dirs)
-            .into_iter()
-            .chain(request.outside_workspace(request.read_only_dirs))
-            .map(|dir| dir.to_string_lossy().into_owned())
-            .collect();
-        if !config.read_only_paths.is_empty() || !step_dirs.is_empty() {
-            args.push("--add-dir".to_string());
-            // No option-like guard here: resolve_read_only_path joins a
-            // relative entry onto the workspace and leaves an absolute one
-            // alone, so the result always begins with '/' and can never be
-            // read as a flag. A guard here would never fire, and a guard that
-            // cannot fire reads like protection that is not there.
-            for path in &config.read_only_paths {
-                args.push(read_only_arg(request.workspace, path));
-            }
-            args.extend(step_dirs);
-        }
-
-        if !config.permission_grants.is_empty() {
-            args.push("--allowedTools".to_string());
-            args.extend(config.permission_grants.iter().cloned());
-        }
-
-        args.push("--disallowedTools".to_string());
-        args.extend(DEFERRING_TOOLS.iter().map(|tool| tool.to_string()));
-
-        if let Some(tier) = &config.model {
-            let model = model_for_tier(self, tier)?;
-            reject_option_like(&model, "model", CLAUDE_CODE)?;
-            args.push("--model".to_string());
-            args.push(model);
-        }
-
-        if let Some(effort) = &config.effort {
-            reject_option_like(effort, "effort", CLAUDE_CODE)?;
-            args.push("--effort".to_string());
-            args.push(effort.clone());
-        }
-
-        if let Some(max_turns) = integer_parameter(config, "max_turns", CLAUDE_CODE)? {
-            args.push("--max-turns".to_string());
-            args.push(max_turns.to_string());
-        }
-
-        if let Some(system_prompt) = string_parameter(config, "append_system_prompt", CLAUDE_CODE)?
-        {
-            reject_option_like(system_prompt, "append_system_prompt", CLAUDE_CODE)?;
-            args.push("--append-system-prompt".to_string());
-            args.push(system_prompt.to_string());
-        }
-
-        if let Some(session) = request.resume_session {
-            reject_option_like(session, "resume_session", CLAUDE_CODE)?;
-            args.push("--resume".to_string());
-            args.push(session.to_string());
-        }
-
-        if let Some(schema) = request.output_schema {
-            let schema = schema.to_string();
-            reject_option_like(&schema, "output_schema", CLAUDE_CODE)?;
-            args.push("--json-schema".to_string());
-            args.push(schema);
-        }
-
-        // Single-valued flags close the list, so whatever stands right
-        // before the prompt takes exactly one value.
-        args.push("--output-format".to_string());
-        args.push("stream-json".to_string());
-
-        if let Some(mode) = mode {
-            args.push("--permission-mode".to_string());
-            args.push(mode.to_string());
-        }
-
-        // `--print` without a prompt argument reads the prompt from stdin.
-        let stdin = if request.prompt.len() > LONGEST_PROMPT_ARGUMENT {
-            Some(request.prompt.to_string())
-        } else {
-            args.push(request.prompt.to_string());
-            None
-        };
-
-        Ok(HarnessInvocation {
-            program: self.program.clone(),
-            args,
-            stdin,
+    fn run<'a>(
+        &'a self,
+        request: &'a AgentRequest,
+        observers: RunObservers<'a>,
+    ) -> BoxFuture<'a, Result<AgentRunEnding, ActionError>> {
+        Box::pin(async move {
+            let (command, started) = self.command_line(request)?;
+            let block = match &request.context {
+                Some(context) => context.prepare(ContextAccess::Readable)?,
+                None => String::new(),
+            };
+            let prompt = with_block(&request.prompt, &block);
+            observers.notify_started(started);
+            let parser = self.stream_parser(request.answer_shape);
+            cli::run(CLAUDE_CODE, command, &prompt, request, parser, &observers).await
         })
     }
 
@@ -551,10 +575,9 @@ fn parse_object(line: &[u8]) -> Option<Map<String, Value>> {
 }
 
 /// The permission mode of this run, validated against what the CLI accepts.
-fn permission_mode<'a>(request: &HarnessRequest<'a>) -> Result<Option<&'a str>, ActionError> {
-    if request.config.parameters.contains_key("permission_mode")
+fn permission_mode(request: &AgentRequest) -> Result<Option<&'static str>, ActionError> {
+    if request.parameters.contains_key("permission_mode")
         || request
-            .config
             .parameters
             .contains_key("dangerously_skip_permissions")
     {

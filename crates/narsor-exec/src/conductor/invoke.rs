@@ -55,15 +55,13 @@ use crate::conductor::response::ConductorResponse;
 use crate::conductor::snapshot::{render, SnapshotBudget, SnapshotInput};
 use crate::conductor::store::ConductorStore;
 use crate::config::{agent_args_for, AgentArgs};
-use crate::domain::{
-    ChoiceDefinition, HarnessStepConfig, WorkflowDefinition, WorkflowExecution, WorkspaceAccess,
-};
+use crate::domain::{ChoiceDefinition, WorkflowDefinition, WorkflowExecution, WorkspaceAccess};
 use crate::engine::actions::agent::{DefaultHarnessSource, BUILT_IN_HARNESS};
 use crate::engine::actions::answer::AnswerShape;
 use crate::engine::actions::harness::{
-    apply_extra_args, HarnessRegistry, HarnessRequest, CLAUDE_CODE, CODEX,
+    AgentRequest, AgentRunEnding, HarnessRegistry, RunObservers, CLAUDE_CODE, CODEX,
 };
-use crate::engine::actions::session::{run_harness_process, ReadingTap, SpawnEnding};
+use crate::engine::actions::session::{ConversationSink, ReadingTap};
 use crate::engine::timeline_file::{ReadingSink, UsageReading};
 use crate::persistence::{ExecutionStore, WorkPaths};
 
@@ -333,45 +331,28 @@ impl HarnessInvoker {
             Autopilot::of_payload(&invocation.request.payload),
         );
 
-        let read_only_dirs: Vec<PathBuf> = repositories
-            .iter()
-            .map(|repository| PathBuf::from(&repository.path))
-            .collect();
-        let config = conductor_config(&self.profile);
-        let schema = answer_schema(invocation.request.purpose);
-        let mut command = adapter
-            .invocation(&HarnessRequest {
-                config: &config,
-                workspace_access: Some(WorkspaceAccess::ReadOnly),
-                prompt: &prompt,
-                workspace: &working_dir,
-                writable_dirs: &[],
-                read_only_dirs: &read_only_dirs,
-                resume_session: None,
-                output_schema: Some(&schema),
-            })
+        let request = AgentRequest {
+            read_only_dirs: repositories
+                .iter()
+                .map(|repository| PathBuf::from(&repository.path))
+                .collect(),
+            answer_schema: Some(answer_schema(invocation.request.purpose)),
+            timeout: Some(self.timeout),
+            extra_args: agent_args_for(&self.extra_args, &harness).to_vec(),
+            ..conductor_request(&self.profile, prompt, working_dir)
+        };
+        let conversation = match self.reading_tap(invocation, &harness) {
+            Some(tap) => ConversationSink::none().with_readings(tap),
+            None => ConversationSink::none(),
+        };
+        let ending = adapter
+            .run(&request, RunObservers::conversation(&conversation))
+            .await
             .map_err(|error| error.message)?;
-        apply_extra_args(
-            &mut command,
-            &prompt,
-            agent_args_for(&self.extra_args, &harness),
-        );
-
-        let ending = run_harness_process(
-            &command.program,
-            &command.args,
-            command.stdin.as_deref(),
-            &working_dir,
-            Some(self.timeout),
-            adapter.stream_parser(AnswerShape::Choice),
-            self.reading_tap(invocation, &harness),
-        )
-        .await
-        .map_err(|error| error.message)?;
 
         let finished = match ending {
-            SpawnEnding::Finished(finished) => finished,
-            SpawnEnding::TimedOut => {
+            AgentRunEnding::Finished(finished) => finished,
+            AgentRunEnding::TimedOut => {
                 return Err(format!(
                     "the conductor's harness '{harness}' was still running after {}s and was \
                      killed",
@@ -500,15 +481,19 @@ fn pinned_source(
     (source, outputs)
 }
 
-/// The harness session the adapters build the conductor's command line from:
-/// the configured model tier and effort (none means the harness's default),
-/// no parameters, read-only.
-fn conductor_config(profile: &ConductorProfile) -> HarnessStepConfig {
-    HarnessStepConfig {
+/// The run of the conductor in `working_dir`: the configured model tier and
+/// effort (none means the harness's default), read-only, answering a choice.
+fn conductor_request(
+    profile: &ConductorProfile,
+    prompt: String,
+    working_dir: PathBuf,
+) -> AgentRequest {
+    AgentRequest {
         model: profile.model.clone(),
         effort: profile.effort.clone(),
         workspace_access: Some(WorkspaceAccess::ReadOnly),
-        ..HarnessStepConfig::default()
+        answer_shape: AnswerShape::Choice,
+        ..AgentRequest::new(prompt, working_dir)
     }
 }
 
@@ -517,19 +502,17 @@ mod conductor_profile_tests {
     use super::*;
 
     #[test]
-    fn the_conductor_runs_on_the_configured_tier_and_effort() {
+    fn the_conductor_runs_read_only_on_the_configured_tier_and_effort() {
         let profile = ConductorProfile {
             model: Some("small".into()),
             effort: Some("low".into()),
         };
-        let config = conductor_config(&profile);
-        assert_eq!(config.model.as_deref(), Some("small"));
-        assert_eq!(config.effort.as_deref(), Some("low"));
-    }
+        let request = conductor_request(&profile, "p".into(), PathBuf::from("/w"));
+        assert_eq!(request.model.as_deref(), Some("small"));
+        assert_eq!(request.effort.as_deref(), Some("low"));
+        assert_eq!(request.workspace_access, Some(WorkspaceAccess::ReadOnly));
 
-    #[test]
-    fn an_empty_profile_leaves_the_choice_to_the_harness() {
-        let config = conductor_config(&ConductorProfile::default());
-        assert!(config.model.is_none() && config.effort.is_none());
+        let request = conductor_request(&ConductorProfile::default(), "p".into(), "/w".into());
+        assert!(request.model.is_none() && request.effort.is_none());
     }
 }

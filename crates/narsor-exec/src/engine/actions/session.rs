@@ -28,18 +28,14 @@
 //! engine's own `emit` does. Without a sink (a direct unit test) the run is
 //! unchanged and the events simply go nowhere.
 
-use std::io;
-use std::path::Path;
-use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
-use narsor_protocol::chat::{ChatElement, PromptAuthor, UnclassifiedReason};
+use narsor_protocol::chat::{ChatElement, PromptAuthor};
 use narsor_protocol::controller::{HarnessUsageReport, UsageLimit};
 use serde_json::{Map, Value};
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::process::Command;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -47,15 +43,15 @@ use crate::config::{agent_args_for, AgentArgs};
 use crate::engine::timeline_file::ReadingSink;
 
 use super::answer::AnswerShape;
+pub(crate) use super::harness::FinishedRun;
 use super::harness::{
-    apply_extra_args, FinalAnswer, HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun,
-    HarnessStreamParser,
+    AgentRequest, AgentRunEnding, HarnessAdapter, HarnessRegistry, HarnessRun, HarnessStreamParser,
+    RunObservers, RunStarted, FINAL_ANSWER_GRACE,
 };
 use super::human::{HumanInputRequest, PermissionDenialDetails, PermissionRequestDetails};
-use super::process_group::{self, GroupGuard};
 use super::scope::StepScope;
-use super::script::{truncate, MAX_BUFFERED_OUTPUT_BYTES};
-use super::{ActionOutcome, ActionRequest, SuspendedAction, TimedOutAction, ACTION_ID_ENV_VAR};
+use super::script::truncate;
+use super::{ActionOutcome, ActionRequest, SuspendedAction, TimedOutAction};
 use crate::domain::{
     ActionError, AgentSession, AgentSessionStatus, Event, EventData, HarnessStepConfig,
 };
@@ -68,12 +64,12 @@ mod denials;
 pub(crate) mod process;
 pub(crate) mod response;
 
+pub(crate) use super::harness::cli::stderr_element;
 use conversation::UsageRelay;
 pub use conversation::{AgentEventSink, LoggingEventSink, UsageReporter};
 pub(crate) use conversation::{ConversationSink, ReadingTap};
 use denials::split_denials;
-use process::{harness_error, run_harness_invocation, FINAL_ANSWER_GRACE};
-pub(crate) use process::{run_harness_process, stderr_element, FinishedRun, SpawnEnding};
+use process::harness_error;
 
 /// The harness used when neither the action nor the configuration names one.
 ///
@@ -267,79 +263,63 @@ impl SessionRunner {
 
         let mut session = new_session(config, &harness, request.execution_id);
 
-        let workspace = scope.start_dir.as_path();
-        let writable_dirs = scope.write_dirs();
-        let read_only_dirs = scope.read_dirs();
-
-        // Opened before `invocation` (Key Technical Decisions): even an
-        // invocation that never runs (a bad parameter, a missing binary)
-        // leaves a conversation file behind, with the prompt and why the
-        // harness never started.
+        // Opened before the run (Key Technical Decisions): even a run that
+        // never starts (a bad parameter, a missing binary) leaves a
+        // conversation file behind, with the prompt and why the harness
+        // never started.
         let conversation = self.open_conversation(request, &harness, resume, &prompt);
 
-        let invocation = match adapter.invocation(&HarnessRequest {
-            config,
+        let agent_request = AgentRequest {
+            model: config.model.clone(),
+            effort: config.effort.clone(),
+            resume_session: resume.map(str::to_string),
             workspace_access: config.workspace_access,
-            prompt: &prompt,
-            workspace,
-            writable_dirs: &writable_dirs,
-            read_only_dirs: &read_only_dirs,
-            resume_session: resume,
-            output_schema: None,
-        }) {
-            Ok(mut invocation) => {
-                apply_extra_args(
-                    &mut invocation,
-                    &prompt,
-                    agent_args_for(&self.extra_args, &harness),
-                );
-                invocation
-            }
-            Err(error) => {
-                conversation.append_outcome(
-                    &format!("harness did not start: {}", error.message),
-                    serde_json::json!({ "error_type": error.error_type }),
-                );
-                conversation.finish();
-                return Err(error);
-            }
+            writable_dirs: scope.write_dirs(),
+            read_only_dirs: scope.read_dirs(),
+            read_only_paths: config.read_only_paths.clone(),
+            permission_grants: config.permission_grants.clone(),
+            parameters: config.parameters.clone(),
+            answer_shape: shape,
+            timeout: request.timeout,
+            final_answer_grace: self.final_answer_grace,
+            action_execution_id: Some(request.action_execution_id.to_string()),
+            extra_args: agent_args_for(&self.extra_args, &harness).to_vec(),
+            ..AgentRequest::new(prompt, scope.start_dir.clone())
         };
 
-        self.emit(
-            request.execution_id,
-            EventData::AgentSessionStarted {
-                session_id: session.id.clone(),
-                // The harness that actually ran, never "unspecified".
-                harness: harness.clone(),
-                action_execution_id: Some(request.action_execution_id.to_string()),
-                resumed_session: resume.map(ToString::to_string),
-                model: flag_value(&invocation.args, &["--model", "-m"])
-                    .or_else(|| config.model.clone()),
-                effort: flag_value(&invocation.args, &["--effort", "--reasoning-effort"]),
-            },
-        );
-        session.status = AgentSessionStatus::Running;
-
+        // `AgentSessionStarted` carries the model and the effort the harness
+        // resolved (R4); it is emitted once the harness is about to start.
+        let started = AtomicBool::new(false);
+        let on_started = |run: &RunStarted| {
+            started.store(true, Ordering::Relaxed);
+            self.emit(
+                request.execution_id,
+                EventData::AgentSessionStarted {
+                    session_id: session.id.clone(),
+                    // The harness that actually ran, never "unspecified".
+                    harness: harness.clone(),
+                    action_execution_id: Some(request.action_execution_id.to_string()),
+                    resumed_session: resume.map(ToString::to_string),
+                    model: run.model.clone(),
+                    effort: run.effort.clone(),
+                },
+            );
+        };
         let usage = self.usage.as_deref().map(|reporter| UsageRelay {
             harness: adapter.name(),
             reporter,
         });
-        let ending = run_harness_invocation(
-            &invocation.program,
-            &invocation.args,
-            invocation.stdin.as_deref(),
-            workspace,
-            Some(request.action_execution_id),
-            request.timeout,
-            self.final_answer_grace,
-            adapter.stream_parser(shape),
-            &conversation,
-            usage,
-        )
-        .await;
+        let observers = RunObservers::conversation(&conversation)
+            .with_usage(usage)
+            .on_started(&on_started);
+        let ending = adapter.run(&agent_request, observers).await;
+        let started = started.load(Ordering::Relaxed);
+        if started {
+            session.status = AgentSessionStatus::Running;
+        }
 
         let finished = match ending {
-            Ok(SpawnEnding::Finished(finished)) => {
+            Ok(AgentRunEnding::Finished(finished)) => {
                 if let Some(group) = finished.terminated_group {
                     conversation.append_outcome(
                         &format!("agent process group {group} terminated after the final answer"),
@@ -354,7 +334,7 @@ impl SessionRunner {
                 }
                 finished
             }
-            Ok(SpawnEnding::TimedOut) => {
+            Ok(AgentRunEnding::TimedOut) => {
                 let limit = request.timeout.unwrap_or_default();
                 conversation.append_outcome(
                     &format!(
@@ -382,6 +362,14 @@ impl SessionRunner {
                         subject: format!("agent harness '{}'", adapter.name()),
                     },
                 )));
+            }
+            Err(error) if !started => {
+                conversation.append_outcome(
+                    &format!("harness did not start: {}", error.message),
+                    serde_json::json!({ "error_type": error.error_type }),
+                );
+                conversation.finish();
+                return Err(error);
             }
             Err(error) => {
                 let started = !matches!(
@@ -710,45 +698,5 @@ fn record_session_in_details(error: &mut ActionError, harness: &str, session_id:
             "harness_session_id".to_string(),
             session_id.map_or(Value::Null, |id| Value::String(id.to_string())),
         );
-    }
-}
-
-/// The value of the first of `flags` on a harness command line, written as
-/// `--flag value` or `--flag=value`.
-fn flag_value(args: &[String], flags: &[&str]) -> Option<String> {
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        if let Some((name, value)) = arg.split_once('=') {
-            if flags.contains(&name) && !value.is_empty() {
-                return Some(value.to_string());
-            }
-        } else if flags.contains(&arg.as_str()) {
-            return args.next().filter(|v| !v.starts_with('-')).cloned();
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod flag_value_tests {
-    use super::flag_value;
-
-    fn args(args: &[&str]) -> Vec<String> {
-        args.iter().map(ToString::to_string).collect()
-    }
-
-    #[test]
-    fn a_flag_gives_its_value_either_way() {
-        let flags = ["--model", "-m"];
-        assert_eq!(
-            flag_value(&args(&["-p", "--model", "opus"]), &flags),
-            Some("opus".into())
-        );
-        assert_eq!(
-            flag_value(&args(&["--model=sonnet"]), &flags),
-            Some("sonnet".into())
-        );
-        assert_eq!(flag_value(&args(&["--model"]), &flags), None);
-        assert_eq!(flag_value(&args(&["--other", "x"]), &flags), None);
     }
 }

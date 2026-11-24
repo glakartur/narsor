@@ -35,16 +35,20 @@
 //!
 //! The system prompt is prepended to the main prompt before passing to the SDK.
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use futures::future::BoxFuture;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use super::{
-    model_for_tier, reject_option_like, string_parameter, tail, HarnessAdapter, HarnessInvocation,
-    HarnessRequest, HarnessRun, HarnessStreamParser,
+use super::copilot_sdk::{
+    run_copilot_sdk, CopilotSdkBackend, CopilotSdkRequest, GitHubCopilotSdkRuntime,
 };
-use crate::domain::ActionError;
-use crate::domain::WorkspaceAccess;
+use super::request::{with_block, ContextAccess, RunStarted};
+use super::{
+    model_for_tier, reject_option_like, resolve_read_only_path, string_parameter, tail,
+    AgentRequest, AgentRunEnding, HarnessAdapter, HarnessRun, HarnessStreamParser, RunObservers,
+};
+use crate::domain::{ActionError, WorkspaceAccess};
 use crate::engine::actions::answer::AnswerShape;
 use narsor_protocol::api::SubagentStats;
 use narsor_protocol::chat::{
@@ -55,31 +59,89 @@ use narsor_protocol::controller::UsageLimit;
 /// The `harness:` value this adapter answers to.
 pub use narsor_protocol::harness::GITHUB_COPILOT;
 
-/// Marker for SDK-based invocation (not a real binary).
-pub const DEFAULT_PROGRAM: &str = "copilot-sdk";
+/// The CLI the SDK starts, which must be on `PATH` (or named by
+/// `COPILOT_CLI_PATH`).
+pub const DEFAULT_PROGRAM: &str = "copilot";
 
 const FAILURE_DETAIL_BYTES: usize = 2 * 1024;
 const TECHNICAL_DATA_MAX_BYTES: usize = 1024;
 
-/// Adapter for the GitHub Copilot SDK.
-#[derive(Debug, Clone)]
+/// Adapter for the GitHub Copilot SDK, run in-process.
+///
+/// # Workspace access is not enforced
+///
+/// The SDK session approves every permission request, and nothing narrows
+/// it to the workflow's `workspace_access`: a read-only step can write.
+/// The prompt names the read-only paths; enforcing them is a separate
+/// change with its own security review
+/// (`docs/follow-ups/2026-11-15-narsor-engine-split-follow-ups.md`).
+#[derive(Clone)]
 pub struct GitHubCopilotAdapter {
-    program: String,
+    backend: Arc<dyn CopilotSdkBackend>,
+}
+
+impl std::fmt::Debug for GitHubCopilotAdapter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GitHubCopilotAdapter")
+            .finish_non_exhaustive()
+    }
 }
 
 impl GitHubCopilotAdapter {
-    /// An adapter using the Copilot SDK.
+    /// An adapter running the Copilot SDK runtime of this build.
     pub fn new() -> Self {
-        Self {
-            program: DEFAULT_PROGRAM.to_string(),
-        }
+        // A unit struct when the `copilot-sdk` feature is off.
+        #[allow(clippy::default_constructed_unit_structs)]
+        let runtime = GitHubCopilotSdkRuntime::default();
+        Self::with_backend(Arc::new(runtime))
     }
 
-    /// An adapter with custom configuration (for testing).
-    pub fn with_program(program: impl Into<String>) -> Self {
-        Self {
-            program: program.into(),
+    /// An adapter running `backend` instead of the SDK.
+    pub(crate) fn with_backend(backend: Arc<dyn CopilotSdkBackend>) -> Self {
+        Self { backend }
+    }
+
+    /// What the SDK is asked for, and the model it runs with.
+    fn sdk_request(
+        &self,
+        request: &AgentRequest,
+    ) -> Result<(CopilotSdkRequest, RunStarted), ActionError> {
+        validate_parameters(request)?;
+        reject_sandbox_parameter(request)?;
+        let mut prompt = message(request);
+        if let Some(system_prompt) =
+            string_parameter(&request.parameters, "append_system_prompt", GITHUB_COPILOT)?
+        {
+            reject_option_like(system_prompt, "append_system_prompt", GITHUB_COPILOT)?;
+            prompt = format!("{system_prompt}\n\n{prompt}");
         }
+
+        let model = match &request.model {
+            Some(tier) => {
+                let model = model_for_tier(self, tier)?;
+                reject_option_like(&model, "model", GITHUB_COPILOT)?;
+                Some(model)
+            }
+            None => None,
+        };
+        if let Some(session) = &request.resume_session {
+            reject_option_like(session, "resume_session", GITHUB_COPILOT)?;
+        }
+
+        let started = RunStarted {
+            model: model.clone(),
+            effort: None,
+        };
+        let sdk_request = CopilotSdkRequest {
+            prompt,
+            model,
+            session_id: request.resume_session.clone(),
+            working_dir: request.working_dir.clone(),
+            action_execution_id: request.action_execution_id.clone(),
+            limit: request.timeout,
+        };
+        Ok((sdk_request, started))
     }
 }
 
@@ -104,42 +166,33 @@ impl HarnessAdapter for GitHubCopilotAdapter {
     }
 
     fn program(&self) -> &str {
-        &self.program
+        DEFAULT_PROGRAM
     }
 
-    fn invocation(&self, request: &HarnessRequest<'_>) -> Result<HarnessInvocation, ActionError> {
-        validate_parameters(request)?;
-        let _sandbox = sandbox(request)?;
-        let mut prompt = message(request);
-
-        if let Some(system_prompt) =
-            string_parameter(request.config, "append_system_prompt", GITHUB_COPILOT)?
-        {
-            reject_option_like(system_prompt, "append_system_prompt", GITHUB_COPILOT)?;
-            prompt = format!("{}\n\n{}", system_prompt, prompt);
-        }
-
-        // Build SDK configuration from request parameters
-        let mut sdk_config = serde_json::json!({
-            "prompt": prompt,
-        });
-
-        if let Some(tier) = &request.config.model {
-            let model = model_for_tier(self, tier)?;
-            reject_option_like(&model, "model", GITHUB_COPILOT)?;
-            sdk_config["model"] = Value::String(model);
-        }
-
-        if let Some(session) = request.resume_session {
-            reject_option_like(session, "resume_session", GITHUB_COPILOT)?;
-            sdk_config["session_id"] = Value::String(session.to_string());
-        }
-
-        // Return SDK marker invocation with encoded configuration
-        Ok(HarnessInvocation {
-            program: self.program.clone(),
-            args: vec!["agent".to_string(), STANDARD.encode(sdk_config.to_string())],
-            stdin: None,
+    fn run<'a>(
+        &'a self,
+        request: &'a AgentRequest,
+        observers: RunObservers<'a>,
+    ) -> BoxFuture<'a, Result<AgentRunEnding, ActionError>> {
+        Box::pin(async move {
+            let (mut sdk_request, started) = self.sdk_request(request)?;
+            // The session approves every permission, so the agent reads the
+            // context directory wherever it is.
+            let block = match &request.context {
+                Some(context) => context.prepare(ContextAccess::Readable)?,
+                None => String::new(),
+            };
+            sdk_request.prompt = with_block(&sdk_request.prompt, &block);
+            if request.workspace_access == Some(WorkspaceAccess::ReadOnly) {
+                observers.conversation.append_outcome(
+                    "github-copilot does not enforce read-only workspace access; \
+                     the agent is only told not to write",
+                    serde_json::json!({ "workspace_access": "read_only", "enforced": false }),
+                );
+            }
+            observers.notify_started(started);
+            let parser = self.stream_parser(request.answer_shape);
+            run_copilot_sdk(self.backend.as_ref(), sdk_request, parser, &observers).await
         })
     }
 
@@ -148,8 +201,8 @@ impl HarnessAdapter for GitHubCopilotAdapter {
     }
 }
 
-fn validate_parameters(request: &HarnessRequest<'_>) -> Result<(), ActionError> {
-    for key in request.config.parameters.keys() {
+fn validate_parameters(request: &AgentRequest) -> Result<(), ActionError> {
+    for key in request.parameters.keys() {
         if matches!(
             key.as_str(),
             "approval_policy" | "append_system_prompt" | "resume_session"
@@ -165,7 +218,8 @@ fn validate_parameters(request: &HarnessRequest<'_>) -> Result<(), ActionError> 
             })),
         });
     }
-    if let Some(policy) = string_parameter(request.config, "approval_policy", GITHUB_COPILOT)? {
+    if let Some(policy) = string_parameter(&request.parameters, "approval_policy", GITHUB_COPILOT)?
+    {
         if !["auto", "ask", "deny"].contains(&policy) {
             return Err(ActionError {
                 message: format!(
@@ -182,8 +236,11 @@ fn validate_parameters(request: &HarnessRequest<'_>) -> Result<(), ActionError> 
     Ok(())
 }
 
-fn sandbox(request: &HarnessRequest<'_>) -> Result<Option<String>, ActionError> {
-    if request.config.parameters.contains_key("sandbox") {
+/// The old `sandbox` parameter is refused: `workspace_access` replaced it.
+/// The SDK has no sandbox to translate `workspace_access` into (see
+/// [`GitHubCopilotAdapter`]).
+fn reject_sandbox_parameter(request: &AgentRequest) -> Result<(), ActionError> {
+    if request.parameters.contains_key("sandbox") {
         return Err(ActionError {
             message: "parameter 'sandbox' is no longer supported for harness 'github-copilot'; use workflow-level 'workspace_access'".to_string(),
             error_type: Some("invalid_parameter".to_string()),
@@ -193,24 +250,23 @@ fn sandbox(request: &HarnessRequest<'_>) -> Result<Option<String>, ActionError> 
             })),
         });
     }
-    Ok(request.workspace_access.map(|access| {
-        match access {
-            WorkspaceAccess::ReadWrite => "workspace-write",
-            WorkspaceAccess::ReadOnly => "read-only",
-        }
-        .to_string()
-    }))
+    Ok(())
 }
 
-fn message(request: &HarnessRequest<'_>) -> String {
-    if request.config.read_only_paths.is_empty() {
+/// The prompt, naming the read-only paths the agent must not modify.
+fn message(request: &AgentRequest) -> String {
+    if request.read_only_paths.is_empty() {
         return request.prompt.to_string();
     }
     let paths = request
-        .config
         .read_only_paths
         .iter()
-        .map(|_path| "- (read-only context)")
+        .map(|path| {
+            format!(
+                "- {}",
+                resolve_read_only_path(&request.working_dir, path).display()
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     format!(
@@ -609,6 +665,128 @@ fn error_text(value: &Value) -> String {
 }
 
 #[cfg(test)]
+mod run_tests {
+    use std::sync::Mutex;
+
+    use super::super::copilot_sdk::{CopilotSdkOutcome, CopilotSdkResponse};
+    use super::super::RunStarted;
+    use super::*;
+    use crate::engine::actions::session::conversation::tests::{tapped, RecordedSessions};
+
+    /// Stands in for the SDK: keeps the request, plays a short session, and
+    /// finishes — or times out.
+    struct MockCopilotSdk {
+        request: Mutex<Option<CopilotSdkRequest>>,
+        times_out: bool,
+    }
+
+    impl MockCopilotSdk {
+        fn new(times_out: bool) -> Arc<Self> {
+            Arc::new(Self {
+                request: Mutex::new(None),
+                times_out,
+            })
+        }
+    }
+
+    impl CopilotSdkBackend for MockCopilotSdk {
+        fn run<'a>(
+            &'a self,
+            request: CopilotSdkRequest,
+            on_event: &'a mut (dyn FnMut(Value) + Send),
+        ) -> BoxFuture<'a, Result<CopilotSdkOutcome, ActionError>> {
+            *self.request.lock().unwrap() = Some(request);
+            on_event(serde_json::json!({ "type": "session", "session_id": "sdk-session" }));
+            on_event(serde_json::json!({
+                "type": "assistant.message",
+                "data": {"messageId": "m-1", "originatingMessageId": "r-1", "content": "hello"}
+            }));
+            let outcome = if self.times_out {
+                CopilotSdkOutcome::TimedOut
+            } else {
+                CopilotSdkOutcome::Finished(CopilotSdkResponse {
+                    session_id: "sdk-session".to_string(),
+                    text: Some("hello".to_string()),
+                    usage_limits: Vec::new(),
+                })
+            };
+            Box::pin(async move { Ok(outcome) })
+        }
+    }
+
+    /// AE5 for copilot: the request alone drives the SDK — the resolved
+    /// model, the session to resume, the real read-only paths in the
+    /// prompt — and the events come back as a parsed run.
+    #[tokio::test]
+    async fn a_request_runs_on_the_sdk_and_comes_back_parsed() {
+        let sdk = MockCopilotSdk::new(false);
+        let adapter = GitHubCopilotAdapter::with_backend(sdk.clone());
+        let request = AgentRequest {
+            model: Some("medium".into()),
+            resume_session: Some("resume-me".into()),
+            read_only_paths: vec!["vendor".into()],
+            action_execution_id: Some("action-123".into()),
+            ..AgentRequest::new("Reply with a short greeting", "/work")
+        };
+        let sessions = Arc::new(RecordedSessions::default());
+        let conversation = tapped(&sessions, GITHUB_COPILOT);
+        let heard = Mutex::new(None);
+        let on_started = |started: &RunStarted| *heard.lock().unwrap() = Some(started.clone());
+
+        let ending = adapter
+            .run(
+                &request,
+                RunObservers::conversation(&conversation).on_started(&on_started),
+            )
+            .await
+            .expect("the SDK ran");
+
+        let AgentRunEnding::Finished(finished) = ending else {
+            panic!("the SDK run timed out");
+        };
+        assert_eq!(finished.run.failure, None);
+        assert_eq!(finished.run.text, "hello");
+        assert_eq!(finished.run.session_id.as_deref(), Some("sdk-session"));
+        assert_eq!(sessions.0.lock().unwrap().len(), 1);
+        assert_eq!(
+            heard
+                .into_inner()
+                .unwrap()
+                .and_then(|started| started.model),
+            Some("claude-sonnet-4.5".to_string())
+        );
+        let sent = sdk.request.lock().unwrap().clone().unwrap();
+        assert_eq!(sent.model.as_deref(), Some("claude-sonnet-4.5"));
+        assert_eq!(sent.session_id.as_deref(), Some("resume-me"));
+        assert_eq!(sent.action_execution_id.as_deref(), Some("action-123"));
+        assert!(sent.prompt.ends_with("- /work/vendor"), "{}", sent.prompt);
+    }
+
+    #[tokio::test]
+    async fn an_sdk_run_past_its_limit_times_out() {
+        let adapter = GitHubCopilotAdapter::with_backend(MockCopilotSdk::new(true));
+        let ending = adapter
+            .run(&AgentRequest::new("go", "/work"), RunObservers::none())
+            .await
+            .unwrap();
+        assert!(matches!(ending, AgentRunEnding::TimedOut));
+    }
+
+    /// Runs only where the `copilot-sdk` feature is off, e.g.
+    /// `cargo test -p narsor-exec` (a workspace build turns it on).
+    #[cfg(not(feature = "copilot-sdk"))]
+    #[tokio::test]
+    async fn without_the_sdk_feature_a_run_fails_and_names_narsor_runner() {
+        let error = GitHubCopilotAdapter::new()
+            .run(&AgentRequest::new("go", "/work"), RunObservers::none())
+            .await
+            .expect_err("a build without the SDK must refuse a Copilot run");
+        assert_eq!(error.error_type.as_deref(), Some("harness_unavailable"));
+        assert!(error.message.contains("narsor-runner"), "{}", error.message);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -855,6 +1033,6 @@ mod tests {
 
         let adapter = result.unwrap();
         assert_eq!(adapter.name(), GITHUB_COPILOT);
-        assert_eq!(adapter.program(), "copilot-sdk");
+        assert_eq!(adapter.program(), "copilot");
     }
 }

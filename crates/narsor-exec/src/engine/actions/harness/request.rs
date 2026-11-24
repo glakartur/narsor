@@ -1,0 +1,491 @@
+//! What a harness is asked to run, what it says while it runs, and how the
+//! run ended: the only input and output of [`super::HarnessAdapter::run`]
+//! (R1–R4).
+//!
+//! The request is harness-neutral. Every caller — the agent step, the
+//! profile step, the conductor — fills the same fields, and each harness
+//! decides alone how they reach its CLI or SDK: which flags, whether the
+//! prompt goes on the command line or on stdin, how the context files are
+//! made readable. No caller reads a command line back.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
+
+use serde_json::Value;
+
+use super::HarnessRun;
+use crate::domain::{ActionError, WorkspaceAccess};
+use crate::engine::actions::answer::AnswerShape;
+use crate::engine::actions::session::conversation::{ConversationSink, UsageRelay};
+
+/// How long the harness may go on after its final answer before its process
+/// group is ended. Long enough for it to write its session to disk, so the
+/// session can be resumed.
+pub const FINAL_ANSWER_GRACE: Duration = Duration::from_secs(15);
+
+/// One run of an agent, as every harness takes it.
+#[derive(Debug, Clone)]
+pub struct AgentRequest {
+    /// The prompt as the agent is to read it, output contract included. Of
+    /// any size: the harness picks how it travels (R5).
+    pub prompt: String,
+
+    /// Files the agent may read when it needs them, kept out of the prompt.
+    pub context: Option<ContextFiles>,
+
+    /// The model tier (`small`, `medium`, `large`, `max`); `None` leaves the
+    /// model to the harness.
+    pub model: Option<String>,
+
+    /// The effort, for a harness that takes one.
+    pub effort: Option<String>,
+
+    /// A harness session to continue instead of starting a fresh one (D18).
+    pub resume_session: Option<String>,
+
+    /// The directory the harness runs in.
+    pub working_dir: PathBuf,
+
+    /// What the agent may do in its workspace, translated by each harness
+    /// to its own permission mechanism.
+    pub workspace_access: Option<WorkspaceAccess>,
+
+    /// Repositories the run may change, by absolute path.
+    pub writable_dirs: Vec<PathBuf>,
+
+    /// Repositories the run may only read, by absolute path. Harnesses that
+    /// cannot enforce it rely on the prompt block (R14).
+    pub read_only_dirs: Vec<PathBuf>,
+
+    /// The step's `read_only_paths`, relative to `working_dir` or absolute.
+    pub read_only_paths: Vec<String>,
+
+    /// One-shot tool permissions an operator granted (Claude Code rules).
+    pub permission_grants: Vec<String>,
+
+    /// The step's harness-specific `parameters` (`max_turns`,
+    /// `append_system_prompt`, `agent`, …); each harness checks its own.
+    pub parameters: HashMap<String, Value>,
+
+    /// The JSON Schema of the answer, for a harness that can enforce one.
+    /// An addition to the text contract in `prompt`, never a replacement.
+    pub answer_schema: Option<Value>,
+
+    /// What the final answer looks like, which ends the run early.
+    pub answer_shape: AnswerShape,
+
+    /// The time limit of the whole run; `None` is unbounded.
+    pub timeout: Option<Duration>,
+
+    /// How long the harness may go on after its final answer.
+    pub final_answer_grace: Duration,
+
+    /// The action attempt the run belongs to, handed to the harness process
+    /// as `ORCHESTRATOR_ACTION_ID`; `None` outside an attempt (the
+    /// conductor).
+    pub action_execution_id: Option<String>,
+
+    /// The operator's extra arguments for this harness; on a conflict they
+    /// replace the flags the harness chose.
+    pub extra_args: Vec<String>,
+}
+
+impl AgentRequest {
+    /// A request for `prompt` in `working_dir`, everything else unset.
+    pub fn new(prompt: impl Into<String>, working_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            context: None,
+            model: None,
+            effort: None,
+            resume_session: None,
+            working_dir: working_dir.into(),
+            workspace_access: None,
+            writable_dirs: Vec::new(),
+            read_only_dirs: Vec::new(),
+            read_only_paths: Vec::new(),
+            permission_grants: Vec::new(),
+            parameters: HashMap::new(),
+            answer_schema: None,
+            answer_shape: AnswerShape::default(),
+            timeout: None,
+            final_answer_grace: FINAL_ANSWER_GRACE,
+            action_execution_id: None,
+            extra_args: Vec::new(),
+        }
+    }
+
+    /// Those of `dirs` that lie outside the working directory.
+    pub(crate) fn outside_working_dir<'d>(&self, dirs: &'d [PathBuf]) -> Vec<&'d Path> {
+        dirs.iter()
+            .map(PathBuf::as_path)
+            .filter(|dir| !dir.starts_with(&self.working_dir))
+            .collect()
+    }
+}
+
+/// One file of context: a name relative to the context directory, what it
+/// holds in one line, and its content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextFile {
+    /// The path inside the context directory, e.g. `conversations/plan-1.md`.
+    pub name: String,
+    /// What the file holds, in one line, for the prompt's list.
+    pub description: String,
+    /// The whole content, uncut.
+    pub content: String,
+}
+
+impl ContextFile {
+    /// A file named `name`, described by `description`.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            content: content.into(),
+        }
+    }
+}
+
+/// The context files of one run and the directory they are written to. The
+/// directory belongs to the run: whatever it held before is removed (R13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextFiles {
+    /// Where the files are written; emptied first.
+    pub dir: PathBuf,
+    /// The files, in the order the prompt lists them. A file without
+    /// content is neither written nor listed.
+    pub files: Vec<ContextFile>,
+}
+
+/// How a harness gives the agent its context files (R6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextAccess {
+    /// The agent can read the context directory: the files are written and
+    /// the prompt lists their paths.
+    Readable,
+    /// The agent cannot reach the directory: the prompt carries each file's
+    /// content instead.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Inline,
+}
+
+/// The heading of the block a harness appends to the prompt.
+pub const CONTEXT_FILES_HEADING: &str = "## Context files";
+
+impl ContextFiles {
+    /// Replaces the directory's content with the files (for
+    /// [`ContextAccess::Readable`]) and returns the block that tells the
+    /// agent about them; an empty string when there is no file to tell of.
+    pub(crate) fn prepare(&self, access: ContextAccess) -> Result<String, ActionError> {
+        let files: Vec<&ContextFile> = self
+            .files
+            .iter()
+            .filter(|file| !file.content.is_empty())
+            .collect();
+        for file in &files {
+            check_name(&file.name)?;
+        }
+        replace_dir(&self.dir)?;
+        if files.is_empty() {
+            return Ok(String::new());
+        }
+
+        let mut block = format!("{CONTEXT_FILES_HEADING}\n\n");
+        match access {
+            ContextAccess::Readable => {
+                block.push_str(
+                    "These files hold more context for this run. They are not part of the \
+                     prompt: read a file only when you need what it holds.\n\n",
+                );
+                for file in files {
+                    let path = self.dir.join(&file.name);
+                    write_file(&path, &file.content)?;
+                    block.push_str(&format!(
+                        "- `{}` ({} bytes): {}\n",
+                        path.display(),
+                        file.content.len(),
+                        file.description
+                    ));
+                }
+            }
+            ContextAccess::Inline => {
+                block.push_str("The content of each context file of this run follows.\n");
+                for file in files {
+                    block.push_str(&format!(
+                        "\n### {} — {}\n\n<<<CONTEXT FILE\n{}\nCONTEXT FILE>>>\n",
+                        file.name, file.description, file.content
+                    ));
+                }
+            }
+        }
+        Ok(block)
+    }
+}
+
+/// `prompt` with `block` appended after a blank line; `prompt` alone when
+/// the block is empty.
+pub(crate) fn with_block(prompt: &str, block: &str) -> String {
+    if block.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{}\n\n{}", prompt.trim_end(), block.trim_end())
+    }
+}
+
+/// A context file name must stay inside its directory.
+fn check_name(name: &str) -> Result<(), ActionError> {
+    let path = Path::new(name);
+    let inside = !name.is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    if inside {
+        return Ok(());
+    }
+    Err(ActionError {
+        message: format!("the context file name '{name}' leaves its directory"),
+        error_type: Some("invalid_context_file".to_string()),
+        details: Some(serde_json::json!({ "name": name })),
+    })
+}
+
+/// Empties `dir`, creating it when it does not exist.
+fn replace_dir(dir: &Path) -> Result<(), ActionError> {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(context_io_error(dir, "emptied", &error)),
+    }
+    fs::create_dir_all(dir).map_err(|error| context_io_error(dir, "created", &error))
+}
+
+fn write_file(path: &Path, content: &str) -> Result<(), ActionError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| context_io_error(parent, "created", &error))?;
+    }
+    fs::write(path, content).map_err(|error| context_io_error(path, "written", &error))
+}
+
+fn context_io_error(path: &Path, what: &str, error: &std::io::Error) -> ActionError {
+    ActionError {
+        message: format!(
+            "the context files at {} could not be {what}: {error}",
+            path.display()
+        ),
+        error_type: Some("context_files_failed".to_string()),
+        details: Some(serde_json::json!({ "path": path.display().to_string() })),
+    }
+}
+
+/// The model and the effort a harness resolved for a run, told before the
+/// run starts (R4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunStarted {
+    /// The model name as the harness takes it, not the tier.
+    pub model: Option<String>,
+    /// The effort as the harness takes it.
+    pub effort: Option<String>,
+}
+
+/// Where a run reports while it goes (R3): every stdout line with its
+/// conversation elements (and the tokens and cost they report), the usage
+/// limits, and the resolved model and effort once the run is about to start.
+pub struct RunObservers<'a> {
+    pub(crate) conversation: &'a ConversationSink,
+    pub(crate) usage: Option<UsageRelay<'a>>,
+    pub(crate) started: Option<&'a (dyn Fn(&RunStarted) + Send + Sync)>,
+}
+
+static NO_CONVERSATION: std::sync::LazyLock<ConversationSink> =
+    std::sync::LazyLock::new(ConversationSink::none);
+
+impl<'a> RunObservers<'a> {
+    /// Observers that record nothing.
+    pub fn none() -> Self {
+        Self {
+            conversation: &NO_CONVERSATION,
+            usage: None,
+            started: None,
+        }
+    }
+
+    /// Records the conversation in `conversation`.
+    pub(crate) fn conversation(conversation: &'a ConversationSink) -> Self {
+        Self {
+            conversation,
+            ..Self::none()
+        }
+    }
+
+    /// Hands the usage limits to `usage`.
+    pub(crate) fn with_usage(mut self, usage: Option<UsageRelay<'a>>) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    /// Calls `started` once the harness has resolved the model and the
+    /// effort, right before it starts.
+    pub fn on_started(mut self, started: &'a (dyn Fn(&RunStarted) + Send + Sync)) -> Self {
+        self.started = Some(started);
+        self
+    }
+
+    /// Tells the `started` observer, if there is one.
+    pub(crate) fn notify_started(&self, started: RunStarted) {
+        if let Some(observer) = self.started {
+            observer(&started);
+        }
+    }
+}
+
+/// A harness run that ran to completion, already parsed.
+#[derive(Debug)]
+pub struct FinishedRun {
+    /// What the harness's stream parser distilled from its output.
+    pub run: HarnessRun,
+    /// The process's exit code (0 for an SDK run).
+    pub exit_code: i32,
+    /// A bounded capture of stderr, for error messages only — the full
+    /// text, unbounded, is what the conversation holds (R14).
+    pub stderr: String,
+    /// The process group that was still alive after the final answer and
+    /// was ended by narsor, when there was one.
+    pub terminated_group: Option<i32>,
+}
+
+/// How a run ended.
+// One value per run, moved once: boxing the large variant buys nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum AgentRunEnding {
+    /// It ran to completion (successfully or not — that is `run.failure`'s
+    /// business, not this type's).
+    Finished(FinishedRun),
+    /// The time limit ran out and the run was stopped.
+    TimedOut,
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A fresh directory, removed when dropped.
+    pub(crate) struct TestDir(PathBuf);
+
+    impl TestDir {
+        pub(crate) fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("narsor-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn context(dir: &Path, files: &[(&str, &str)]) -> ContextFiles {
+        ContextFiles {
+            dir: dir.to_path_buf(),
+            files: files
+                .iter()
+                .map(|(name, content)| ContextFile::new(*name, format!("about {name}"), *content))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn readable_files_are_written_and_listed_by_path_description_and_size() {
+        let root = TestDir::new();
+        let dir = root.path().join("context");
+        let block = context(
+            &dir,
+            &[("events.md", "abc"), ("conversations/a-1.md", "hello")],
+        )
+        .prepare(ContextAccess::Readable)
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(dir.join("events.md")).unwrap(), "abc");
+        assert_eq!(
+            fs::read_to_string(dir.join("conversations/a-1.md")).unwrap(),
+            "hello"
+        );
+        let events = dir.join("events.md");
+        assert!(
+            block.contains(&format!(
+                "- `{}` (3 bytes): about events.md",
+                events.display()
+            )),
+            "{block}"
+        );
+        assert!(
+            block.contains("(5 bytes): about conversations/a-1.md"),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn a_new_run_leaves_only_its_own_files_and_lists_no_empty_one() {
+        let root = TestDir::new();
+        let dir = root.path().join("context");
+        context(&dir, &[("old.md", "old")])
+            .prepare(ContextAccess::Readable)
+            .unwrap();
+
+        let block = context(&dir, &[("new.md", "new"), ("empty.md", "")])
+            .prepare(ContextAccess::Readable)
+            .unwrap();
+
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["new.md"]);
+        assert!(!block.contains("empty.md"), "{block}");
+
+        let block = context(&dir, &[]).prepare(ContextAccess::Readable).unwrap();
+        assert!(block.is_empty());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn inline_access_writes_nothing_and_carries_the_content() {
+        let root = TestDir::new();
+        let dir = root.path().join("context");
+        let block = context(&dir, &[("workflow.yaml", "states: {}")])
+            .prepare(ContextAccess::Inline)
+            .unwrap();
+
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(
+            block.contains("### workflow.yaml — about workflow.yaml"),
+            "{block}"
+        );
+        assert!(block.contains("states: {}"), "{block}");
+    }
+
+    #[test]
+    fn a_name_that_leaves_the_directory_is_refused() {
+        let root = TestDir::new();
+        for name in ["../escape.md", "/etc/passwd", ""] {
+            let error = context(&root.path().join("context"), &[(name, "x")])
+                .prepare(ContextAccess::Readable)
+                .expect_err(name);
+            assert_eq!(error.error_type.as_deref(), Some("invalid_context_file"));
+        }
+    }
+}

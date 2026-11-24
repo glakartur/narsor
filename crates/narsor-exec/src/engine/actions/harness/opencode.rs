@@ -23,6 +23,15 @@
 //!   `parameters.fork` for the case where the continuation must not disturb the
 //!   original.
 //!
+//! # Prompt and context files
+//!
+//! The message is the last argument up to
+//! [`cli::LONGEST_PROMPT_ARGUMENT`]; a longer one goes on stdin with no
+//! message argument, which `opencode run` takes as the message (recorded in
+//! `tests/fixtures/opencode/`). `--file` would attach it next to a message
+//! instead of making it the message. Context files are read where they are
+//! written: the recorded run read a file outside its working directory.
+//!
 //! # Permissions
 //!
 //! `--auto` auto-approves every permission that is not explicitly denied. The
@@ -38,10 +47,14 @@
 //! may look at. That is visibility only — read-only *enforcement* is D15's
 //! permission bits on the provisioned directories, for both harnesses.
 
+use futures::future::BoxFuture;
+
+use super::cli::{self, CommandLine};
+use super::request::{with_block, ContextAccess, RunStarted};
 use super::{
     bool_parameter, model_for_tier, not_classified, reject_option_like, resolve_read_only_path,
-    string_parameter, tail, HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun,
-    HarnessStreamParser,
+    string_parameter, tail, AgentRequest, AgentRunEnding, HarnessAdapter, HarnessRun,
+    HarnessStreamParser, RunObservers,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
@@ -80,6 +93,61 @@ impl OpenCodeAdapter {
     }
 }
 
+impl OpenCodeAdapter {
+    /// The command line of `request`, without the message, and the model it
+    /// runs with. opencode takes no effort.
+    fn command_line(
+        &self,
+        request: &AgentRequest,
+    ) -> Result<(CommandLine, RunStarted), ActionError> {
+        let mut started = RunStarted::default();
+        let mut args = vec!["run".to_string()];
+
+        if let Some(tier) = &request.model {
+            let model = model_for_tier(self, tier)?;
+            reject_option_like(&model, "model", OPENCODE)?;
+            args.push("--model".to_string());
+            args.push(model.clone());
+            started.model = Some(model);
+        }
+
+        if let Some(agent) = string_parameter(&request.parameters, "agent", OPENCODE)? {
+            reject_option_like(agent, "agent", OPENCODE)?;
+            args.push("--agent".to_string());
+            args.push(agent.to_string());
+        }
+
+        if let Some(session) = &request.resume_session {
+            reject_option_like(session, "resume_session", OPENCODE)?;
+            args.push("--session".to_string());
+            args.push(session.to_string());
+
+            if bool_parameter(&request.parameters, "fork", OPENCODE)?.unwrap_or(false) {
+                args.push("--fork".to_string());
+            }
+        }
+
+        if request.parameters.contains_key("auto_approve") {
+            return Err(ActionError {
+                message: "parameter 'auto_approve' is no longer supported for harness 'opencode'; use workflow-level 'workspace_access'".to_string(),
+                error_type: Some("invalid_parameter".to_string()),
+                details: Some(serde_json::json!({ "harness": OPENCODE, "parameter": "auto_approve" })),
+            });
+        }
+
+        match request.workspace_access {
+            Some(WorkspaceAccess::ReadWrite) => args.push("--auto".to_string()),
+            Some(WorkspaceAccess::ReadOnly) | None => {}
+        }
+
+        // Takes exactly one value, so the message cannot be swallowed.
+        args.push("--format".to_string());
+        args.push("json".to_string());
+
+        Ok((CommandLine::new(&self.program, args), started))
+    }
+}
+
 impl Default for OpenCodeAdapter {
     fn default() -> Self {
         Self::new()
@@ -104,56 +172,21 @@ impl HarnessAdapter for OpenCodeAdapter {
         &self.program
     }
 
-    fn invocation(&self, request: &HarnessRequest<'_>) -> Result<HarnessInvocation, ActionError> {
-        let config = request.config;
-        let mut args = vec!["run".to_string()];
-
-        if let Some(tier) = &config.model {
-            let model = model_for_tier(self, tier)?;
-            reject_option_like(&model, "model", OPENCODE)?;
-            args.push("--model".to_string());
-            args.push(model);
-        }
-
-        if let Some(agent) = string_parameter(config, "agent", OPENCODE)? {
-            reject_option_like(agent, "agent", OPENCODE)?;
-            args.push("--agent".to_string());
-            args.push(agent.to_string());
-        }
-
-        if let Some(session) = request.resume_session {
-            reject_option_like(session, "resume_session", OPENCODE)?;
-            args.push("--session".to_string());
-            args.push(session.to_string());
-
-            if bool_parameter(config, "fork", OPENCODE)?.unwrap_or(false) {
-                args.push("--fork".to_string());
-            }
-        }
-
-        if config.parameters.contains_key("auto_approve") {
-            return Err(ActionError {
-                message: "parameter 'auto_approve' is no longer supported for harness 'opencode'; use workflow-level 'workspace_access'".to_string(),
-                error_type: Some("invalid_parameter".to_string()),
-                details: Some(serde_json::json!({ "harness": OPENCODE, "parameter": "auto_approve" })),
-            });
-        }
-
-        match request.workspace_access {
-            Some(WorkspaceAccess::ReadWrite) => args.push("--auto".to_string()),
-            Some(WorkspaceAccess::ReadOnly) | None => {}
-        }
-
-        // Takes exactly one value, so the message cannot be swallowed.
-        args.push("--format".to_string());
-        args.push("json".to_string());
-
-        args.push(message(request));
-
-        Ok(HarnessInvocation {
-            program: self.program.clone(),
-            args,
-            stdin: None,
+    fn run<'a>(
+        &'a self,
+        request: &'a AgentRequest,
+        observers: RunObservers<'a>,
+    ) -> BoxFuture<'a, Result<AgentRunEnding, ActionError>> {
+        Box::pin(async move {
+            let (command, started) = self.command_line(request)?;
+            let block = match &request.context {
+                Some(context) => context.prepare(ContextAccess::Readable)?,
+                None => String::new(),
+            };
+            let prompt = with_block(&message(request), &block);
+            observers.notify_started(started);
+            let parser = self.stream_parser(request.answer_shape);
+            cli::run(OPENCODE, command, &prompt, request, parser, &observers).await
         })
     }
 
@@ -262,8 +295,8 @@ impl HarnessStreamParser for OpenCodeStreamParser {
 
 /// The message the agent receives: the prompt, plus the read-only paths this
 /// harness cannot pass as a flag.
-fn message(request: &HarnessRequest<'_>) -> String {
-    let paths = &request.config.read_only_paths;
+fn message(request: &AgentRequest) -> String {
+    let paths = &request.read_only_paths;
     if paths.is_empty() {
         return request.prompt.to_string();
     }
@@ -273,7 +306,7 @@ fn message(request: &HarnessRequest<'_>) -> String {
         .map(|path| {
             format!(
                 "- {}",
-                resolve_read_only_path(request.workspace, path).display()
+                resolve_read_only_path(&request.working_dir, path).display()
             )
         })
         .collect::<Vec<_>>()

@@ -980,6 +980,11 @@ impl FakeHarness {
             .collect()
     }
 
+    /// What the `nth` call read on stdin.
+    pub fn stdin(&self, nth: usize) -> String {
+        fs::read_to_string(self.dir.join(format!("stdin.{nth}"))).expect("the harness read stdin")
+    }
+
     /// The working directory of the `nth` call.
     pub fn cwd(&self, nth: usize) -> String {
         read_line(&self.dir.join(format!("cwd.{nth}")))

@@ -242,7 +242,7 @@ impl ConversationSink {
     }
 
     /// The sink handing the use that the harness reports on to `tap`.
-    pub(super) fn with_readings(mut self, tap: ReadingTap) -> Self {
+    pub(crate) fn with_readings(mut self, tap: ReadingTap) -> Self {
         self.1 = Some(tap);
         self
     }
@@ -257,7 +257,7 @@ impl ConversationSink {
 
     /// Appends one entry with its elements, logging (and otherwise
     /// ignoring) a failure to.
-    pub(super) fn append(
+    pub(crate) fn append(
         &self,
         source: ConversationSource,
         raw: &[u8],
@@ -295,7 +295,7 @@ impl ConversationSink {
     /// A narsor-authored entry about the harness process — its exit code,
     /// timeout, or failure to run — whose one element is a
     /// [`TechnicalCategory::Process`] event summarized by the same `text`.
-    pub(super) fn append_outcome(&self, text: &str, data: Value) {
+    pub(crate) fn append_outcome(&self, text: &str, data: Value) {
         let element = ChatElement::Technical {
             category: TechnicalCategory::Process,
             summary: text.to_string(),
