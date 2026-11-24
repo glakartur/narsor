@@ -111,7 +111,10 @@ The sign-in form says which token it needs (*Skąd wziąć token?*).
 - **Akcje:** what you can do with the task now, as the server offers it
   (pause, resume, select a step, archive …). Irreversible actions say so and
   ask for confirmation. Archive is offered only when the run reached a
-  terminal state of its workflow; move a stuck task there first.
+  terminal state of its workflow; move a stuck task there first. The comment
+  you type for a selected `agent` or `profile` step goes to the end of the
+  prompt of the first agent attempt of that step, under "Operator recovery
+  note:", and does not stay for later runs.
 - **Historia** (`H`): the archived tasks. An archived task opens with its
   header (workspaces, final status, workflow, the usage row with the total
   cost) and *Przebieg*: one row per step with harness, model, effort, cost,
