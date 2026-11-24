@@ -166,7 +166,7 @@ pub struct ContextFiles {
 }
 
 /// The heading of the block a harness appends to the prompt.
-pub const CONTEXT_FILES_HEADING: &str = "## Context files";
+const CONTEXT_FILES_HEADING: &str = "## Context files";
 
 impl ContextFiles {
     /// Replaces the directory's content with the files and returns the
@@ -181,7 +181,9 @@ impl ContextFiles {
         for file in &files {
             check_name(&file.name)?;
         }
-        empty_dir(&self.dir).map_err(|error| context_io_error(&self.dir, "emptied", &error))?;
+        remove_dir_if_present(&self.dir)
+            .and_then(|()| create_private_dir(&self.dir))
+            .map_err(|error| context_io_error(&self.dir, "emptied", &error))?;
         if files.is_empty() {
             return Ok(String::new());
         }
@@ -224,12 +226,46 @@ impl AgentRequest {
 
 /// Empties `dir`, creating it when it does not exist.
 pub(crate) fn empty_dir(dir: &Path) -> std::io::Result<()> {
-    match fs::remove_dir_all(dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
+    remove_dir_if_present(dir)?;
     fs::create_dir_all(dir)
+}
+
+fn remove_dir_if_present(dir: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+/// Context files carry conversation records, the same sensitivity class
+/// the conversation store keeps owner-only: directories are created 0700
+/// and files 0600 on unix.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
+fn write_private_file(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(content.as_bytes())
 }
 
 /// A context file name must stay inside its directory.
@@ -251,9 +287,9 @@ fn check_name(name: &str) -> Result<(), ActionError> {
 
 fn write_file(path: &Path, content: &str) -> Result<(), ActionError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| context_io_error(parent, "created", &error))?;
+        create_private_dir(parent).map_err(|error| context_io_error(parent, "created", &error))?;
     }
-    fs::write(path, content).map_err(|error| context_io_error(path, "written", &error))
+    write_private_file(path, content).map_err(|error| context_io_error(path, "written", &error))
 }
 
 fn context_io_error(path: &Path, what: &str, error: &std::io::Error) -> ActionError {
@@ -453,5 +489,22 @@ pub(crate) mod tests {
                 .expect_err(name);
             assert_eq!(error.error_type.as_deref(), Some("invalid_context_file"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_files_are_readable_by_their_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDir::new();
+        let dir = root.path().join("context");
+        context(&dir, &[("conversations/a-1.md", "secret")])
+            .prepare()
+            .unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("conversations")), 0o700);
+        assert_eq!(mode(&dir.join("conversations/a-1.md")), 0o600);
     }
 }

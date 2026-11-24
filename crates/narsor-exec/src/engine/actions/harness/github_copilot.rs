@@ -175,6 +175,7 @@ impl HarnessAdapter for GitHubCopilotAdapter {
         observers: RunObservers<'a>,
     ) -> BoxFuture<'a, Result<AgentRunEnding, ActionError>> {
         Box::pin(async move {
+            self.backend.check_available()?;
             let (mut sdk_request, started) = self.sdk_request(request)?;
             // The session approves every permission, so the agent reads the
             // context directory wherever it is.

@@ -558,7 +558,7 @@ async fn opencode_runs_in_an_empty_scratch_directory_and_is_shown_the_artifacts(
     let prompt = args.last().expect("the prompt");
     let plan = invoker
         .context_dir(&fixture.execution_id)
-        .join("artifacts/plan");
+        .join("artifacts/001-plan");
     assert!(prompt.contains(&format!("`{}`", plan.display())), "{prompt}");
     assert!(prompt.contains("a scratch directory"), "{prompt}");
     assert!(fs::read_to_string(plan)
@@ -595,7 +595,7 @@ async fn a_sandboxed_conductor_is_not_shown_the_artifact_files() {
 
     let prompt = fixture.claude.args(1).last().cloned().unwrap();
     assert!(!prompt.contains("Unit 1: write the parser."));
-    assert!(!prompt.contains("artifacts/plan"), "{prompt}");
+    assert!(!prompt.contains("artifacts/"), "{prompt}");
     assert!(prompt.contains("opened read-only"));
     assert!(prompt.contains("workflow.yaml"), "the pinned definition");
 }

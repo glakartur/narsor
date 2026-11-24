@@ -437,9 +437,9 @@ fn context_files(input: SnapshotInput) -> Vec<ContextFile> {
         ));
     }
 
-    for artifact in input.artifacts {
+    for (index, artifact) in input.artifacts.into_iter().enumerate() {
         files.push(ContextFile::new(
-            format!("artifacts/{}", file_safe(&artifact.name)),
+            format!("artifacts/{:03}-{}", index + 1, file_safe(&artifact.name)),
             format!(
                 "The workflow artifact `{}` ({}).",
                 artifact.name, artifact.location

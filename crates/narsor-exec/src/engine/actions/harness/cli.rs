@@ -67,8 +67,9 @@ impl CommandLine {
 }
 
 /// Runs `command` with `prompt` for `request`: the context files, extra
-/// arguments, prompt transport, the process and the parse loop. `started`
-/// goes to the observers once the process is running.
+/// arguments, prompt transport, the process and the parse loop. `started`,
+/// with any model or effort the extra arguments override, goes to the
+/// observers once the process is running.
 pub(crate) async fn run(
     harness: &str,
     mut command: CommandLine,
@@ -80,6 +81,7 @@ pub(crate) async fn run(
 ) -> Result<AgentRunEnding, ActionError> {
     let prompt = request.prompt_with_context(prompt)?;
     apply_extra_args(&mut command.args, &request.extra_args);
+    let started = with_extra_args_overrides(started, &request.extra_args);
     let stdin = place_prompt(harness, &mut command, prompt);
     spawn_and_wait(&command, stdin, started, request, parser, observers).await
 }
@@ -151,6 +153,41 @@ pub(crate) fn apply_extra_args(args: &mut Vec<String>, extra: &[String]) {
     }
     kept.extend(extra.iter().cloned());
     *args = kept;
+}
+
+/// `started` with the model and the effort the operator's extra arguments
+/// set, since they replace the harness's own flags: `--model`/`-m`,
+/// `--effort`, and codex's `-c model_reasoning_effort=…`.
+fn with_extra_args_overrides(mut started: RunStarted, extra: &[String]) -> RunStarted {
+    for (index, token) in extra.iter().enumerate() {
+        if !token.starts_with('-') {
+            continue;
+        }
+        let (flag, value) = match token.split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (
+                token.as_str(),
+                extra
+                    .get(index + 1)
+                    .map(String::as_str)
+                    .filter(|value| !value.starts_with('-')),
+            ),
+        };
+        let Some(value) = value else {
+            continue;
+        };
+        match flag {
+            "--model" | "-m" => started.model = Some(value.to_string()),
+            "--effort" => started.effort = Some(value.to_string()),
+            "-c" | "--config" => {
+                if let Some(level) = value.strip_prefix("model_reasoning_effort=") {
+                    started.effort = Some(level.trim_matches('"').to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    started
 }
 
 /// Whether `flag` was written as `flag=value` in `extra`.
@@ -598,6 +635,32 @@ mod tests {
         let mut args = strings(&["--effort", "low"]);
         apply_extra_args(&mut args, &strings(&["--effort=high"]));
         assert_eq!(args, ["--effort=high"]);
+    }
+
+    #[test]
+    fn the_operator_model_and_effort_are_the_ones_reported_as_started() {
+        let chosen = RunStarted {
+            model: Some("chosen-model".to_string()),
+            effort: Some("low".to_string()),
+        };
+        for (extra, model, effort) in [
+            (vec!["--model", "operator-model"], "operator-model", "low"),
+            (vec!["--effort=high"], "chosen-model", "high"),
+            (
+                vec![
+                    "-m",
+                    "operator-model",
+                    "-c",
+                    "model_reasoning_effort=\"xhigh\"",
+                ],
+                "operator-model",
+                "xhigh",
+            ),
+        ] {
+            let started = with_extra_args_overrides(chosen.clone(), &strings(&extra));
+            assert_eq!(started.model.as_deref(), Some(model), "{extra:?}");
+            assert_eq!(started.effort.as_deref(), Some(effort), "{extra:?}");
+        }
     }
 
     #[test]

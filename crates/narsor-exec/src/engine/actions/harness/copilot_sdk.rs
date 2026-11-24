@@ -125,6 +125,12 @@ pub(crate) enum CopilotSdkOutcome {
 /// Runs one request through the GitHub Copilot SDK; the tests put a fake in
 /// its place.
 pub(crate) trait CopilotSdkBackend: Send + Sync {
+    /// Fails when this backend cannot run at all, so the harness reports
+    /// the run as not started instead of started and failed.
+    fn check_available(&self) -> Result<(), ActionError> {
+        Ok(())
+    }
+
     fn run<'a>(
         &'a self,
         request: CopilotSdkRequest,
@@ -140,21 +146,26 @@ pub(crate) struct GitHubCopilotSdkRuntime;
 
 #[cfg(not(feature = "copilot-sdk"))]
 impl CopilotSdkBackend for GitHubCopilotSdkRuntime {
+    fn check_available(&self) -> Result<(), ActionError> {
+        Err(ActionError {
+            message: "the GitHub Copilot harness runs only in narsor-runner: this binary \
+                      was built without the `copilot-sdk` feature of narsor-exec"
+                .to_string(),
+            error_type: Some("harness_unavailable".to_string()),
+            details: Some(serde_json::json!({
+                "harness": super::github_copilot::GITHUB_COPILOT,
+            })),
+        })
+    }
+
     fn run<'a>(
         &'a self,
         _request: CopilotSdkRequest,
         _on_event: &'a mut (dyn FnMut(serde_json::Value) + Send),
     ) -> BoxFuture<'a, Result<CopilotSdkOutcome, ActionError>> {
-        Box::pin(async {
-            Err(ActionError {
-                message: "the GitHub Copilot harness runs only in narsor-runner: this binary \
-                          was built without the `copilot-sdk` feature of narsor-exec"
-                    .to_string(),
-                error_type: Some("harness_unavailable".to_string()),
-                details: Some(serde_json::json!({
-                    "harness": super::github_copilot::GITHUB_COPILOT,
-                })),
-            })
-        })
+        let error = self
+            .check_available()
+            .expect_err("a build without the SDK is never available");
+        Box::pin(async move { Err(error) })
     }
 }

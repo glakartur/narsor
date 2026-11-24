@@ -2248,15 +2248,27 @@ async fn a_question_does_not_start_the_grace_period() {
 }
 
 #[tokio::test]
-async fn a_missing_harness_binary_names_it_and_says_it_must_be_on_path() {
+async fn a_missing_harness_binary_names_it_and_starts_no_session() {
     let root = TempRoot::new();
+    let sink = Arc::new(RecordingSink::default());
 
     let executor =
         AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(Arc::new(
             ClaudeCodeAdapter::with_program("claude-that-is-not-installed"),
-        )));
+        )))
+        .with_event_sink(sink.clone());
 
     let error = fail(&executor, agent_action("look around"), &root.workspace()).await;
+
+    // A harness that never ran is not a session: no started, no failed.
+    assert!(
+        !sink
+            .types()
+            .iter()
+            .any(|kind| kind.starts_with("agent_session")),
+        "{:?}",
+        sink.types()
+    );
 
     assert_eq!(error.error_type.as_deref(), Some("harness_not_found"));
     assert!(
