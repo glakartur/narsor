@@ -1398,8 +1398,17 @@ pub(super) fn render_view(
         parts.tabs.width.saturating_sub(3),
         parts.tabs.height.min(1),
     );
-    let (names, selected_start, selected_width) =
-        tab_bar(view.tab, focused, styles, tabs_content.width);
+    let (names, selected_start, selected_width) = tab_bar(
+        if closed_run {
+            &DetailTab::HISTORY
+        } else {
+            &DetailTab::ALL
+        },
+        view.tab,
+        focused,
+        styles,
+        tabs_content.width,
+    );
     frame.render_widget(Paragraph::new(names), tabs_content);
     if parts.tabs.height > 1 {
         // The segment stays inside the names' room, as the names do.
@@ -1469,7 +1478,9 @@ pub(super) fn render_view(
             );
         }
         (DetailTab::Progress, None) => {
-            view.detail.ensure_step_built();
+            if !closed_run {
+                view.detail.ensure_step_built();
+            }
             progress::render(
                 frame,
                 content,
@@ -1480,6 +1491,7 @@ pub(super) fn render_view(
                 content_keys,
                 glyph,
                 axis_rows,
+                closed_run,
             )
         }
         (DetailTab::Conversation, None) => {
@@ -1578,12 +1590,12 @@ pub(super) fn render_view(
 /// The tab titles, the active one in the focus role while the details have
 /// the keyboard; and where the active one starts and how wide it is.
 fn tab_bar(
+    tabs: &[DetailTab],
     active: DetailTab,
     focused: bool,
     styles: &Styles,
     width: u16,
 ) -> (Line<'static>, usize, usize) {
-    let tabs = DetailTab::ALL;
     let names_width: usize = tabs.iter().map(|tab| Span::raw(tab.title()).width()).sum();
     let padded_width = names_width + tabs.len() * 2 + tabs.len().saturating_sub(1);
     let pad = usize::from(padded_width <= usize::from(width));
@@ -1591,7 +1603,7 @@ fn tab_bar(
     let mut column = 0usize;
     let mut selected_start = 0usize;
     let mut selected_width = 0usize;
-    for (index, tab) in tabs.into_iter().enumerate() {
+    for (index, &tab) in tabs.iter().enumerate() {
         if index > 0 {
             spans.push(Span::raw(" "));
             column += 1;

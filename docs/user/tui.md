@@ -145,11 +145,14 @@ wraps.
 
 **The history's details** (`H`) show what the archive kept. The header is the
 one of an active task, with the total cost. *Przebieg* shows one row per step
-(harness, model, effort, tokens, subagents, cost and conductor cost); the steps
-cannot be picked or opened, and nothing is followed. The step conversations,
-the events and the conductor went away with the storage, so *Rozmowa*,
-*Zdarzenia* and *Dyrygent* say `storage usunięty przy archiwizacji`. *Przebieg*
-says it only when the task has no kept run at all. When the read of the run
+(harness, model, effort, tokens, subagents, cost and conductor cost). The history
+has two tabs, *Przebieg* and *Info*: the step conversations, the events, the
+conductor and the state went away with the storage, so their tabs are not
+shown. Pick a step with `j` / `k` (`↓` / `↑`) and `g` / `G`; the list scrolls
+to keep it in view, and each entry keeps its step. The steps cannot be opened,
+and nothing is followed. The right side shows the facts of the step and the
+line `rozmowa usunięta przy archiwizacji`. *Przebieg* says
+`storage usunięty przy archiwizacji` only when the task has no kept run at all. When the read of the run
 fails, *Przebieg* shows why; select the entry again to read it again.
 
 **The *Stan* tab** shows every value the workflow sees now, as one sorted list
@@ -375,7 +378,7 @@ the current step or a draft.
 | List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `Ctrl+.` (or `.`) action panel, `n` `z` `H` `R`, `Ctrl+↑` `Ctrl+↓` `m`, `o` `c` `r`, `h` default harness, `L` task limit |
 | Details | `[` / `]` tabs, `Tab` content ↔ panel, `Ctrl+.` (or `.`) action panel, `h` default harness, `L` task limit (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step, `v` one row or full rows per step |
-| — *Przebieg* in the history | `Esc` list, `v` one row or full rows per step (the steps of an archived run cannot be picked or opened) |
+| — *Przebieg* in the history | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `v` one row or full rows per step (the steps of an archived run cannot be opened or followed) |
 | — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry (a subagent's group `▸` / `▾` too), `v` raw entry, `Ctrl+V` raw all |
 | — the other tabs | `Esc` list, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` to the end and follow |
 | Panel | `Tab` actions ↔ fields, `Enter` send, `Ctrl+J` new line (also `Shift+Enter` / `Alt+Enter` where the terminal reports modifiers), `Esc` fold (with the server's forms: next form), `1`–`9` choose, `[` / `]` previous / next waiting (not with the server's forms) |

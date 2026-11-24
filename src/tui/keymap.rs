@@ -172,14 +172,13 @@ pub struct Stack {
 
 impl Stack {
     /// The stacks with a layer, each layer over the bases it goes with.
-    pub const LAYERED: [Stack; 7] = [
+    pub const LAYERED: [Stack; 6] = [
         Stack::layered(Context::Axis, Context::Details),
         Stack::layered(Context::StepConversation, Context::Details),
         Stack::layered(Context::Reading, Context::Details),
         Stack::layered(Context::HistoryAxis, Context::HistoryDetails),
         Stack::layered(Context::Reading, Context::HistoryDetails),
         Stack::layered(Context::AgentConversation, Context::Details),
-        Stack::layered(Context::AgentConversation, Context::HistoryDetails),
     ];
 
     /// `layer` over `base`.
@@ -1347,9 +1346,9 @@ pub static BINDINGS: &[Binding] = &[
         "widok",
         "jedno- albo wieloliniowa lista kroków",
     ),
-    // The timeline of *Przebieg* in the history: a closed run, nothing to
-    // follow, and its steps are header rows only, so there is no step to pick
-    // or open.
+    // The timeline of *Przebieg* in the history: a closed run, so the steps can
+    // be picked but there is nothing to follow, and no step conversation to
+    // enter.
     bind(
         Context::HistoryAxis,
         Key::code(KeyCode::Esc),
@@ -1357,6 +1356,12 @@ pub static BINDINGS: &[Binding] = &[
         "lista",
         "wróć na listę historii",
     ),
+    bind(Context::HistoryAxis, Key::char('j'), Action::Down, "kroki", "następny krok"),
+    bind(Context::HistoryAxis, Key::code(KeyCode::Down), Action::Down, "", "następny krok"),
+    bind(Context::HistoryAxis, Key::char('k'), Action::Up, "", "poprzedni krok"),
+    bind(Context::HistoryAxis, Key::code(KeyCode::Up), Action::Up, "", "poprzedni krok"),
+    bind(Context::HistoryAxis, Key::char('g'), Action::Top, "", "pierwszy krok"),
+    bind(Context::HistoryAxis, Key::char('G'), Action::Bottom, "", "ostatni krok"),
     bind(
         Context::HistoryAxis,
         Key::char('v'),
