@@ -7111,6 +7111,102 @@ mod task_app_create_render {
         }
     }
 
+    fn many_steps(count: usize) -> Vec<narsor_protocol::api::Position> {
+        (1..=count)
+            .map(|n| archived_step(&format!("step{n:02}"), "claude", "opus", 0.1))
+            .collect()
+    }
+
+    /// The history with `steps` of an archived run, the keys on its axis.
+    fn history_axis(steps: Vec<narsor_protocol::api::Position>) -> TaskApp {
+        let mut app = app();
+        keys(&mut app, "H");
+        app.open_history(listing(vec![archived("old", "NAR-9", 5)], "c"));
+        app.on_history_timeline("old", Ok(archived_timeline("old", steps)));
+        press(&mut app, KeyCode::Enter);
+        app
+    }
+
+    /// What the axis column of the details shows: the right side always names
+    /// the selected step, so only these columns tell that the axis scrolled.
+    fn axis_column(app: &mut TaskApp, width: u16, height: u16) -> String {
+        let buffer = draw_buffer(app, width, height, false);
+        rows(&buffer)
+            .iter()
+            .map(|row| {
+                row.chars()
+                    .skip(usize::from(layout::LIST_WIDTH))
+                    .take(18)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_history_axis_scrolls_to_the_selected_step_in_both_layouts() {
+        let mut app = history_axis(many_steps(30));
+        keys(&mut app, "v");
+        assert!(axis_column(&mut app, 130, 20).contains("step01"));
+        keys(&mut app, "G");
+        let axis = axis_column(&mut app, 130, 20);
+        assert!(axis.contains("step30"), "{axis}");
+        assert!(!axis.contains("step01"), "{axis}");
+        keys(&mut app, "g");
+        let axis = axis_column(&mut app, 130, 20);
+        assert!(axis.contains("step01"), "{axis}");
+        assert!(!axis.contains("step30"), "{axis}");
+    }
+
+    #[test]
+    fn the_selected_history_step_stays_in_view_across_the_layout_and_the_size() {
+        let mut app = history_axis(many_steps(30));
+        for _ in 0..9 {
+            keys(&mut app, "j");
+        }
+        assert!(axis_column(&mut app, 130, 20).contains("step10"));
+        keys(&mut app, "v");
+        assert!(axis_column(&mut app, 130, 20).contains("step10"));
+        keys(&mut app, "G");
+        assert!(axis_column(&mut app, 130, 40).contains("step30"));
+        assert!(axis_column(&mut app, 130, 20).contains("step30"));
+    }
+
+    #[test]
+    fn a_selected_archived_step_shows_its_facts_and_that_its_conversation_is_gone() {
+        let mut failed = archived_step("plan", "claude", "opus", 0.4);
+        failed.status = narsor_protocol::api::PositionStatus::Failed;
+        failed.error = Some("brak miejsca na dysku".to_string());
+        let mut app = history_axis(vec![failed]);
+        app.start_detail_reads();
+        assert!(!app.has_running(), "no conversation read starts");
+        let screen = draw_app(&mut app, 130, 30, false);
+        for expected in [
+            "✗ brak miejsca na dysku",
+            "rozmowa usunięta przy archiwizacji",
+        ] {
+            assert!(screen.contains(expected), "{expected}:\n{screen}");
+        }
+        assert!(!screen.contains("wczytuję rozmowę kroku"), "{screen}");
+        // On a short tab the fixed line keeps its row.
+        let short = draw_app(&mut app, 130, 20, false);
+        assert!(
+            short.contains("rozmowa usunięta przy archiwizacji"),
+            "{short}"
+        );
+    }
+
+    #[test]
+    fn the_history_tab_strip_has_only_przebieg_and_info() {
+        let mut app = history_axis(many_steps(2));
+        let screen = draw_app(&mut app, 130, 30, false);
+        assert!(screen.contains("Przebieg"), "{screen}");
+        assert!(screen.contains("Info"), "{screen}");
+        for removed in ["Rozmowa", "Zdarzenia", "Dyrygent", "Stan"] {
+            assert!(!screen.contains(removed), "{removed}:\n{screen}");
+        }
+    }
+
     #[test]
     fn an_archived_task_without_a_kept_run_says_its_storage_is_gone() {
         let mut app = app();
@@ -9350,10 +9446,7 @@ mod task_app_state_render {
     };
     use serde_json::json;
 
-    use crate::task_app_support::{
-        archived, archived_step, archived_timeline, listing, task, titled, with_controller,
-        with_runner,
-    };
+    use crate::task_app_support::{listing, task, titled, with_controller, with_runner};
 
     fn press(app: &mut TaskApp, code: KeyCode) {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
@@ -9459,33 +9552,5 @@ mod task_app_state_render {
             failed.contains("stan z 2026-11-22 10:00:00 UTC"),
             "{failed}"
         );
-    }
-
-    #[tokio::test]
-    async fn an_archived_task_from_the_history_says_its_storage_is_gone_and_reads_nothing() {
-        let mut app = new_app();
-        app.load(listing(vec![], "c"));
-        app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
-        app.open_history(listing(vec![archived("old", "NAR-9", 5)], "c"));
-        app.on_history_timeline(
-            "old",
-            Ok(archived_timeline(
-                "old",
-                vec![archived_step("plan", "claude", "opus", 0.4)],
-            )),
-        );
-        press(&mut app, KeyCode::Enter);
-        while app.history().unwrap().tab() != DetailTab::State {
-            press(&mut app, KeyCode::Char(']'));
-        }
-
-        app.start_detail_reads();
-        assert!(!app.has_running(), "no read starts");
-        let screen = draw_app(&mut app, 130, 30);
-        assert!(
-            screen.contains("storage usunięty przy archiwizacji"),
-            "{screen}"
-        );
-        assert!(!screen.contains("context:"), "no rows:\n{screen}");
     }
 }

@@ -191,6 +191,10 @@ impl DetailTab {
         DetailTab::Info,
     ];
 
+    /// The tabs of the history, left to right: an archived task keeps its
+    /// steps and its facts, and nothing else.
+    pub const HISTORY: [DetailTab; 2] = [DetailTab::Progress, DetailTab::Info];
+
     /// The name on the tab.
     pub fn title(self) -> &'static str {
         match self {
@@ -205,9 +209,15 @@ impl DetailTab {
 
     /// The tab `by` places along, wrapping round.
     pub fn shifted(self, by: isize) -> Self {
-        let at = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
-        let count = Self::ALL.len() as isize;
-        Self::ALL[(at as isize + by).rem_euclid(count) as usize]
+        self.shifted_in(&Self::ALL, by)
+    }
+
+    /// The tab `by` places along `tabs`, wrapping round; counted from the
+    /// first tab when `self` is not among them.
+    pub fn shifted_in(self, tabs: &[DetailTab], by: isize) -> Self {
+        let at = tabs.iter().position(|tab| *tab == self).unwrap_or(0);
+        let count = tabs.len() as isize;
+        tabs[(at as isize + by).rem_euclid(count) as usize]
     }
 }
 
@@ -771,12 +781,6 @@ impl TaskApp {
             (View::Tasks, Context::StepConversation) => {
                 let task_id = self.list.selected()?.task_id.as_str();
                 self.detail.view(task_id)?.step_conversation()?.transcript()
-            }
-            (View::History(history), Context::AgentConversation) => {
-                history.selected_detail()?.conversation().transcript()
-            }
-            (View::History(history), Context::StepConversation) => {
-                history.selected_detail()?.step_conversation()?.transcript()
             }
             _ => return None,
         };

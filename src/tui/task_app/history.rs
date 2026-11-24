@@ -5,7 +5,7 @@
 //! │ Historia            │ NAR-9  Poprawka raportów                  fix-bug v1 │
 //! │ ✓ NAR-9    archiwum │ ✓ done · zarchiwizowane                              │
 //! │ ✓ NAR-7    archiwum │ razem $1.20 · ✨ $1.20                                │
-//! │                     │  Przebieg   Rozmowa   Zdarzenia   Dyrygent   Info    │
+//! │                     │  Przebieg   Info                                      │
 //! │                     │ ✓ ✨ plan #1     $0.80                                │
 //! │                     │      opus  claude                                    │
 //! │                     │ ✓ ✨ review #1   $0.40                                │
@@ -14,15 +14,17 @@
 //!
 //! # Read only
 //!
-//! The tabs are the ones of the details of a task, over the same state
-//! ([`TaskDetail`]); nothing here sends anything but reads. An archived task
+//! The tabs are *Przebieg* and *Info* of the details of a task, over the same
+//! state ([`TaskDetail`]); nothing here sends anything but reads. An archived task
 //! is its [`TaskSummary`] and the run the archive kept: selecting an entry
 //! reads its timeline once ([`TaskApp::start_history_read`]) into that
 //! entry's own details, so the header has the total cost and *Przebieg* the
-//! header row of every step. The steps cannot be picked or opened: their
-//! conversations went away with the storage, as did the events and the
-//! conductor, so *Rozmowa*, *Zdarzenia* and *Dyrygent* say so. A failed read
-//! says why on *Przebieg*, and the next selection of the entry reads again.
+//! header row of every step. The steps can be picked (`j`/`k`, `g`/`G`) but
+//! not opened or followed: their conversations went away with the storage, as
+//! did the events, the conductor and the state, so the other tabs are not
+//! shown, and a step says so in place of its conversation. Each entry keeps
+//! its selected step. A failed read says why on *Przebieg*, and the next
+//! selection of the entry reads again.
 //! *Info* shows what the control plane kept. `Esc` goes back to the list of
 //! tasks.
 
@@ -187,7 +189,7 @@ impl History {
 
     /// `[` / `]`: the tab `by` places along.
     fn shift_tab(&mut self, by: isize) {
-        self.tab = self.tab.shifted(by);
+        self.tab = self.tab.shifted_in(&DetailTab::HISTORY, by);
     }
 }
 
@@ -344,8 +346,7 @@ impl TaskApp {
             .entry(task_id.to_string())
             .or_insert_with(|| TaskDetail::new(task_id))
             .progress;
-        progress.apply(revision, result);
-        progress.drop_selection();
+        progress.apply_closed_run(revision, result);
     }
 
     /// Does `change` to the history, while it is open.
