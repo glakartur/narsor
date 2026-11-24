@@ -14,7 +14,7 @@ execution: code
 
 - **Objective:** An operator who reads an archived task in the history sees only tabs that can hold content, and can move along every step of the archived run and read each step, however long the run and whatever the terminal height.
 - **Product authority:** This plan covers the TUI history (`H`) and the matching check of the Web UI history and `narsor-cli`. The live task details are not active scope.
-- **Open blockers:** None. Two questions in "Pytania otwarte dla użytkownika" have a recommended default that planning can use.
+- **Open blockers:** None. Q1 and Q2 were answered by the person; the plan follows both answers.
 
 ---
 
@@ -40,7 +40,7 @@ The full layout (`v`) uses two rows per step, so the problem shows sooner there.
 
 - **The history keeps the cursor model of the live *Przebieg*, without the parts that need a live run.** No follow (`f`), no step conversation, no `Enter`/`→` into a step. Governs R3, R4, R6.
 - **The history drops *Rozmowa*, *Zdarzenia* and *Dyrygent*.** Decision Q1: the person chose to remove all three, because each shows only "storage deleted". Governs R1.
-- **The CLI does not change.** `narsor-cli task show` and `task conversation` for an archived task print one availability line ("the task is archived"), not a conversation view. Governs R9.
+- **The CLI does not change.** `narsor-cli task show` and `task conversation` for an archived task print one availability line ("the task is archived"), not a conversation view. Governs R11.
 
 ### Requirements
 
@@ -66,7 +66,7 @@ The full layout (`v`) uses two rows per step, so the problem shows sooner there.
 
 **Documentation**
 
-- R12. The user documentation of the history (`docs/user/tui.md`, and `docs/user/web.md` if Q2 changes the Web UI) says which tabs the history has and how to move along the steps.
+- R12. The user documentation of the history (`docs/user/tui.md`) says which tabs the history has and how to move along the steps.
 
 ### Acceptance Examples
 
@@ -115,3 +115,14 @@ The full layout (`v`) uses two rows per step, so the problem shows sooner there.
 - `crates/narsor-web/ui/js/ui/settings.js` (`ArchivedTask`) and `crates/narsor-web/ui/js/ui/tabs/progress.js` (`readOnly`) — the Web UI history.
 - `src/cli/task_text.rs` (`unavailable_reason`) and `src/cli/remote.rs` — the CLI for archived tasks.
 - `docs/plans/2026-11-20-002-feat-archive-task-run-snapshot-plan.md` — the earlier decision that history steps have no cursor; this plan reverses that part.
+
+## Deferred / Open Questions
+
+These entries are review items left for the author. They do not block implementation.
+
+### From 2026-11-24 review
+
+- **The *Stan* tab stays in the history but shows only "storage deleted"** — Product Contract: Summary, R1 (P2, feasibility, design-lens, confidence 75)
+
+  The plan removes *Rozmowa*, *Zdarzenia* and *Dyrygent* because each shows only "storage deleted", but it keeps *Stan*. For an archived task, *Stan* shows the same text (`unstarted_message` in `src/tui/task_app/detail.rs` returns it for archived tasks). The history would keep one tab that cannot hold content, which breaks the objective "sees only tabs that can hold content". Answer Q1 covers only the three named tabs.
+  Change: ask the person whether *Stan* is also removed. If yes, update the Summary, R1, A1, AE5 and R12 so the history has only *Przebieg* and *Info*.
