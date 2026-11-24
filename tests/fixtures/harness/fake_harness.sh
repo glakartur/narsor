@@ -18,6 +18,7 @@
 #   cwd.<n>              its working directory
 #   action_id.<n>        the value of ORCHESTRATOR_ACTION_ID
 #   args.<n>             its arguments, each terminated by a --%ARG%-- line
+#   stdin.<n>            what it read on stdin (empty when stdin was closed)
 set -u
 
 dir=$(dirname "$0")
@@ -39,6 +40,9 @@ printf '%s\n' "${ORCHESTRATOR_ACTION_ID-}" > "$dir/action_id.$count"
 for arg in "$@"; do
     printf '%s\n--%%ARG%%--\n' "$arg" >> "$dir/args.$count"
 done
+
+# Read in full before answering, as a real harness reading its prompt does.
+if [ -t 0 ]; then : > "$dir/stdin.$count"; else cat > "$dir/stdin.$count"; fi
 
 # Output is printed *before* the sleep, and flushed line-by-line (`cat` does
 # not buffer), so a streaming reader on the other end of the pipe really does

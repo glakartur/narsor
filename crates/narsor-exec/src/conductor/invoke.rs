@@ -360,6 +360,7 @@ impl HarnessInvoker {
         let ending = run_harness_process(
             &command.program,
             &command.args,
+            command.stdin.as_deref(),
             &working_dir,
             Some(self.timeout),
             adapter.stream_parser(AnswerShape::Choice),
