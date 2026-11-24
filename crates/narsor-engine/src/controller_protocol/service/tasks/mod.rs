@@ -19,7 +19,7 @@ pub(crate) use create::launch_refusal;
 pub(crate) use history::served_timeline;
 pub use view::task_workspaces;
 #[cfg(test)]
-pub(crate) use view::{transition_offer, workflow_steps};
+pub(crate) use view::{step_kind, transition_offer, workflow_steps};
 
 use crate::controller_protocol::wire::*;
 

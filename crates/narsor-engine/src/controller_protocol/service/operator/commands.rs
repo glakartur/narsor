@@ -2,6 +2,7 @@
 //! running task.
 
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
+use crate::controller_protocol::service::tasks::step_kind;
 use crate::controller_protocol::service::ProtocolService;
 use crate::controller_protocol::wire::*;
 use crate::domain::LaunchDefinitionError;
@@ -171,8 +172,8 @@ impl ProtocolService {
             }
             self.check_transition_legal(record, target, *forced)?;
         }
-        if let OperatorCommand::SelectStep { target, .. } = command {
-            check_step_exists(record, target)?;
+        if let OperatorCommand::SelectStep { target, note } = command {
+            check_step_choice(record, target, note.as_deref())?;
         }
         check_conductor_command(command)
     }
@@ -272,23 +273,37 @@ fn check_conductor_command(command: &OperatorCommand) -> ProtocolResult<()> {
     }
 }
 
-/// Checks the step an owner chose against the workflow snapshot; silent
-/// when the task has none to check against.
-pub(crate) fn check_step_exists(record: &TaskRecord, target: &str) -> ProtocolResult<()> {
+/// Checks the step an owner chose, and the comment for its agent, against
+/// the workflow snapshot: the step exists, and a comment goes only to a step
+/// that runs an agent — no attempt of any other could take it. Silent when
+/// the task has no snapshot to check against.
+pub(crate) fn check_step_choice(
+    record: &TaskRecord,
+    target: &str,
+    note: Option<&str>,
+) -> ProtocolResult<()> {
     if target.trim().is_empty() {
         return Err(ProtocolError::bad_request(
             "missing_target",
             "a step choice needs a step",
         ));
     }
+    let commented = note.is_some_and(|note| !note.trim().is_empty());
     match record.launch_spec.definition() {
-        Ok(definition) if !definition.states.contains_key(target) => {
-            Err(ProtocolError::bad_request(
+        Ok(definition) => match definition.states.get(target) {
+            None => Err(ProtocolError::bad_request(
                 "unknown_step",
                 format!("the workflow has no step '{target}'"),
-            ))
-        }
-        Ok(_) | Err(LaunchDefinitionError::Missing(_)) => Ok(()),
+            )),
+            Some(state) if commented && !step_kind(state).runs_agent() => {
+                Err(ProtocolError::bad_request(
+                    "note_not_allowed",
+                    format!("step '{target}' runs no agent, so it cannot take a comment"),
+                ))
+            }
+            Some(_) => Ok(()),
+        },
+        Err(LaunchDefinitionError::Missing(_)) => Ok(()),
         Err(error) => Err(ProtocolError::Internal(format!(
             "the task's workflow snapshot is unusable: {error}"
         ))),
