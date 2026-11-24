@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  Store, connectionText, mutationGate, nextWaiting, reconnectDelay, retryDelay, settleSelection, staleLabel,
+  Store, connectionText, mutationGate, nextWaiting, reconnectDelay, refusalOf, retryDelay, settleSelection, staleLabel,
 } from '../ui/js/store.js';
 import { ApiError } from '../ui/js/api.js';
 
@@ -124,4 +124,18 @@ test('a 401 stops the schedule and asks for a token', async () => {
   await store.refresh();
   assert.equal(store.state.auth, 'unauthorized');
   store.stop();
+});
+
+test('a command the runner refused after it was queued shows its reason', () => {
+  const tasks = [{ task_id: 't-1', title: 'Fix login' }];
+  const frame = (kind) => ({ cursor: 'c-2', event: { task_id: 't-1', kind } });
+  const resolved = (status, detail) => frame({ type: 'operator_command_resolved', command_id: 'k-1', status, detail });
+
+  assert.equal(
+    refusalOf(resolved('rejected', "step 'two' is already running; stop the task and choose the step again"), tasks),
+    "Fix login: polecenie odrzucone przez runnera — step 'two' is already running; stop the task and choose the step again",
+  );
+  assert.equal(refusalOf(resolved('rejected', null), []), 't-1: polecenie odrzucone przez runnera — bez podania przyczyny');
+  assert.equal(refusalOf(resolved('applied', null), tasks), null);
+  assert.equal(refusalOf(frame({ type: 'priority_changed', priority: 1 }), tasks), null);
 });
