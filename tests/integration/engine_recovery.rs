@@ -1513,6 +1513,37 @@ async fn a_comment_for_a_step_that_runs_no_agent_is_refused() {
         .expect("a blank comment is no comment");
 }
 
+/// A save that fails leaves the execution as it was: the move, the note and
+/// the key of the comment on the pause are stored together or not at all.
+#[tokio::test]
+async fn a_failed_save_leaves_the_chosen_step_and_its_comment_unstored() {
+    let harness = Harness::new();
+    let (engine, paused) = back_at_plan(&harness).await;
+    let before = harness.store().load_execution(&paused.id).unwrap();
+    // The save writes `context.json` first: a folder in its place makes it fail.
+    let context = harness.store().paths().context_file(&paused.id);
+    std::fs::remove_file(&context).expect("remove the context");
+    std::fs::create_dir(&context).expect("block the context");
+
+    let error = engine
+        .select_step(
+            &workflow("step_history"),
+            &paused.id,
+            &chosen(
+                "brainstorm",
+                Some("use the new API"),
+                Some("mind the flaky test"),
+            ),
+        )
+        .expect_err("the save fails");
+
+    assert!(matches!(error, EngineError::Persistence(_)), "{error:?}");
+    let stored = harness.store().load_execution(&paused.id).unwrap();
+    assert_eq!(stored.current_state, before.current_state);
+    assert_eq!(stored.status, before.status);
+    assert_eq!(stored.metadata, before.metadata);
+}
+
 fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")

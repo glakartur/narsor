@@ -3473,16 +3473,48 @@ async fn a_step_choice_refused_at_the_launch_starts_no_step() {
     let choice = select_step("no-such-step", Some("Use the new API."));
     fixture.session.startup_commands = vec![queued("select-1", choice.clone())];
 
-    assert_eq!(fixture.begin().await, None);
-    fixture.settled().await;
+    assert_eq!(
+        fixture.begin().await,
+        Some(RunnerExit::Stopped { clean: true })
+    );
 
     assert!(fixture.agent.calls().is_empty());
     assert!(!fixture.session.pass_active());
     let execution = fixture.execution();
     assert_eq!(execution.status, ExecutionStatus::Paused);
     assert_eq!(execution.current_state.as_deref(), Some("two"));
+    let session = fixture.session.storage.session().unwrap().unwrap();
+    assert!(
+        session.closed.is_some(),
+        "the session closes: the task is stopped"
+    );
     let reason = fixture.rejected("select-1", choice).await;
     assert!(reason.contains("no state"), "{reason}");
+}
+
+/// Two step moves queued for one launch with a comment on the pause: the
+/// comment goes to the step the last move chose, not to one a later move
+/// replaced.
+#[tokio::test]
+async fn the_comment_on_a_pause_goes_to_the_step_the_last_queued_move_chose() {
+    let root = TempRoot::new();
+    let storage = paused_between_steps(&root).await;
+    let mut fixture = resumed(&root, &storage, Some(launch_with_comment("pod-2")));
+    fixture.session.startup_commands = vec![
+        queued("select-1", select_step("one", None)),
+        queued("select-2", select_step("two", None)),
+    ];
+
+    assert_eq!(fixture.begin().await, None);
+    fixture.settled().await;
+
+    let calls = fixture.agent.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].prompt.contains("Second.") && calls[0].prompt.contains("Mind the flaky test."),
+        "{}",
+        calls[0].prompt
+    );
 }
 
 /// A runner lost while the step after its pause ran, without closing its

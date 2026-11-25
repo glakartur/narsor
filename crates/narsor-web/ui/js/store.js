@@ -29,8 +29,21 @@ export function refusalOf(envelope, tasks) {
   const kind = event?.kind;
   if (kind?.type !== 'operator_command_resolved' || kind.status !== 'rejected') return null;
   const task = (tasks ?? []).find((row) => row.task_id === event.task_id);
-  const reason = String(kind.detail ?? '').trim() || 'bez podania przyczyny';
-  return `${task ? titleOf(task) : event.task_id}: polecenie odrzucone przez runnera — ${reason}`;
+  const command = (task?.operator_commands ?? []).find((row) => row.command_id === kind.command_id)?.command;
+  const reason = String(kind.detail ?? '').replace(/\s+/g, ' ').trim() || 'bez podania przyczyny';
+  return `${task ? titleOf(task) : event.task_id}: ${commandName(command)} odrzucone przez runnera — ${reason}`;
+}
+
+/** The name of a command in the bar, as the TUI says it. */
+function commandName(command) {
+  switch (command?.kind) {
+    case 'interrupt': return 'przerwanie kroku';
+    case 'stop_step': return 'zatrzymanie kroku';
+    case 'select_step': return `wybór kroku „${command.target}”`;
+    case 'transition': return `${command.override ? 'override' : 'przejście'} do „${command.target}”`;
+    case 'restart_step': return 'restart kroku';
+    default: return 'polecenie operatora';
+  }
 }
 
 /** The delay before stream connection attempt `failures + 1`: 0, 250 ms × 2ⁿ, at most 15 s. */

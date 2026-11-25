@@ -244,6 +244,16 @@ pub enum RunnerExit {
     Problem(RunnerProblem),
 }
 
+/// What the step moves queued for a launch came to.
+enum StartupMoves {
+    /// None was queued.
+    None,
+    /// All were applied; the pass started.
+    Applied,
+    /// One was refused: no step starts.
+    Refused,
+}
+
 /// Longest wait for the launch view before a clean restart resumes.
 const CLEAN_LAUNCH_WAIT: Duration = Duration::from_secs(5);
 
@@ -569,6 +579,7 @@ fn assemble_session(
         title_wanted: spec.title.is_none(),
         startup_commands: Vec::new(),
         launching: false,
+        launch_comment_wanted: false,
     }
 }
 
@@ -1056,6 +1067,9 @@ struct Session {
     /// The commands carried out now come before the launch's first pass:
     /// they start none of their own.
     launching: bool,
+    /// Whether the move being settled at the launch is the last one, the
+    /// only one that takes the comment left on the pause.
+    launch_comment_wanted: bool,
 }
 
 /// How the work on this storage continues.
@@ -1202,11 +1216,17 @@ impl Session {
                 // without the comment, which stays in the record.
                 let _ =
                     tokio::time::timeout(self.timing.clean_launch_wait, self.await_launch()).await;
-                if !self.take_startup_moves().await? {
-                    self.go_on()?;
+                match self.take_startup_moves().await? {
+                    StartupMoves::None => self.go_on()?,
+                    StartupMoves::Applied => {}
+                    StartupMoves::Refused => return self.stop_after_refused_moves().await,
                 }
             }
-            Continuation::Recover(decision) => self.recover(decision).await?,
+            Continuation::Recover(decision) => {
+                if let Some(exit) = self.recover(decision).await? {
+                    return Ok(Some(exit));
+                }
+            }
         }
         // After the runner's own recovery, like the daemon's startup hook.
         self.conductor.restore_at_startup();
@@ -1478,13 +1498,18 @@ impl Session {
     /// Runs reconciliation the owner or the resume policy authorized and,
     /// when it finds an action that was in flight (or an execution an earlier
     /// attempt already left `Unknown`), starts that action again.
-    async fn recover(&mut self, decision: Decision) -> Result<(), RunnerError> {
+    ///
+    /// `Some` when a step move queued for the launch was refused: the
+    /// session closed at the safe point and the runner must stop.
+    async fn recover(&mut self, decision: Decision) -> Result<Option<RunnerExit>, RunnerError> {
         let execution_id = self.execution_id.clone().unwrap_or_default();
         let reconciliation = reconcile(self.engine.store(), &execution_id)?;
         tracing::info!(?decision, outcome = ?reconciliation.outcome, "recovering after an unexpected stop");
         // A step the owner chose replaces the recovery of the one in flight.
-        if self.take_startup_moves().await? {
-            return Ok(());
+        match self.take_startup_moves().await? {
+            StartupMoves::None => {}
+            StartupMoves::Applied => return Ok(None),
+            StartupMoves::Refused => return self.stop_after_refused_moves().await,
         }
         // An execution an earlier attempt already turned `Unknown` is not
         // examined again, but it is still waiting for this explicit recovery,
@@ -1501,9 +1526,10 @@ impl Session {
             // step's session with it, or puts it in the note.
             let message = self.untaken_resume_message()?;
             self.recover_with_message(&execution_id, Some(decision.comment()), message)?;
-            return Ok(());
+            return Ok(None);
         }
-        self.go_on()
+        self.go_on()?;
+        Ok(None)
     }
 
     /// Carries out the step moves the owner queued for this launch — a
@@ -1512,8 +1538,13 @@ impl Session {
     ///
     /// The control plane is not told here: the next poll delivers them
     /// again, and the verdict recorded now answers it. When one is refused,
-    /// no step starts: the owner reads why and decides again.
-    async fn take_startup_moves(&mut self) -> Result<bool, RunnerError> {
+    /// no step starts and the caller closes the session at the safe point:
+    /// the owner reads why and decides again. Every move is settled first;
+    /// one that applied stays applied, and the comment is not taken.
+    ///
+    /// The comment left on the pause goes to the last move only, so a move
+    /// that a later one replaces cannot take it away.
+    async fn take_startup_moves(&mut self) -> Result<StartupMoves, RunnerError> {
         let moves: Vec<DeliveredOperatorCommand> = std::mem::take(&mut self.startup_commands)
             .into_iter()
             .filter(|delivered| {
@@ -1525,17 +1556,33 @@ impl Session {
             })
             .collect();
         if moves.is_empty() {
-            return Ok(false);
+            return Ok(StartupMoves::None);
         }
         self.launching = true;
         let mut refused = false;
-        for delivered in moves {
-            refused |= !self.settle_command(delivered).await?.applied;
+        let last = moves.len() - 1;
+        for (index, delivered) in moves.into_iter().enumerate() {
+            self.launch_comment_wanted = index == last;
+            let id = delivered.command_id.clone();
+            let verdict = self.settle_command(delivered).await?;
+            refused |= !verdict.applied;
+            // A refusal ends the launch, so its reason goes to the owner
+            // now: no poll follows to deliver it.
+            if let Some(client) = self.link.client() {
+                if let Err(error) = client
+                    .ack_command(&id, verdict.applied, verdict.detail)
+                    .await
+                {
+                    // Redelivered later and answered from the recorded verdict.
+                    self.link.failed(&error, &self.timing);
+                }
+            }
         }
         self.launching = false;
+        self.launch_comment_wanted = false;
         if refused {
             tracing::warn!("a step move queued for this launch was refused; no step starts");
-            return Ok(true);
+            return Ok(StartupMoves::Refused);
         }
         let execution_id = self.execution_id.clone().unwrap_or_default();
         let status = self.engine.store().load_execution(&execution_id)?.status;
@@ -1546,7 +1593,18 @@ impl Session {
             self.take_resume_message()?;
         }
         self.resume_pass()?;
-        Ok(true)
+        Ok(StartupMoves::Applied)
+    }
+
+    /// Ends the launch after a refused step move: the session closes, so
+    /// the task is stopped again and the owner decides anew. With the
+    /// control plane in reach, the safe point is reported first.
+    async fn stop_after_refused_moves(&mut self) -> Result<Option<RunnerExit>, RunnerError> {
+        if self.link.client().is_some() {
+            return self.finish_at_safe_point().await;
+        }
+        self.close_session("a step move queued for the launch was refused")?;
+        Ok(Some(RunnerExit::Stopped { clean: true }))
     }
 
     /// Goes on after a stop with nothing to reconcile. A step that failed

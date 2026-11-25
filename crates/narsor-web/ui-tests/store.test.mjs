@@ -67,7 +67,7 @@ function fakeClock() {
   };
 }
 
-function fakeApi(listings) {
+function fakeApi(listings, events = []) {
   let calls = 0;
   return {
     calls: () => calls,
@@ -80,7 +80,10 @@ function fakeApi(listings) {
     async harness() { return { effective: 'claude-code', override: null }; },
     async capabilities() { return { connection_name: 'local' }; },
     async usage() { return { harnesses: [] }; },
-    async *streamEvents() { /* never yields; ends */ await new Promise(() => {}); },
+    async *streamEvents() {
+      yield* events;
+      await new Promise(() => {});
+    },
   };
 }
 
@@ -127,15 +130,42 @@ test('a 401 stops the schedule and asks for a token', async () => {
 });
 
 test('a command the runner refused after it was queued shows its reason', () => {
-  const tasks = [{ task_id: 't-1', title: 'Fix login' }];
+  const tasks = [{
+    task_id: 't-1',
+    title: 'Fix login',
+    operator_commands: [{ command_id: 'k-1', command: { kind: 'select_step', target: 'two' } }],
+  }];
   const frame = (kind) => ({ cursor: 'c-2', event: { task_id: 't-1', kind } });
   const resolved = (status, detail) => frame({ type: 'operator_command_resolved', command_id: 'k-1', status, detail });
 
   assert.equal(
     refusalOf(resolved('rejected', "step 'two' is already running; stop the task and choose the step again"), tasks),
-    "Fix login: polecenie odrzucone przez runnera — step 'two' is already running; stop the task and choose the step again",
+    "Fix login: wybór kroku „two” odrzucone przez runnera — step 'two' is already running; stop the task and choose the step again",
   );
-  assert.equal(refusalOf(resolved('rejected', null), []), 't-1: polecenie odrzucone przez runnera — bez podania przyczyny');
+  assert.equal(refusalOf(resolved('rejected', null), []), 't-1: polecenie operatora odrzucone przez runnera — bez podania przyczyny');
+  assert.equal(
+    refusalOf(resolved('rejected', 'first line\n  second line'), tasks),
+    'Fix login: wybór kroku „two” odrzucone przez runnera — first line second line',
+  );
   assert.equal(refusalOf(resolved('applied', null), tasks), null);
   assert.equal(refusalOf(frame({ type: 'priority_changed', priority: 1 }), tasks), null);
+});
+
+test('the stream shows the reason of a command the runner refused after it was queued', async () => {
+  const clock = fakeClock();
+  const tasks = [{
+    task_id: 't-1',
+    state: 'paused',
+    title: 'Fix login',
+    operator_commands: [{ command_id: 'k-1', command: { kind: 'select_step', target: 'two' } }],
+  }];
+  const refused = {
+    cursor: 'c-2',
+    event: { task_id: 't-1', kind: { type: 'operator_command_resolved', command_id: 'k-1', status: 'rejected', detail: 'no state' } },
+  };
+  const store = new Store(fakeApi([{ tasks, cursor: 'c-1' }], [refused]), { clock });
+  await store.refresh();
+  await flush();
+  assert.equal(store.state.notification.text, 'Fix login: wybór kroku „two” odrzucone przez runnera — no state');
+  store.stop();
 });

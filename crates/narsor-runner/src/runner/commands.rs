@@ -205,7 +205,7 @@ impl Session {
         if self.pass_active() {
             return Err(self.went_on(execution_id));
         }
-        if self.launching {
+        if self.launching && self.launch_comment_wanted {
             selection.owner_message = self
                 .untaken_resume_message()
                 .map_err(|error| error.to_string())?
