@@ -48,6 +48,8 @@ use crate::tui::transcript::{TranscriptId, TranscriptState};
 const AXIS_MAX_WIDTH: u16 = 34;
 /// Columns between the axis and the step's content.
 const AXIS_GAP: u16 = 3;
+/// What a closed run's step says in place of its conversation.
+const CONVERSATION_DELETED: &str = "rozmowa usunięta przy archiwizacji";
 /// Narrowest a step's label is cut to before its times go.
 const MIN_LABEL: usize = 8;
 
@@ -326,12 +328,21 @@ impl Progress {
         }
     }
 
-    /// A closed run, as the history shows it: no step is picked, so the axis
-    /// has no cursor and no step's content shows, and nothing is followed.
-    pub fn drop_selection(&mut self) {
-        self.selected = None;
+    /// Takes a read of a closed run's timeline in, as the history shows it:
+    /// nothing is followed and no step is running. The selected step stays
+    /// when the read still has it, else the first step is selected; a read
+    /// that failed changes no selection.
+    pub fn apply_closed_run(&mut self, revision: u64, result: Result<TimelineResponse, String>) {
+        let read = result.is_ok();
+        let before = self.selected.clone();
         self.follow = false;
         self.paused = false;
+        self.apply(revision, result);
+        if !read {
+            return;
+        }
+        let kept = before.filter(|label| self.positions().iter().any(|step| step.label == *label));
+        self.selected = kept.or_else(|| self.positions().first().map(|step| step.label.clone()));
     }
 
     /// `f`: follow the running step, or stay where the cursor is. Following
@@ -791,6 +802,7 @@ pub fn render(
     keys: Option<StepFocus>,
     glyph: &str,
     axis_rows: AxisRows,
+    closed_run: bool,
 ) {
     let axis_focused = keys == Some(StepFocus::Axis);
     let conversation_focused = keys == Some(StepFocus::Conversation);
@@ -865,6 +877,7 @@ pub fn render(
         stale,
         conversation_focused,
         glyph,
+        closed_run,
     );
 }
 
@@ -881,6 +894,7 @@ fn render_step(
     stale: bool,
     focused: bool,
     glyph: &str,
+    closed_run: bool,
 ) {
     let (positions, gate) = overlaid;
     let Some(label) = progress.selected_label() else {
@@ -898,6 +912,24 @@ fn render_step(
         gate.filter(|_| super::gate::is_gate_position(positions, gate, &position.label))
     {
         lines.extend(super::gate::lines(gate, styles));
+    }
+    if closed_run {
+        // The archive kept the facts, not the conversation: the fixed line
+        // keeps the last row when the facts do not fit.
+        let facts = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .min(area.height.saturating_sub(1));
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect::new(area.x, area.y, area.width, facts),
+        );
+        if area.height > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::styled(CONVERSATION_DELETED, styles.of(Role::Done))),
+                Rect::new(area.x, area.y + facts, area.width, 1),
+            );
+        }
+        return;
     }
     lines.push(Line::raw(""));
     let facts = u16::try_from(lines.len())

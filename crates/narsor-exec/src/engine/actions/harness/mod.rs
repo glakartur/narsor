@@ -58,8 +58,7 @@ pub use github_copilot::{GitHubCopilotAdapter, GITHUB_COPILOT};
 pub use opencode::{OpenCodeAdapter, OPENCODE};
 pub use request::{
     AgentRequest, AgentRunEnding, ContextContent, ContextFile, ContextFiles, ContextSource,
-    FinishedRun, RunObservers, RunStarted,
-    FINAL_ANSWER_GRACE,
+    FinishedRun, RunObservers, RunStarted, FINAL_ANSWER_GRACE,
 };
 
 /// What an adapter read out of a finished harness run.

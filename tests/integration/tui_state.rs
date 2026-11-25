@@ -855,11 +855,7 @@ mod foundations {
 
         #[test]
         fn the_history_has_the_same_layers_without_the_tasks_actions_or_following() {
-            for layer in [
-                Context::HistoryAxis,
-                Context::Reading,
-                Context::AgentConversation,
-            ] {
+            for layer in [Context::HistoryAxis, Context::Reading] {
                 let stack = Stack::layered(layer, Context::HistoryDetails);
                 let keys = stack_keys(stack);
                 for task_only in ["p", "x", "t", "s", "a", ".", "m", "c", "w"] {
@@ -871,9 +867,14 @@ mod foundations {
             }
             let axis = Stack::layered(Context::HistoryAxis, Context::HistoryDetails);
             assert!(!stack_keys(axis).iter().any(|key| key == "f"));
-            // The steps of an archived run are header rows only: none opens.
-            for code in [KeyCode::Enter, KeyCode::Right, KeyCode::Char('j')] {
+            // The steps of an archived run can be picked, but none opens.
+            for code in [KeyCode::Enter, KeyCode::Right] {
                 assert_eq!(lookup(axis, &press(code)), None, "{code:?}");
+            }
+            assert_eq!(lookup(axis, &press(KeyCode::Char('j'))), Some(Action::Down));
+            let keys = stack_keys(axis);
+            for key in ["j", "k", "g", "G"] {
+                assert!(keys.iter().any(|bound| bound == key), "{key}: {keys:?}");
             }
         }
 
@@ -5864,7 +5865,11 @@ mod task_app_waiting {
         assert_eq!(first.label, "Napisz do agenta");
         assert_eq!(first.unavailable, None);
         assert_eq!(Some(first.description.clone()), offer.description);
-        assert!(first.description.contains("nowej sesji"), "{}", first.description);
+        assert!(
+            first.description.contains("nowej sesji"),
+            "{}",
+            first.description
+        );
     }
 
     /// R8: a send that fails keeps the text in the field, and the panel says
@@ -9247,8 +9252,8 @@ mod task_app_conductor {
     use narsor_protocol::controller::ConductorView;
 
     use super::task_app_support::{
-        archived, archived_step, archived_timeline, chat_entry, conductor_view, event, listing,
-        task, titled, waiting_on, with_conductor, with_controller, with_runner, without_conductor,
+        chat_entry, conductor_view, event, listing, task, titled, waiting_on, with_conductor,
+        with_controller, with_runner, without_conductor,
     };
 
     fn app() -> TaskApp {
@@ -10098,30 +10103,6 @@ mod task_app_conductor {
             assert!(
                 conductor(&app).is_typing(),
                 "the conductor is still there to write to"
-            );
-        }
-
-        #[test]
-        fn an_archived_task_says_its_storage_went_with_the_archiving() {
-            let mut app = app();
-            app.load(listing(vec![], "c"));
-            press(&mut app, KeyCode::Char('H'));
-            app.open_history(listing(vec![archived("a", "NAR-12", 1)], "c"));
-            // The run the archive kept does not bring the conductor back.
-            app.on_history_timeline(
-                "a",
-                Ok(archived_timeline(
-                    "a",
-                    vec![archived_step("plan", "claude", "opus", 0.4)],
-                )),
-            );
-            while app.history().unwrap().tab() != DetailTab::Conductor {
-                press(&mut app, KeyCode::Char(']'));
-            }
-            let text = screen(&mut app, 120, 30);
-            assert!(
-                text.contains("storage usunięty przy archiwizacji"),
-                "{text}"
             );
         }
 
@@ -11508,7 +11489,7 @@ mod task_app_create {
         }
 
         #[test]
-        fn an_archived_task_shows_its_kept_run_and_says_the_rest_of_its_storage_is_gone() {
+        fn an_archived_task_shows_its_kept_run_and_keeps_only_przebieg_and_info() {
             let mut app = opened();
             app.on_history_timeline(
                 "old",
@@ -11519,19 +11500,15 @@ mod task_app_create {
             );
             press(&mut app, KeyCode::Enter);
             assert_eq!(app.key_context().base, Context::HistoryDetails);
-            for (tab, expected) in [
-                (DetailTab::Progress, "plan #1"),
-                (
-                    DetailTab::Conversation,
-                    "storage usunięty przy archiwizacji",
-                ),
-                (DetailTab::Events, "storage usunięty przy archiwizacji"),
-            ] {
+            for (tab, expected) in [(DetailTab::Progress, "plan #1"), (DetailTab::Info, "Info")] {
                 while app.history().unwrap().tab() != tab {
                     press(&mut app, KeyCode::Char(']'));
                 }
                 let screen = screen(&mut app, 130, 30);
                 assert!(screen.contains(expected), "{tab:?}:\n{screen}");
+                for removed in ["Rozmowa", "Zdarzenia", "Dyrygent", "Stan"] {
+                    assert!(!screen.contains(removed), "{removed}:\n{screen}");
+                }
             }
             // The details are not the ones of the task list.
             let screen = screen(&mut app, 130, 30);
@@ -11539,27 +11516,108 @@ mod task_app_create {
             assert!(screen.contains("Historia"), "{screen}");
         }
 
+        fn steps(count: usize) -> Vec<narsor_protocol::api::Position> {
+            (1..=count)
+                .map(|n| archived_step(&format!("step{n:02}"), "claude", "opus", 0.1))
+                .collect()
+        }
+
+        /// The step selected on the selected history entry.
+        fn selected_step(app: &TaskApp) -> Option<String> {
+            app.history()?
+                .selected_detail()?
+                .progress()
+                .selected_label()
+                .map(str::to_string)
+        }
+
         #[test]
-        fn enter_on_a_step_of_an_archived_run_opens_nothing() {
+        fn enter_on_a_step_of_an_archived_run_opens_nothing_and_j_moves_the_cursor() {
             let mut app = opened();
-            app.on_history_timeline(
-                "old",
-                Ok(archived_timeline(
-                    "old",
-                    vec![
-                        archived_step("plan", "claude", "opus", 0.4),
-                        archived_step("review", "claude", "sonnet", 0.2),
-                    ],
-                )),
-            );
+            app.on_history_timeline("old", Ok(archived_timeline("old", steps(2))));
             press(&mut app, KeyCode::Enter);
-            for code in [KeyCode::Enter, KeyCode::Right, KeyCode::Char('j')] {
+            assert_eq!(selected_step(&app).as_deref(), Some("step01 #1"));
+            for code in [KeyCode::Enter, KeyCode::Right] {
                 press(&mut app, code);
             }
             let history = app.history().unwrap();
             let progress = history.selected_detail().unwrap().progress();
-            assert_eq!(progress.selected_label(), None, "no step is picked");
-            assert!(progress.step_view().is_none());
+            assert!(progress.step_view().is_none(), "no step conversation opens");
+            assert_eq!(selected_step(&app).as_deref(), Some("step01 #1"));
+            press(&mut app, KeyCode::Char('j'));
+            assert_eq!(selected_step(&app).as_deref(), Some("step02 #1"));
+        }
+
+        #[test]
+        fn the_cursor_stops_at_both_ends_of_an_archived_run() {
+            let mut app = opened();
+            app.on_history_timeline("old", Ok(archived_timeline("old", steps(30))));
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('G'));
+            assert_eq!(selected_step(&app).as_deref(), Some("step30 #1"));
+            press(&mut app, KeyCode::Char('j'));
+            assert_eq!(selected_step(&app).as_deref(), Some("step30 #1"));
+            press(&mut app, KeyCode::Char('g'));
+            assert_eq!(selected_step(&app).as_deref(), Some("step01 #1"));
+            press(&mut app, KeyCode::Up);
+            assert_eq!(selected_step(&app).as_deref(), Some("step01 #1"));
+            press(&mut app, KeyCode::Down);
+            assert_eq!(selected_step(&app).as_deref(), Some("step02 #1"));
+        }
+
+        #[test]
+        fn an_entry_keeps_its_step_when_read_again_and_when_the_list_moves_away_and_back() {
+            let mut app = opened();
+            app.on_history_timeline("old", Ok(archived_timeline("old", steps(5))));
+            app.on_history_timeline("older", Ok(archived_timeline("older", steps(5))));
+            press(&mut app, KeyCode::Enter);
+            for _ in 0..2 {
+                press(&mut app, KeyCode::Char('j'));
+            }
+            assert_eq!(selected_step(&app).as_deref(), Some("step03 #1"));
+            // The same entry read again keeps its step.
+            app.on_history_timeline("old", Ok(archived_timeline("old", steps(5))));
+            assert_eq!(selected_step(&app).as_deref(), Some("step03 #1"));
+            // Another entry has its own, and the first keeps its own.
+            press(&mut app, KeyCode::Esc);
+            ch(&mut app, 'j');
+            assert_eq!(selected_step(&app).as_deref(), Some("step01 #1"));
+            ch(&mut app, 'k');
+            assert_eq!(selected_step(&app).as_deref(), Some("step03 #1"));
+            // A step that is gone from the read falls back to the first.
+            app.on_history_timeline("old", Ok(archived_timeline("old", steps(2))));
+            assert_eq!(selected_step(&app).as_deref(), Some("step01 #1"));
+        }
+
+        #[test]
+        fn a_failed_or_empty_read_of_an_archived_run_leaves_no_cursor() {
+            let mut app = opened();
+            app.on_history_timeline(
+                "old",
+                Err(narsor::api::ClientError::Unavailable("refused".into())),
+            );
+            let mut nothing_kept = archived_timeline("older", Vec::new());
+            nothing_kept.timeline = None;
+            app.on_history_timeline("older", Ok(nothing_kept));
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('j'));
+            assert_eq!(selected_step(&app), None);
+            press(&mut app, KeyCode::Esc);
+            ch(&mut app, 'j');
+            assert_eq!(selected_step(&app), None);
+        }
+
+        #[test]
+        fn the_history_axis_lists_the_step_keys_and_no_follow() {
+            let stack = Stack::layered(Context::HistoryAxis, Context::HistoryDetails);
+            let keys = keymap::help_entries(stack)
+                .iter()
+                .flat_map(|entry| entry.keys.split('/').map(str::to_string))
+                .collect::<Vec<_>>();
+            for key in ["j", "k", "g", "G"] {
+                assert!(keys.iter().any(|bound| bound == key), "{key}: {keys:?}");
+            }
+            assert!(!keys.iter().any(|bound| bound == "f"), "{keys:?}");
         }
 
         #[tokio::test]
@@ -11635,15 +11693,16 @@ mod task_app_create {
         fn brackets_switch_the_tabs_from_the_history_list_and_its_details() {
             let mut app = opened();
             ch(&mut app, ']');
-            assert_eq!(app.history().unwrap().tab(), DetailTab::Events);
+            assert_eq!(app.history().unwrap().tab(), DetailTab::Info);
             press(&mut app, KeyCode::Enter);
-            ch(&mut app, ']');
-            assert_eq!(app.history().unwrap().tab(), DetailTab::Conductor);
             assert_eq!(
                 app.key_context(),
                 Stack::layered(Context::Reading, Context::HistoryDetails)
             );
+            ch(&mut app, ']');
+            assert_eq!(app.history().unwrap().tab(), DetailTab::Progress);
             ch(&mut app, '[');
+            assert_eq!(app.history().unwrap().tab(), DetailTab::Info);
             ch(&mut app, '[');
             assert_eq!(app.history().unwrap().tab(), DetailTab::Progress);
             assert_eq!(
@@ -13581,7 +13640,10 @@ mod task_app_state {
         let all = texts(&state);
         assert!(all.iter().any(|t| t.trim() == "VALUE"), "{all:?}");
 
-        let tall = (1..=6).map(|n| format!("l{n}")).collect::<Vec<_>>().join("\n");
+        let tall = (1..=6)
+            .map(|n| format!("l{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut state = shown(json!({ long: tall }), 20, 4);
         state.on_action(Action::Expand);
         for _ in 0..12 {

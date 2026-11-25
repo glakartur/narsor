@@ -4,5 +4,5 @@ mod commands;
 mod input;
 
 #[cfg(test)]
-pub(crate) use commands::check_step_exists;
+pub(crate) use commands::check_step_choice;
 pub(crate) use input::protocol_delivery;

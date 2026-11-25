@@ -57,9 +57,8 @@ pub use agent::{AgentExecutor, DefaultHarnessSource};
 pub use answer::ChoiceAnswer;
 pub use harness::{
     AgentRequest, AgentRunEnding, ClaudeCodeAdapter, CodexAdapter, ContextContent, ContextFile,
-    ContextFiles, ContextSource,
-    FinishedRun, HarnessAdapter, HarnessRegistry, HarnessRun, OpenCodeAdapter, RunObservers,
-    RunStarted,
+    ContextFiles, ContextSource, FinishedRun, HarnessAdapter, HarnessRegistry, HarnessRun,
+    OpenCodeAdapter, RunObservers, RunStarted,
 };
 pub use human::{
     check_gate_answer, ConductorAnalysis, HumanActionError, HumanExecutor, HumanInputDelivery,

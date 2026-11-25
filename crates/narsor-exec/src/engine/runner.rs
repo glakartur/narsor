@@ -148,7 +148,7 @@ pub use failure::handoff::{
 pub use human_input::manual_transition::record_manual_transition;
 pub use human_input::operations::{
     execution_episode, manual_override_allowed, plan_operator_transition, ManualTransition,
-    OperatorTransition, OutputDecisionUndo, TransitionPlan, UndoneOutputDecision,
+    OperatorTransition, OutputDecisionUndo, StepSelection, TransitionPlan, UndoneOutputDecision,
 };
 pub use lifecycle::finish::terminal_status;
 pub use lifecycle::run_handle::RunHandle;

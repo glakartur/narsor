@@ -20,7 +20,7 @@ use super::{RunnerError, Session};
 use crate::controller_client::DeliveredOperatorCommand;
 use crate::domain::runner_snapshot::RETIRED_CONDUCTOR_HARNESS;
 use crate::domain::ExecutionStatus;
-use crate::engine::{EngineError, OperatorTransition, Recovery};
+use crate::engine::{EngineError, OperatorTransition, OwnerMessage, Recovery, StepSelection};
 use narsor_protocol::controller::OperatorCommand;
 
 impl Session {
@@ -94,19 +94,16 @@ impl Session {
                     forced,
                     reason,
                     requested_by: delivered.requested_by,
-                    select: false,
                 },
             ),
             OperatorCommand::SelectStep { target, note } => self.select_step(
                 &execution_id,
-                OperatorTransition {
+                StepSelection {
                     target,
-                    forced: true,
-                    reason: None,
                     requested_by: delivered.requested_by,
-                    select: true,
+                    note,
+                    owner_message: None,
                 },
-                note,
             ),
             OperatorCommand::RestartStep { note, failure_key } => {
                 self.restart_step(&execution_id, note, failure_key)
@@ -196,36 +193,40 @@ impl Session {
             .map_err(|error| error.to_string())
     }
 
-    /// Goes on from the step the owner chose: the transition, the owner's
-    /// note for an agent step, and the pass that carries on from there.
+    /// Goes on from the step the owner chose: the move and the owner's
+    /// comment for an agent step, stored together or not at all, and the
+    /// pass that carries on from there. At the launch the comment left on
+    /// the pause goes with it, and the launch starts the pass.
     fn select_step(
         &mut self,
         execution_id: &str,
-        transition: OperatorTransition,
-        note: Option<String>,
+        mut selection: StepSelection,
     ) -> Result<(), String> {
         if self.pass_active() {
-            return Err("a step is running; interrupt it first".to_string());
+            return Err(self.went_on(execution_id));
+        }
+        if self.launching && self.launch_comment_wanted {
+            selection.owner_message = self
+                .untaken_resume_message()
+                .map_err(|error| error.to_string())?
+                .map(|message| OwnerMessage {
+                    key: message.key,
+                    text: message.text,
+                });
         }
         self.engine
-            .take_operator_transition(&self.definition, execution_id, &transition)
+            .select_step(&self.definition, execution_id, &selection)
             .map_err(|error| refusal(&error))?;
-        // The step has moved: a note that cannot be written must not leave
-        // the task without a pass, and a retry would not repeat the move.
-        if let Some(note) = note.filter(|note| !note.trim().is_empty()) {
-            if let Err(error) = self.engine.leave_operator_note(execution_id, &note, None) {
-                tracing::warn!(
-                    "the owner's note for the chosen step was not written: {}",
-                    refusal(&error)
-                );
-            }
+        if self.launching {
+            return Ok(());
         }
         self.resume_pass().map_err(|error| error.to_string())
     }
 
     /// Takes the transition and, when it leads into a state that still has
     /// work to do, carries on from there: the owner chose where the task
-    /// goes, and nothing in a running task asks for a second "resume".
+    /// goes, and nothing in a running task asks for a second "resume". At
+    /// the launch, the launch starts the pass.
     fn transition(
         &mut self,
         execution_id: &str,
@@ -235,10 +236,24 @@ impl Session {
             .engine
             .take_operator_transition(&self.definition, execution_id, &transition)
             .map_err(|error| refusal(&error))?;
-        if execution.status == ExecutionStatus::Paused {
+        if execution.status == ExecutionStatus::Paused && !self.launching {
             self.resume_pass().map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    /// Why the owner cannot choose a step now: the task went on from where
+    /// it stopped (the control plane was not reachable when it started, so
+    /// the choice came late) or another step runs.
+    fn went_on(&self, execution_id: &str) -> String {
+        let step = self
+            .engine
+            .store()
+            .load_execution(execution_id)
+            .ok()
+            .and_then(|execution| execution.current_state)
+            .unwrap_or_default();
+        format!("step '{step}' is already running; stop the task and choose the step again")
     }
 
     /// Starts the failed or interrupted step again: a failed or unknown

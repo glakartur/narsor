@@ -26,6 +26,7 @@ narsor-cli task input <task> --field reason=ok [--artifact name=path] [--variabl
 narsor-cli task interrupt <task>                      # cut short the step the runner works on
 narsor-cli task transition <task> <state> [--override --reason <why>]   # manual transition; an override is audited
 narsor-cli task restart-step <task> [--note <text>] [--failure-key K]   # run the failed or interrupted step again
+narsor-cli task select-step <task> <step> [--note <text>]   # a stopped task goes on from this step; the note goes to its first agent attempt only
 narsor-cli task conversation <task> [<attempt>]   # read through the control plane
 narsor-cli task watch                             # follow every task's events
 narsor-cli task repo list|add|remove              # the control plane's repository registry
