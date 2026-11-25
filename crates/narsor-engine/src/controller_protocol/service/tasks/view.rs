@@ -196,15 +196,7 @@ pub(crate) fn workflow_steps(record: &TaskRecord) -> Option<Vec<StepView>> {
     Some(
         ids.into_iter()
             .filter_map(|id| {
-                let state = definition.states.get(id.as_str())?;
-                let kind = match &state.action {
-                    Some(ActionConfig::Agent(_)) => StepKind::Agent,
-                    Some(ActionConfig::Profile(_)) => StepKind::Profile,
-                    Some(ActionConfig::Script(_)) => StepKind::Script,
-                    Some(ActionConfig::Human(_)) => StepKind::Human,
-                    Some(ActionConfig::Decision(_)) => StepKind::Decision,
-                    None => StepKind::Terminal,
-                };
+                let kind = step_kind(definition.states.get(id.as_str())?);
                 Some(StepView {
                     label: id.clone(),
                     id,
@@ -213,6 +205,18 @@ pub(crate) fn workflow_steps(record: &TaskRecord) -> Option<Vec<StepView>> {
             })
             .collect(),
     )
+}
+
+/// What kind of step `state` is, as the owner's choice of a step shows it.
+pub(crate) fn step_kind(state: &crate::domain::State) -> StepKind {
+    match &state.action {
+        Some(ActionConfig::Agent(_)) => StepKind::Agent,
+        Some(ActionConfig::Profile(_)) => StepKind::Profile,
+        Some(ActionConfig::Script(_)) => StepKind::Script,
+        Some(ActionConfig::Human(_)) => StepKind::Human,
+        Some(ActionConfig::Decision(_)) => StepKind::Decision,
+        None => StepKind::Terminal,
+    }
 }
 
 /// What an owner can ask for out of `current` in `definition`.

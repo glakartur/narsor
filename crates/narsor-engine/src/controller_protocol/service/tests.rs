@@ -1,4 +1,4 @@
-use super::operator::check_step_exists;
+use super::operator::check_step_choice;
 use super::tasks::{transition_offer, workflow_steps};
 use super::*;
 use crate::domain::WorkflowDefinition;
@@ -210,12 +210,12 @@ fn record_of(yaml: Option<&str>, runner_state: RunnerState) -> TaskRecord {
 fn a_step_choice_names_a_step_of_the_workflow() {
     let record = record_of(Some(STEPS), RunnerState::Stopped);
 
-    assert!(check_step_exists(&record, "check").is_ok());
-    match check_step_exists(&record, "nowhere") {
+    assert!(check_step_choice(&record, "check", None).is_ok());
+    match check_step_choice(&record, "nowhere", None) {
         Err(ProtocolError::BadRequest { code, .. }) => assert_eq!(code, "unknown_step"),
         other => panic!("an unknown step: {other:?}"),
     }
-    match check_step_exists(&record, "  ") {
+    match check_step_choice(&record, "  ", None) {
         Err(ProtocolError::BadRequest { code, .. }) => assert_eq!(code, "missing_target"),
         other => panic!("an empty target: {other:?}"),
     }
@@ -225,7 +225,31 @@ fn a_step_choice_names_a_step_of_the_workflow() {
 fn a_step_choice_is_not_checked_without_a_workflow_snapshot() {
     let record = record_of(None, RunnerState::Stopped);
 
-    assert!(check_step_exists(&record, "anything").is_ok());
+    assert!(check_step_choice(&record, "anything", Some("x")).is_ok());
+}
+
+/// A comment for the agent is refused for a step that runs none: no
+/// attempt of it could take the comment, and it must not reach a later
+/// step. A blank comment is no comment.
+#[test]
+fn a_comment_is_refused_for_a_step_that_runs_no_agent() {
+    let scripts = record_of(Some(STEPS), RunnerState::Stopped);
+    let agents = record_of(Some(PROFILE_THEN_AGENT), RunnerState::Stopped);
+
+    match check_step_choice(&scripts, "check", Some("x")) {
+        Err(ProtocolError::BadRequest { code, .. }) => assert_eq!(code, "note_not_allowed"),
+        other => panic!("a comment for a script: {other:?}"),
+    }
+    for (record, step, note) in [
+        (&scripts, "check", Some("  ")),
+        (&agents, "profile", Some("x")),
+        (&agents, "work", Some("x")),
+    ] {
+        assert!(
+            check_step_choice(record, step, note).is_ok(),
+            "{step}: {note:?}"
+        );
+    }
 }
 
 #[test]
@@ -260,7 +284,16 @@ fn the_steps_of_a_stopped_task_start_at_the_initial_state_and_name_their_kind() 
 
 #[test]
 fn a_profile_step_is_listed_with_its_own_kind() {
-    let yaml = r#"
+    let record = record_of(Some(PROFILE_THEN_AGENT), RunnerState::Stopped);
+
+    let steps = workflow_steps(&record).expect("a stopped task lists its steps");
+
+    let kind_of = |id: &str| steps.iter().find(|step| step.id == id).unwrap().kind;
+    assert_eq!(kind_of("profile"), StepKind::Profile);
+    assert_eq!(kind_of("work"), StepKind::Agent);
+}
+
+const PROFILE_THEN_AGENT: &str = r#"
 schema: v2
 name: steps
 version: 1
@@ -280,14 +313,6 @@ states:
   completed: {}
 terminal_states: { completed: completed }
 "#;
-    let record = record_of(Some(yaml), RunnerState::Stopped);
-
-    let steps = workflow_steps(&record).expect("a stopped task lists its steps");
-
-    let kind_of = |id: &str| steps.iter().find(|step| step.id == id).unwrap().kind;
-    assert_eq!(kind_of("profile"), StepKind::Profile);
-    assert_eq!(kind_of("work"), StepKind::Agent);
-}
 
 #[test]
 fn a_task_that_is_not_stopped_lists_no_steps() {

@@ -118,10 +118,22 @@ pub struct OperatorTransition {
     pub reason: Option<String>,
     /// Who asked, for the audit.
     pub requested_by: String,
-    /// The owner chose the step (not an override of the current one): any
-    /// step of the workflow is allowed, out of a finished workflow as well,
-    /// and no reason is needed.
-    pub select: bool,
+}
+
+/// The step an owner chose for the task to go on from, as
+/// [`Engine::select_step`] carries it out: any step of the workflow, out of
+/// a finished workflow as well, with no reason needed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepSelection {
+    /// The state to go on from.
+    pub target: String,
+    /// Who asked, for the audit.
+    pub requested_by: String,
+    /// The owner's comment for the first agent attempt of `target`.
+    pub note: Option<String>,
+    /// The comment the owner left on the pause the task goes on from, given
+    /// to that same attempt after the note.
+    pub owner_message: Option<OwnerMessage>,
 }
 
 /// How a transition out of a state is taken: through which declared output
@@ -377,7 +389,7 @@ impl Engine {
     ) -> Result<WorkflowExecution, EngineError> {
         let _guard = self.begin_run(execution_id)?;
         let execution = self.store.load_execution(execution_id)?;
-        self.apply_manual_transition(definition, execution, transition)
+        self.apply_manual_transition(definition, execution, transition, None)
     }
 
     /// Takes a transition an owner asked a runner for (U3): the same
@@ -402,20 +414,6 @@ impl Engine {
             .clone()
             .unwrap_or_else(|| definition.initial_state.clone());
         let from_state = self.state_of(definition, &execution, &from_state_id)?;
-        if transition.select {
-            if !definition.states.contains_key(&transition.target) {
-                return Err(EngineError::InvalidTransition {
-                    message: format!("the workflow has no state '{}'", transition.target),
-                });
-            }
-            let mut manual =
-                ManualTransition::by_operator(None, Some(transition.target.clone()), true);
-            manual.reason = format!(
-                "Step '{}' chosen by {}.",
-                transition.target, transition.requested_by
-            );
-            return self.apply_manual_transition(definition, execution, &manual);
-        }
         let reason = transition
             .reason
             .as_deref()
@@ -440,16 +438,88 @@ impl Engine {
                 transition.requested_by
             );
         }
-        self.apply_manual_transition(definition, execution, &manual)
+        self.apply_manual_transition(definition, execution, &manual, None)
+    }
+
+    /// Moves the execution to the step the owner chose and keeps the owner's
+    /// comment — the note, then the comment left on the pause — for the
+    /// first agent attempt of that step, and of no other.
+    ///
+    /// The move and the comment are one save: either both are stored, or the
+    /// execution record is left as it was. A comment for a step that runs
+    /// no agent is refused before anything is written, since no attempt of
+    /// that step could take it. The comment on the pause is given once: its
+    /// key goes into the same save, and a key given before is not given
+    /// again; a step that runs no agent leaves it alone.
+    pub fn select_step(
+        &self,
+        definition: &WorkflowDefinition,
+        execution_id: &str,
+        selection: &StepSelection,
+    ) -> Result<WorkflowExecution, EngineError> {
+        let _guard = self.begin_run(execution_id)?;
+        let mut execution = self.store.load_execution(execution_id)?;
+        if !definition.states.contains_key(&selection.target) {
+            return Err(EngineError::InvalidTransition {
+                message: format!("the workflow has no state '{}'", selection.target),
+            });
+        }
+        let target = self.state_of(definition, &execution, &selection.target)?;
+        let note = selection
+            .note
+            .as_deref()
+            .filter(|note| !note.trim().is_empty());
+        let runs_agent = runs_harness(target);
+        if note.is_some() && !runs_agent {
+            return Err(EngineError::InvalidTransition {
+                message: format!(
+                    "step '{}' runs no agent, so no comment can be given to it",
+                    selection.target
+                ),
+            });
+        }
+        let message = selection
+            .owner_message
+            .as_ref()
+            .filter(|_| runs_agent)
+            .filter(|message| {
+                let engine = engine_metadata_mut(&mut execution);
+                engine
+                    .get(METADATA_RESUME_MESSAGE_KEY)
+                    .and_then(Value::as_str)
+                    != Some(message.key.as_str())
+            });
+        if let Some(message) = message {
+            engine_metadata_mut(&mut execution).insert(
+                METADATA_RESUME_MESSAGE_KEY.to_string(),
+                Value::String(message.key.clone()),
+            );
+        }
+        let texts: Vec<&str> = note
+            .into_iter()
+            .chain(message.map(|message| message.text.as_str()))
+            .collect();
+        let bound = (!texts.is_empty()).then(|| texts.join("\n\n"));
+
+        let mut manual = ManualTransition::by_operator(None, Some(selection.target.clone()), true);
+        manual.reason = format!(
+            "Step '{}' chosen by {}.",
+            selection.target, selection.requested_by
+        );
+        self.apply_manual_transition(definition, execution, &manual, bound)
     }
 
     /// The body of a manual transition, once the claim is held and the
-    /// execution loaded from under it.
+    /// execution loaded from under it. `note` is kept for the first agent
+    /// attempt of the target, in the same save as the move; a note kept
+    /// for another step before is dropped, so it never reaches the wrong
+    /// one.
     fn apply_manual_transition(
         &self,
         definition: &WorkflowDefinition,
         mut execution: WorkflowExecution,
         transition: &ManualTransition,
+        note: Option<String>,
     ) -> Result<WorkflowExecution, EngineError> {
         let execution_id = execution.id.clone();
         let execution_id = execution_id.as_str();
@@ -535,6 +605,7 @@ impl Engine {
         // A step chosen after the end of the workflow opens it again.
         execution.completed_at = None;
         self.clear_pending_step(&mut execution);
+        keep_selected_step_note(&mut execution, &target, note);
 
         let closing = if target_state.terminal {
             let status = terminal_status(target_state);
@@ -792,4 +863,28 @@ fn abandon_step_records(execution: &mut WorkflowExecution) {
     clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
     clear_engine_metadata(execution, METADATA_STEP_FAILURE_KEY);
     clear_engine_metadata(execution, METADATA_CONDUCTOR_RETRY_KEY);
+}
+
+/// Keeps `note` for the first agent attempt of `state`. Without a note, a
+/// note kept for another step is dropped: the execution leaves the step it
+/// was meant for.
+fn keep_selected_step_note(execution: &mut WorkflowExecution, state: &str, note: Option<String>) {
+    let engine = engine_metadata_mut(execution);
+    match note {
+        Some(text) => {
+            engine.insert(
+                METADATA_SELECTED_STEP_NOTE_KEY.to_string(),
+                serde_json::json!({ "state": state, "text": text }),
+            );
+        }
+        None => {
+            let kept_for = engine
+                .get(METADATA_SELECTED_STEP_NOTE_KEY)
+                .and_then(|kept| kept.get("state"))
+                .and_then(Value::as_str);
+            if kept_for != Some(state) {
+                engine.remove(METADATA_SELECTED_STEP_NOTE_KEY);
+            }
+        }
+    }
 }

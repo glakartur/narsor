@@ -273,6 +273,14 @@ step (`Akcje › Wybierz krok · krok 2 z 3`):
 3. **Confirm**: the panel shows the name, what the action does, what you typed
    and `! nieodwracalne` for an action that cannot be undone. `Enter` sends.
 
+**The comment of a chosen step.** In *Wybierz krok*, an `agent` or `profile`
+step has a field for a comment. The comment goes to the end of the prompt of
+the first agent attempt of that step, under "Operator recovery note:". It
+does not stay for later runs of the step. The task starts from the chosen
+step: the step it stopped at does not run first. When the step cannot take
+the comment, the command is refused, no step starts, and the bar shows the
+reason. `narsor-cli task select-step` does the same.
+
 **A gate that watches a queue.** While a `human` gate waits, the action
 panel offers *Uruchom od nowa*: the gate closes the current wait and asks
 again in a new episode. When the gate watches a queue, the queue's exit

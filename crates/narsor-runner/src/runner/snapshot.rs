@@ -422,7 +422,12 @@ mod tests {
         use crate::engine::timeline_file::{record_session, ReportedSession};
 
         let cases = [
-            ("a session reported mid-step", ExecutionStatus::Running, true, None),
+            (
+                "a session reported mid-step",
+                ExecutionStatus::Running,
+                true,
+                None,
+            ),
             ("no session", ExecutionStatus::Running, false, None),
             (
                 "a failure in a session",
@@ -492,8 +497,8 @@ mod tests {
             assert_eq!(snapshot.agent_session_resumable, expected, "{name}");
             // The flag reaches the wire, and a request without it reads as
             // "no session".
-            let mut request = serde_json::to_value(snapshot.to_request().expect("request"))
-                .expect("json");
+            let mut request =
+                serde_json::to_value(snapshot.to_request().expect("request")).expect("json");
             assert_eq!(request["agent_session_resumable"], expected, "{name}");
             request
                 .as_object_mut()

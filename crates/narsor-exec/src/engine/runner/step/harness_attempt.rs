@@ -84,7 +84,7 @@ impl Engine {
             }
             step.permission_grants = input.permission_rules.clone();
         }
-        if let Some(note) = self.take_operator_recovery_note(execution)? {
+        if let Some(note) = self.take_operator_notes(execution, state)? {
             prompt.push_str("\n\nOperator recovery note:\n");
             prompt.push_str(&note);
             if let Some(input) = &mut input {
@@ -305,10 +305,13 @@ impl Engine {
         config.harness = Some(harness.clone());
     }
 
-    /// Removes and persists the note destined for the next agent attempt.
-    fn take_operator_recovery_note(
+    /// Removes and persists the operator's notes for this attempt of
+    /// `state`: first the one kept for the step the owner chose, when this
+    /// is that step, then the one for whichever agent attempt comes next.
+    fn take_operator_notes(
         &self,
         execution: &mut WorkflowExecution,
+        state: &State,
     ) -> Result<Option<String>, AttemptFailure> {
         let Some(engine) = execution
             .metadata
@@ -317,15 +320,26 @@ impl Engine {
         else {
             return Ok(None);
         };
-        let note = engine
+        let for_this_step = engine
+            .get(METADATA_SELECTED_STEP_NOTE_KEY)
+            .and_then(|kept| kept.get("state"))
+            .and_then(Value::as_str)
+            == Some(state.id.as_str());
+        let selected = for_this_step
+            .then(|| engine.remove(METADATA_SELECTED_STEP_NOTE_KEY))
+            .flatten()
+            .and_then(|kept| kept.get("text")?.as_str().map(ToString::to_string));
+        let untargeted = engine
             .remove(METADATA_OPERATOR_RECOVERY_NOTE_KEY)
             .and_then(|value| value.as_str().map(ToString::to_string));
-        if note.is_some() {
-            self.store
-                .save_execution(execution)
-                .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
+        let notes: Vec<String> = selected.into_iter().chain(untargeted).collect();
+        if notes.is_empty() {
+            return Ok(None);
         }
-        Ok(note)
+        self.store
+            .save_execution(execution)
+            .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
+        Ok(Some(notes.join("\n\n")))
     }
 
     /// Consumes only an answer for the state currently executing. A mismatched

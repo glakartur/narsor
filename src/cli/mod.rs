@@ -700,6 +700,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn select_step_parses_the_step_and_the_optional_note() {
+        for (extra, expected) in [
+            (vec!["--note", "use the new API"], Some("use the new API")),
+            (vec![], None),
+        ] {
+            let mut argv = vec!["narsor-cli", "task", "select-step", "T", "implement"];
+            argv.extend(extra);
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Command::Task {
+                command: remote::TaskCommand::SelectStep { args, target, note },
+            } = cli.command
+            else {
+                panic!("expected task select-step");
+            };
+            assert_eq!(args.task_id, "T");
+            assert_eq!(target, "implement");
+            assert_eq!(note.as_deref(), expected);
+        }
+    }
+
+    #[test]
     fn an_entry_limit_says_how_to_decide() {
         let pending = serde_json::json!({
             "state_id": "fix",

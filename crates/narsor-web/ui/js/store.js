@@ -19,6 +19,33 @@ export function retryDelay(failures) {
   return Math.min(1000 * 2 ** (failures - 1), 10_000);
 }
 
+/**
+ * What the bar says about one stream frame: the reason of a command the
+ * runner refused after the server queued it, as the TUI says it; `null` for
+ * any other frame.
+ */
+export function refusalOf(envelope, tasks) {
+  const event = envelope?.event;
+  const kind = event?.kind;
+  if (kind?.type !== 'operator_command_resolved' || kind.status !== 'rejected') return null;
+  const task = (tasks ?? []).find((row) => row.task_id === event.task_id);
+  const command = (task?.operator_commands ?? []).find((row) => row.command_id === kind.command_id)?.command;
+  const reason = String(kind.detail ?? '').replace(/\s+/g, ' ').trim() || 'bez podania przyczyny';
+  return `${task ? titleOf(task) : event.task_id}: ${commandName(command)} odrzucone przez runnera — ${reason}`;
+}
+
+/** The name of a command in the bar, as the TUI says it. */
+function commandName(command) {
+  switch (command?.kind) {
+    case 'interrupt': return 'przerwanie kroku';
+    case 'stop_step': return 'zatrzymanie kroku';
+    case 'select_step': return `wybór kroku „${command.target}”`;
+    case 'transition': return `${command.override ? 'override' : 'przejście'} do „${command.target}”`;
+    case 'restart_step': return 'restart kroku';
+    default: return 'polecenie operatora';
+  }
+}
+
 /** The delay before stream connection attempt `failures + 1`: 0, 250 ms × 2ⁿ, at most 15 s. */
 export function reconnectDelay(failures) {
   if (failures <= 0) return 0;
@@ -295,6 +322,8 @@ export class Store {
           cursor: envelope.cursor,
           connection: { ...this.state.connection, state: 'live', lastData: this.clock.now(), retryAt: null },
         });
+        const refusal = refusalOf(envelope, this.state.tasks);
+        if (refusal) this.notify('error', refusal);
         this.requestRefresh();
       }
       if (controller.signal.aborted) return;
