@@ -1598,13 +1598,23 @@ impl Session {
 
     /// Ends the launch after a refused step move: the session closes, so
     /// the task is stopped again and the owner decides anew. With the
-    /// control plane in reach, the safe point is reported first.
+    /// control plane in reach, the stop is reported as a problem: at launch
+    /// the task is running, so it would not accept a safe point.
     async fn stop_after_refused_moves(&mut self) -> Result<Option<RunnerExit>, RunnerError> {
-        if self.link.client().is_some() {
-            return self.finish_at_safe_point().await;
-        }
         self.close_session("a step move queued for the launch was refused")?;
-        Ok(Some(RunnerExit::Stopped { clean: true }))
+        if self.link.client().is_none() {
+            return Ok(Some(RunnerExit::Stopped { clean: true }));
+        }
+        let problem = RunnerProblem {
+            code: PROBLEM_OWNER_DECISION.to_string(),
+            message: "a step move queued for the launch was refused; the task is stopped \
+                      until the owner decides anew"
+                .to_string(),
+        };
+        let mut snapshot = self.snapshot(Some(problem.clone()), true)?;
+        snapshot.snapshot_sequence = self.storage.next_snapshot_sequence()?;
+        send_until(&mut self.link, &self.timing, &snapshot).await;
+        Ok(Some(RunnerExit::Problem(problem)))
     }
 
     /// Goes on after a stop with nothing to reconcile. A step that failed

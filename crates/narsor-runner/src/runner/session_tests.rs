@@ -3492,6 +3492,69 @@ async fn a_step_choice_refused_at_the_launch_starts_no_step() {
     assert!(reason.contains("no state"), "{reason}");
 }
 
+/// With the control plane in reach, a refused move still ends the launch,
+/// even when the control plane answers `continue` (the task runs at launch,
+/// so it takes no safe point): the session stays closed and the stop is
+/// reported as a problem.
+#[tokio::test]
+async fn a_refused_step_choice_stops_the_runner_when_the_control_plane_says_continue() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let root = TempRoot::new();
+    let storage = paused_between_steps(&root).await;
+    let mut fixture = resumed(&root, &storage, Some(launch_without_comment()));
+    let choice = select_step("no-such-step", None);
+    fixture.session.startup_commands = vec![queued("select-1", choice)];
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let body = serde_json::to_string(&RunnerSnapshotResponse {
+        applied: true,
+        directive: RunnerDirective::Continue,
+        generation: 1,
+        runner_state: narsor_protocol::controller::RunnerState::Running,
+        launch: launch_without_comment(),
+        default_harness: None,
+    })
+    .unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = Arc::clone(&requests);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = vec![0u8; 65536];
+            let n = socket.read(&mut buffer).await.unwrap_or(0);
+            seen.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buffer[..n]).to_string());
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+        }
+    });
+    fixture.session.link.base_url = format!("http://{address}");
+    fixture.session.timing.problem_report_deadline = Duration::from_secs(5);
+    fs::write(&fixture.session.link.credential_file, "token").unwrap();
+
+    let exit = fixture.begin().await;
+
+    assert!(
+        matches!(&exit, Some(RunnerExit::Problem(p)) if p.code == PROBLEM_OWNER_DECISION),
+        "{exit:?}"
+    );
+    assert!(!fixture.session.pass_active());
+    let session = fixture.session.storage.session().unwrap().unwrap();
+    assert!(session.closed.is_some(), "the session stays closed");
+    assert!(requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.contains("/runner/v1/snapshots")));
+}
+
 /// Two step moves queued for one launch with a comment on the pause: the
 /// comment goes to the step the last move chose, not to one a later move
 /// replaced.
