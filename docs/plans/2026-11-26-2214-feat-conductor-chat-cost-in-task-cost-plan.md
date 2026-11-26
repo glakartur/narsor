@@ -15,8 +15,8 @@ execution: code
 - **Objective:** The cost and tokens that the conductor uses to answer the operator's chat messages are part of the task cost that every frontend shows, so the operator sees what a task really cost.
 - **Means:** A task-level conductor bucket on the timeline, filled from the readings in `timeline.json` that belong to no timeline position, and added to the task total by every frontend (KTD1, KTD2, KTD3).
 - **Product authority:** This plan covers only area 2 of `docs/bugs/NARSOR-1124-001.md` ("Koszt czatu z dyrygentem w koszcie taska"). Area 1 (multi-thread conductor chat) is not active scope; see How This Work Fits Together. The E2BIG fix in the same bug document is already done and is not part of this plan. The Product Contract wins on behavior; the KTDs win on mechanism.
-- **Open blockers:** None. One question for the person is left in "Pytania otwarte dla użytkownika" (Q1). It does not block U1-U5: the plan implements R8 as written. A different answer to Q1 adds U6. The line format question (Q2) is decided: option a.
-- **Execution profile:** One pull request, units U1-U5 in order (U6 only when Q1 is answered "b"). Rust 2021 workspace plus the plain-JS Web UI.
+- **Open blockers:** None. Q1 (subagents of gate and failure runs) is decided: option b. Q2 (line format) is decided: option a.
+- **Execution profile:** One pull request, units U1-U6 in order. Rust 2021 workspace plus the plain-JS Web UI.
 - **Stop conditions:** Stop and report when a reading of a run without a position cannot reach `timeline.json` (for example, the conductor runs where no `ExecutionStore` of the task exists), or when the controller drops unknown `Timeline` fields on the way to a frontend.
 - **Who finishes:** The implementer runs the Verification Contract and hands the branch back. No commit or push unless the person asks (`AGENTS.md`).
 
@@ -58,7 +58,7 @@ The task cost line (`src/client/task_usage_text.rs`) adds up positions only. A t
 - R5. Per-position usage (the usage of each timeline position) does not include the task-level bucket and does not change.
 - R6. A task whose conductor made no run without a timeline position shows the same text as today. A run that generates the task title is such a run, so it adds its cost to the bucket (R1).
 
-- R8. The subagents of a conductor run that has no timeline position add to the task subagent count and subagent tokens, marked as the conductor's. They follow the same rules as the subagents of agents that process task steps. They add no money to the cost, because the conductor's cost already includes them.
+- R8. The subagents of every conductor run (chat, title, gate decision and failure handling) add to the task subagent count and subagent tokens, marked as the conductor's. They follow the same rules as the subagents of agents that process task steps. They add no money to the cost, because the conductor's cost already includes them.
 
 **Compatibility**
 
@@ -76,7 +76,7 @@ The task cost line (`src/client/task_usage_text.rs`) adds up positions only. A t
 
 - Multi-thread conductor chat and `--resume` of conductor sessions are out of scope (area 1).
 - No per-message or per-thread cost display in the chat itself. Deferred.
-- No change to how gate decisions and failure handling of the conductor are counted; they keep their position-keyed readings.
+- Gate decisions and failure handling of the conductor keep their position-keyed readings and cost. Only their subagents also count in the task subagent figure (R8, U6).
 - No budget limits or alerts on conductor cost. Deferred.
 
 <!-- ce-section: work-relationships -->
@@ -100,7 +100,7 @@ This plan covers area 2 of `docs/bugs/NARSOR-1124-001.md`: conductor chat cost i
 
 ### Pytania otwarte dla użytkownika
 
-- Q1. **Do the subagents of the conductor's gate and failure runs also count in the task subagent figure?** (Section: Requirements, R8, and Scope Boundaries.) Today R8 counts the subagents of conductor runs without a timeline position only. Gate and failure runs keep their position-keyed readings, so their subagents would be missing from the figure with no sign that it is partial.
+- Q1 (decided: option b, answered on the merge request). **Do the subagents of the conductor's gate and failure runs also count in the task subagent figure?** (Section: Requirements, R8, and Scope Boundaries.) Today R8 counts the subagents of conductor runs without a timeline position only. Gate and failure runs keep their position-keyed readings, so their subagents would be missing from the figure with no sign that it is partial.
   - **b (recommended):** Yes. Every conductor run counts its subagents the same way, so the figure is complete and matches "the same rules as the subagents of agents". The plan already keeps the subagent stats of every conductor run (KTD4), so this adds only U6. R8 and the Scope Boundaries line about gate decisions change to say so.
   - **a:** No. R8 stays as written, and R8 and the Key Decision say that the conductor subagent figure covers chat and title runs only. U6 is not built.
 - Q2 (decided: option a, answered on the merge request). **Where does the line show the conductor's subagents?** (Section: Requirements, R8; Planning Contract, KTD5.) R8 says "add to the task subagent count ... marked as the conductor's".
@@ -271,17 +271,17 @@ flowchart TB
   - Covers AE5. A timeline without `conductor_usage` gives the same string as before.
 - **Verification:** `node --test crates/narsor-web/ui-tests/*.mjs` passes.
 
-### U6. Count the subagents of position-keyed conductor runs (only if Q1 = b)
+### U6. Count the subagents of position-keyed conductor runs
 
 - **Goal:** The conductor's subagents of gate and failure runs count too, on their position and in the task figure.
-- **Requirements:** R8 as changed by Q1 "b".
+- **Requirements:** R8 (Q1 decided "b").
 - **Dependencies:** U3, U4, U5.
 - **Files:**
   - `crates/narsor-protocol/src/api/timeline.rs` (`PositionUsage.conductor_subagent_stats`)
   - `crates/narsor-exec/src/engine/timeline_file.rs`
   - `src/client/task_usage_text.rs`, `crates/narsor-web/ui/js/text.js` and their tests
   - `tests/integration/timeline.rs`
-- **Approach:** `apply_usage` adds `conductor_subagent_stats` of a position's readings to a new optional `PositionUsage.conductor_subagent_stats`. `sum` and `sumUsage` add it to the conductor's subagent figures. Update R8 and the Scope Boundaries line about gate decisions in this document.
+- **Approach:** `apply_usage` adds `conductor_subagent_stats` of a position's readings to a new optional `PositionUsage.conductor_subagent_stats`. `sum` and `sumUsage` add it to the conductor's subagent figures.
 - **Test scenarios:**
   - A gate reading on `d1` with 1 spawned subagent and a chat reading with 2 give a conductor subagent count of 3 in the task line.
   - The agent's `subagent_count` of `d1` does not change.
@@ -301,7 +301,7 @@ flowchart TB
 
 ## Definition of Done
 
-- U1-U5 are done and their test scenarios pass. U6 is done only when Q1 is answered "b".
+- U1-U6 are done and their test scenarios pass (U6 is required: Q1 decided "b").
 - AE1-AE5 each have a passing test that names them.
 - A task without any conductor run without a position shows the same text in all three frontends as before (R6, R7).
 - Doc comments of `reading_tap`, `with_reading_sink`, `apply_usage`, `TaskUsage` and the `line` example describe the new bucket.
