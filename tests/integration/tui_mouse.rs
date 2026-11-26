@@ -20,7 +20,8 @@ use narsor::tui::task_app::{layout, Focus, Request, TaskApp};
 use narsor_engine::domain::ExecutionStatus;
 
 use crate::task_app_support::{
-    listing, queued, task, titled, with_controller, with_panel, with_pending, with_runner,
+    archived, archived_step, archived_timeline, listing, queued, task, titled, with_controller,
+    with_panel, with_pending, with_runner,
 };
 
 fn app() -> TaskApp {
@@ -305,5 +306,114 @@ mod routing {
         click(&mut app, 100, 25);
         assert_eq!(app.focus(), Focus::Details);
         assert_eq!(app.list().selected_id().map(str::to_string), selected);
+    }
+}
+
+mod list {
+    use super::*;
+
+    /// The right part of the screen, from `column` on: the details.
+    fn right_of(buffer: &Buffer, column: u16) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                row(buffer, y)
+                    .chars()
+                    .skip(usize::from(column))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_wheel_over_the_list_moves_the_selection_and_leaves_the_focus_in_the_details() {
+        let mut app = queue();
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Details);
+        let buffer = draw(&mut app, 120, 30);
+        // The details show the selected NAR-1 too; NAR-2 is only in the list.
+        let (column, y) = find(&buffer, "NAR-2");
+
+        wheel_down(&mut app, column, y);
+        wheel_down(&mut app, column, y);
+
+        assert_eq!(app.list().selected_id(), Some("t3"));
+        assert_eq!(app.focus(), Focus::Details);
+        let buffer = draw(&mut app, 120, 30);
+        // The details begin where the frame of the list ends.
+        let details = right_of(&buffer, find(&buffer, "╮╭").0 + 1);
+        assert!(details.contains("NAR-3"), "{details}");
+    }
+
+    #[test]
+    fn the_wheel_stops_at_the_first_and_the_last_task() {
+        let mut app = queue();
+        let buffer = draw(&mut app, 120, 30);
+        let (column, y) = find(&buffer, "NAR-2");
+        assert_eq!(app.list().selected_id(), Some("t1"));
+
+        wheel_up(&mut app, column, y);
+        assert_eq!(app.list().selected_id(), Some("t1"));
+
+        for _ in 0..4 {
+            wheel_down(&mut app, column, y);
+        }
+        assert_eq!(app.list().selected_id(), Some("t3"));
+    }
+
+    #[test]
+    fn a_click_on_any_row_of_a_task_selects_it_and_keeps_the_focus_on_the_list() {
+        let mut app = queue();
+        let buffer = draw(&mut app, 120, 30);
+        // A task takes three rows; its title is on the second.
+        let (column, y) = find(&buffer, "NAR-3");
+        assert_eq!(find(&buffer, "t3").1 + 1, y, "the title is the second row");
+
+        assert_eq!(click(&mut app, column, y), Request::None);
+
+        assert_eq!(app.list().selected_id(), Some("t3"));
+        assert_eq!(app.focus(), Focus::List);
+    }
+
+    #[test]
+    fn a_click_on_a_task_from_the_details_selects_it_and_moves_the_focus_to_the_list() {
+        let mut app = queue();
+        key(&mut app, KeyCode::Enter);
+        let buffer = draw(&mut app, 120, 30);
+        let (column, y) = find(&buffer, "NAR-2");
+
+        click(&mut app, column, y);
+
+        assert_eq!(app.list().selected_id(), Some("t2"));
+        assert_eq!(app.focus(), Focus::List);
+    }
+
+    #[test]
+    fn a_click_on_an_archived_task_selects_it_and_its_kept_run_follows() {
+        let mut app = queue();
+        key(&mut app, KeyCode::Char('H'));
+        app.open_history(listing(
+            vec![archived("old", "NAR-9", 5), archived("older", "NAR-8", 1)],
+            "c",
+        ));
+        for (id, state) in [("old", "planning"), ("older", "reviewing")] {
+            app.on_history_timeline(
+                id,
+                Ok(archived_timeline(
+                    id,
+                    vec![archived_step(state, "claude", "opus", 0.4)],
+                )),
+            );
+        }
+        let buffer = draw(&mut app, 120, 30);
+        assert!(screen(&buffer).contains("planning"), "{}", screen(&buffer));
+        let (column, y) = find(&buffer, "NAR-8");
+
+        click(&mut app, column, y);
+
+        assert_eq!(app.history().unwrap().selected(), 1);
+        let shown = screen(&draw(&mut app, 120, 30));
+        assert!(shown.contains("reviewing"), "{shown}");
+        assert!(!shown.contains("planning"), "{shown}");
     }
 }

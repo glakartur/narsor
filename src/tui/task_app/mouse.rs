@@ -131,10 +131,41 @@ impl TaskApp {
             Hold::Inside(holder) if self.panels.covers(holder, column, row) => {}
             Hold::Inside(_) | Hold::Everything => return Request::None,
         }
-        if gesture == Gesture::Click {
-            self.click_focus(panel);
+        match (gesture, panel) {
+            (Gesture::WheelUp, Panel::List) => self.step_list(-1),
+            (Gesture::WheelDown, Panel::List) => self.step_list(1),
+            (Gesture::Click, Panel::List) => {
+                self.click_focus(panel);
+                self.click_list(column, row);
+            }
+            (Gesture::Click, _) => self.click_focus(panel),
+            _ => {}
         }
         Request::None
+    }
+
+    /// A notch over the list: the selection `by` items along, stopping at
+    /// the ends, as `j` and `k` move it; the focus stays where it is.
+    fn step_list(&mut self, by: isize) {
+        if let View::History(history) = &mut self.view {
+            history.step(by);
+        } else {
+            self.change_list(|list| list.step(by));
+        }
+    }
+
+    /// A click on the list selects the item drawn at `column`, `row`; a
+    /// click on a rule or below the last item selects nothing.
+    fn click_list(&mut self, column: u16, row: u16) {
+        if let View::History(history) = &mut self.view {
+            if let Some(index) = history.index_at(column, row) {
+                history.select(index);
+            }
+            return;
+        }
+        if let Some(id) = self.list.id_at(column, row).map(str::to_string) {
+            self.change_list(|list| list.select(&id));
+        }
     }
 
     /// What holds the screen now, from the state and not from what was drawn
