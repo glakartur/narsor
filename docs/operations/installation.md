@@ -13,19 +13,20 @@ by this artifact.
 Run the installer of the newest release and follow its prompts:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install.sh | bash
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.33.0/install.sh | bash
 ```
 
 The URL pins a release tag because every release is currently published as a
 pre-release, and GitHub's `/releases/latest/download/` URL ignores
 pre-releases (it returns 404). The tag is bumped with each release (see
-`CONTRIBUTING.md`). The script itself still defaults to `latest` when run
-without a version.
+`CONTRIBUTING.md`). The `install.sh` attached to a release installs that
+release when it runs without a version; only the copy in the repository
+defaults to `latest`.
 
 To select a different version, pass its tag to the script:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.33.0/install.sh |
   bash -s -- v1.2.3
 ```
 
@@ -69,8 +70,8 @@ The data directory is the root: the configuration gets `global.root: ROOT`
 and the `server` section with the relative directories `catalog`, `state`
 and `work` (they resolve to `ROOT/catalog`, `ROOT/state`, `ROOT/work`),
 followed by the other settings as commented-out defaults inside
-their sections (remove the `#` to change one; each comment names the flat key
-the setting replaces). The number of tasks processed in parallel is the
+their sections (remove the `#` to change one; each comment describes the setting and names
+its environment variable, for example `# Env: NARSOR_SERVER__MODE`). The number of tasks processed in parallel is the
 `server.max_concurrent_tasks` setting (default 1). The file is a tree of
 sections, one per program; see [Configuration](../user/configuration.md#the-tree-of-sections).
 `ROOT/state` and `ROOT/work` are roots: each program keeps its files in a
@@ -78,8 +79,8 @@ directory of its own below them (`state/narsor-server/`,
 `state/narsor-controller-local/`, `work/narsor-controller-local/`, …), and
 the server and its clients meet in `state/run/`; see
 [The on-disk layout](../user/configuration.md#the-on-disk-layout). An
-installation of an older version is moved to this layout once, at the first
-start of the new server; see
+installation of an older version is moved to this layout once by
+`narsor-migrate`, which the installer runs; see
 [Updates](updates.md#update-to-a-directory-per-program-state-ownership).
 
 For the `local` role, `narsor-cli init` also asks for the **work mode for
@@ -110,7 +111,7 @@ configuration file is used, or the user's default config path if none exists.
 Use `--config-file` to choose another file explicitly:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.33.0/install.sh |
   bash -s -- --role frontend --non-interactive \
     --bin-dir /usr/local/bin \
     --data-dir /var/lib/narsor \
@@ -130,7 +131,7 @@ non-interactive mode; `--data-dir` defaults to `~/.narsor`. For `local`, add
 For example, on a dedicated VM behind an existing corporate proxy:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.33.0/install.sh |
   sudo bash -s -- --role server --non-interactive \
     --bin-dir /usr/local/bin \
     --data-dir /var/lib/narsor \
@@ -154,8 +155,9 @@ with the effective value are rejected. If an effective system-wide config is
 not writable, the interactive installer asks for another target. A
 non-interactive invocation must use a writable `--config-file`.
 
-If Narsor processes (`narsor`, `narsor-server`, `narsor-controller`,
-`narsor-runner`, `narsor-observer-worker`, `narsor-migrate`) of your user are already running, the installer lists them
+If Narsor processes (`narsor`, `narsor-cli`, `narsor-web`, `narsor-server`,
+`narsor-controller`, `narsor-runner`, `narsor-observer-worker`,
+`narsor-migrate`) of your user are already running, the installer lists them
 before it replaces the binaries and asks whether to stop them. Stopping them
 interrupts running tasks. A stopped process gets `SIGTERM` and 10 seconds to
 exit, then `SIGKILL`. If you answer no, they keep running the previous version
@@ -200,7 +202,7 @@ instead. The GitHub Copilot SDK in `narsor-runner` targets Copilot CLI
 The same script removes what it installed:
 
 ```bash
-curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.14.3/install.sh |
+curl -fsSL https://github.com/glakartur/narsor/releases/download/v0.33.0/install.sh |
   bash -s -- --uninstall
 ```
 

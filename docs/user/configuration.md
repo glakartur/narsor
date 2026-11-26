@@ -134,7 +134,8 @@ web:
 > Check the file with `narsor-cli config show`: a value you set that shows
 > the source `built-in` did not arrive.
 
-`narsor-server` and `narsor-web` also write a **warning at start** (not an
+`narsor-server`, `narsor-web`, `narsor`, `narsor-cli` and
+`narsor-controller local` also write a **warning at start** (not an
 error) when the file has a top-level key, or the environment has a variable,
 with the name of an old flat setting (see
 [the table below](#old-and-new-names)). The warning names each old name and
@@ -520,8 +521,9 @@ other program finds its own directory:
 - the controller gives each runner the paths of one task only (workload
   directory, task storage, secrets directory).
 
-An older installation keeps its files at the old places until the first start
-of a new `narsor-server`, which moves them once. See
+An older installation keeps its files at the old places until
+`narsor-migrate` moves them once (the installer runs it). Until then, a new
+`narsor-server` refuses to start. See
 [Updates](../operations/updates.md#update-to-a-directory-per-program-state-ownership).
 
 Every write of `state.json` and `context.json` is atomic (temporary file in

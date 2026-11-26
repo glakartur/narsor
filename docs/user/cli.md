@@ -1,6 +1,6 @@
 # Command-line interface
 
-Reference for the `narsor-cli` command line: global options, every command, and exit codes. For the full-screen interface see [the TUI guide](tui.md).
+Reference for the `narsor-cli` command line: global options, the most-used commands, and exit codes. Run `narsor-cli --help` for the full list (also `task`, `workflow`, `backend`, `harness`, `usage`, `auth`, `controller`, `init`, `purge` and `connection-profile`). For the full-screen interface see [the TUI guide](tui.md).
 
 ## Global options
 
@@ -28,7 +28,10 @@ stop signal to the server recorded for that state directory; it does not start
 the server. The same lifecycle operation is available as
 `narsor-server stop --root <DIRECTORY>`.
 
-### `validate <FILE>`
+### `validate <WORKFLOW>`
+
+`WORKFLOW` is a YAML file, or the name of a workflow in the server's
+catalogue.
 
 Static validation of a definition against [`workflow-schema.md`](../dev/workflow-schema.md) §5: graph
 consistency, well-formed actions and decisions, references to variables. It
@@ -43,7 +46,7 @@ Definition 'tests/fixtures/invalid/five_violations.yaml' is invalid — 5 violat
   - ...
 ```
 
-### `run <FILE> [--input NAME=VALUE]…`
+### `run <WORKFLOW> [--input NAME=VALUE]…`
 
 Durably queues a task, then stays attached while the scheduler admits it,
 the backend provisions its workspace, and its execution reaches a stopping
@@ -51,7 +54,8 @@ point or fails. The task id is acknowledged first; an execution id is printed
 only after the admitted runner has created a real execution.
 
 `--input` values are parsed **according to the type declared in the
-definition**: `string` and `repository` as text, `integer` as a whole number,
+definition**: `string` and `text` as text (the legacy type `repository` reads
+as `string`), `integer` as a whole number,
 `boolean` as `true`/`false`. That is why `--input is_experimental=true` reaches
 the context as a boolean and not as a string. Missing required inputs are
 reported **before** anything is written to disk.
@@ -101,7 +105,7 @@ file.
 
 ### `list`
 
-Lists the executions in the data directory, newest first. An empty store is not
+Lists the executions from the control plane's task records, newest first. An empty store is not
 an error.
 
 ```console
@@ -163,7 +167,7 @@ The event history in sequence order: number, timestamp, type, description.
 state.
 
 ```console
-$ narsor events 4f1c8f0e-...-9b21
+$ narsor-cli events 4f1c8f0e-...-9b21
     1  2026-09-23T19:43:49+00:00  workflow_started       Workflow 'cli-greet' started
     2  2026-09-23T19:43:49+00:00  state_entered          Entered state 'announce'
     3  2026-09-23T19:43:49+00:00  action_started         Action 'script' started
@@ -171,8 +175,8 @@ $ narsor events 4f1c8f0e-...-9b21
 
 ### `steps <EXECUTION_ID>`
 
-The step timeline: one line per action attempt, computed from the event log
-alone (not stored separately) — the CLI counterpart of the *Przebieg* tab of the
+The step timeline that the task's runner last reported, kept in the task
+record: one line per action attempt — the CLI counterpart of the *Przebieg* tab of the
 TUI. A state visited twice, or retried once, produces two or three lines,
 never one line mutated in place: `<state> #n` counts attempts of that state
 across the whole execution, so a retried step shows up as `plan #1` (failed)
@@ -196,24 +200,23 @@ plan #2        succeeded          agent      2026-09-26T10:00:02+00:00  ->  2026
 
 ### `conversation <EXECUTION_ID> <ATTEMPT_ID>`
 
-One agent attempt's conversation, in order, in full — nothing is truncated
-(unlike the `AgentMessage` event, which is). `ATTEMPT_ID` is the attempt's
-`action_execution_id`, as printed by `steps` or `events`. Every entry is
-classified the same way the TUI's *Rozmowa* tab classifies it (user, assistant,
-thinking, tool call, tool result, the harness's final result, system,
-`stderr`, or a narsor-written line — the prompt sent, or the attempt's
-outcome) and printed with its full decoded content; an entry this module does
-not recognize the shape of still prints in full, tagged `raw`. An attempt with
+One agent attempt's conversation, in order, read through the task's runner.
+`ATTEMPT_ID` is the attempt's `action_execution_id`, as printed by `steps` or
+`events`. Each conversation element is one line: entry number, timestamp,
+category (`sent`, `thinking`, `agent`, `question`, `tool`, `result`,
+`technical`, `unclassified`) and the same one-line summary the TUI's
+*Rozmowa* tab shows. Lines that narsor wrote (the prompt, the outcome) are
+printed whole; an unclassified entry shows the start of its raw line. A line
+of a subagent is indented and starts with `↳ [name]`. An attempt with
 no conversation record — a script step, an agent step whose conversation
 never started, or a step from a log written before this feature existed — is
 a readable failure, not silent empty output.
 
 ```console
 $ narsor-cli conversation 4f1c8f0e-...-9b21 3f9c2e10-...-77aa
-    1  2026-09-26T10:00:02+00:00  narsor     prompt: implement the feature…
-    2  2026-09-26T10:00:03+00:00  assistant  I'll start by reading the existing tests.
-    3  2026-09-26T10:00:04+00:00  tool call  {"name":"bash","input":{"command":"cargo test"}}
-    4  2026-09-26T10:00:05+00:00  result     {"subtype":"success","result":"done"}
+    1  2026-09-26T10:00:02+00:00  sent       [Narsor] implement the feature…
+    2  2026-09-26T10:00:03+00:00  agent      I'll start by reading the existing tests.
+    3  2026-09-26T10:00:04+00:00  tool       Bash cargo test
 ```
 
 ### `input <EXECUTION_ID> [--field NAME=VALUE]… [--label LABEL] [--artifact NAME=PATH]… [--variable NAME=VALUE]… [--comment TEXT]`
@@ -221,8 +224,10 @@ $ narsor-cli conversation 4f1c8f0e-...-9b21 3f9c2e10-...-77aa
 Delivers a human answer to an `input_needed` execution and resumes it. `--field` fills in
 the form fields declared by the `human` action; `--label` names the output label
 explicitly — needed when the action has no fields, or when it has several and
-the label cannot be derived from a single `select` field. `--file` points at the
-definition when the file has moved.
+the label cannot be derived from a single `select` field. `--file` is refused:
+the runner always uses the workflow sealed with the task. For a Claude Code
+permission request, give `--permission deny|allow-exact|allow-group|allow-pattern`
+(with `--pattern` for `allow-pattern`, and optionally `--denial-index`).
 
 For an agent's `awaiting_input` question, submit `--field answer=...`; no
 `--label` is needed because the answer resumes the same agent action rather
@@ -281,10 +286,11 @@ registered in the system* — this is that system. Registering a repository lets
 a definition say `repository: acme-api` instead of embedding a URL that changes
 whenever the hosting does.
 
-The registry is one JSON document, `{root}/repositories.json`, so it follows the
-global `--root` like everything else. Every write is atomic (temporary file in
-the same directory, `fsync`, `rename`), and a root without that file is simply
-an empty registry — not an error.
+The registry is a directory of YAML files, one per repository:
+`{catalog}/repositories/{id}.yaml` (`server.catalog` defaults to the root). A
+catalogue without that directory is an empty registry, not an error. The
+commands go through the control plane, so `--server` selects the registry
+they change.
 
 #### `repo add <ID> --remote <URL|PATH> [--name …] [--provider …] [--default-branch …] [--description …]`
 
@@ -306,7 +312,7 @@ $ narsor-cli repo add acme-api \
 Registered repository 'acme-api' -> https://github.com/acme/api.git
 
 $ narsor-cli repo add acme-api --remote https://github.com/acme/other.git
-Could not register the repository: repository 'acme-api' is already registered in '…/repositories.json'
+Could not register the repository: repository 'acme-api' is already registered in '…/repositories/acme-api.yaml'
 ```
 
 #### `repo list`

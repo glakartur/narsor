@@ -63,7 +63,7 @@ The sign-in form says which token it needs (*Skąd wziąć token?*).
   `Origin` is another site, is refused with `403` (other sites and DNS
   rebinding).
 - Only the routes the interface uses go through (`/control/v1/…`,
-  `/settings/…`, `/auth/v1/whoami`, `POST /tasks`); anything else is a
+  `/settings/…`, `/auth/v1/whoami`, `/tasks`); anything else is a
   `404`, so `narsor-web` is no open relay.
 - `--open` never puts the session token in a process argument: the browser
   opener gets a page in its own state directory

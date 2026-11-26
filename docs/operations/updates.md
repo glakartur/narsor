@@ -427,7 +427,7 @@ cutover: there is no transition period and no migration tool.
 |---|---|---|
 | Configuration file | Flat keys at the top level (`server_mode: network`) | Sections (`server: {mode: network}`). A flat key at the top level is an unknown root: it is ignored, not reported as an error. |
 | Environment variables | `NARSOR_<KEY>` (`NARSOR_SERVER_MODE`) | `NARSOR_<SECTION>__<KEY>` (`NARSOR_SERVER__MODE`). The old variables are ignored. |
-| Directories | Three separate paths; `--root` set all three; a relative path was relative to the working directory | `--root` sets `global.root` only; a relative `server.catalog`, `server.state` or `server.work` is resolved against it, an absolute one is used as is. The built-in values (`./.narsor`, and `.` for each directory) keep the old layout. |
+| Directories | Three separate paths; `--root` set all three; a relative path was relative to the working directory | `--root` sets `global.root` only; a relative `server.catalog`, `server.state` or `server.work` is resolved against it, an absolute one is used as is. The built-in values (`./.narsor`, and `.` for each directory) keep the old layout. (A later update changed the built-in `server.state` and `server.work` to `state` and `work`; see [Update to a directory per program](#update-to-a-directory-per-program-state-ownership).) |
 | Observer worker switch | `on` / `off` | `server.observer.enabled: true` / `false` |
 | Kubernetes runner arguments | ConfigMap key and variable `NARSOR_AGENT_ARGS` | `NARSOR_RUNNER__AGENT_ARGS`, in the controller ConfigMap and in the admission policy (`deploy/kubernetes/`) |
 | Removed settings | `agent_timeout`, `escalation_threshold` | Removed, not moved: nothing read them. An agent state without `timeout` has no limit unless its workflow sets one. |
@@ -437,8 +437,8 @@ cutover: there is no transition period and no migration tool.
 **An un-migrated installation does not stop.** The old names are ignored,
 so a server that still has a flat file or old variables starts on the
 built-in values: trusted mode on loopback, the observer worker off, the
-default directories. `narsor-server` and `narsor-web` write a warning at
-start (a warning, not an error) that names every old key in the file and
+default directories. `narsor-server`, `narsor-web`, `narsor`, `narsor-cli`
+and `narsor-controller local` write a warning at start (a warning, not an error) that names every old key in the file and
 every old variable in the environment, with its new name. Do not rely on
 the warning: rewrite the configuration before the update.
 
@@ -453,7 +453,8 @@ names as unknown keys, and the new programs ignore the flat keys.
    `server.observer.enabled: true` for the old `on`. Remove
    `agent_timeout` and `escalation_threshold`. Alternatively, run
    `narsor-cli init` of the new release in a temporary directory: it writes
-   a tree in which each commented default names the old key it replaces.
+   a tree with each setting's environment variable in an `# Env:` comment;
+   take the old names from the table in Configuration.
 3. **Rename the environment variables** in every service definition, shell
    profile, container spec and ConfigMap that sets `NARSOR_*` settings.
    Variables that are not settings keep their names (`NARSOR_SERVER`,
@@ -495,6 +496,11 @@ when a gate episode enters and leaves its queue. See
 [Automations and queues](../user/observers.md). The update is a hard
 cutover: Narsor does not migrate the observers stored in
 `{state}/observers/`.
+
+> The paths in this section are those of the release that made this update.
+> After the [update to a directory per program](#update-to-a-directory-per-program-state-ownership),
+> the queue state is in `{state}/narsor-server/observer-queues/`, and old
+> observer records are looked for in `observers/` below the old state root.
 
 ### What changes
 
