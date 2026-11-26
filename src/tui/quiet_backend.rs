@@ -3,12 +3,11 @@
 //! The loop redraws on a timer ([`super::TICK`]) so relative ages stay
 //! honest. Plain `ratatui` sends bytes for every such frame even when no cell
 //! changed: the colour and attribute resets after the cell diff, and the
-//! cursor hide. Those bytes go to a terminal that may not read them — a
-//! terminal window in the background, a browser tab, a remote console under
-//! flow control. The pty buffer fills, the write blocks, and the whole loop
-//! blocks with it: keys pile up unseen and are applied at once only when the
-//! terminal reads again. A frame without changes stays off the wire, so an
-//! idle screen leaves the terminal nothing to fall behind on.
+//! cursor hide. A terminal that does not read for a while (a window in the
+//! background, a browser tab, a remote console under flow control) would
+//! fall behind on bytes that show nothing new. A frame without changes stays
+//! off the wire; [`super::screen`] keeps the loop going when real changes
+//! still pile up.
 
 use std::io;
 
@@ -23,6 +22,8 @@ pub struct QuietBackend<B> {
     inner: B,
     /// What the cursor was last set to; `None` until the backend sets it.
     cursor_hidden: Option<bool>,
+    /// Where the cursor was last placed.
+    cursor_position: Position,
 }
 
 impl<B> QuietBackend<B> {
@@ -30,6 +31,7 @@ impl<B> QuietBackend<B> {
         Self {
             inner,
             cursor_hidden: None,
+            cursor_position: Position::ORIGIN,
         }
     }
 }
@@ -70,12 +72,19 @@ impl<B: Backend<Error = io::Error>> Backend for QuietBackend<B> {
         Ok(())
     }
 
+    /// Where the cursor was last placed, without asking the terminal. Asking
+    /// is a round trip: it races the key reader for the answer, and a
+    /// terminal that does not read never answers. The interface hides the
+    /// cursor, so `ratatui` asks only to put it back after a clear.
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        self.inner.get_cursor_position()
+        Ok(self.cursor_position)
     }
 
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
-        self.inner.set_cursor_position(position)
+        let position = position.into();
+        self.inner.set_cursor_position(position)?;
+        self.cursor_position = position;
+        Ok(())
     }
 
     fn clear(&mut self) -> io::Result<()> {
