@@ -637,6 +637,7 @@ pub fn build_timeline(
         positions,
         links,
         default_position,
+        conductor_usage: None,
     }
 }
 

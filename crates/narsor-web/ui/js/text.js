@@ -139,28 +139,55 @@ function addCost(sum, cost) {
   return typeof cost === 'number' ? (sum ?? 0) + cost : sum;
 }
 
-/** The usage of all positions of a timeline, summed; `null` when none reported. */
-export function sumUsage(positions) {
+/** Adds the subagents the conductor started, and their tokens, when any ran. */
+function addConductorSubagents(sum, stats) {
+  if (!(stats?.spawned > 0)) return;
+  sum.conductorCount += stats.spawned;
+  sum.conductorTokens += stats.tokens ?? 0;
+}
+
+/** Adds one reading of the conductor's use: tokens, cost and subagents. */
+function addConductor(sum, total, cost, stats) {
+  sum.conductor = addCounts(sum.conductor, total);
+  sum.conductorCost = addCost(sum.conductorCost, cost);
+  addConductorSubagents(sum, stats);
+}
+
+/**
+ * The usage of a timeline, summed: its positions, and what its conductor
+ * used in runs without a position (`conductor_usage`); `null` when none
+ * reported. The conductor's subagents add no cost: its cost includes them.
+ */
+export function sumUsage(timeline) {
   let sum = null;
-  for (const position of positions ?? []) {
+  const start = () => sum ??= {
+    total: null, subagents: null, count: 0, cost: null,
+    conductor: null, conductorCost: null, conductorCount: 0, conductorTokens: 0,
+  };
+  for (const position of timeline?.positions ?? []) {
     const usage = position.usage;
     if (!usage) continue;
-    sum ??= { total: null, subagents: null, count: 0, cost: null, conductor: null, conductorCost: null };
+    start();
     sum.total = addCounts(sum.total, usage.total);
     sum.subagents = addCounts(sum.subagents, usage.subagents);
     sum.count += usage.subagent_count ?? 0;
     sum.cost = addCost(sum.cost, usage.cost_usd);
-    sum.conductor = addCounts(sum.conductor, usage.conductor_total);
-    sum.conductorCost = addCost(sum.conductorCost, usage.conductor_cost_usd);
+    addConductor(sum, usage.conductor_total, usage.conductor_cost_usd, usage.conductor_subagent_stats);
+  }
+  const bucket = timeline?.conductor_usage;
+  if (bucket) {
+    start();
+    addConductor(sum, bucket.total, bucket.cost_usd, bucket.subagent_stats);
   }
   return sum;
 }
 
 const money = (value) => `$${value.toFixed(2)}`;
 const tokens = (counts) => `↑${scaled(counts.input)} ↓${scaled(counts.output)}`;
+const together = (count) => `↕${scaled(count)}`;
 const group = (parts) => parts.filter(Boolean).join(' ');
 
-/** The task usage row: `razem $… · ✨ $… ↑… ↓… (◈ n …) · ⚡ $… ↑… ↓…`; `null` when nothing. */
+/** The task usage row: `razem $… · ✨ $… ↑… ↓… (◈ n …) · ⚡ $… ↑… ↓… (◈ n ↕…)`; `null` when nothing. */
 export function usageLine(sum) {
   if (!sum) return null;
   const parts = [];
@@ -171,8 +198,11 @@ export function usageLine(sum) {
   if (sum.cost !== null || sum.total) {
     parts.push(group(['✨', sum.cost !== null ? money(sum.cost) : null, sum.total ? tokens(sum.total) : null, subs]));
   }
-  if (sum.conductorCost !== null || sum.conductor) {
-    parts.push(group(['⚡', sum.conductorCost !== null ? money(sum.conductorCost) : null, sum.conductor ? tokens(sum.conductor) : null]));
+  const conductorSubs = sum.conductorCount > 0
+    ? `(${group(['◈', String(sum.conductorCount), sum.conductorTokens > 0 ? together(sum.conductorTokens) : null])})`
+    : null;
+  if (sum.conductorCost !== null || sum.conductor || conductorSubs) {
+    parts.push(group(['⚡', sum.conductorCost !== null ? money(sum.conductorCost) : null, sum.conductor ? tokens(sum.conductor) : null, conductorSubs]));
   }
   return parts.length ? parts.join(' · ') : null;
 }
@@ -205,7 +235,7 @@ export function archivedRun(read) {
   if (read.error) return { kind: 'error', text: read.error };
   const timeline = read.data?.timeline ?? null;
   if (!timeline?.positions?.length) return { kind: 'missing', text: STORAGE_DELETED };
-  return { kind: 'steps', usage: usageLine(sumUsage(timeline.positions)), timeline };
+  return { kind: 'steps', usage: usageLine(sumUsage(timeline)), timeline };
 }
 
 /**

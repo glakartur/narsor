@@ -27,7 +27,7 @@ test('harness names and header text', () => {
   assert.equal(harnessText({ effective: 'codex', override: null }, 'opencode'), 'harness opencode…');
 });
 
-import { eventDetail, groupEntries, pagingDone, sumUsage, usageLine, attemptsOf, duration } from '../ui/js/text.js';
+import { eventDetail, groupEntries, pagingDone, stepDetails, sumUsage, usageLine, attemptsOf, duration } from '../ui/js/text.js';
 
 test('event details follow the TUI texts', () => {
   assert.equal(eventDetail({ type: 'state_exited', state_id: 'work', output_label: 'done' }), 'state_exited  work → done');
@@ -46,9 +46,36 @@ test('usage line matches the TUI example', () => {
     total: { input: 152, output: 36000 }, subagents: { input: 50, output: 10000 }, subagent_count: 1,
     cost_usd: 17.075, conductor_total: { input: 152, output: 36000 }, conductor_cost_usd: 17.075,
   };
-  const line = usageLine(sumUsage([{ usage: half }, { usage: half }, { usage: null }]));
+  const line = usageLine(sumUsage({ positions: [{ usage: half }, { usage: half }, { usage: null }] }));
   assert.equal(line, 'razem $68.30 · ✨ $34.15 ↑304 ↓72k (◈ 2 ↑100 ↓20k) · ⚡ $34.15 ↑304 ↓72k');
-  assert.equal(usageLine(sumUsage([{}])), null);
+  assert.equal(usageLine(sumUsage({ positions: [{}] })), null);
+  assert.equal(usageLine(sumUsage(null)), null);
+});
+
+test('the conductor task bucket adds to the conductor part and to the total', () => {
+  const step = { usage: { cost_usd: 1.0, conductor_cost_usd: 0.1 } };
+  const bucket = { cost_usd: 0.05 };
+  assert.equal(usageLine(sumUsage({ positions: [step], conductor_usage: bucket })), 'razem $1.15 · ✨ $1.00 · ⚡ $0.15');
+  assert.equal(usageLine(sumUsage({ positions: [], conductor_usage: bucket })), 'razem $0.05 · ⚡ $0.05');
+});
+
+test('the conductor subagents have a block of their own in its group', () => {
+  const step = { usage: { cost_usd: 1.0, subagents: { input: 100, output: 20000 }, subagent_count: 1 } };
+  const bucket = { cost_usd: 0.05, subagent_stats: { spawned: 2, tokens: 3000 } };
+  assert.equal(
+    usageLine(sumUsage({ positions: [step], conductor_usage: bucket })),
+    'razem $1.05 · ✨ $1.00 (◈ 1 ↑100 ↓20k) · ⚡ $0.05 (◈ 2 ↕3k)',
+  );
+});
+
+test('the conductor subagents of a gate add to the task figure and not to the step', () => {
+  const gate = { usage: { conductor_cost_usd: 0.1, conductor_subagent_stats: { spawned: 1, tokens: 1000 } } };
+  const bucket = { cost_usd: 0.05, subagent_stats: { spawned: 2, tokens: 3000 } };
+  assert.equal(
+    usageLine(sumUsage({ positions: [gate], conductor_usage: bucket })),
+    'razem $0.15 · ⚡ $0.15 (◈ 3 ↕4k)',
+  );
+  assert.equal(stepDetails(gate), stepDetails({ usage: { conductor_cost_usd: 0.1 } }));
 });
 
 test('conversation paging stops like the TUI', () => {
