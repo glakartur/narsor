@@ -382,7 +382,7 @@ the current step or a draft.
 
 | Where | Keys |
 |---|---|
-| Everywhere | `?` help, `q` quit (asks when a draft would be lost) |
+| Everywhere | `?` help, `q` quit (asks when a draft would be lost), `D` write the problem log to a file (not while you type in a field) |
 | List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `Ctrl+.` (or `.`) action panel, `n` `z` `H` `R`, `Ctrl+↑` `Ctrl+↓` `m`, `o` `c` `r`, `h` default harness, `L` task limit |
 | Details | `[` / `]` tabs, `Tab` content ↔ panel, `Ctrl+.` (or `.`) action panel, `h` default harness, `L` task limit (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step, `v` one row or full rows per step |
@@ -408,3 +408,19 @@ with `RUST_LOG` unset no subscriber is installed at all and the records are
 dropped. Either way nothing
 reaches the terminal while the interface is up. Every other subcommand keeps
 logging to stderr.
+
+**Problem log.** Independently of `narsor.log` and of `RUST_LOG`, the
+interface keeps a log of its problems in memory for the last 30 minutes:
+every call to the server that failed (the screen or tab and the task, the
+method and path, the kind of error, the full cause the client saw — for
+example a request timeout or a refused connection — and how long the call
+took) and every error or warning it showed you. Entries older than 30 minutes
+are dropped. Nothing is written to disk until you press `D`: the interface
+then writes the log to a new file in the system temporary directory
+(`$TMPDIR`, else `/tmp`), named `narsor-problems-<date>-<time>-<pid>.txt` and
+readable by you only, and shows its full path on the bar. The file starts with
+the narsor version, the server URL (without credentials or query) and the
+request timeout; an empty log still gives a file that says no problem was
+recorded. When the file cannot be written, the bar says why and the log stays
+as it was. The file can contain task names and repository URLs: check it
+before you attach it to a ticket. The interface does not remove old files.

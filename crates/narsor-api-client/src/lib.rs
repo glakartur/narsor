@@ -21,7 +21,8 @@ pub mod api {
     pub mod token;
 
     pub use client::{
-        reconnect_delay, ApiClient, BranchRead, BranchSource, ForwardAuth, UsageRead, UsageSource,
+        error_kind, reconnect_delay, ApiClient, BranchRead, BranchSource, CallFailure,
+        FailureObserver, ForwardAuth, UsageRead, UsageSource,
     };
     pub use connect::{connect, ServerTarget};
     pub use discovery::{ensure_daemon_running, DiscoveryError};

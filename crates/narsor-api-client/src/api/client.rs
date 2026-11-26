@@ -45,9 +45,10 @@
 //! the only endpoint a client ever talks to (R1, R41).
 
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::future::FutureExt as _;
@@ -140,6 +141,106 @@ pub enum ForwardAuth {
     Header(reqwest::header::HeaderValue),
 }
 
+/// One call to the server that failed, as a [`FailureObserver`] sees it.
+///
+/// Plain data only: no header of the request reaches it, so it can never
+/// hold the bearer token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallFailure {
+    /// The HTTP method, `GET`, `POST`, ….
+    pub method: String,
+    /// The path of the request, without its query.
+    pub path: String,
+    /// A short, stable name of the [`ClientError`] variant
+    /// ([`error_kind`]).
+    pub kind: &'static str,
+    /// Everything the client knew of the failure. For a transport failure
+    /// this is the whole cause chain of the `reqwest` error, which the
+    /// [`ClientError::Unavailable`] text does not carry, with `[timeout]` or
+    /// `[connect]` when `reqwest` classified it so.
+    pub detail: String,
+    /// How long the call took before it failed.
+    pub elapsed: Duration,
+}
+
+/// Called once for every call of an [`ApiClient`] that failed
+/// ([`ApiClient::with_failure_observer`]).
+pub type FailureObserver = Arc<dyn Fn(&CallFailure) + Send + Sync>;
+
+/// A short, stable name of `error`'s variant, for a diagnostic record.
+pub fn error_kind(error: &ClientError) -> &'static str {
+    match error {
+        ClientError::Unavailable(_) => "unavailable",
+        ClientError::Unauthorized => "unauthorized",
+        ClientError::Forbidden => "forbidden",
+        ClientError::Credential(_) => "credential",
+        ClientError::NotFound => "not_found",
+        ClientError::Conflict => "conflict",
+        ClientError::Refused { .. } => "refused",
+        ClientError::Degraded { .. } => "degraded",
+        ClientError::Request { .. } => "request",
+        ClientError::Server(_) => "server",
+    }
+}
+
+/// A failed call inside the client: the error its caller gets, and the
+/// fuller detail only a [`FailureObserver`] sees.
+struct Failed {
+    error: ClientError,
+    detail: String,
+}
+
+impl From<ClientError> for Failed {
+    fn from(error: ClientError) -> Self {
+        Self {
+            detail: error.to_string(),
+            error,
+        }
+    }
+}
+
+impl Failed {
+    /// A transport failure: [`ClientError::Unavailable`] with the error's
+    /// own text, as callers always got it, and the whole cause chain for an
+    /// observer.
+    fn transport(error: reqwest::Error) -> Self {
+        Self {
+            detail: transport_detail(&error),
+            error: ClientError::Unavailable(error.to_string()),
+        }
+    }
+}
+
+/// `error` with every cause under it, joined with `: `, then how `reqwest`
+/// classified it. The top-level text of a `reqwest` error names only what
+/// was being done and the URL; why it failed ("operation timed out",
+/// "Connection refused") is in its sources.
+fn transport_detail(error: &reqwest::Error) -> String {
+    let mut detail = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !detail.contains(&text) {
+            detail.push_str(": ");
+            detail.push_str(&text);
+        }
+        source = cause.source();
+    }
+    if error.is_timeout() {
+        detail.push_str(" [timeout]");
+    }
+    if error.is_connect() {
+        detail.push_str(" [connect]");
+    }
+    detail
+}
+
+fn path_of(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .map(|url| url.path().to_string())
+        .unwrap_or_else(|_| url.split('?').next().unwrap_or_default().to_string())
+}
+
 /// A client bound to one running server: a loopback daemon
 /// ([`ApiClient::new`]) or a control plane at a URL ([`ApiClient::remote`]).
 ///
@@ -162,6 +263,8 @@ pub struct ApiClient {
     /// here would have `reqwest` tear the connection down mid-stream the
     /// moment an execution paused for a human gate.
     stream_http: reqwest::Client,
+    request_timeout: Duration,
+    observer: Option<FailureObserver>,
 }
 
 impl std::fmt::Debug for ApiClient {
@@ -223,6 +326,53 @@ impl ApiClient {
             token: Arc::new(TokenCell::new(source)),
             http,
             stream_http,
+            request_timeout: timeout,
+            observer: None,
+        }
+    }
+
+    /// This client, telling `observer` of every call that fails: once per
+    /// call, after the call is over, with how long it took. A `401` that a
+    /// re-read token turns into an answer is not a failure. Clones share the
+    /// observer. A client without one behaves exactly the same.
+    pub fn with_failure_observer(
+        mut self,
+        observer: impl Fn(&CallFailure) + Send + Sync + 'static,
+    ) -> Self {
+        self.observer = Some(Arc::new(observer));
+        self
+    }
+
+    /// How long one ordinary request may take before it counts as the
+    /// server being unavailable.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// Runs one call, timed; a failure is told to the observer and handed
+    /// back as the plain [`ClientError`].
+    async fn observed<T>(
+        &self,
+        method: &str,
+        url: &str,
+        call: impl Future<Output = Result<T, Failed>>,
+    ) -> Result<T, ClientError> {
+        let started = Instant::now();
+        call.await.map_err(|failed| {
+            self.report(method, url, &failed, started.elapsed());
+            failed.error
+        })
+    }
+
+    fn report(&self, method: &str, url: &str, failed: &Failed, elapsed: Duration) {
+        if let Some(observer) = &self.observer {
+            observer(&CallFailure {
+                method: method.to_string(),
+                path: path_of(url),
+                kind: error_kind(&failed.error),
+                detail: failed.detail.clone(),
+                elapsed,
+            });
         }
     }
 
@@ -251,19 +401,22 @@ impl ApiClient {
                 .headers(headers.clone())
                 .body(body.clone())
         };
-        match auth {
-            ForwardAuth::Header(value) => build(&self.stream_http)
-                .header(reqwest::header::AUTHORIZATION, value)
-                .send()
-                .await
-                .map_err(|error| ClientError::Unavailable(error.to_string())),
-            ForwardAuth::Own => {
-                self.send(&self.stream_http, |http, token| {
-                    build(http).bearer_auth(token)
-                })
-                .await
+        let call = async {
+            match auth {
+                ForwardAuth::Header(value) => build(&self.stream_http)
+                    .header(reqwest::header::AUTHORIZATION, value)
+                    .send()
+                    .await
+                    .map_err(Failed::transport),
+                ForwardAuth::Own => {
+                    self.send(&self.stream_http, |http, token| {
+                        build(http).bearer_auth(token)
+                    })
+                    .await
+                }
             }
-        }
+        };
+        self.observed(method.as_str(), &url, call).await
     }
 
     /// The server's base URL, without a trailing slash.
@@ -444,14 +597,17 @@ impl ApiClient {
         id: &str,
     ) -> Result<RepositoryBranchesResponse, ClientError> {
         let url = format!("{}/control/v1/repositories/{id}/branches", self.base_url);
-        let response = self
-            .send(&self.stream_http, |http, token| {
-                http.get(&url)
-                    .bearer_auth(token)
-                    .timeout(BRANCH_LISTING_TIMEOUT)
-            })
-            .await?;
-        handle_json_response(response).await
+        self.observed("GET", &url, async {
+            let response = self
+                .send(&self.stream_http, |http, token| {
+                    http.get(&url)
+                        .bearer_auth(token)
+                        .timeout(BRANCH_LISTING_TIMEOUT)
+                })
+                .await?;
+            Ok(handle_json_response(response).await?)
+        })
+        .await
     }
 
     /// Registers a repository.
@@ -597,15 +753,18 @@ impl ApiClient {
         Q: serde::Serialize + ?Sized,
         R: serde::de::DeserializeOwned,
     {
-        let response = self
-            .send(&self.stream_http, |http, token| {
-                http.get(url)
-                    .bearer_auth(token)
-                    .query(query)
-                    .timeout(CONVERSATION_PAGE_TIMEOUT)
-            })
-            .await?;
-        handle_json_response(response).await
+        self.observed("GET", url, async {
+            let response = self
+                .send(&self.stream_http, |http, token| {
+                    http.get(url)
+                        .bearer_auth(token)
+                        .query(query)
+                        .timeout(CONVERSATION_PAGE_TIMEOUT)
+                })
+                .await?;
+            Ok(handle_json_response(response).await?)
+        })
+        .await
     }
 
     /// The raw events of a task's execution after `query.after`: from the
@@ -723,16 +882,19 @@ impl ApiClient {
         bundle: Bytes,
     ) -> Result<MaterialUploadResponse, ClientError> {
         let url = format!("{}/control/v1/tasks/{task_id}/materials", self.base_url);
-        let response = self
-            .send(&self.stream_http, |http, token| {
-                http.post(&url)
-                    .bearer_auth(token)
-                    .header(reqwest::header::CONTENT_TYPE, BUNDLE_CONTENT_TYPE)
-                    .body(bundle.clone())
-                    .timeout(MATERIAL_TRANSFER_TIMEOUT)
-            })
-            .await?;
-        handle_json_response(response).await
+        self.observed("POST", &url, async {
+            let response = self
+                .send(&self.stream_http, |http, token| {
+                    http.post(&url)
+                        .bearer_auth(token)
+                        .header(reqwest::header::CONTENT_TYPE, BUNDLE_CONTENT_TYPE)
+                        .body(bundle.clone())
+                        .timeout(MATERIAL_TRANSFER_TIMEOUT)
+                })
+                .await?;
+            Ok(handle_json_response(response).await?)
+        })
+        .await
     }
 
     /// The remote task's materials.
@@ -782,30 +944,34 @@ impl ApiClient {
                 "{}/control/v1/tasks/{task_id}/materials/{material_id}/blobs/{sha256}",
                 self.base_url
             );
-            let response = self
-                .send(&self.stream_http, |http, token| {
-                    http.get(&url)
-                        .bearer_auth(token)
-                        .timeout(MATERIAL_TRANSFER_TIMEOUT)
+            let bytes = self
+                .observed("GET", &url, async {
+                    let response = self
+                        .send(&self.stream_http, |http, token| {
+                            http.get(&url)
+                                .bearer_auth(token)
+                                .timeout(MATERIAL_TRANSFER_TIMEOUT)
+                        })
+                        .await?;
+                    if response.status() != StatusCode::OK {
+                        return Err(Failed::from(
+                            match handle_json_response::<serde_json::Value>(response).await {
+                                Err(error) => error,
+                                Ok(_) => ClientError::Server(
+                                    "unexpected answer to a blob download".into(),
+                                ),
+                            },
+                        ));
+                    }
+                    let bytes = response.bytes().await.map_err(Failed::transport)?;
+                    if bytes.len() as u64 != size || material_sha256_hex(&bytes) != sha256 {
+                        return Err(Failed::from(ClientError::Server(format!(
+                            "blob {sha256} of material '{material_id}' does not match its manifest"
+                        ))));
+                    }
+                    Ok(bytes)
                 })
                 .await?;
-            if response.status() != StatusCode::OK {
-                return Err(
-                    match handle_json_response::<serde_json::Value>(response).await {
-                        Err(error) => error,
-                        Ok(_) => ClientError::Server("unexpected answer to a blob download".into()),
-                    },
-                );
-            }
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|error| ClientError::Unavailable(error.to_string()))?;
-            if bytes.len() as u64 != size || material_sha256_hex(&bytes) != sha256 {
-                return Err(ClientError::Server(format!(
-                    "blob {sha256} of material '{material_id}' does not match its manifest"
-                )));
-            }
             blobs.insert(sha256, bytes);
         }
         Ok((view, blobs))
@@ -851,14 +1017,18 @@ impl ApiClient {
     /// due while the control plane held the request.
     pub async fn claim_observer_run(&self) -> Result<Option<ObserverWorkerRun>, ClientError> {
         let url = format!("{}/observer/v1/worker/claim", self.base_url);
-        let response = self
-            .send(&self.stream_http, |http, token| {
-                http.post(url.as_str())
-                    .bearer_auth(token)
-                    .timeout(OBSERVER_CLAIM_TIMEOUT)
+        let response: ObserverClaimResponse = self
+            .observed("POST", &url, async {
+                let response = self
+                    .send(&self.stream_http, |http, token| {
+                        http.post(url.as_str())
+                            .bearer_auth(token)
+                            .timeout(OBSERVER_CLAIM_TIMEOUT)
+                    })
+                    .await?;
+                Ok(handle_json_response(response).await?)
             })
             .await?;
-        let response: ObserverClaimResponse = handle_json_response(response).await?;
         Ok(response.run)
     }
 
@@ -1025,31 +1195,45 @@ impl ApiClient {
         let client = self.clone();
 
         async move {
-            let response = match client
-                .send(&client.stream_http, |http, token| {
-                    http.get(&url).bearer_auth(token)
+            let started = Instant::now();
+            let connected = client
+                .observed("GET", &url, async {
+                    let response = client
+                        .send(&client.stream_http, |http, token| {
+                            http.get(&url).bearer_auth(token)
+                        })
+                        .await?;
+                    let refusal = match response.status() {
+                        StatusCode::OK => return Ok(response),
+                        StatusCode::UNAUTHORIZED => ClientError::Unauthorized,
+                        StatusCode::FORBIDDEN => ClientError::Forbidden,
+                        StatusCode::NOT_FOUND => ClientError::NotFound,
+                        StatusCode::BAD_REQUEST => {
+                            match response.json::<RequestErrorResponse>().await {
+                                Ok(error) => ClientError::Request {
+                                    code: error.code,
+                                    message: error.message,
+                                },
+                                Err(error) => ClientError::Server(error.to_string()),
+                            }
+                        }
+                        status => ClientError::Server(format!("unexpected status {status}")),
+                    };
+                    Err(Failed::from(refusal))
                 })
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => return single_error_stream(error),
-            };
-
-            match response.status() {
-                StatusCode::OK => sse_events(response, decode).boxed(),
-                StatusCode::UNAUTHORIZED => single_error_stream(ClientError::Unauthorized),
-                StatusCode::FORBIDDEN => single_error_stream(ClientError::Forbidden),
-                StatusCode::NOT_FOUND => single_error_stream(ClientError::NotFound),
-                StatusCode::BAD_REQUEST => match response.json::<RequestErrorResponse>().await {
-                    Ok(error) => single_error_stream(ClientError::Request {
-                        code: error.code,
-                        message: error.message,
-                    }),
-                    Err(error) => single_error_stream(ClientError::Server(error.to_string())),
-                },
-                status => {
-                    single_error_stream(ClientError::Server(format!("unexpected status {status}")))
-                }
+                .await;
+            match connected {
+                Ok(response) => sse_events(
+                    response,
+                    decode,
+                    BodyFailures {
+                        client: client.clone(),
+                        url,
+                        started,
+                    },
+                )
+                .boxed(),
+                Err(error) => single_error_stream(error),
             }
         }
         .flatten_stream()
@@ -1070,27 +1254,37 @@ impl ApiClient {
         &self,
         http: &reqwest::Client,
         build: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, ClientError> {
+    ) -> Result<reqwest::Response, Failed> {
         let token = self.token.current().await?;
         let response = build(http, &token)
             .send()
             .await
-            .map_err(|error| ClientError::Unavailable(error.to_string()))?;
+            .map_err(Failed::transport)?;
         if response.status() != StatusCode::UNAUTHORIZED || !self.token.refresh(&token).await? {
             return Ok(response);
         }
         let token = self.token.current().await?;
-        build(http, &token)
-            .send()
-            .await
-            .map_err(|error| ClientError::Unavailable(error.to_string()))
+        build(http, &token).send().await.map_err(Failed::transport)
+    }
+
+    /// One request on [`Self::http`] whose answer is decoded as `T`; a
+    /// failure is told to the observer.
+    async fn call_json<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        url: &str,
+        build: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+    ) -> Result<T, ClientError> {
+        self.observed(method, url, async {
+            let response = self.send(&self.http, build).await?;
+            Ok(handle_json_response(response).await?)
+        })
+        .await
     }
 
     async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ClientError> {
-        let response = self
-            .send(&self.http, |http, token| http.get(url).bearer_auth(token))
-            .await?;
-        handle_json_response(response).await
+        self.call_json("GET", url, |http, token| http.get(url).bearer_auth(token))
+            .await
     }
 
     /// `POST url` with a JSON body, decoding the response as `T`.
@@ -1099,20 +1293,16 @@ impl ApiClient {
         url: &str,
         body: &B,
     ) -> Result<T, ClientError> {
-        let response = self
-            .send(&self.http, |http, token| {
-                http.post(url).bearer_auth(token).json(body)
-            })
-            .await?;
-        handle_json_response(response).await
+        self.call_json("POST", url, |http, token| {
+            http.post(url).bearer_auth(token).json(body)
+        })
+        .await
     }
 
     /// `POST url` with no body, decoding the response as `T`.
     async fn post_empty<T: DeserializeOwned>(&self, url: &str) -> Result<T, ClientError> {
-        let response = self
-            .send(&self.http, |http, token| http.post(url).bearer_auth(token))
-            .await?;
-        handle_json_response(response).await
+        self.call_json("POST", url, |http, token| http.post(url).bearer_auth(token))
+            .await
     }
 
     async fn put_json<B: Serialize, T: DeserializeOwned>(
@@ -1120,21 +1310,17 @@ impl ApiClient {
         url: &str,
         body: &B,
     ) -> Result<T, ClientError> {
-        let response = self
-            .send(&self.http, |http, token| {
-                http.put(url).bearer_auth(token).json(body)
-            })
-            .await?;
-        handle_json_response(response).await
+        self.call_json("PUT", url, |http, token| {
+            http.put(url).bearer_auth(token).json(body)
+        })
+        .await
     }
 
     async fn delete_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ClientError> {
-        let response = self
-            .send(&self.http, |http, token| {
-                http.delete(url).bearer_auth(token)
-            })
-            .await?;
-        handle_json_response(response).await
+        self.call_json("DELETE", url, |http, token| {
+            http.delete(url).bearer_auth(token)
+        })
+        .await
     }
 }
 
@@ -1330,6 +1516,16 @@ struct SseState<S, T> {
     done: bool,
     /// Turns a frame's payload into an item.
     decode: FrameDecoder<T>,
+    /// Where a failure of the body is told.
+    failures: BodyFailures,
+}
+
+/// What telling the observer of a stream whose body broke needs: the
+/// client, the stream's URL and when it was opened.
+struct BodyFailures {
+    client: ApiClient,
+    url: String,
+    started: Instant,
 }
 
 /// Turns a successful (`200 OK`) SSE response into a stream of decoded
@@ -1337,6 +1533,7 @@ struct SseState<S, T> {
 fn sse_events<T: Send + 'static>(
     response: reqwest::Response,
     decode: FrameDecoder<T>,
+    failures: BodyFailures,
 ) -> impl Stream<Item = Result<T, ClientError>> {
     let state = SseState {
         inner: response.bytes_stream(),
@@ -1344,6 +1541,7 @@ fn sse_events<T: Send + 'static>(
         queue: VecDeque::new(),
         done: false,
         decode,
+        failures,
     };
     stream::unfold(state, |state| sse_unfold_step(state))
 }
@@ -1376,9 +1574,12 @@ where
                 );
             }
             Some(Err(error)) => {
-                state
-                    .queue
-                    .push_back(Err(ClientError::Unavailable(error.to_string())));
+                let failed = Failed::transport(error);
+                let failures = &state.failures;
+                failures
+                    .client
+                    .report("GET", &failures.url, &failed, failures.started.elapsed());
+                state.queue.push_back(Err(failed.error));
                 state.done = true;
             }
             None => {

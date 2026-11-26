@@ -82,6 +82,7 @@ use super::background::{DetailJob, JobKey, Outcome};
 use super::list::{describe_loss, state_icon, title_of, StateIcon};
 use super::notify::Severity;
 use super::panel::WaitingPanel;
+use super::problems::{self, Problem};
 use super::tabs::conductor::{self, Conductor};
 use super::tabs::conversation::{
     self, transcript_action, AttemptRead, Attempts, Conversation, ReadFailure,
@@ -619,7 +620,7 @@ impl TaskApp {
         );
         match read {
             DetailRead::Timeline(result) => {
-                let result = self.settle(result);
+                let result = self.settle(DetailTab::Progress.title(), task_id, result);
                 self.detail
                     .view_mut(task_id)
                     .progress
@@ -627,7 +628,7 @@ impl TaskApp {
                 self.reread_waiting(task_id);
             }
             DetailRead::Events { after, result } => {
-                let result = self.settle(result);
+                let result = self.settle(DetailTab::Events.title(), task_id, result);
                 self.detail
                     .view_mut(task_id)
                     .events
@@ -638,7 +639,8 @@ impl TaskApp {
                 from,
                 result,
             } => {
-                let result = self.settle_with(result, ReadFailure::of);
+                let place = format!("{}, attempt {attempt_id}", DetailTab::Conversation.title());
+                let result = self.settle_with(&place, task_id, result, ReadFailure::of);
                 self.detail
                     .view_mut(task_id)
                     .attempts
@@ -667,15 +669,23 @@ impl TaskApp {
     /// A failed read as the words of its tab. Only a server that cannot be
     /// reached counts against the connection: a `503` with a reason is the
     /// relay missing its deadline (the connection is fine), and a refusal is
-    /// an answer.
-    pub(super) fn settle<T>(&mut self, result: Result<T, ClientError>) -> Result<T, String> {
-        self.settle_with(result, |_, reason| reason)
+    /// an answer. The words go to the problem log under `place` (the tab)
+    /// and `task_id`, the task the read was for.
+    pub(super) fn settle<T>(
+        &mut self,
+        place: &str,
+        task_id: &str,
+        result: Result<T, ClientError>,
+    ) -> Result<T, String> {
+        self.settle_with(place, task_id, result, |_, reason| reason)
     }
 
     /// [`Self::settle`], with the failure made by `failure` from the error
     /// and its words.
     pub(super) fn settle_with<T, E>(
         &mut self,
+        place: &str,
+        task_id: &str,
         result: Result<T, ClientError>,
         failure: impl FnOnce(&ClientError, String) -> E,
     ) -> Result<T, E> {
@@ -684,6 +694,11 @@ impl TaskApp {
                 self.note_transport(&error);
             }
             let reason = failure_reason(&error);
+            let now = Instant::now();
+            self.problems().record(
+                Problem::shown(problems::task_label(place, task_id), "error", &reason, now),
+                now,
+            );
             failure(&error, reason)
         })
     }
@@ -838,7 +853,7 @@ impl TaskApp {
         }
         // Filed under the generation asked for, so a response that is ahead
         // of the list still settles the read the list is waiting on.
-        let outcome = match self.settle(result) {
+        let outcome = match self.settle(DetailTab::Info.title(), task_id, result) {
             Ok(task) => DriftOutcome::Known(task.environment_drift),
             Err(_) => DriftOutcome::Unknown,
         };
@@ -881,7 +896,7 @@ impl TaskApp {
         {
             return;
         }
-        let result = self.settle(result);
+        let result = self.settle(DetailTab::State.title(), task_id, result);
         self.detail
             .view_mut(task_id)
             .state

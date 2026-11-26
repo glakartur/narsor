@@ -333,6 +333,8 @@ pub enum Action {
     RemoveRepository,
     /// Open the queues view (read only).
     Queues,
+    /// Write the problem log of the last half hour to a temporary file.
+    DumpProblems,
 }
 
 /// A key a binding listens to.
@@ -493,6 +495,13 @@ pub static BINDINGS: &[Binding] = &[
         Action::Quit,
         "wyjście",
         "wyjście z narsora (wymaga ponownego naciśnięcia q)",
+    ),
+    bind(
+        Context::Global,
+        Key::char('D'),
+        Action::DumpProblems,
+        "",
+        "zapisz dziennik problemów z ostatnich 30 minut do pliku tymczasowego",
     ),
     // The task list.
     bind(

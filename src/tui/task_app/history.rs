@@ -329,7 +329,7 @@ impl TaskApp {
         task_id: &str,
         result: Result<TimelineResponse, ClientError>,
     ) {
-        let result = self.settle(result);
+        let result = self.settle("Historia, Przebieg", task_id, result);
         let View::History(history) = &mut self.view else {
             return;
         };
