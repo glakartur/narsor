@@ -104,6 +104,7 @@ pub mod list;
 pub mod new_task;
 pub mod notify;
 pub mod panel;
+pub mod problems;
 pub mod queues;
 pub mod repositories;
 pub mod tabs;
