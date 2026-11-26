@@ -347,6 +347,10 @@ pub async fn run(
                 }
                 // A paste is text for the field being typed in, never keys.
                 Some(TerminalEvent::Paste(text)) => app.on_paste(&text),
+                Some(TerminalEvent::Mouse(mouse)) => {
+                    let request = app.on_mouse(mouse);
+                    app.dispatch(request).await;
+                }
                 // A resize needs no state change: the next draw re-derives the
                 // whole layout from the new area.
                 Some(_) => {}

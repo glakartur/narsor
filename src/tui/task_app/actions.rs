@@ -1549,11 +1549,13 @@ fn launch_browser(url: &str) -> std::io::Result<()> {
 // Drawing
 // ---------------------------------------------------------------------
 
-/// Draws what sits over the screen, if anything, centred in `area`.
-pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles) {
+/// Draws what sits over the screen, if anything, centred in `area`. Where
+/// it drew a window that takes clicks: not the exit confirmation, and not the
+/// action panel drawn in the details.
+pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles) -> Option<Rect> {
     if app.quit_confirm {
         render_quit_confirmation(frame, area, styles, app.detail().has_drafts());
-        return;
+        return None;
     }
     let title = app
         .overlay
@@ -1566,44 +1568,36 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles)
         })
         .map(title_of)
         .unwrap_or_default();
-    if let Some(overlay) = app.overlay.as_mut() {
-        match overlay {
-            Overlay::Confirm(confirmation) => {
-                render_confirmation(frame, area, confirmation, styles)
+    let place = match app.overlay.as_mut()? {
+        Overlay::Confirm(confirmation) => render_confirmation(frame, area, confirmation, styles),
+        Overlay::Actions(panel) => {
+            // Drawn in the details, in the place of the conversation's
+            // form, when the details were drawn; here otherwise.
+            if panel.in_details {
+                return None;
             }
-            Overlay::Actions(panel) => {
-                // Drawn in the details, in the place of the conversation's
-                // form, when the details were drawn; here otherwise.
-                if !panel.in_details {
-                    render_panel_popup(frame, area, &title, panel, styles);
-                }
-            }
-            Overlay::Links(list) => {
-                render_list(
-                    frame,
-                    area,
-                    &format!("Linki · {title}"),
-                    &mut list.chooser,
-                    styles,
-                );
-            }
-            Overlay::Comment(form) => {
-                render_list(
-                    frame,
-                    area,
-                    &format!("Komentarz · {title}"),
-                    &mut form.chooser,
-                    styles,
-                );
-            }
-            Overlay::Harness(list) => {
-                render_list(frame, area, "Domyślny harness", list.chooser_mut(), styles);
-            }
-            Overlay::Limit(list) => {
-                render_list(frame, area, "Limit zadań", list.chooser_mut(), styles);
-            }
+            render_panel_popup(frame, area, &title, panel, styles)
         }
-    }
+        Overlay::Links(list) => render_list(
+            frame,
+            area,
+            &format!("Linki · {title}"),
+            &mut list.chooser,
+            styles,
+        ),
+        Overlay::Comment(form) => render_list(
+            frame,
+            area,
+            &format!("Komentarz · {title}"),
+            &mut form.chooser,
+            styles,
+        ),
+        Overlay::Harness(list) => {
+            render_list(frame, area, "Domyślny harness", list.chooser_mut(), styles)
+        }
+        Overlay::Limit(list) => render_list(frame, area, "Limit zadań", list.chooser_mut(), styles),
+    };
+    Some(place)
 }
 
 pub fn render_quit_confirmation(frame: &mut Frame, area: Rect, styles: &Styles, has_drafts: bool) {
@@ -1737,20 +1731,28 @@ fn render_panel_popup(
     title: &str,
     panel: &mut ActionPanel,
     styles: &Styles,
-) {
+) -> Rect {
     let width = area.width.saturating_sub(4).min(100);
     let height = panel_height(panel, width).min(area.height.saturating_sub(2));
     let place = popup(area, width, height);
     render_panel(frame, place, title, panel, styles);
+    place
 }
 
-fn render_list(frame: &mut Frame, area: Rect, title: &str, chooser: &mut Chooser, styles: &Styles) {
+fn render_list(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    chooser: &mut Chooser,
+    styles: &Styles,
+) -> Rect {
     let width = area.width.saturating_sub(4).min(100);
     let height = chooser.preferred_height(width.saturating_sub(2)) + 2;
     let place = popup(area, width, height.min(area.height.saturating_sub(2)));
     let inner = framed(frame, place, Role::Focus, title, styles);
     // An overlay has the keys for as long as it is open.
     chooser::render(frame, inner, chooser, styles, true);
+    place
 }
 
 fn render_confirmation(
@@ -1758,7 +1760,7 @@ fn render_confirmation(
     area: Rect,
     confirmation: &Confirmation,
     styles: &Styles,
-) {
+) -> Rect {
     let width = area.width.saturating_sub(4).min(72);
     let text_width = usize::from(width.saturating_sub(4)).max(1);
     let rows: usize = confirmation
@@ -1796,4 +1798,5 @@ fn render_confirmation(
         inner.height,
     );
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), padded);
+    place
 }

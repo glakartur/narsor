@@ -45,6 +45,7 @@ use super::super::style::{Role, Styles};
 use super::detail::fit_cells;
 use super::harness::HarnessHeader;
 use super::list::{Counters, Slots, TaskList};
+use super::mouse::Panel;
 use super::{actions, detail, history, new_task, repositories, usage};
 use super::{Focus, TaskApp, View};
 
@@ -155,6 +156,8 @@ pub fn render_at(
     now_utc: DateTime<Utc>,
 ) {
     let areas = areas(frame.area(), app.focus());
+    // The mouse reaches only what this frame draws.
+    app.panels_mut().clear();
     if areas.screen == Screen::TooSmall {
         render_too_small(frame, areas.outer, styles);
         if app.form_confirming() {
@@ -176,6 +179,7 @@ pub fn render_at(
 
     let list_focused = app.keys_on_list();
     if let Some(list_area) = areas.list {
+        app.panels_mut().record(Panel::List, list_area);
         if let View::History(open) = &mut app.view {
             history::render_list(frame, list_area, open, styles, list_focused, stale);
         } else {
@@ -191,11 +195,14 @@ pub fn render_at(
     }
     app.unplace_action_panel();
     if let Some(detail_area) = areas.detail {
+        app.panels_mut().record(Panel::Details, detail_area);
         render_view(frame, detail_area, app, styles, stale);
     }
     render_bar(frame, areas.bar, app, styles, now, now_utc);
     let body = overlay_area(areas.outer);
-    actions::render(frame, body, app, styles);
+    if let Some(place) = actions::render(frame, body, app, styles) {
+        app.panels_mut().record(Panel::Overlay, place);
+    }
     if app.form_confirming() {
         crate::tui::form::confirm::render(frame, body, styles);
     }

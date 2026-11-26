@@ -8,19 +8,19 @@
 
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::Terminal;
 
 use narsor::api::ApiClient;
 use narsor::tui::style::Styles;
-use narsor::tui::task_app::{layout, TaskApp};
+use narsor::tui::task_app::{layout, Focus, Request, TaskApp};
 
 use narsor_engine::domain::ExecutionStatus;
 
 use crate::task_app_support::{
-    listing, task, titled, with_controller, with_panel, with_pending, with_runner,
+    listing, queued, task, titled, with_controller, with_panel, with_pending, with_runner,
 };
 
 fn app() -> TaskApp {
@@ -145,5 +145,165 @@ mod toggle {
         key(&mut app, KeyCode::Char('P'));
         assert!(app.mouse_captured());
         assert_eq!(app.list().filter(), "P");
+    }
+}
+
+/// A mouse event of `kind` at `column`, `row`.
+fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn click(app: &mut TaskApp, column: u16, row: u16) -> Request {
+    app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), column, row))
+}
+
+fn wheel_down(app: &mut TaskApp, column: u16, row: u16) {
+    app.on_mouse(mouse(MouseEventKind::ScrollDown, column, row));
+}
+
+fn wheel_up(app: &mut TaskApp, column: u16, row: u16) {
+    app.on_mouse(mouse(MouseEventKind::ScrollUp, column, row));
+}
+
+/// Where `text` is on the screen: its first cell.
+fn find(buffer: &Buffer, text: &str) -> (u16, u16) {
+    for y in 0..buffer.area.height {
+        let line = row(buffer, y);
+        if let Some(at) = line.find(text) {
+            let column = line[..at].chars().count();
+            return (u16::try_from(column).unwrap(), y);
+        }
+    }
+    panic!("{text:?} is not on the screen:\n{}", screen(buffer));
+}
+
+/// What a stray event must not change: the selected task, the focus, the
+/// filter and the order of the list.
+fn what_the_operator_sees(app: &TaskApp) -> (Option<String>, Focus, String, Vec<String>) {
+    (
+        app.list().selected_id().map(str::to_string),
+        app.focus(),
+        app.list().filter().to_string(),
+        app.list().rows().into_iter().map(|row| row.title).collect(),
+    )
+}
+
+/// Three queued tasks, `NAR-1` to `NAR-3`.
+fn queue() -> TaskApp {
+    let mut app = app();
+    app.load(listing(
+        (1..=3)
+            .map(|n| titled(queued(&format!("t{n}"), n), &format!("NAR-{n}")))
+            .collect(),
+        "c",
+    ));
+    app
+}
+
+mod routing {
+    use super::*;
+
+    #[test]
+    fn a_click_on_a_task_behind_the_action_menu_changes_nothing_behind_it() {
+        // AE5
+        let mut app = queue();
+        key(&mut app, KeyCode::Char('.'));
+        assert!(app.overlay().is_some());
+        let buffer = draw(&mut app, 120, 30);
+        let (column, y) = find(&buffer, "NAR-3");
+        let before = what_the_operator_sees(&app);
+
+        assert_eq!(click(&mut app, column, y), Request::None);
+        wheel_down(&mut app, column, y);
+
+        assert_eq!(what_the_operator_sees(&app), before);
+        assert!(app.overlay().is_some(), "the menu stays open");
+    }
+
+    #[test]
+    fn the_header_the_bar_and_a_too_small_screen_take_no_clicks() {
+        let mut app = queue();
+        key(&mut app, KeyCode::Enter);
+        let before = what_the_operator_sees(&app);
+        draw(&mut app, 120, 30);
+        for (column, y) in [(5, 0), (5, 29), (60, 0), (60, 29)] {
+            click(&mut app, column, y);
+            wheel_down(&mut app, column, y);
+        }
+        assert_eq!(what_the_operator_sees(&app), before);
+
+        draw(&mut app, 50, 10);
+        for (column, y) in [(2, 3), (40, 5)] {
+            click(&mut app, column, y);
+            wheel_down(&mut app, column, y);
+        }
+        assert_eq!(what_the_operator_sees(&app), before);
+    }
+
+    #[test]
+    fn in_the_narrow_layout_the_mouse_reaches_only_the_panel_on_screen() {
+        let mut app = queue();
+        draw(&mut app, 90, 30);
+        // Where the details would be in the split layout.
+        click(&mut app, 60, 10);
+        assert_eq!(app.focus(), Focus::List);
+    }
+
+    #[test]
+    fn moves_drags_releases_and_other_buttons_change_nothing() {
+        let mut app = queue();
+        let buffer = draw(&mut app, 120, 30);
+        let (column, y) = find(&buffer, "NAR-3");
+        let before = what_the_operator_sees(&app);
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Middle),
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+        ] {
+            for (x, y) in [(column, y), (60, 10)] {
+                assert_eq!(app.on_mouse(mouse(kind, x, y)), Request::None);
+            }
+        }
+        assert_eq!(what_the_operator_sees(&app), before);
+    }
+
+    #[test]
+    fn while_the_filter_is_typed_or_a_task_is_moved_the_mouse_does_nothing() {
+        let mut filtering = queue();
+        key(&mut filtering, KeyCode::Char('/'));
+        key(&mut filtering, KeyCode::Char('N'));
+        let mut moving = queue();
+        key(&mut moving, KeyCode::Char('m'));
+        assert!(moving.list().moving().is_some());
+
+        for mut app in [filtering, moving] {
+            let buffer = draw(&mut app, 120, 30);
+            let (column, y) = find(&buffer, "NAR-3");
+            let before = what_the_operator_sees(&app);
+            wheel_down(&mut app, column, y);
+            wheel_up(&mut app, column, y);
+            click(&mut app, column, y);
+            click(&mut app, 60, 10);
+            assert_eq!(what_the_operator_sees(&app), before);
+        }
+    }
+
+    #[test]
+    fn a_click_on_empty_space_in_the_details_gives_them_the_focus_and_keeps_the_task() {
+        let mut app = queue();
+        draw(&mut app, 120, 30);
+        let selected = app.list().selected_id().map(str::to_string);
+        click(&mut app, 100, 25);
+        assert_eq!(app.focus(), Focus::Details);
+        assert_eq!(app.list().selected_id().map(str::to_string), selected);
     }
 }

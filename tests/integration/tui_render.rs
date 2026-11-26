@@ -7590,7 +7590,7 @@ mod bracketed_list_render {
                 selected,
                 focused,
                 top,
-            )
+            );
         })
     }
 
@@ -7721,7 +7721,7 @@ mod bracketed_list_render {
                         Some(1),
                         focused,
                         &mut top,
-                    )
+                    );
                 });
                 let filled = draw_list(width, height, &styles, &list, Some(1), focused, &mut 0);
                 let marks = styles.selection_marks(focused);
@@ -7758,7 +7758,7 @@ mod bracketed_list_render {
                 Some(1),
                 true,
                 &mut top,
-            )
+            );
         });
         assert!(rule_rows(&buffer).is_empty(), "{}", screen(&buffer));
         assert_eq!(buffer[(0, 0)].symbol(), "│");

@@ -101,6 +101,7 @@ pub mod history;
 pub mod layout;
 pub mod limit;
 pub mod list;
+pub mod mouse;
 pub mod new_task;
 pub mod notify;
 pub mod panel;
@@ -564,6 +565,8 @@ pub struct TaskApp {
     /// Whether the operator wants the terminal to report the mouse: on at
     /// start, `P` switches it. The loop tells the terminal.
     mouse_captured: bool,
+    /// Where the last frame drew its panels, for the mouse.
+    panels: mouse::Panels,
 }
 
 /// What a read of the list must tell after work was sent to a task without a
@@ -637,6 +640,7 @@ impl TaskApp {
             problems,
             dump_dir: std::env::temp_dir(),
             mouse_captured: true,
+            panels: mouse::Panels::default(),
         }
     }
 
