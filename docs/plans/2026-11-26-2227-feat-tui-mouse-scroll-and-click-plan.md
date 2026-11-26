@@ -15,7 +15,7 @@ execution: code
 - **Objective:** An operator who holds a mouse can move through the lists and the conversations of the `narsor` TUI with the wheel, and can put the focus on a panel and a list item with one click, without first learning the keys.
 - **Means:** Mouse reporting in the terminal (crossterm), routed to the panel under the pointer. The keyboard stays the primary input and keeps all its behavior.
 - **Product authority:** This plan covers the `narsor` TUI only (`src/tui/`). The Web UI, `narsor-cli`, the server and the protocol are not active scope. Drag, double-click, right-click, hover and clicks on tabs, links and form fields are not active scope (see Scope Boundaries).
-- **Open blockers:** Q1 in "Pytania otwarte dla użytkownika" (mouse capture takes native text selection from the terminal). The document uses assumption Z1 until the person answers.
+- **Open blockers:** None. Q1 (mouse capture vs. native text selection) is decided: mouse on by default, a key toggles it, `docs/user/tui.md` describes `Shift`+drag.
 
 ---
 
@@ -41,6 +41,7 @@ The TUI is keyboard-only today: `src/tui/mod.rs` says "nothing depends on a mous
 **Mouse reporting**
 
 - R1. The TUI turns on terminal mouse reporting when it takes the screen, and turns it off on every exit path, including the panic path, together with the other terminal modes (`restore_terminal`).
+- R1a. A key toggles mouse reporting while the TUI runs, so the operator can select text with a plain drag. Mouse reporting is on at start. The TUI shows the current state (on or off) in the shortcut bar or the help. The key is chosen in planning and must not clash with an existing key.
 - R2. The TUI ignores mouse events that this plan does not use (move, drag, right and middle button, release) without any visible effect.
 
 **Wheel**
@@ -62,7 +63,7 @@ The TUI is keyboard-only today: `src/tui/mod.rs` says "nothing depends on a mous
 - R11. All keys keep their current behavior; the mouse adds input and removes none.
 - R12. In the narrow layout (`Screen::Full`, under 100 columns) the mouse acts only on the one panel on screen. On the "terminal too small" screen the mouse does nothing.
 - R13. While a modal form or chooser covers part of the screen, a click or a wheel notch outside it does not reach the panels under it.
-- R14. `docs/user/tui.md` describes the mouse behavior, and the module comment in `src/tui/mod.rs` no longer says that nothing uses the mouse.
+- R14. `docs/user/tui.md` describes the mouse behavior, the toggle key and `Shift`+drag text selection, and the module comment in `src/tui/mod.rs` no longer says that nothing uses the mouse.
 
 ### Acceptance Examples
 
@@ -82,11 +83,11 @@ Deferred for later:
 - Clicks on links (`PR !482 ↗`) and on form fields, buttons in forms.
 - Drag to select or to move tasks in the queue; drag of the panel border.
 - Right-click menus, hover highlight, middle-click paste.
-- A setting in the configuration file that turns the mouse on or off (see Q1).
+- A setting in the configuration file that turns the mouse on or off. The key of R1a is the only switch.
 
 ### Założenia do potwierdzenia
 
-- Z1. Mouse capture is on by default every time the TUI starts. Most terminals still allow native text selection with `Shift`+drag (or `Option`/`Fn` on macOS) while capture is on; `docs/user/tui.md` says so. If the person picks another answer to Q1, R1 changes.
+- Z1. (Confirmed by the person, Q1 option 1.) Mouse capture is on by default every time the TUI starts, and a key toggles it (R1a). Most terminals still allow native text selection with `Shift`+drag (or `Option`/`Fn` on macOS) while capture is on; `docs/user/tui.md` says so.
 - Z2. "Jump through list options" means the wheel moves the selected item, not only the visible window (R3). Where a list has no selection (read-only content), the wheel scrolls the content (R4).
 - Z3. The "active element" is the pair the TUI already tracks: the focused panel and the selected item in it. A click sets both (R7, R8); it does not run the item's action.
 - Z4. The wheel acts on the panel under the pointer and does not move the focus (R5), as in most terminal tools with panels (for example `lazygit`).
@@ -97,7 +98,7 @@ Deferred for later:
 
 Resolve Before Planning:
 
-- Q1. See "Pytania otwarte dla użytkownika".
+- None. Q1 is answered (see Z1).
 
 Deferred to Planning:
 
@@ -107,10 +108,7 @@ Deferred to Planning:
 
 ### Pytania otwarte dla użytkownika
 
-- Q1. Mouse capture takes text selection away from the terminal: a normal drag no longer selects text for copying (only `Shift`+drag does in most terminals). How should the TUI handle this?
-  - (recommended) Mouse on by default; a key toggles it while the TUI runs; `docs/user/tui.md` describes `Shift`+drag.
-  - Mouse on by default, no toggle; `Shift`+drag is the only way to copy.
-  - Mouse off by default; the operator turns it on with a key or a configuration setting.
+None. Q1 was answered: option 1 (mouse on by default, a key toggles it, `Shift`+drag documented).
 
 ### Sources / Research
 
