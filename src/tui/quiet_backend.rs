@@ -24,6 +24,8 @@ pub struct QuietBackend<B> {
     cursor_hidden: Option<bool>,
     /// Where the cursor was last placed.
     cursor_position: Position,
+    /// The size to report instead of asking the terminal; `None` asks.
+    size: Option<Size>,
 }
 
 impl<B> QuietBackend<B> {
@@ -32,7 +34,15 @@ impl<B> QuietBackend<B> {
             inner,
             cursor_hidden: None,
             cursor_position: Position::ORIGIN,
+            size: None,
         }
+    }
+
+    /// Reports `size` instead of the terminal's: what a test without a
+    /// terminal draws on.
+    pub fn with_size(mut self, size: Size) -> Self {
+        self.size = Some(size);
+        self
     }
 }
 
@@ -96,7 +106,10 @@ impl<B: Backend<Error = io::Error>> Backend for QuietBackend<B> {
     }
 
     fn size(&self) -> io::Result<Size> {
-        self.inner.size()
+        match self.size {
+            Some(size) => Ok(size),
+            None => self.inner.size(),
+        }
     }
 
     fn window_size(&mut self) -> io::Result<WindowSize> {

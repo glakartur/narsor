@@ -71,7 +71,6 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::Viewport;
 use tokio::sync::mpsc;
 
 use crate::api::ApiClient;
@@ -183,7 +182,7 @@ impl TerminalGuard {
 
     fn take_over() -> io::Result<Self> {
         let stdout = take_screen()?;
-        let screen = Screen::new(stdout, Viewport::Fullscreen)?;
+        let screen = Screen::new(stdout)?;
         Ok(Self {
             screen: Some(screen),
         })

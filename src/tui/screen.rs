@@ -20,7 +20,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
-use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use ratatui::{Frame, Terminal};
 use tokio::sync::Notify;
 
 use super::quiet_backend::QuietBackend;
@@ -40,15 +40,24 @@ pub struct Screen {
 }
 
 impl Screen {
-    /// A screen writing to `out` from its own thread. `viewport` is
-    /// [`Viewport::Fullscreen`] for the real terminal.
-    pub fn new<W: Write + Send + 'static>(out: W, viewport: Viewport) -> io::Result<Self> {
+    /// A full screen writing to `out` from its own thread.
+    pub fn new<W: Write + Send + 'static>(out: W) -> io::Result<Self> {
+        Self::build(out, QuietBackend::new)
+    }
+
+    /// [`Self::new`] on a terminal of `size`, never asked for its own.
+    #[cfg(test)]
+    fn of_size<W: Write + Send + 'static>(out: W, size: ratatui::layout::Size) -> io::Result<Self> {
+        Self::build(out, |backend| QuietBackend::new(backend).with_size(size))
+    }
+
+    fn build<W: Write + Send + 'static>(
+        out: W,
+        backend: impl FnOnce(CrosstermBackend<FrameSink>) -> QuietBackend<CrosstermBackend<FrameSink>>,
+    ) -> io::Result<Self> {
         let pending = Arc::new(Mutex::new(Vec::new()));
         let sink = FrameSink(Arc::clone(&pending));
-        let terminal = Terminal::with_options(
-            QuietBackend::new(CrosstermBackend::new(sink)),
-            TerminalOptions { viewport },
-        )?;
+        let terminal = Terminal::new(backend(CrosstermBackend::new(sink)))?;
         Ok(Self {
             terminal,
             pending,
@@ -258,7 +267,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::layout::Rect;
+    use ratatui::layout::Size;
 
     use super::*;
 
@@ -300,7 +309,7 @@ mod tests {
     }
 
     fn screen(terminal: &GatedTerminal, width: u16) -> Screen {
-        Screen::new(terminal.clone(), Viewport::Fixed(Rect::new(0, 0, width, 1))).unwrap()
+        Screen::of_size(terminal.clone(), Size::new(width, 1)).unwrap()
     }
 
     fn show(screen: &mut Screen, text: &str) {
