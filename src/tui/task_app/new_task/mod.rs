@@ -1249,7 +1249,7 @@ impl TaskApp {
             {
                 outgoing.retry_at = None;
             }
-            self.send_task(id).await;
+            super::problems::labeled(format!("resend new task {id}"), self.send_task(id)).await;
         }
         !due.is_empty()
     }

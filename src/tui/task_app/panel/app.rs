@@ -454,7 +454,7 @@ impl TaskApp {
         revision: u64,
         result: Result<ConductorReadResponse, ClientError>,
     ) {
-        let result = self.settle(result);
+        let result = self.settle(super::super::DetailTab::Conductor.title(), task_id, result);
         let Some(task) = self
             .list
             .tasks()

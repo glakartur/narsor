@@ -57,9 +57,17 @@ pub async fn labeled<F: Future>(label: String, work: F) -> F::Output {
 
 /// The operation the current task runs, or [`OUTSIDE_A_SCREEN`].
 pub fn current_label() -> String {
-    OPERATION
-        .try_with(String::clone)
-        .unwrap_or_else(|_| OUTSIDE_A_SCREEN.to_string())
+    label_or(|| OUTSIDE_A_SCREEN.to_string())
+}
+
+/// The operation the current task runs, or what `fallback` says.
+pub fn label_or(fallback: impl FnOnce() -> String) -> String {
+    OPERATION.try_with(String::clone).unwrap_or_else(|_| fallback())
+}
+
+/// The label of what `place` (a tab, a view) shows of `task_id`.
+pub fn task_label(place: &str, task_id: &str) -> String {
+    format!("{place} — task {task_id}")
 }
 
 /// Where an entry came from.

@@ -140,6 +140,7 @@ use list::{title_of, MoveRequest, Removal, ResumeNotice, ResumeNoticeKind, TaskL
 use new_task::{NewTaskForm, Outgoing};
 use notify::{Notifier, Severity};
 use panel::AnswerRequest;
+use problems::{Problem, ProblemLog};
 use repositories::Repositories;
 
 /// Where the keyboard is.
@@ -447,6 +448,33 @@ pub enum Request {
     SetHarness(Option<String>),
 }
 
+impl Request {
+    /// The operation a failed call of this request is recorded under in the
+    /// problem log.
+    fn label(&self) -> String {
+        match self {
+            Self::None => "no request".to_string(),
+            Self::OpenNewTask => "open Nowe zadanie".to_string(),
+            Self::OpenHistory => "open Historia".to_string(),
+            Self::OpenRepositories => "open Repozytoria".to_string(),
+            Self::OpenQueues => "open Queues".to_string(),
+            Self::SendTask(id) => format!("send new task {id}"),
+            Self::ValidatePath(_) => "Nowe zadanie — check the workflow path".to_string(),
+            Self::AddRepository(_) => "Repozytoria — add a repository".to_string(),
+            Self::RemoveRepository(id) => format!("Repozytoria — remove repository {id}"),
+            Self::Move(request) => format!("move task {}", request.task_id),
+            Self::Answer(request) => problems::task_label("answer", &request.task_id),
+            Self::Act(request) => problems::task_label(&request.verb, &request.task_id),
+            Self::OpenLink(_) => "open a link".to_string(),
+            Self::OpenHarness => "open Domyślny harness".to_string(),
+            Self::OpenLimit => "open the task limit".to_string(),
+            Self::ReadBranches(_) => "Nowe zadanie — read branches".to_string(),
+            Self::SetLimit { limit } => format!("set the task limit to {limit}"),
+            Self::SetHarness(_) => "set the default harness".to_string(),
+        }
+    }
+}
+
 /// A fresh key for a command that must not run twice (an owner command, an
 /// answer): the server treats a repeat of a key as the same command.
 pub fn idempotency_key() -> String {
@@ -529,6 +557,8 @@ pub struct TaskApp {
     /// When the next read of the usage limits is due: at once, then a period
     /// after the previous read finished ([`usage::USAGE_PERIOD`]).
     next_usage_at: Instant,
+    /// What went wrong in the last half hour: failed calls and shown errors.
+    problems: ProblemLog,
 }
 
 /// What a read of the list must tell after work was sent to a task without a
@@ -542,11 +572,24 @@ struct QueueCheck {
 impl TaskApp {
     /// An application over `client`, called `connection_name` until the
     /// server says its own. Nothing is read until [`Self::refresh`].
+    ///
+    /// Every call of the client that fails is recorded in the problem log
+    /// ([`Self::problems`]); [`Self::client`] is that observed client, so
+    /// what else uses it (the event stream) is recorded too.
     pub fn new(
         client: ApiClient,
         connection_name: impl Into<String>,
         refresh_interval: Option<Duration>,
     ) -> Self {
+        let problems = ProblemLog::default();
+        let sink = problems.clone();
+        let client = client.with_failure_observer(move |failure| {
+            let now = Instant::now();
+            sink.record(
+                Problem::call_failed(problems::current_label(), failure, now),
+                now,
+            );
+        });
         let usage_source: Arc<dyn UsageSource> = Arc::new(client.clone());
         let branch_source: Arc<dyn BranchSource> = Arc::new(client.clone());
         Self {
@@ -586,12 +629,18 @@ impl TaskApp {
             branch_source,
             harness_usage: None,
             next_usage_at: Instant::now(),
+            problems,
         }
     }
 
     /// The client, for opening the event stream.
     pub fn client(&self) -> &ApiClient {
         &self.client
+    }
+
+    /// What went wrong in the last half hour.
+    pub fn problems(&self) -> &ProblemLog {
+        &self.problems
     }
 
     /// The task list.
@@ -807,7 +856,38 @@ impl TaskApp {
     }
 
     fn notify(&mut self, severity: Severity, text: impl AsRef<str>) {
-        self.notifier.push(severity, text, Instant::now());
+        let now = Instant::now();
+        self.record_shown(severity, text.as_ref(), now);
+        self.notifier.push(severity, text, now);
+    }
+
+    /// Records a warning or an error the operator is shown, under the
+    /// operation that runs or else the screen shown. A success is not a
+    /// problem.
+    fn record_shown(&self, severity: Severity, text: &str, now: Instant) {
+        let word = match severity {
+            Severity::Success => return,
+            Severity::Warning => "warning",
+            Severity::Error => "error",
+        };
+        let label = problems::label_or(|| self.screen_label());
+        self.problems
+            .record(Problem::shown(label, word, text, now), now);
+    }
+
+    /// The screen shown, in the words of the problem log.
+    fn screen_label(&self) -> String {
+        match &self.view {
+            View::Tasks => match (self.focus, self.list.selected_id()) {
+                (Focus::Details, Some(id)) => problems::task_label(self.detail.tab.title(), id),
+                _ => "task list".to_string(),
+            },
+            View::NewTask(_) => "Nowe zadanie".to_string(),
+            View::History(_) => "Historia".to_string(),
+            View::Repositories(_) => "Repozytoria".to_string(),
+            View::Queues(_) => "Queues".to_string(),
+            View::Opening(kind) => format!("open {}", kind.title().trim()),
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1206,6 +1286,13 @@ impl TaskApp {
     /// with — is started and its answer comes back through
     /// [`Self::next_outcome`].
     pub async fn dispatch(&mut self, request: Request) {
+        // A write is awaited here, on the loop's task: its failed calls are
+        // recorded under the request that made them.
+        let label = request.label();
+        problems::labeled(label, self.perform_request(request)).await;
+    }
+
+    async fn perform_request(&mut self, request: Request) {
         match request {
             Request::None => {}
             Request::OpenNewTask => self.start_opening(OpeningKind::NewTask),
@@ -1565,10 +1652,8 @@ impl TaskApp {
     /// error.
     fn notify_resume(&mut self, resume: &ResumeNotice, now: Instant) {
         match &resume.kind {
-            ResumeNoticeKind::Resumed { attempt, limit } => self.notifier.push_counted(
-                Severity::Warning,
-                "auto-resume",
-                if *attempt == 0 {
+            ResumeNoticeKind::Resumed { attempt, limit } => {
+                let one = if *attempt == 0 {
                     format!(
                         "{}: wznowiono automatycznie po restarcie kontrolera (poza limitem {limit} prób)",
                         resume.title
@@ -1578,18 +1663,24 @@ impl TaskApp {
                         "{}: wznowiono automatycznie po utracie runnera (próba {attempt}/{limit})",
                         resume.title
                     )
-                },
-                |count| format!("wznowiono automatycznie {count} {}", crate::tui::plural(count, ["zadanie", "zadania", "zadań"])),
-                now,
-            ),
-            ResumeNoticeKind::Exhausted(detail) => self.notifier.push(
-                Severity::Error,
-                format!(
+                };
+                self.record_shown(Severity::Warning, &one, now);
+                self.notifier.push_counted(
+                    Severity::Warning,
+                    "auto-resume",
+                    one,
+                    |count| format!("wznowiono automatycznie {count} {}", crate::tui::plural(count, ["zadanie", "zadania", "zadań"])),
+                    now,
+                );
+            }
+            ResumeNoticeKind::Exhausted(detail) => {
+                let text = format!(
                     "{}: nie udało się wznowić automatycznie: {detail}",
                     resume.title
-                ),
-                now,
-            ),
+                );
+                self.record_shown(Severity::Error, &text, now);
+                self.notifier.push(Severity::Error, text, now);
+            }
         }
     }
 

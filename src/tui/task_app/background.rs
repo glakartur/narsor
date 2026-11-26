@@ -25,7 +25,7 @@ use std::future::Future;
 
 use tokio::task::{AbortHandle, JoinSet};
 
-use super::TaskApp;
+use super::{problems, TaskApp};
 use crate::api::{ApiClient, ClientError, HarnessSelectionSnapshot};
 use crate::controller_protocol::{
     CapabilitiesView, ObserverQueueListResponse, RepositoryListResponse, TaskListResponse,
@@ -173,6 +173,32 @@ pub(super) enum JobKey {
 }
 
 impl JobKey {
+    /// The operation a failed call of this job is recorded under in the
+    /// problem log: the screen or tab, and the task where the key has one.
+    fn label(&self) -> String {
+        match self {
+            Self::Refresh => "task list".to_string(),
+            Self::Detail(task_id, job) => {
+                let place = match job {
+                    DetailJob::Timeline => "Przebieg".to_string(),
+                    DetailJob::ArchivedTimeline => "Historia, Przebieg".to_string(),
+                    DetailJob::Conductor => "Dyrygent".to_string(),
+                    DetailJob::Events => "Zdarzenia".to_string(),
+                    DetailJob::Attempt(attempt) => format!("Rozmowa, attempt {attempt}"),
+                    DetailJob::Drift => "Info".to_string(),
+                    DetailJob::State => "Stan".to_string(),
+                };
+                problems::task_label(&place, task_id)
+            }
+            Self::Open(kind) => format!("open {}", kind.title().trim()),
+            Self::Reload(kind) => format!("reload {}", kind.title().trim()),
+            Self::Branches(repository) => format!("Nowe zadanie — branches of {repository}"),
+            Self::Limit => "task limit".to_string(),
+            Self::Queue(queue) => format!("Queues — queue {queue}"),
+            Self::Usage => "harness usage".to_string(),
+        }
+    }
+
     fn task(&self) -> Option<&str> {
         match self {
             Self::Detail(task_id, _) => Some(task_id),
@@ -211,7 +237,10 @@ impl Background {
         }
         let id = self.next_id;
         self.next_id += 1;
-        let handle = self.jobs.spawn(async move { (id, read.await) });
+        let label = key.label();
+        let handle = self
+            .jobs
+            .spawn(async move { (id, problems::labeled(label, read).await) });
         self.running.insert(key, (id, handle));
         true
     }

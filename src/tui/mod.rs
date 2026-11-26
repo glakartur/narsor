@@ -256,13 +256,14 @@ pub async fn run(
     install_panic_hook();
 
     let styles = Styles::from_env();
-    let mut app = TaskApp::new(client.clone(), connection_name, refresh_interval);
+    let mut app = TaskApp::new(client, connection_name, refresh_interval);
     app.set_spinner(spinner::Spinner::from_env());
     app.detail_mut()
         .set_hyperlinks(detail::hyperlinks_supported(|name| {
             std::env::var(name).ok()
         }));
-    let mut feed = EventFeed::new(client);
+    // The application's client: its failures go to the problem log.
+    let mut feed = EventFeed::new(app.client().clone());
 
     let mut guard = TerminalGuard::enter()?;
     let stop = Arc::new(AtomicBool::new(false));
