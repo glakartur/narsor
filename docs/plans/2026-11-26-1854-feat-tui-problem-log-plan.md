@@ -93,7 +93,7 @@ The TUI already has a trace log (`narsor.log` in the TUI state directory, `src/t
 
 ### Pytania otwarte dla użytkownika
 
-- Q1. **Resolve Before Planning (the plan assumes option 1).** Does this work only collect evidence, or does it also change what the operator sees when a server call fails?
+- Q1. **Resolved: option 1 (evidence only), confirmed by the user on the pull request.** Does this work only collect evidence, or does it also change what the operator sees when a server call fails?
   1. (recommended) Evidence only: add the log and `D`, keep the messages; decide on a fix after the first dumps show the cause.
   2. Also show the kind of failure in the message, for example `brak połączenia z serwerem (przekroczono czas 800 ms)` vs `(połączenie odrzucone)`.
   3. Also change the cause now: give the *Przebieg* read a longer timeout in local mode, in addition to option 2.
