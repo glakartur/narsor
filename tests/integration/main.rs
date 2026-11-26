@@ -20,6 +20,7 @@ mod kubernetes_support;
 mod task_app_support;
 
 mod actions_agent;
+mod api_client_failures;
 mod actions_human;
 mod actions_script;
 mod agent_harness_selection;
