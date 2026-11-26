@@ -89,7 +89,7 @@ This plan covers area 2 of `docs/bugs/NARSOR-1124-001.md`: conductor chat cost i
   - Shares the conductor's chat request path; if area 1 resumes harness sessions, its readings may become session totals instead of single-run deltas. Still to decide in area 1's own brainstorm.
   - Still to decide: whether cost is also shown per thread.
 
-### Założenia do potwierdzenia
+### Assumptions to confirm
 
 1. **This brainstorm covers area 2 (cost) and not area 1 (multi-thread chat).** The bug document holds two independent features. Cost is the smaller one and it fixes lost data, so it goes first. Area 1 needs its own brainstorm.
 2. **Option A (task-level bucket) is chosen.** The bug document recommends it; option B loses cost when no position exists.
@@ -98,7 +98,7 @@ This plan covers area 2 of `docs/bugs/NARSOR-1124-001.md`: conductor chat cost i
 5. **Readings of a chat reply are single-run totals,** because each chat invocation starts a new harness session (`resume_session: None`).
 
 
-### Pytania otwarte dla użytkownika
+### Open questions for the user
 
 None. Both questions of the earlier pass are decided on the merge request; see "Decided on the merge request" under Outstanding Questions.
 
