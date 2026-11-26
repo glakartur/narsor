@@ -114,3 +114,21 @@ The current script-path rule is also tied to the catalogue root (`crates/narsor-
 - `dist/install.sh` — install and update flow; work-mode question (`--local-mode`).
 - `src/cli/init.rs` — embedded example runtime and component scripts.
 - `docs/dev/architecture.md` D81 (KTD8: "a bare string script is a path inside the catalogue"), D83 (environment refresh).
+
+## Deferred / Open Questions
+
+These are review items left for the author. They do not block implementation.
+
+### From 2026-11-26 review
+
+- **Install script move breaks installs whose scripts sit outside components/** — R13 (install script migration), with R4 (script stays inside the runtime directory) and A3 (P1, adversarial and coherence, confidence 75)
+
+  After an update, the installer reports success, but every launch of a local task that seals the task image can fail. Today a script path may point anywhere inside the catalogue, for example `tools/x.sh`. R13 moves only `runtime.yaml` and `components/`, and R4 then refuses any path outside `runtime/`. This defeats the Goal Capsule objective that an existing installation keeps working after the update. A3 tells the operator to move such scripts by hand, but nothing detects the case or warns. R5 already keeps the old layout working, so leaving the old layout in place is a safe outcome.
+
+  Change: The install script moves the old layout only when every bare-string `install` and `version` path in the old `runtime.yaml` starts with `components/`. Otherwise it leaves the old layout unchanged, prints a warning that names the offending entries and says to move those scripts into `runtime/` or make them inline, and exits successfully. Add an acceptance example for this case. If the author prefers that the installer stops with an error instead, say so; the choice decides whether an update can finish unattended.
+
+- **Install script move has no defined timing, failure mode or role scope** — R13 (install script migration) and R6 (both files present is an error) (P2, adversarial, confidence 75)
+
+  The installer puts the new binaries in place before any later step. If the move then stops with an error on a catalogue that has both layouts, the new server is already installed. By R6 it refuses every task launch until the operator fixes the files. If Narsor processes still run, moving files under the old server also makes it lose the task image until restart. The existing data migration step in `dist/install.sh` already handles these cases; R13 states none of them, and does not define what "both layouts exist" means (for example an old `runtime.yaml` next to an existing `runtime/components/`).
+
+  Change: R13 runs for the local and server roles only, in the same position as the existing data migration step. It is skipped with a loud warning and the command to run when Narsor processes still run. A collision at `runtime/runtime.yaml` or `runtime/components/` counts as both layouts existing: the installer prints a loud warning that names both paths and changes nothing. In non-interactive mode it fails only after it prints the manual step.
