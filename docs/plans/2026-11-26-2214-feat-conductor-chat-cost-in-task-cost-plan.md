@@ -23,13 +23,13 @@ execution: code
 
 ### Summary
 
-Every conductor invocation that has no timeline position (today: each reply to a chat message) records its cost and tokens in a task-level conductor bucket. The task cost line in the TUI, the Web UI and the CLI includes this bucket in the conductor part and in the combined total. Per-position usage does not change.
+Every conductor invocation that has no timeline position (today: each reply to a chat message and each generation of the task title) records its cost and tokens in a task-level conductor bucket. The task cost line in the TUI, the Web UI and the CLI includes this bucket in the conductor part and in the combined total. Per-position usage does not change.
 
 ### Problem Frame
 
 The operator can talk to the conductor of a task (the *Dyrygent* tab). Each reply is a real harness run that costs money. Today that cost disappears:
 
-- A chat request has no episode (`crates/narsor-exec/src/conductor/store.rs`, `ConductorRequest::for_chat`).
+- A chat request has no episode (`crates/narsor-exec/src/conductor/store.rs`, `ConductorRequest::for_chat`). The title request (`crates/narsor-exec/src/conductor/title.rs`) has no episode either, so its cost is dropped the same way.
 - The reading tap returns nothing for a request without an episode (`crates/narsor-exec/src/conductor/invoke.rs`, `reading_tap`), so the tokens and the cost of the run are dropped.
 - `apply_usage` (`crates/narsor-exec/src/engine/timeline_file.rs`) only counts readings keyed by an attempt of a timeline position, so there is nowhere to put a reading that belongs to the task and not to a position.
 
@@ -53,7 +53,7 @@ The task cost line (`src/client/task_usage_text.rs`) adds up positions only. A t
 
 - R4. The task cost that the TUI, the Web UI and `narsor-cli` show includes the task-level bucket in the conductor part (`⚡`) and in the combined total (`razem`).
 - R5. Per-position usage (the usage of each timeline position) does not include the task-level bucket and does not change.
-- R6. A task with no chat cost shows the same text as today.
+- R6. A task whose conductor made no run without a timeline position shows the same text as today. A run that generates the task title is such a run, so it adds its cost to the bucket (R1).
 
 - R8. The subagents of a conductor run that has no timeline position add to the task subagent count and subagent tokens, marked as the conductor's. They follow the same rules as the subagents of agents that process task steps. They add no money to the cost, because the conductor's cost already includes them.
 
@@ -91,7 +91,7 @@ This plan covers area 2 of `docs/bugs/NARSOR-1124-001.md`: conductor chat cost i
 1. **This brainstorm covers area 2 (cost) and not area 1 (multi-thread chat).** The bug document holds two independent features. Cost is the smaller one and it fixes lost data, so it goes first. Area 1 needs its own brainstorm.
 2. **Option A (task-level bucket) is chosen.** The bug document recommends it; option B loses cost when no position exists.
 3. **Conductor subagents are added to the task subagent counter, marked as the conductor's.** The person decided this. The conductor's cost from the harness already includes its subagents' cost, so subagents show their part of the cost and do not add to the money total. The same rules apply to agents and subagents that process task steps.
-4. **The bucket is for every conductor run without a position, not only chat.** Today only chat replies have no episode; a future trigger without an episode is then counted too, instead of being lost again.
+4. **The bucket is for every conductor run without a position, not only chat.** Today chat replies and title generation have no episode; both are counted, and a future trigger without an episode is counted too, instead of being lost again.
 5. **Readings of a chat reply are single-run totals,** because each chat invocation starts a new harness session (`resume_session: None`).
 
 ### Pytania otwarte dla użytkownika
@@ -114,3 +114,13 @@ None. Q1 (conductor subagents in the task subagent counter) is answered: option 
 - `crates/narsor-exec/src/engine/timeline_file.rs` — `UsageReading::of_conductor`, `apply_usage`.
 - `crates/narsor-protocol/src/api/timeline.rs` — `conductor_cost_usd` on position usage.
 - `src/client/task_usage_text.rs` — `TaskUsage`, `combined_cost_usd`, `line`.
+
+## Deferred / Open Questions
+
+These entries are review items left for the author. They do not block implementation.
+
+### From 2026-11-26 review
+
+- **The task subagent counter would show only part of the conductor's subagents** — R8 and Scope Boundaries (P2, feasibility and scope-guardian, confidence 75)
+
+  The conductor's gate and failure runs keep their position-keyed readings, and today the code that builds a conductor reading keeps only tokens and cost, so their subagents are dropped. R8 counts subagents only for runs without a timeline position. The operator would then see a task subagent counter that includes chat and title subagents but omits the subagents of gate and failure runs, with no sign that the figure is partial. Decide whether R8 also covers position-keyed conductor runs. If yes, those readings must carry subagent count and tokens, and the matching Scope Boundaries line changes. If no, R8 and the Key Decision must say that the conductor subagent figure covers only runs without a position.
