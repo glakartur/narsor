@@ -15,7 +15,7 @@ execution: code
 - **Objective:** The cost and tokens that the conductor uses to answer the operator's chat messages are part of the task cost that every frontend shows, so the operator sees what a task really cost.
 - **Means:** A task-level conductor bucket in the task's usage data, next to the per-position usage, that the task total adds up.
 - **Product authority:** This plan covers only area 2 of `docs/bugs/NARSOR-1124-001.md` ("Koszt czatu z dyrygentem w koszcie taska"). Area 1 (multi-thread conductor chat) is not active scope; see How This Work Fits Together. The E2BIG fix in the same bug document is already done and is not part of this plan.
-- **Open blockers:** None. One question in "Pytania otwarte dla użytkownika" (conductor subagents in the task subagent counter) has a recommended answer that this plan already assumes; planning can continue on it.
+- **Open blockers:** None. The person answered the question about conductor subagents: they count in the task subagent counter (see Key Decisions and R8).
 
 ---
 
@@ -39,6 +39,7 @@ The task cost line (`src/client/task_usage_text.rs`) adds up positions only. A t
 
 - **Task-level bucket, not attribution to a position.** Chosen over adding the chat cost to the current or last timeline position (option B in the bug document): option B loses the cost when no position exists, for example after the task ends, and it puts operator-driven cost on an agent step that did not cause it. Governs R1, R3.
 - **The conductor's chat cost stays apart from the agents' cost.** The existing rule "conductor use is reported apart from agent use" (`src/client/task_usage_text.rs`, module doc) holds for the new bucket. Governs R4.
+- **Conductor subagents follow the same rules as the subagents of agents that process task steps.** The harness cost of the conductor already includes the cost of its subagents. The subagent count and subagent tokens only show which part of that cost the subagents used. They do not add money. Decided by the person on the review of this plan. Governs R8.
 
 ### Requirements
 
@@ -53,6 +54,8 @@ The task cost line (`src/client/task_usage_text.rs`) adds up positions only. A t
 - R4. The task cost that the TUI, the Web UI and `narsor-cli` show includes the task-level bucket in the conductor part (`⚡`) and in the combined total (`razem`).
 - R5. Per-position usage (the usage of each timeline position) does not include the task-level bucket and does not change.
 - R6. A task with no chat cost shows the same text as today.
+
+- R8. The subagents of a conductor run that has no timeline position add to the task subagent count and subagent tokens, marked as the conductor's. They follow the same rules as the subagents of agents that process task steps. They add no money to the cost, because the conductor's cost already includes them.
 
 **Compatibility**
 
@@ -87,20 +90,19 @@ This plan covers area 2 of `docs/bugs/NARSOR-1124-001.md`: conductor chat cost i
 
 1. **This brainstorm covers area 2 (cost) and not area 1 (multi-thread chat).** The bug document holds two independent features. Cost is the smaller one and it fixes lost data, so it goes first. Area 1 needs its own brainstorm.
 2. **Option A (task-level bucket) is chosen.** The bug document recommends it; option B loses cost when no position exists.
-3. **Conductor subagents are not added to the task subagent counter.** This keeps the current rule that conductor use is apart from agent use. The conductor's cost from the harness already includes its subagents' cost, so the money total is complete without this. See the open question below.
+3. **Conductor subagents are added to the task subagent counter, marked as the conductor's.** The person decided this. The conductor's cost from the harness already includes its subagents' cost, so subagents show their part of the cost and do not add to the money total. The same rules apply to agents and subagents that process task steps.
 4. **The bucket is for every conductor run without a position, not only chat.** Today only chat replies have no episode; a future trigger without an episode is then counted too, instead of being lost again.
 5. **Readings of a chat reply are single-run totals,** because each chat invocation starts a new harness session (`resume_session: None`).
 
 ### Pytania otwarte dla użytkownika
 
-1. **Should the conductor's subagents count in the task's subagent counter?** (Deferred to Planning: the plan assumes option a until the person answers.)
-   - a. (Recommended) No. Conductor subagents stay out of the task subagent counter; their cost is already inside the conductor's cost.
-   - b. Yes. Conductor subagents add to the task subagent count and subagent tokens, marked as the conductor's.
+None. Q1 (conductor subagents in the task subagent counter) is answered: option b. See R8.
 
 ### Outstanding Questions
 
 **Deferred to Planning**
 
+- How the bucket stores the conductor's subagent count and subagent tokens, and how the TUI, the Web UI and the CLI show them marked as the conductor's.
 - Where the task-level bucket lives (in `timeline.json` next to `positions`, or in the readings store keyed by a task-level key) and how the protocol carries it to frontends.
 - Whether a conductor request whose episode has no matching timeline position also loses its reading today, and if so, whether R1 covers it through the same bucket.
 
