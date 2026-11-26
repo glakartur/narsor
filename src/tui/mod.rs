@@ -46,6 +46,7 @@ pub mod input_form;
 pub mod keymap;
 pub mod paths;
 pub mod queues;
+pub mod quiet_backend;
 pub mod refresh;
 pub mod scroll;
 pub mod selection;
@@ -75,6 +76,7 @@ use tokio::sync::mpsc;
 
 use crate::api::ApiClient;
 
+use quiet_backend::QuietBackend;
 use style::Styles;
 use task_app::{detail, layout, EventFeed, TaskApp};
 
@@ -89,7 +91,7 @@ pub(crate) fn plural(count: usize, forms: [&'static str; 3]) -> &'static str {
 }
 
 /// The terminal this interface draws on.
-pub type Tui = Terminal<CrosstermBackend<Stdout>>;
+pub type Tui = Terminal<QuietBackend<CrosstermBackend<Stdout>>>;
 
 /// How long the key reader blocks before looking at the stop flag again.
 const KEY_POLL_INTERVAL: Duration = Duration::from_millis(120);
@@ -182,7 +184,7 @@ impl TerminalGuard {
 
     fn take_over() -> io::Result<Self> {
         let stdout = take_screen()?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        let terminal = Terminal::new(QuietBackend::new(CrosstermBackend::new(stdout)))?;
         Ok(Self { terminal })
     }
 
