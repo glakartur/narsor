@@ -78,7 +78,7 @@ chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 # "env": `narsor-controller` reads its settings from flags or environment
 # variables (a Deployment sets env, an operator types flags).
-clap = { version = "4.6.7", features = ["derive", "env"] }
+clap = { version = "4.6.10", features = ["derive", "env"] }
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 
@@ -113,7 +113,7 @@ narsor-observer-worker = { path = "crates/narsor-observer-worker" }
 # ES256 keys for the in-process mock OIDC issuer of tests/auth.rs. Already in
 # the tree through jsonwebtoken's `rust_crypto`.
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
-jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto"] }
 rand = "0.10"
 # Reading the backup archive of narsor-migrate (tests/integration/layout_migration.rs).
 tar = "0.4"

@@ -8,7 +8,7 @@ narsor-exec = { path = "../narsor-exec", features = ["copilot-sdk"] }
 narsor-controller-client = { path = "../narsor-controller-client" }
 narsor-protocol = { path = "../narsor-protocol" }
 bytes = "1"
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.10", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

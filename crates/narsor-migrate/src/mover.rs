@@ -33,8 +33,6 @@ use std::os::unix::fs::{
 };
 use std::path::{Path, PathBuf};
 
-use filetime::FileTime;
-
 pub use narsor_shared::config::old_layout::LAYOUT_MARKER_FILE as MARKER_FILE;
 
 /// Suffix of the copy being made across filesystems, beside the target.
@@ -276,12 +274,11 @@ fn retry_writable<T>(
     }
 }
 
-/// The times of `metadata` as `filetime` takes them.
-fn times(metadata: &fs::Metadata) -> (FileTime, FileTime) {
-    (
-        FileTime::from_last_access_time(metadata),
-        FileTime::from_last_modification_time(metadata),
-    )
+/// The access and modification times of `metadata`, to apply to a copy.
+fn times(metadata: &fs::Metadata) -> io::Result<fs::FileTimes> {
+    Ok(fs::FileTimes::new()
+        .set_accessed(metadata.accessed()?)
+        .set_modified(metadata.modified()?))
 }
 
 /// The permission bits a copy keeps: read, write and execute only.
@@ -299,12 +296,11 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
     // Without the set-id and sticky bits: a copy belongs to whoever runs
     // the tool, so a set-id bit kept on it would grant that user's rights.
     let mode = metadata.permissions().mode() & COPIED_MODE_BITS;
-    let (atime, mtime) = times(&metadata);
+    let times = times(&metadata).map_err(|error| at(source, error))?;
     if file_type.is_symlink() {
         let link = fs::read_link(source).map_err(|error| at(source, error))?;
         std::os::unix::fs::symlink(link, target).map_err(|error| at(target, error))?;
-        return filetime::set_symlink_file_times(target, atime, mtime)
-            .map_err(|error| at(target, error));
+        return fs::set_times_nofollow(target, times).map_err(|error| at(target, error));
     }
     if file_type.is_dir() {
         fs::DirBuilder::new()
@@ -331,7 +327,7 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
     }
     fs::set_permissions(target, fs::Permissions::from_mode(mode))
         .map_err(|error| at(target, error))?;
-    filetime::set_file_times(target, atime, mtime).map_err(|error| at(target, error))
+    fs::set_times(target, times).map_err(|error| at(target, error))
 }
 
 /// Checks that `copy` holds what `source` holds: the same entries (sockets,
@@ -436,9 +432,12 @@ mod tests {
         for mover in [Mover::new(), Mover::copying()] {
             let temp = Temp::new();
             let source = private_tree(&temp.0);
-            let old_time = FileTime::from_unix_time(1_600_000_000, 0);
-            filetime::set_file_times(source.join("nested/data"), old_time, old_time).unwrap();
-            filetime::set_file_times(source.join("nested"), old_time, old_time).unwrap();
+            let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+            let old_times = fs::FileTimes::new()
+                .set_accessed(old_time)
+                .set_modified(old_time);
+            fs::set_times(source.join("nested/data"), old_times).unwrap();
+            fs::set_times(source.join("nested"), old_times).unwrap();
             let target = temp.0.join("new").join("secrets");
 
             assert_eq!(mover.move_entry(&source, &target).unwrap(), Moved::Moved);
