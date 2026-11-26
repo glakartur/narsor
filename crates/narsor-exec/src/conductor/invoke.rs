@@ -64,10 +64,10 @@ use crate::config::{agent_args_for, AgentArgs};
 use crate::domain::{ChoiceDefinition, WorkflowDefinition, WorkflowExecution, WorkspaceAccess};
 use crate::engine::actions::agent::{DefaultHarnessSource, BUILT_IN_HARNESS};
 use crate::engine::actions::answer::AnswerShape;
+use crate::engine::actions::harness::request::empty_dir;
 use crate::engine::actions::harness::{
     AgentRequest, AgentRunEnding, ContextFiles, HarnessRegistry, RunObservers, CLAUDE_CODE, CODEX,
 };
-use crate::engine::actions::harness::request::empty_dir;
 use crate::engine::actions::session::{ConversationSink, ReadingTap};
 use crate::engine::timeline_file::{ReadingSink, UsageReading};
 use crate::persistence::{ExecutionStore, WorkPaths};

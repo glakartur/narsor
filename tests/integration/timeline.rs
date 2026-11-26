@@ -918,7 +918,9 @@ fn a_timeline_file_in_the_wrong_state_is_made_again() {
 /// it, also once the log moves on and the timeline is built again.
 #[test]
 fn the_session_an_attempt_reported_while_it_ran_is_on_its_position() {
-    use narsor_engine::engine::timeline_file::{record_session, reported_sessions, ReportedSession};
+    use narsor_engine::engine::timeline_file::{
+        record_session, reported_sessions, ReportedSession,
+    };
 
     let store = scratch("in-flight-session");
     let mut log = Log::new();
@@ -947,13 +949,19 @@ fn the_session_an_attempt_reported_while_it_ran_is_on_its_position() {
     record_session(&store, EXEC, "a1", session.clone()).unwrap();
 
     let during = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Running, &none);
-    assert_eq!(during.positions[0].harness_session_id.as_deref(), Some("hs-cut"));
+    assert_eq!(
+        during.positions[0].harness_session_id.as_deref(),
+        Some("hs-cut")
+    );
     assert_eq!(during.positions[0].usage.unwrap().cost_usd, Some(0.1));
 
     log.push(EventData::WorkflowPaused {
         reason: "the workload was lost".to_string(),
     });
     let rebuilt = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Unknown, &none);
-    assert_eq!(rebuilt.positions[0].harness_session_id.as_deref(), Some("hs-cut"));
+    assert_eq!(
+        rebuilt.positions[0].harness_session_id.as_deref(),
+        Some("hs-cut")
+    );
     assert_eq!(reported_sessions(&store, EXEC).get("a1"), Some(&session));
 }

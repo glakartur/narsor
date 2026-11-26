@@ -180,7 +180,16 @@ impl HarnessAdapter for OpenCodeAdapter {
         Box::pin(async move {
             let (command, started) = self.command_line(request)?;
             let parser = self.stream_parser(request.answer_shape);
-            cli::run(OPENCODE, command, started, message(request), request, parser, &observers).await
+            cli::run(
+                OPENCODE,
+                command,
+                started,
+                message(request),
+                request,
+                parser,
+                &observers,
+            )
+            .await
         })
     }
 

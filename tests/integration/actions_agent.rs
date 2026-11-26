@@ -1010,8 +1010,7 @@ async fn the_session_a_harness_reports_is_kept_before_the_step_ends() {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let reported = loop {
-        if let Some(session) = reported_sessions(&store, EXECUTION_ID).remove(ACTION_EXECUTION_ID)
-        {
+        if let Some(session) = reported_sessions(&store, EXECUTION_ID).remove(ACTION_EXECUTION_ID) {
             break session;
         }
         assert!(

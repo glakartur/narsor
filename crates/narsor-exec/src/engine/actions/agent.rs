@@ -48,9 +48,7 @@ use super::answer::{self, AnswerShape, ChoiceAnswer};
 use super::harness::{FinalAnswer, HarnessRegistry, HarnessRun};
 use super::human::HumanInputRequest;
 use super::script::truncate;
-use super::session::{
-    resume_session, ConversationSink, SessionEnd, SessionRunner, SessionStart,
-};
+use super::session::{resume_session, ConversationSink, SessionEnd, SessionRunner, SessionStart};
 use super::{ActionExecutor, ActionOutcome, ActionRequest, StepContract, SuspendedAction};
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, AgentActionConfig, AgentSession, WorkspaceAccess,

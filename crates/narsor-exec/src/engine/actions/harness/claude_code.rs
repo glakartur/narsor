@@ -277,7 +277,16 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         Box::pin(async move {
             let (command, started) = self.command_line(request)?;
             let parser = self.stream_parser(request.answer_shape);
-            cli::run(CLAUDE_CODE, command, started, request.prompt.clone(), request, parser, &observers).await
+            cli::run(
+                CLAUDE_CODE,
+                command,
+                started,
+                request.prompt.clone(),
+                request,
+                parser,
+                &observers,
+            )
+            .await
         })
     }
 

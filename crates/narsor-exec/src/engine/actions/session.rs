@@ -44,8 +44,8 @@ use crate::engine::timeline_file::ReadingSink;
 
 use super::answer::AnswerShape;
 use super::harness::{
-    AgentRequest, AgentRunEnding, FinishedRun, HarnessAdapter, HarnessRegistry, HarnessRun, HarnessStreamParser,
-    RunObservers, RunStarted, FINAL_ANSWER_GRACE,
+    AgentRequest, AgentRunEnding, FinishedRun, HarnessAdapter, HarnessRegistry, HarnessRun,
+    HarnessStreamParser, RunObservers, RunStarted, FINAL_ANSWER_GRACE,
 };
 use super::human::{HumanInputRequest, PermissionDenialDetails, PermissionRequestDetails};
 use super::scope::StepScope;
