@@ -46,7 +46,9 @@ pub mod input_form;
 pub mod keymap;
 pub mod paths;
 pub mod queues;
+pub mod quiet_backend;
 pub mod refresh;
+pub mod screen;
 pub mod scroll;
 pub mod selection;
 pub mod spinner;
@@ -69,12 +71,11 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::api::ApiClient;
 
+use screen::Screen;
 use style::Styles;
 use task_app::{detail, layout, EventFeed, TaskApp};
 
@@ -87,9 +88,6 @@ pub(crate) fn plural(count: usize, forms: [&'static str; 3]) -> &'static str {
         _ => forms[2],
     }
 }
-
-/// The terminal this interface draws on.
-pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// How long the key reader blocks before looking at the stop flag again.
 const KEY_POLL_INTERVAL: Duration = Duration::from_millis(120);
@@ -166,7 +164,9 @@ pub fn restore_count() -> usize {
 /// Covers the normal exit and the unwinding one; [`install_panic_hook`] covers
 /// the panic that never reaches this frame.
 pub struct TerminalGuard {
-    terminal: Tui,
+    /// `None` only while dropping: the screen's last writes must end before
+    /// the terminal is restored.
+    screen: Option<Screen>,
 }
 
 impl TerminalGuard {
@@ -182,13 +182,17 @@ impl TerminalGuard {
 
     fn take_over() -> io::Result<Self> {
         let stdout = take_screen()?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        Ok(Self { terminal })
+        let screen = Screen::new(stdout)?;
+        Ok(Self {
+            screen: Some(screen),
+        })
     }
 
-    /// The terminal to draw on.
-    pub fn terminal(&mut self) -> &mut Tui {
-        &mut self.terminal
+    /// The screen to draw on.
+    pub fn screen(&mut self) -> &mut Screen {
+        self.screen
+            .as_mut()
+            .expect("the screen lives as long as its guard")
     }
 }
 
@@ -238,6 +242,7 @@ pub fn arm_bracketed_paste(out: &mut impl Write) {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        drop(self.screen.take());
         restore_terminal();
     }
 }
@@ -246,7 +251,9 @@ impl Drop for TerminalGuard {
 ///
 /// Keys are read on a dedicated thread because `crossterm` reads block, and
 /// are forwarded over a channel so the loop can wait on keys, control-plane
-/// events and the next due read at once. `connection_name` is what the header
+/// events and the next due read at once. Frames are written on another
+/// thread too ([`screen`]): a terminal that stops reading never stops the
+/// loop. `connection_name` is what the header
 /// calls the server until the server says its own name.
 pub async fn run(
     client: ApiClient,
@@ -265,6 +272,7 @@ pub async fn run(
     let mut feed = EventFeed::new(app.client().clone());
 
     let mut guard = TerminalGuard::enter()?;
+    let written = guard.screen().written();
     let stop = Arc::new(AtomicBool::new(false));
     let (keys_tx, mut keys_rx) = mpsc::unbounded_channel();
     let reader_stop = Arc::clone(&stop);
@@ -276,7 +284,7 @@ pub async fn run(
 
     while !app.should_quit() {
         guard
-            .terminal()
+            .screen()
             .draw(|frame| layout::render(frame, &mut app, &styles, Instant::now()))?;
 
         if first_read_pending {
@@ -302,6 +310,9 @@ pub async fn run(
                 None => break,
             },
             received = feed.next() => app.on_stream(received),
+            // The terminal took the last frame: what was drawn meanwhile goes
+            // with the next draw.
+            _ = written.notified() => {}
             Some(outcome) = app.next_outcome(), if app.has_running() => app.on_outcome(outcome),
             _ = tokio::time::sleep(wait) => app.advance_animation(),
         }
