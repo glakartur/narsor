@@ -14,8 +14,8 @@ execution: code
 
 - **Objective:** When the TUI shows a server problem (for example `nie udało się wczytać przebiegu: brak połączenia z serwerem` on *Przebieg*), the operator can save, with one key, a file that tells what actually failed in the last 30 minutes, so the cause can be found instead of guessed.
 - **Means:** An in-memory problem log inside the TUI process, with entries older than 30 minutes dropped automatically, and a global key `D` that writes the current log to a temporary file.
-- **Product authority:** This plan covers the `narsor` TUI only. The server, the protocol, the Web UI and `narsor-cli` are not active scope. A fix of the root cause of the failed reads is not active scope (see Q1).
-- **Open blockers:** Q1 (does this work also change the visible message, or only collect evidence). The plan is written for the safest answer (evidence only); planning can start on it.
+- **Product authority:** This plan covers the `narsor` TUI only. The server, the protocol, the Web UI and `narsor-cli` are not active scope. A fix of the root cause of the failed reads is not active scope (Q1 settled this: evidence only).
+- **Open blockers:** None. Q1 (does this work also change the visible message, or only collect evidence) is resolved: evidence only.
 
 ---
 
@@ -38,7 +38,7 @@ The TUI already has a trace log (`narsor.log` in the TUI state directory, `src/t
 - **Always on, in memory, not on disk.** The log costs nothing on disk and needs no configuration; the operator writes it out only when they need it. Governs R1, R4. (session-settled: user-directed — chosen over a file log: the request asks for memory with a dump on demand)
 - **30 minutes by age.** Entries older than 30 minutes are dropped. Governs R4. (session-settled: user-directed — the request names 30 minutes)
 - **Global key `D` writes to a temporary file.** Any temporary location is acceptable. Governs R6, R7. (session-settled: user-directed — the request names `D` and a temporary file)
-- **Diagnosis first, visible messages unchanged.** This work collects evidence; it does not change what the screens say or how the client retries or times out. Governs R10. (assumption — see Q1)
+- **Diagnosis first, visible messages unchanged.** This work collects evidence; it does not change what the screens say or how the client retries or times out. Governs R10. (user-confirmed — Q1, option 1)
 - **Separate from the existing `narsor.log`.** The problem log does not depend on the configured log level and does not replace the trace log. Governs R1.
 
 ### Requirements
@@ -56,7 +56,7 @@ The TUI already has a trace log (`narsor.log` in the TUI state directory, `src/t
 
 **Writing the dump**
 
-- R6. Pressing `D` on any screen writes the current log to a new file in the system temporary directory and shows the full path of the file in a notification.
+- R6. Pressing `D` on any screen writes the current log to a new file in the system temporary directory and shows the full path of the file in a notification. The operator must be able to read the whole path: on a narrow terminal the TUI may shorten the directory part but never the file name, and a later notification does not replace the path within the normal notification lifetime.
 - R7. `D` does not act while a text field has focus (filter, forms, dialogs with text input); there `D` types the letter as before.
 - R8. When the log is empty, `D` still writes a file with the header and a line that says no problem was recorded, so the operator knows the key worked.
 - R9. When the file cannot be written, the TUI shows a notification with the reason and keeps the log in memory unchanged.
@@ -83,12 +83,12 @@ The TUI already has a trace log (`narsor.log` in the TUI state directory, `src/t
 
 ### Założenia do potwierdzenia
 
-- The work only collects evidence; the visible messages stay the same (Q1 asks about this).
+- The work only collects evidence; the visible messages stay the same (confirmed by the user in Q1).
 - "Every problem" means every failed server call (also refusals such as 404 or 409, not only transport failures) and every error message the TUI shows. Successful calls are not recorded.
 - "Any temporary file" means a new file with a unique name in the system temporary directory (`$TMPDIR`, else `/tmp`), readable only by the owner, because it can contain task names and repository URLs. Each `D` writes a new file; old files are not removed by the TUI.
 - `D` is global except while a text field has focus (R7). Today `D` has no other meaning in the TUI (no binding for `Char('D')` found in `src/tui`).
 - The 30-minute limit counts from the time each entry was recorded. The memory bound in R4 (for example a maximum number of entries) is a planning choice.
-- The problem log is independent of the existing `narsor.log`. When a log level is configured, the problem entries may also go to `narsor.log`; planning decides.
+- The problem log is independent of the existing `narsor.log`. The problem log writes nothing to disk except the file that `D` creates; problem entries do not go to `narsor.log`.
 - The dump is plain text, readable by a person and attachable to a ticket.
 
 ### Pytania otwarte dla użytkownika
