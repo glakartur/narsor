@@ -100,14 +100,14 @@ This plan covers area 2 of `docs/bugs/NARSOR-1124-001.md`: conductor chat cost i
 
 ### Pytania otwarte dla użytkownika
 
-- Q1 (decided: option b, answered on the merge request). **Do the subagents of the conductor's gate and failure runs also count in the task subagent figure?** (Section: Requirements, R8, and Scope Boundaries.) Today R8 counts the subagents of conductor runs without a timeline position only. Gate and failure runs keep their position-keyed readings, so their subagents would be missing from the figure with no sign that it is partial.
-  - **b (recommended):** Yes. Every conductor run counts its subagents the same way, so the figure is complete and matches "the same rules as the subagents of agents". The plan already keeps the subagent stats of every conductor run (KTD4), so this adds only U6. R8 and the Scope Boundaries line about gate decisions change to say so.
-  - **a:** No. R8 stays as written, and R8 and the Key Decision say that the conductor subagent figure covers chat and title runs only. U6 is not built.
-- Q2 (decided: option a, answered on the merge request). **Where does the line show the conductor's subagents?** (Section: Requirements, R8; Planning Contract, KTD5.) R8 says "add to the task subagent count ... marked as the conductor's".
-  - **a (recommended):** In a subagent block of its own inside the conductor group: `⚡ $0.15 ↑2k ↓400 (👥 1 ↕3k)`. The agents' `👥` block does not change. This keeps the Key Decision "the conductor's chat cost stays apart from the agents' cost".
-  - **b:** Added into the agents' `👥` count and tokens, with a conductor mark next to the number (for example `👥 3 (⚡1)`). One combined counter, but the agents' figures then include conductor use.
+None. Both questions of the earlier pass are decided on the merge request; see "Decided on the merge request" under Outstanding Questions.
 
 ### Outstanding Questions
+
+**Decided on the merge request**
+
+- Q1, option b. **Do the subagents of the conductor's gate and failure runs also count in the task subagent figure?** Yes. Every conductor run counts its subagents the same way. R8 and Scope Boundaries say so, and U6 builds it.
+- Q2, option a. **Where does the line show the conductor's subagents?** In a subagent block of its own inside the conductor group: `⚡ $0.15 ↑2k ↓400 (👥 1 ↕3k)`. The agents' `👥` block does not change. KTD5, U4 and U5 build it.
 
 **Resolved in planning**
 
@@ -130,14 +130,14 @@ This plan covers area 2 of `docs/bugs/NARSOR-1124-001.md`: conductor chat cost i
 
 ## Planning Contract
 
-Product Contract preservation: Product Contract unchanged. The three "Deferred to Planning" questions are resolved in place; the review item on R8 moved to "Pytania otwarte dla użytkownika" as Q1, and Q2 was added.
+Product Contract preservation: The Product Contract changed only where the merge request decided Q1: R8 and Scope Boundaries now cover gate and failure runs. The three "Deferred to Planning" questions are resolved in place. Q1 and Q2 are decided and listed under Outstanding Questions.
 
 ### Key Technical Decisions
 
 - KTD1. **A run without a position writes its reading under a reserved key in the existing `readings` map of `timeline.json`.** The key is `conductor:<invocation_id>`. Attempt ids are UUIDs, so the colon prefix cannot match one. Chosen over a new top-level field in `TimelineFile` with a new `ReadingSink` method: the reserved key keeps the sink trait, `ReadingTap`, the file lock and the atomic write as they are, and an older binary that reads the file ignores the extra keys. One key per invocation keeps each run's reading apart, so `absorb` never merges two runs. Governs R1, R2, R3.
 - KTD2. **The bucket is computed, not stored: `apply_usage` adds the conductor part of every reading whose key is not an attempt of any position.** This one rule covers chat, title, a future trigger without an episode, and an episode that matches no position (Outstanding Questions). `apply_usage` stays pure, and `record_reading` and `current_timeline` already call it, so the bucket is current on both paths. The agent part of such a reading is ignored, as today. A reading of an attempt the cached timeline does not show yet counts in the bucket until the timeline is rebuilt, then moves to its position; the task total does not change. Governs R1, R5, R7.
 - KTD3. **The protocol carries the bucket as an optional field on `Timeline`: `conductor_usage`, of a new type `ConductorUsage` (tokens, cost, subagent stats).** It uses `#[serde(default, skip_serializing_if = "Option::is_none")]`. `Timeline` already travels from the runner snapshot (`crates/narsor-runner/src/runner/snapshot.rs`) through the controller (`RunnerSnapshot`, `TimelineResponse`, the archived task record) to the TUI, the CLI and the Web UI, so no new endpoint is needed. A timeline without the field reads as `None`. Chosen over reusing `PositionUsage`, whose subagent fields mean the agent's subagents. Governs R3, R4, R7.
-- KTD4. **`UsageReading::of_conductor` keeps the run's `subagent_stats` in a new field `conductor_subagent_stats`, for every conductor run.** `absorb` adds the field (each conductor run is its own harness process and reports one `RunResult`), and `is_empty` counts it. The field is stored for gate and failure runs too, because stored readings cannot be filled in later. U3 reads it only for the bucket, as R8 says. Q1 "b" adds U6, which also reads it on positions. Governs R8.
+- KTD4. **`UsageReading::of_conductor` keeps the run's `subagent_stats` in a new field `conductor_subagent_stats`, for every conductor run.** `absorb` adds the field (each conductor run is its own harness process and reports one `RunResult`), and `is_empty` counts it. The field is kept for gate and failure runs too. U3 reads it for the bucket, and U6 reads it on positions (Q1 "b"). `absorb` adds it with `SubagentStats::plus`, not with the "later replaces earlier" rule of the agent's `subagent_stats`: the readings under one key come from different conductor runs (several gate decisions of one attempt). The field is not part of `has_agent_use`, so a conductor reading still does not change the agent's basis or harness. Governs R8.
 - KTD5. **Frontends sum the whole timeline, not only its positions.** `task_usage_text::sum` and the JS `sumUsage` take the timeline and add `conductor_usage` to the conductor part (`⚡`) and to `razem`. The conductor's subagents get their own block in the conductor group (Q2 "a"). The block shows the subagent count (`spawned`) and the tokens (`↕`), and never a cost: the harness cost already includes them (Key Decisions). Governs R4, R6, R8.
 
 ### High-Level Technical Design
@@ -252,7 +252,7 @@ flowchart TB
   - A timeline whose positions report nothing but whose bucket has $0.05 gives a line `razem $0.05 · ⚡ $0.05`.
   - Covers R8. A bucket with `subagent_stats { spawned: 2, tokens: 3000 }` gives `(👥 2 ↕3k)` in the conductor group, and the agents' `👥` block does not change. With `with_subagents = false` the block is left out.
   - Covers AE5. A timeline without `conductor_usage` gives exactly the line the existing tests expect today.
-- **Verification:** Scenarios pass; the TUI and CLI callers compile with the new signature and show the line for the live and the archived task.
+- **Verification:** Scenarios pass; the TUI and CLI callers compile with the new signature. The TUI shows the line for the live and the archived task. The CLI shows it for the archived task, which is the only case where `narsor-cli` shows a usage line today (`src/cli/task_text.rs`, archived branch); do not add a usage line to the live CLI branch.
 
 ### U5. Show the bucket in the Web UI
 
@@ -263,11 +263,12 @@ flowchart TB
   - `crates/narsor-web/ui/js/text.js` (`sumUsage`, `usageLine`, `archivedRun`)
   - `crates/narsor-web/ui/js/ui/details.js` (caller near line 110)
   - `crates/narsor-web/ui-tests/text.test.mjs`
-- **Approach:** `sumUsage` takes the timeline and adds `timeline.conductor_usage` to `conductor` and `conductorCost`. It also keeps the conductor's subagent count and tokens. `usageLine` puts `(◈ n ↕tokens)` after the `⚡` parts, in the Web UI's own subagent icon. A sum that has only a bucket is not `null`.
+- **Approach:** `sumUsage` takes the timeline and adds `timeline.conductor_usage` to `conductor` and `conductorCost`. It also keeps the conductor's subagent count from `subagent_stats.spawned` (the bucket has no `subagent_count`) and the tokens from `subagent_stats.tokens`. `usageLine` puts `(◈ n ↕tokens)` after the `⚡` parts, in the Web UI's own subagent icon. `text.js` has no `↕` formatter today: add one next to `tokens`, with the same `scaled` rule. A count or tokens at zero is left out, as in U4. A sum that has only a bucket is not `null`.
 - **Patterns to follow:** the existing `sumUsage`/`usageLine` tests in `text.test.mjs`.
 - **Test scenarios:**
   - Covers AE1. The same numbers as U4 give `razem $1.15` and `⚡ $0.15`.
   - A timeline with no position usage and a bucket of $0.05 gives `razem $0.05 · ⚡ $0.05`.
+  - Covers R8. A bucket of $0.05 with `subagent_stats { spawned: 2, tokens: 3000 }` gives `⚡ $0.05 (◈ 2 ↕3k)`, and the agents' `◈` block does not change.
   - Covers AE5. A timeline without `conductor_usage` gives the same string as before.
 - **Verification:** `node --test crates/narsor-web/ui-tests/*.mjs` passes.
 
@@ -281,10 +282,11 @@ flowchart TB
   - `crates/narsor-exec/src/engine/timeline_file.rs`
   - `src/client/task_usage_text.rs`, `crates/narsor-web/ui/js/text.js` and their tests
   - `tests/integration/timeline.rs`
-- **Approach:** `apply_usage` adds `conductor_subagent_stats` of a position's readings to a new optional `PositionUsage.conductor_subagent_stats`. `sum` and `sumUsage` add it to the conductor's subagent figures.
+- **Approach:** `apply_usage` adds `conductor_subagent_stats` of a position's readings to a new optional `PositionUsage.conductor_subagent_stats` (`#[serde(default, skip_serializing_if = "Option::is_none")]`). A position whose readings have only this field still gets a `PositionUsage`. `sum` and `sumUsage` add it to the conductor's subagent figures. The per-step views do not read it: the TUI step cells (`subagent_count`, `subagent_total` in `src/client/task_usage_text.rs`) and the Web UI `stepDetails` keep showing the agent's subagents only. Thus R5 holds for what each step shows.
 - **Test scenarios:**
   - A gate reading on `d1` with 1 spawned subagent and a chat reading with 2 give a conductor subagent count of 3 in the task line.
-  - The agent's `subagent_count` of `d1` does not change.
+  - The agent's `subagent_count` and `subagent_stats` of `d1` do not change, and the step line of `d1` (TUI cells and Web UI `stepDetails`) is the same as without the gate's subagents.
+  - Two gate readings absorbed into the attempt key of `d1`, with 1 and 2 spawned conductor subagents, give 3 (they add up and do not replace each other; KTD4).
 - **Verification:** Scenarios pass; a position without the new field reads back as before.
 
 ---
