@@ -567,9 +567,7 @@ pub(crate) mod tests {
     fn a_new_run_leaves_only_its_own_files_and_lists_no_empty_one() {
         let root = TestDir::new();
         let dir = root.path().join("context");
-        context(&dir, &[("old.md", "old")])
-            .prepare()
-            .unwrap();
+        context(&dir, &[("old.md", "old")]).prepare().unwrap();
 
         let block = context(&dir, &[("new.md", "new"), ("empty.md", "")])
             .prepare()

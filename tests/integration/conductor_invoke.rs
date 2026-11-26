@@ -19,9 +19,9 @@ use engine_support::{fixtures, workflow, Harness};
 use narsor_engine::conductor::snapshot::{render, AttemptConversation, SnapshotInput};
 use narsor_engine::conductor::{
     prompt::{conductor_prompt, conductor_prompt_for},
-    Autopilot, ChatEntryKind, ConductorAccess, ConductorRegistry,
-    ConductorResponse, ConductorStore, Decision, DecisionKind, HarnessInvoker, Invocation,
-    InvocationOutcome, LiveHarness, QueuedRequest, ResponseError,
+    Autopilot, ChatEntryKind, ConductorAccess, ConductorRegistry, ConductorResponse,
+    ConductorStore, Decision, DecisionKind, HarnessInvoker, Invocation, InvocationOutcome,
+    LiveHarness, QueuedRequest, ResponseError,
 };
 use narsor_engine::domain::{
     ArtifactReference, ChoiceDefinition, ConductorOutcome, ConductorPurpose, ConductorTrigger,
@@ -448,7 +448,9 @@ async fn a_recorded_conversation_reaches_its_context_file_whole() {
         .conversation_store(&fixture.execution_id)
         .writer("attempt-recorded")
         .unwrap();
-    writer.append_narsor("prompt: write the parser", &[]).unwrap();
+    writer
+        .append_narsor("prompt: write the parser", &[])
+        .unwrap();
     let long_line = "tool output ".repeat(50_000);
     writer
         .append(ConversationSource::Stdout, long_line.as_bytes(), &[])
@@ -492,12 +494,19 @@ async fn a_prompt_too_long_for_one_argument_reaches_claude_on_stdin() {
         ..fixture.rescue()
     };
 
-    let outcome = fixture.invoker("claude-code").invoke_once(&invocation).await;
+    let outcome = fixture
+        .invoker("claude-code")
+        .invoke_once(&invocation)
+        .await;
 
     answered(outcome, ConductorPurpose::ChooseOutput);
     assert!(fixture.claude.stdin(1).contains(&marker));
     assert!(
-        fixture.claude.args(1).iter().all(|arg| arg.len() < 128 * 1024),
+        fixture
+            .claude
+            .args(1)
+            .iter()
+            .all(|arg| arg.len() < 128 * 1024),
         "no argument may reach the kernel's per-argument limit"
     );
 }
@@ -612,7 +621,10 @@ async fn opencode_runs_in_an_empty_scratch_directory_and_is_shown_the_artifacts(
     let plan = invoker
         .context_dir(&fixture.execution_id)
         .join("artifacts/001-plan");
-    assert!(prompt.contains(&format!("`{}`", plan.display())), "{prompt}");
+    assert!(
+        prompt.contains(&format!("`{}`", plan.display())),
+        "{prompt}"
+    );
     assert!(prompt.contains("a scratch directory"), "{prompt}");
     assert!(fs::read_to_string(plan)
         .unwrap()
@@ -1303,8 +1315,11 @@ fn long_task(purpose: ConductorPurpose) -> SnapshotInput {
             state_id: if index < 2 { "review" } else { "implement" }.to_string(),
             attempt_id: format!("attempt-{index}"),
             current: index >= 2,
-            content: format!("[stdout] attempt {index}\n{}", "tool output\n".repeat(20_000))
-                .into(),
+            content: format!(
+                "[stdout] attempt {index}\n{}",
+                "tool output\n".repeat(20_000)
+            )
+            .into(),
         })
         .collect();
     SnapshotInput {
@@ -1345,11 +1360,16 @@ fn a_gate_summary_keeps_conversations_and_events_out_of_the_prompt_and_uncut() {
     assert!(!snapshot.core.contains("tool output"));
     assert!(!snapshot.core.contains("event 500"));
     assert!(!snapshot.core.contains("The parser is written."));
-    assert!(snapshot.core.contains("- `implemented` — The work is done."));
+    assert!(snapshot
+        .core
+        .contains("- `implemented` — The work is done."));
     assert!(snapshot.core.contains("Approve the parser."));
     assert!(snapshot.core.contains("## Definition of the current state"));
     assert!(snapshot.core.contains("Write the parser."));
-    assert!(!snapshot.core.contains("Review it."), "only the current state");
+    assert!(
+        !snapshot.core.contains("Review it."),
+        "only the current state"
+    );
 
     let file = |name: &str| {
         snapshot
@@ -1395,7 +1415,11 @@ fn an_execution_without_history_has_only_its_definition_as_a_context_file() {
         definition: Ok("name: empty\n".to_string()),
         ..SnapshotInput::default()
     });
-    let names: Vec<_> = snapshot.files.iter().map(|file| file.name.as_str()).collect();
+    let names: Vec<_> = snapshot
+        .files
+        .iter()
+        .map(|file| file.name.as_str())
+        .collect();
     assert_eq!(names, ["workflow.yaml"]);
 }
 

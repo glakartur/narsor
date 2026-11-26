@@ -156,7 +156,16 @@ impl HarnessAdapter for CodexAdapter {
         Box::pin(async move {
             let (command, started) = self.command_line(request)?;
             let parser = self.stream_parser(request.answer_shape);
-            cli::run(CODEX, command, started, message(request), request, parser, &observers).await
+            cli::run(
+                CODEX,
+                command,
+                started,
+                message(request),
+                request,
+                parser,
+                &observers,
+            )
+            .await
         })
     }
 

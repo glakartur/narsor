@@ -2045,7 +2045,10 @@ terminal_states: { completed: completed, cancelled: cancelled }
         assert!(!sent.replayed);
         let after = service.control.task(&record.task_id).unwrap();
         assert_eq!(
-            after.resume_message.as_ref().map(|message| message.text.as_str()),
+            after
+                .resume_message
+                .as_ref()
+                .map(|message| message.text.as_str()),
             Some("Dokończ testy")
         );
         assert_ne!(after.runner_state, RunnerState::Interrupted, "resumed");

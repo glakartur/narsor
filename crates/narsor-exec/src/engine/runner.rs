@@ -152,11 +152,11 @@ pub use human_input::operations::{
 };
 pub use lifecycle::finish::terminal_status;
 pub use lifecycle::run_handle::RunHandle;
+pub use metadata::agent_session::{resumable_agent_session, ResumableSession};
 pub use metadata::keys::{
     METADATA_ENGINE_KEY, METADATA_LAST_AGENT_STEP_KEY, METADATA_OUTPUT_REJECTION_KEY,
     METADATA_OUTPUT_RESCUE_KEY, METADATA_PENDING_STEP_KEY,
 };
-pub use metadata::agent_session::{resumable_agent_session, ResumableSession};
 pub use metadata::last_agent_step::LastAgentStep;
 pub use metadata::pending_step::PendingStep;
 pub use output::rejection::{owed_reprompt, OutputRejection};

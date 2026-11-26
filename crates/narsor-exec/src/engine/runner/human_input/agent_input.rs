@@ -64,7 +64,11 @@ pub(crate) fn leave_owner_message(
     restart_if_refused: bool,
 ) -> MessageLeft {
     let engine = engine_metadata_mut(execution);
-    if engine.get(METADATA_RESUME_MESSAGE_KEY).and_then(Value::as_str) == Some(key) {
+    if engine
+        .get(METADATA_RESUME_MESSAGE_KEY)
+        .and_then(Value::as_str)
+        == Some(key)
+    {
         return MessageLeft::Before;
     }
     engine.insert(

@@ -53,7 +53,9 @@ fn elements_of(entry: &mut ConversationEntry) -> Vec<ChatElement> {
     }
     match entry.source {
         ConversationSource::Stderr => {
-            vec![crate::engine::actions::harness::cli::stderr_element(&entry.raw)]
+            vec![crate::engine::actions::harness::cli::stderr_element(
+                &entry.raw,
+            )]
         }
         ConversationSource::Narsor | ConversationSource::Stdout => {
             vec![ChatElement::Unclassified {
