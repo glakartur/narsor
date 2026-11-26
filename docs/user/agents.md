@@ -145,11 +145,11 @@ steps. Other binaries are built without the SDK (the `copilot-sdk` feature of
 `narsor-exec`) and refuse such a step with "the GitHub Copilot harness runs
 only in narsor-runner".
 
-The SDK of this release (`github-copilot-sdk` 1.0.27, see `Cargo.lock`)
-targets Copilot CLI 1.0.104 (its `cli-version.txt`). This is not verified
+The SDK of this release (`github-copilot-sdk` 1.0.35, see `Cargo.lock`)
+targets Copilot CLI 1.0.112 (its `cli-version.txt`). This is not verified
 against other CLI versions. A much older or much newer CLI can speak a
 different protocol, and the step then fails when the SDK starts or talks to
-the CLI. If that happens, install a CLI version close to 1.0.104.
+the CLI. If that happens, install a CLI version close to 1.0.112.
 
 ### Sessions
 
@@ -173,23 +173,25 @@ still carries only the harness's final text — the event log is not a place
 for megabytes of tool chatter — but nothing said over the stream is lost: the
 conversation record is the byte-for-byte source of truth for what the harness
 actually said, in order, prompt included. `narsor-cli conversation <id> <attempt>`
-(and the TUI's *Rozmowa* tab) read it; nothing else in narsor reads it. A conversation
+(and the TUI's *Rozmowa* tab) read it through the task's runner, and the conductor
+copies it into its context files. A conversation
 record's key is the attempt's `action_execution_id` — the same idempotency key
 D24 already assigns fresh on every attempt — so a retried step never shares
 one record between its attempts, and the record survives a local takeover
 untouched, in the same directory the checkpoint bundle lives beside.
 
-Resumption is **half-wired on purpose.** `parameters.resume_session: <id>`
-continues a known session (`--resume` / `--session`), but `parameters` is not
-template-expanded — only `message` is — so a session captured by one state
-cannot yet be chained into the next by writing
-`{{ context.variables.agent_session_id }}`. The id is captured and exposed so
-that chaining becomes a one-line change in the template scope, and nothing more.
+The engine resumes the agent's own session when it reprompts, when it
+delivers an answer to `awaiting_input`, and when it continues a step after a
+lost workload or an error. A workflow can continue a known session with
+`parameters.resume_session: <id>` (`--resume` / `--session` / `exec resume`),
+which requires an explicit `harness:`. `parameters` is not template-expanded —
+only `message` is — so a session captured by one state cannot be chained into
+the next by writing `{{ context.variables.agent_session_id }}`.
 
 ### `read_only_paths`
 
 Extra directories the agent may look at, resolved against the workspace. They
-become `--add-dir` for `claude-code`; `opencode run` and Codex have no safe
+become `--add-dir` for `claude-code`; `opencode run`, Codex and GitHub Copilot have no safe
 read-only equivalent, so they are named in the message instead. Either way this is about **visibility,
 not enforcement**: read-only access to secondary repositories is enforced by the
 workspace provisioner's permission bits (D15), and would still be enforced if
@@ -198,8 +200,9 @@ the flag were left out.
 ### Permissions, non-interactivity, and what that costs
 
 The narsor runs unattended, so a harness that stopped on a permission
-prompt would hang a workflow until its timeout. Both harnesses are therefore run
-in their batch mode, where nothing can be prompted for.
+prompt would hang a workflow until its timeout. Every harness is therefore run
+non-interactively: Claude Code, Codex and OpenCode in their batch modes, and
+GitHub Copilot through its SDK. Nothing can be prompted for.
 
 The portable default is **`read-write`**. The adapter maps it to Claude's
 `acceptEdits`, OpenCode's `--auto`, and Codex's `workspace-write`. An action
@@ -207,7 +210,9 @@ that must inspect only sets `workspace_access: read-only`; it maps to Claude's
 `plan` mode, omits OpenCode's auto-approval flag, and uses Codex's `read-only`
 sandbox. Codex always passes `approval_policy=never` and never allows
 `danger-full-access`; its operator-provided environment and profile are
-otherwise preserved for authentication and skills.
+otherwise preserved for authentication and skills. GitHub Copilot does not
+enforce `workspace_access`: its SDK session approves every permission
+request, so a read-only step can write.
 
 A workflow in `schema: v2` states the access per repository instead, in the step's `workspaces`
 section (see [the workflow schema](../dev/workflow-schema.md), §3.2.1): the step prompt lists each
@@ -235,9 +240,13 @@ The narsor talks to the main agent only. A subagent is recognised by the
 `parent_tool_use_id` of a stream line, not by `session_id`. The conversation
 shows subagents as separate groups (see [the TUI](tui.md)).
 
-**The security consequence is real and is not hypothetical.** Containerisation
-(D14) is still deferred, so the only boundary around an agent is D15's
-filesystem layout and permission bits — which protects against a mistake, not
+**The security consequence is real and is not hypothetical.** Container
+isolation is opt-in: the Kubernetes backend and the Docker work mode of the
+local backend (`controller.local.mode: docker`, see
+[Local tasks in Docker](local-docker.md)) run each task's runner in a
+container. The default `process` mode of the local backend does not, and
+there the only boundary around an agent is D15's filesystem layout and
+permission bits — which protects against a mistake, not
 against a determined or prompt-injected agent. In particular, OpenCode's
 read-write mapping auto-approves its tool requests; without container isolation
 this can reach beyond the workspace. Use writable actions only for workflows

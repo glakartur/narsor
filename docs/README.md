@@ -26,6 +26,7 @@ install it.
 
 - [Building and testing](dev/building-and-testing.md) — also known limitations.
 - [Architecture decisions](dev/architecture.md)
+- [Components](dev/components.md) — the crates, the binaries and their dependencies.
 - [Domain model](dev/domain-model.md)
 - [Workflow schema](dev/workflow-schema.md)
 - [CONTRIBUTING.md](../CONTRIBUTING.md)

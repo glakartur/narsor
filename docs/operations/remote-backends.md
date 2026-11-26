@@ -78,8 +78,10 @@ or a wiped controller state):
   holds a lease of its own — a newer `epoch` than the one before its start;
   it gives up after 10 s, and the start fails with the last lines the
   controller wrote;
-* the controller gets every setting as a flag (`--no-config`) and none of the
-  daemon's `NARSOR_*` variables; the enrollment code reaches it only as
+* the controller reads the configuration file that won the daemon's search
+  (`--config <file>`, or `--no-config` when none did) and gets only the
+  daemon's `NARSOR_GLOBAL__*` and `NARSOR_CONTROLLER__*` variables; the
+  enrollment code reaches it only as
   `NARSOR_ENROLLMENT_CODE`, and never reaches a runner;
 * its log lines are in the daemon's log, prefixed with `narsor-controller:`;
   `RUST_LOG` follows the daemon's log level;
@@ -882,20 +884,20 @@ narsor-cli backend default                       # get; also: set <backend>, res
 narsor-cli harness default                       # get; also: set <harness>, reset — new and running tasks
 narsor-cli task create implement-feature --input ticket=NAR-1 \
   [--backend k8s] [--profile default] [--harness codex] \
-  [--repository api --commit <sha>] [--workflow-version 1] [--task-id my-id]
+  [--repository code=api --commit code=<sha>] [--workflow-version 1] [--task-id my-id]
 narsor-cli task create --file ./workflow.yaml --input name=value   # local daemon only
 narsor-cli task list [--archived] [--json]       # the attention mark `?`/`!`, the title; --archived: the history
 narsor-cli task show <task> [--json [--drift]]   # title, links, what it waits on, observations; --drift: environment drift in JSON
 narsor-cli task pause|resume|start|archive <task> [--expected-generation N]
 narsor-cli task move <task> --before <other> | --after <other> | --top | --bottom
 narsor-cli task refresh-env <task>               # re-resolve a stopped task's environment from the catalogue
-narsor-cli task input <task> --field reason=ok [--data k=v] [--variable k=v] \
+narsor-cli task input <task> --field reason=ok [--artifact name=path] [--variable k=v] \
   [--label approved] [--comment …] [--waiting-id <id>]
 narsor-cli task interrupt <task> [--wait-secs N]
 narsor-cli task transition <task> <state> [--override --reason <why>] [--wait-secs N]
 narsor-cli task restart-step <task> [--note <text>] [--failure-key K] [--wait-secs N]
 narsor-cli task conductor chat <task> <text> | history <task> [--after N]
-narsor-cli task conductor confirm|reject <task> <proposal> | undo <task> <decision>
+narsor-cli task conductor confirm|reject <task> <proposal>
 narsor-cli task conversation <task> [<attempt>] [--from N]
 narsor-cli task events <task> [--follow]
 narsor-cli task watch [--cursor C]               # every task, reconnecting from the cursor
@@ -923,7 +925,7 @@ the interface is a `narsor-cli task …` command: `move` (`K` / `J` / `m`), `pau
 reasoned override), `start` (`s`), `archive` (`a`), `input` and
 `restart-step` (the answer panel), `conductor …` (the *Dyrygent* tab), `create`
 (`n`, also `create --file` for a path, with `workflows` and `validate` for the
-catalogue and the check), `list --archived` and `history …` (`H`), `repo …`
+catalogue and the check), `list --archived` (`H`), `repo …`
 (`R`) and `capabilities`; besides those, `h` is `narsor-cli harness default set`
 / `reset`, the installation's default harness the header names. `?` shows the keys, [the TUI guide](../user/tui.md) describes the screens.
 
@@ -1014,7 +1016,7 @@ The ordinary test suite needs no cluster. Against a real cluster:
    export NARSOR_K8S_SMOKE_TOKEN_FILE=<token with the controller's Role>
    export NARSOR_K8S_SMOKE_CA_FILE=<cluster CA PEM>
    export NARSOR_K8S_SMOKE_STORAGE_CLASS=narsor-delete
-   cargo test --test kubernetes_adapter live_cluster_smoke -- --ignored
+   cargo test --test integration kubernetes_adapter::live_cluster_smoke -- --ignored
    ```
 
 2. **Full cycle, by hand, in a disposable namespace** (before exposing a
@@ -1038,8 +1040,11 @@ The ordinary test suite needs no cluster. Against a real cluster:
 
 * One control plane per installation; no HA, no teams — one owner, who is
   also the operator.
-* Kubernetes is the only production adapter; `local` and `fake` exist for the
-  local path and tests. No local Docker or cloud adapters.
+* Kubernetes is the only adapter for remote clusters; `fake` exists for
+  tests. The `local` backend runs tasks as host processes or, in the Docker
+  work mode, in local containers (see
+  [Local tasks in Docker](../user/local-docker.md)). There are no cloud
+  adapters.
 * No per-step images on Kubernetes; a fixed `PATH` in the main container.
 * Narsor does not isolate task egress; restrict it with NetworkPolicies or
   the backend's own mechanisms.

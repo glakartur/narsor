@@ -4,8 +4,7 @@ How the control plane runs tasks on registered backends. Operating a server and 
 
 ## Remote tasks and backends
 
-Besides the local executions above, the daemon is a **control plane** for
-remote tasks: each task runs isolated on a registered backend (Kubernetes
+The daemon is a **control plane** for tasks: each task runs isolated on a registered backend (Kubernetes
 first, or the `local` backend), with its own storage, and is created, paused,
 resumed and archived through one owner API — clients never talk to a backend
 or a runner directly.
