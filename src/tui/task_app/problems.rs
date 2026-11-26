@@ -30,7 +30,11 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 
+use super::background::{JobKey, Outcome};
+use super::notify::Severity;
+use super::{Focus, TaskApp, View};
 use crate::api::CallFailure;
+use crate::tui::keymap::Context;
 
 /// How long an entry is kept, from the time it was recorded.
 pub const WINDOW: Duration = Duration::from_secs(30 * 60);
@@ -62,7 +66,9 @@ pub fn current_label() -> String {
 
 /// The operation the current task runs, or what `fallback` says.
 pub fn label_or(fallback: impl FnOnce() -> String) -> String {
-    OPERATION.try_with(String::clone).unwrap_or_else(|_| fallback())
+    OPERATION
+        .try_with(String::clone)
+        .unwrap_or_else(|_| fallback())
 }
 
 /// The label of what `place` (a tab, a view) shows of `task_id`.
@@ -363,6 +369,67 @@ pub fn write_dump(dir: &Path, text: &str, at: DateTime<Local>) -> io::Result<Pat
     ))
 }
 
+impl TaskApp {
+    /// Writes the dumps of `D` to `dir` in place of the system's temporary
+    /// directory: what a test sets.
+    #[must_use]
+    pub fn with_dump_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.dump_dir = dir.into();
+        self
+    }
+
+    /// Whether a typed key is text now: the list filter, or a field of a
+    /// form, the panel or the conductor's chat. There `D` is a letter.
+    pub fn accepts_text(&self) -> bool {
+        let filtering = matches!(self.view, View::Tasks)
+            && self.focus == Focus::List
+            && self.list.is_filtering();
+        filtering
+            || matches!(
+                self.key_context().base,
+                Context::Form | Context::FormConfirm
+            )
+    }
+
+    /// `D`: writes what the log holds now to a new file, in the background.
+    /// The bar shows the file's path, or why it could not be written; the
+    /// log stays as it was either way. A second `D` while one is written
+    /// does nothing.
+    pub(super) fn start_dump(&mut self) {
+        let now = Instant::now();
+        let written_at = Local::now();
+        let header = Header {
+            version: narsor_protocol::VERSION.to_string(),
+            connection: connection_of(self.client.base_url()),
+            timeout: self.client.request_timeout(),
+        };
+        let text = render(&self.problems.snapshot(now), &header, written_at);
+        let dir = self.dump_dir.clone();
+        self.background.start(JobKey::Dump, async move {
+            let written =
+                tokio::task::spawn_blocking(move || write_dump(&dir, &text, written_at)).await;
+            let written = written.unwrap_or_else(|error| Err(io::Error::other(error)));
+            Outcome::new(move |app: &mut TaskApp| app.on_dump_written(written))
+        });
+    }
+
+    fn on_dump_written(&mut self, written: io::Result<PathBuf>) {
+        let now = Instant::now();
+        match written {
+            Ok(path) => self.notifier.push_held(
+                Severity::Success,
+                format!("dziennik problemów zapisany: {}", path.display()),
+                now,
+            ),
+            Err(error) => self.notifier.push_held(
+                Severity::Error,
+                format!("nie udało się zapisać dziennika problemów: {error}"),
+                now,
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,7 +476,11 @@ mod tests {
     fn a_long_detail_is_cut_on_a_character_boundary() {
         let long = "żółć".repeat(10 * 1024 / "żółć".len() + 1);
         let problem = shown_at(Instant::now(), &long);
-        assert!(problem.detail.len() <= MAX_DETAIL, "{}", problem.detail.len());
+        assert!(
+            problem.detail.len() <= MAX_DETAIL,
+            "{}",
+            problem.detail.len()
+        );
         assert!(problem.detail.ends_with('…'));
         assert!(long.starts_with(problem.detail.trim_end_matches('…')));
     }

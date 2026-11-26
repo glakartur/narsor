@@ -170,6 +170,8 @@ pub(super) enum JobKey {
     /// The read of the usage limits of the harnesses, in the background: no
     /// screen waits for it, so it does not animate the marker.
     Usage,
+    /// Writing the problem log to a file (`D`).
+    Dump,
 }
 
 impl JobKey {
@@ -196,6 +198,7 @@ impl JobKey {
             Self::Limit => "task limit".to_string(),
             Self::Queue(queue) => format!("Queues — queue {queue}"),
             Self::Usage => "harness usage".to_string(),
+            Self::Dump => "problem log dump".to_string(),
         }
     }
 

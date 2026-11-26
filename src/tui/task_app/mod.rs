@@ -559,6 +559,8 @@ pub struct TaskApp {
     next_usage_at: Instant,
     /// What went wrong in the last half hour: failed calls and shown errors.
     problems: ProblemLog,
+    /// Where `D` writes the problem log: the system's temporary directory.
+    dump_dir: std::path::PathBuf,
 }
 
 /// What a read of the list must tell after work was sent to a task without a
@@ -630,6 +632,7 @@ impl TaskApp {
             harness_usage: None,
             next_usage_at: Instant::now(),
             problems,
+            dump_dir: std::env::temp_dir(),
         }
     }
 
@@ -919,6 +922,14 @@ impl TaskApp {
 
     /// Folds a key into the state. Returns what needs the API.
     pub fn on_key(&mut self, key: KeyEvent) -> Request {
+        // `D` works on every screen, so it is looked at before any of them
+        // takes the key — except where a typed `D` is text.
+        if keymap::lookup(Context::Global, &key) == Some(Action::DumpProblems)
+            && !self.accepts_text()
+        {
+            self.start_dump();
+            return Request::None;
+        }
         if matches!(self.view, View::Tasks) && self.focus == Focus::List && self.list.is_filtering()
         {
             self.on_filter_key(key);
@@ -1669,7 +1680,12 @@ impl TaskApp {
                     Severity::Warning,
                     "auto-resume",
                     one,
-                    |count| format!("wznowiono automatycznie {count} {}", crate::tui::plural(count, ["zadanie", "zadania", "zadań"])),
+                    |count| {
+                        format!(
+                            "wznowiono automatycznie {count} {}",
+                            crate::tui::plural(count, ["zadanie", "zadania", "zadań"])
+                        )
+                    },
                     now,
                 );
             }

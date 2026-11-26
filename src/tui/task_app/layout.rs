@@ -514,7 +514,8 @@ pub fn render_bar(
 }
 
 /// The right of the bar in at most `room` columns: the notification, cut
-/// with `…` when longer, or else the usage limits.
+/// with `…` when longer (a held one, which may end in a path, from the
+/// directory side), or else the usage limits.
 fn bar_right(
     app: &TaskApp,
     styles: &Styles,
@@ -523,11 +524,51 @@ fn bar_right(
     room: usize,
 ) -> Line<'static> {
     if let Some(note) = app.notifier().span(styles, now) {
-        return Line::from(Span::styled(fit_cells(&note.content, room), note.style));
+        let held = app.notifier().current(now).is_some_and(|note| note.held);
+        let text = if held {
+            fit_path(&note.content, room)
+        } else {
+            fit_cells(&note.content, room)
+        };
+        return Line::from(Span::styled(text, note.style));
     }
     app.harness_usage().map_or_else(Line::default, |state| {
         Line::from(usage::bar_spans(state, now_utc, styles, room))
     })
+}
+
+/// `text`, which ends in a path, in at most `width` cells. When it is
+/// longer, characters go from the start of the path's directory part, where
+/// `…` marks the cut; the words before the path go too once they and the
+/// file name do not fit together. The file name is cut only when it alone is
+/// wider than `width`. Text without a path is cut at the end.
+fn fit_path(text: &str, width: usize) -> String {
+    let cells = |part: &str| Span::raw(part).width();
+    if cells(text) <= width {
+        return text.to_string();
+    }
+    let Some(path_start) = text.find('/') else {
+        return fit_cells(text, width);
+    };
+    let (words, path) = text.split_at(path_start);
+    let name = path.rsplit('/').next().unwrap_or_default();
+    let words = if cells(words) + 1 + cells(name) <= width {
+        words
+    } else {
+        ""
+    };
+    let room = width.saturating_sub(cells(words) + 1);
+    let mut tail = path.len();
+    let mut used = 0;
+    for (index, character) in path.char_indices().rev() {
+        let wide = cells(character.encode_utf8(&mut [0; 4]));
+        if used + wide > room {
+            break;
+        }
+        used += wide;
+        tail = index;
+    }
+    format!("{words}…{}", &path[tail..])
 }
 
 /// The context whose keys the bar and help describe.

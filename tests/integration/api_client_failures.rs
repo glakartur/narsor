@@ -60,8 +60,7 @@ async fn a_request_that_times_out_is_told_with_its_cause_and_duration() {
     assert_eq!(failure.path, "/control/v1/tasks/hang/timeline");
     assert_eq!(failure.kind, "unavailable");
     assert!(
-        failure.detail.to_lowercase().contains("timed out")
-            && failure.detail.contains("[timeout]"),
+        failure.detail.to_lowercase().contains("timed out") && failure.detail.contains("[timeout]"),
         "{}",
         failure.detail
     );

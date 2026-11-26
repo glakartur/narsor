@@ -61,6 +61,10 @@ pub struct Notification {
     /// The kind of news it counts, and how many so far
     /// ([`Notifier::push_counted`]).
     pub counted: Option<(&'static str, usize)>,
+    /// Held on the bar for its whole lifetime ([`Notifier::push_held`]): it
+    /// may end in a file path, which the bar shortens from the directory
+    /// side.
+    pub held: bool,
 }
 
 /// The latest notification.
@@ -70,15 +74,38 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    /// Raises a notification, replacing the one on the bar. Text from the
-    /// server is made safe and put on one line.
+    /// Raises a notification, replacing the one on the bar — unless a held
+    /// one is still there. Text from the server is made safe and put on one
+    /// line.
     pub fn push(&mut self, severity: Severity, text: impl AsRef<str>, now: Instant) {
+        if self.holding(now) {
+            return;
+        }
         self.current = Some(Notification {
             text: one_line(text.as_ref()),
             severity,
             at: now,
             counted: None,
+            held: false,
         });
+    }
+
+    /// Raises a notification the operator must be able to read whole (the
+    /// path of a file written for them): it replaces whatever is on the bar,
+    /// and no [`Self::push`] or [`Self::push_counted`] replaces it while it
+    /// is on the bar; another held one does.
+    pub fn push_held(&mut self, severity: Severity, text: impl AsRef<str>, now: Instant) {
+        self.current = Some(Notification {
+            text: one_line(text.as_ref()),
+            severity,
+            at: now,
+            counted: None,
+            held: true,
+        });
+    }
+
+    fn holding(&self, now: Instant) -> bool {
+        self.current(now).is_some_and(|note| note.held)
     }
 
     /// Raises a notification of the kind `kind`: `one` alone, or — while
@@ -92,6 +119,9 @@ impl Notifier {
         many: impl FnOnce(usize) -> String,
         now: Instant,
     ) {
+        if self.holding(now) {
+            return;
+        }
         let count = self
             .current(now)
             .and_then(|note| note.counted)
@@ -107,6 +137,7 @@ impl Notifier {
             severity,
             at: now,
             counted: Some((kind, count)),
+            held: false,
         });
     }
 

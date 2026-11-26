@@ -82,6 +82,7 @@ use super::background::{DetailJob, JobKey, Outcome};
 use super::list::{describe_loss, state_icon, title_of, StateIcon};
 use super::notify::Severity;
 use super::panel::WaitingPanel;
+use super::problems::{self, Problem};
 use super::tabs::conductor::{self, Conductor};
 use super::tabs::conversation::{
     self, transcript_action, AttemptRead, Attempts, Conversation, ReadFailure,
@@ -91,7 +92,6 @@ use super::tabs::info::{self, DriftOutcome, Info};
 use super::tabs::progress::{self, AxisRows, Progress, StepView};
 use super::tabs::state::{self as state_tab, State};
 use super::workspace_rows::{self, Part, Piece};
-use super::problems::{self, Problem};
 use super::{failure_reason, DetailTab, DetailView, StepFocus, TaskApp};
 
 /// Everything the details of one task remember.

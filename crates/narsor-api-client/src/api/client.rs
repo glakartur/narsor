@@ -45,8 +45,8 @@
 //! the only endpoint a client ever talks to (R1, R41).
 
 use std::collections::{BTreeMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
 use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1267,10 +1267,7 @@ impl ApiClient {
             return Ok(response);
         }
         let token = self.token.current().await?;
-        build(http, &token)
-            .send()
-            .await
-            .map_err(Failed::transport)
+        build(http, &token).send().await.map_err(Failed::transport)
     }
 
     /// One request on [`Self::http`] whose answer is decoded as `T`; a
@@ -1582,12 +1579,9 @@ where
             Some(Err(error)) => {
                 let failed = Failed::transport(error);
                 let failures = &state.failures;
-                failures.client.report(
-                    "GET",
-                    &failures.url,
-                    &failed,
-                    failures.started.elapsed(),
-                );
+                failures
+                    .client
+                    .report("GET", &failures.url, &failed, failures.started.elapsed());
                 state.queue.push_back(Err(failed.error));
                 state.done = true;
             }
