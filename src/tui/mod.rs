@@ -262,7 +262,6 @@ pub async fn run(
         .set_hyperlinks(detail::hyperlinks_supported(|name| {
             std::env::var(name).ok()
         }));
-    // The application's client: its failures go to the problem log.
     let mut feed = EventFeed::new(app.client().clone());
 
     let mut guard = TerminalGuard::enter()?;

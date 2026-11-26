@@ -523,8 +523,7 @@ fn bar_right(
     now_utc: DateTime<Utc>,
     room: usize,
 ) -> Line<'static> {
-    if let Some(note) = app.notifier().span(styles, now) {
-        let held = app.notifier().current(now).is_some_and(|note| note.held);
+    if let Some((note, held)) = app.notifier().span(styles, now) {
         let text = if held {
             fit_path(&note.content, room)
         } else {

@@ -641,7 +641,6 @@ impl TaskApp {
         &self.client
     }
 
-    /// What went wrong in the last half hour.
     pub fn problems(&self) -> &ProblemLog {
         &self.problems
     }
@@ -878,7 +877,6 @@ impl TaskApp {
             .record(Problem::shown(label, word, text, now), now);
     }
 
-    /// The screen shown, in the words of the problem log.
     fn screen_label(&self) -> String {
         match &self.view {
             View::Tasks => match (self.focus, self.list.selected_id()) {

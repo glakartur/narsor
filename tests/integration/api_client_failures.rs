@@ -1,7 +1,3 @@
-//! The failure observer of the API client: every failed call is told once,
-//! with the cause the client saw, how long the call took and nothing of the
-//! request's credentials.
-
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

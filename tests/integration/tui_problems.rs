@@ -1,7 +1,3 @@
-//! The problem log of the interface: every failed call and every error shown
-//! is recorded with the screen and task it belongs to, and the visible
-//! messages stay as they were.
-
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -85,7 +81,6 @@ async fn a_timeline_read_that_times_out_is_recorded_with_its_tab_task_and_cause(
 
     app.sync_detail().await;
 
-    // The tab says what it always said.
     let view = app.detail().view("t1").expect("the details of t1");
     assert_eq!(
         view.progress().failure(),
@@ -174,10 +169,6 @@ async fn an_auto_resume_that_gives_up_records_its_notice() {
         "NAR-2: nie udało się wznowić automatycznie: pod evicted"
     );
 }
-
-// ---------------------------------------------------------------------
-// `D`: the dump
-// ---------------------------------------------------------------------
 
 /// A fresh directory under the system temp dir, removed when dropped.
 struct TempDir(PathBuf);
@@ -284,7 +275,6 @@ async fn the_dump_names_the_server_and_never_holds_the_token() {
     .expect("a loopback client");
     let dir = TempDir::new();
     let mut app = TaskApp::new(client, "remote", None).with_dump_dir(&dir.0);
-    // The list is a `404` on the stub: one failed call, and what it shows.
     app.refresh().await;
     assert!(!problems(&app).is_empty());
 
@@ -312,7 +302,6 @@ async fn a_dump_that_cannot_be_written_says_why_keeps_the_log_and_replaces_the_l
     let (written, _) = dir.only_file();
     assert!(bar_text(&app).ends_with(&file_name(&written)));
 
-    // Within the lifetime of the path on the bar, a dump that fails.
     let missing = dir.0.join("missing");
     let mut app = app.with_dump_dir(&missing);
     press_d(&mut app);
@@ -328,7 +317,6 @@ async fn a_dump_that_cannot_be_written_says_why_keeps_the_log_and_replaces_the_l
         .starts_with("nie udało się zapisać dziennika problemów: "));
     assert_eq!(problems(&app), before);
 
-    // A later dump still has every entry.
     let mut app = app.with_dump_dir(&dir.0);
     press_d(&mut app);
     app.drain_jobs().await;
@@ -352,7 +340,6 @@ async fn the_path_stays_on_the_bar_over_an_unrelated_error() {
     app.drain_jobs().await;
     let (path, _) = dir.only_file();
 
-    // A move fails: an error notification, recorded but not on the bar.
     app.dispatch(move_t1()).await;
 
     assert!(

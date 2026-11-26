@@ -235,7 +235,6 @@ fn transport_detail(error: &reqwest::Error) -> String {
     detail
 }
 
-/// The path of `url`, without its query.
 fn path_of(url: &str) -> String {
     reqwest::Url::parse(url)
         .map(|url| url.path().to_string())
@@ -264,9 +263,7 @@ pub struct ApiClient {
     /// here would have `reqwest` tear the connection down mid-stream the
     /// moment an execution paused for a human gate.
     stream_http: reqwest::Client,
-    /// The bound of every request on `http`.
     request_timeout: Duration,
-    /// Told of every failed call, when set.
     observer: Option<FailureObserver>,
 }
 

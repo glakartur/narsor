@@ -1,26 +1,8 @@
 //! The problem log: what went wrong while the interface ran, kept in memory
 //! for the operator to write to a file with `D`.
-//!
-//! The screens say "brak połączenia z serwerem" for every transport failure,
-//! and the trace log (`narsor.log`) is only written when a log level was
-//! configured beforehand. This log is always on and costs nothing on disk:
-//! every failed call to the server (with the cause the client saw and how
-//! long the call took) and every error or warning the interface showed, for
-//! the last [`WINDOW`]. Nothing is written until the operator asks for it.
-//!
-//! * A failed call is told by the client's failure observer
-//!   ([`crate::api::ApiClient::with_failure_observer`]), labelled with the
-//!   operation that made it ([`labeled`], [`current_label`]): the job or the
-//!   operator action awaiting the call sets the label around it.
-//! * What was shown is recorded where errors become words: the notification
-//!   on the bar and the failure text of a tab.
-//! * The log is bounded by age ([`WINDOW`]) and by size ([`MAX_ENTRIES`],
-//!   [`MAX_DETAIL`]); repeats are kept, because when failures happen is the
-//!   evidence.
-//! * The time is handed in by the caller, as for the notifications, so a
-//!   test steps it without sleeping.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::{self, Write as _};
@@ -42,7 +24,6 @@ pub const WINDOW: Duration = Duration::from_secs(30 * 60);
 /// The most entries kept; past it the oldest goes.
 pub const MAX_ENTRIES: usize = 2000;
 
-/// The most bytes of one entry's detail.
 pub const MAX_DETAIL: usize = 4 * 1024;
 
 /// The label of a call made outside any job or operator action (the event
@@ -79,14 +60,11 @@ pub fn task_label(place: &str, task_id: &str) -> String {
 /// Where an entry came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// A call to the server failed.
     CallFailed,
-    /// The interface showed an error or a warning.
     Shown,
 }
 
 impl Source {
-    /// The word the dump uses.
     pub fn word(self) -> &'static str {
         match self {
             Self::CallFailed => "call failed",
@@ -95,18 +73,12 @@ impl Source {
     }
 }
 
-/// One problem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problem {
-    /// When it was recorded, on the wall clock.
     pub wall: DateTime<Local>,
-    /// When it was recorded, for its age.
     pub at: Instant,
-    /// A failed call or a shown text.
     pub source: Source,
-    /// The screen or tab and the operation.
     pub label: String,
-    /// The method and path of a failed call.
     pub call: Option<String>,
     /// The kind of the error of a failed call, or the severity of a shown
     /// text.
@@ -114,7 +86,6 @@ pub struct Problem {
     /// What the client knew of the failure, or the text shown; at most
     /// [`MAX_DETAIL`] bytes.
     pub detail: String,
-    /// How long a failed call took.
     pub duration: Option<Duration>,
 }
 
@@ -164,10 +135,8 @@ fn cut(text: &str) -> String {
     cut
 }
 
-/// What the log holds at one moment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
-    /// The entries younger than [`WINDOW`], oldest first.
     pub entries: Vec<Problem>,
     /// How many entries younger than [`WINDOW`] the size bound dropped since
     /// the interface started.
@@ -229,18 +198,11 @@ impl ProblemLog {
     }
 }
 
-// ---------------------------------------------------------------------
-// The dump
-// ---------------------------------------------------------------------
-
 /// What the head of a dump says about the interface that wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
-    /// The version of narsor.
     pub version: String,
-    /// The server, as a URL with no user-info and no query.
     pub connection: String,
-    /// The bound of an ordinary request.
     pub timeout: Duration,
 }
 
@@ -264,66 +226,66 @@ pub fn render(snapshot: &Snapshot, header: &Header, written_at: DateTime<Local>)
     let mut text = String::new();
     let from = written_at - chrono::Duration::from_std(WINDOW).unwrap_or_default();
     text.push_str("Narsor problem log\n");
-    text.push_str(&format!("version:      {}\n", header.version));
-    text.push_str(&format!("connection:   {}\n", header.connection));
-    text.push_str(&format!(
-        "timeout:      {} ms\n",
-        header.timeout.as_millis()
-    ));
-    text.push_str(&format!(
-        "written at:   {}\n",
+    let _ = writeln!(text, "version:      {}", header.version);
+    let _ = writeln!(text, "connection:   {}", header.connection);
+    let _ = writeln!(text, "timeout:      {} ms", header.timeout.as_millis());
+    let _ = writeln!(
+        text,
+        "written at:   {}",
         written_at.format("%Y-%m-%d %H:%M:%S %:z")
-    ));
-    text.push_str(&format!(
+    );
+    let _ = write!(
+        text,
         "covers:       {} – {} ({} min); {} entries; {} dropped by the cap\n\n",
         from.format("%H:%M:%S"),
         written_at.format("%H:%M:%S"),
         WINDOW.as_secs() / 60,
         snapshot.entries.len(),
         snapshot.dropped,
-    ));
+    );
     if snapshot.entries.is_empty() {
-        text.push_str(&format!(
-            "no problems recorded in the last {} minutes\n",
+        let _ = writeln!(
+            text,
+            "no problems recorded in the last {} minutes",
             WINDOW.as_secs() / 60
-        ));
+        );
         return text;
     }
     const INDENT: &str = "              ";
     for problem in &snapshot.entries {
-        text.push_str(&format!(
+        let _ = write!(
+            text,
             "{}  {:<12}  {}",
             problem.wall.format("%H:%M:%S%.3f"),
             problem.source.word(),
             problem.label,
-        ));
+        );
         if let Some(call) = &problem.call {
-            text.push_str(&format!("   {call}"));
+            let _ = write!(text, "   {call}");
         }
         text.push('\n');
         match problem.source {
             Source::CallFailed => {
-                text.push_str(&format!("{INDENT}kind: {}", problem.kind));
+                let _ = write!(text, "{INDENT}kind: {}", problem.kind);
                 if let Some(duration) = problem.duration {
-                    text.push_str(&format!("   after: {} ms", duration.as_millis()));
+                    let _ = write!(text, "   after: {} ms", duration.as_millis());
                 }
                 text.push('\n');
-                text.push_str(&format!(
-                    "{INDENT}detail: {}\n",
-                    one_line_raw(&problem.detail)
-                ));
+                let _ = writeln!(text, "{INDENT}detail: {}", one_line_raw(&problem.detail));
             }
-            Source::Shown => text.push_str(&format!(
-                "{INDENT}{}: {}\n",
-                problem.kind,
-                one_line_raw(&problem.detail)
-            )),
+            Source::Shown => {
+                let _ = writeln!(
+                    text,
+                    "{INDENT}{}: {}",
+                    problem.kind,
+                    one_line_raw(&problem.detail)
+                );
+            }
         }
     }
     text
 }
 
-/// `text` on one line: a line break would break the layout of the dump.
 fn one_line_raw(text: &str) -> String {
     text.replace(['\r', '\n'], " ")
 }
@@ -470,6 +432,20 @@ mod tests {
             snapshot.entries.last().unwrap().detail,
             format!("problem {MAX_ENTRIES}")
         );
+    }
+
+    #[test]
+    fn repeated_problems_are_all_kept() {
+        let base = Instant::now();
+        let log = ProblemLog::default();
+        for step in 0..3 {
+            let at = base + Duration::from_secs(step);
+            log.record(shown_at(at, "same text"), at);
+        }
+
+        let snapshot = log.snapshot(base + Duration::from_secs(10));
+
+        assert_eq!(snapshot.entries.len(), 3);
     }
 
     #[test]

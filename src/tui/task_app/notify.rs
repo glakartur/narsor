@@ -153,12 +153,14 @@ impl Notifier {
         self.current.as_ref()
     }
 
-    /// The notification as a span: an icon, then the text, in its role.
-    pub fn span(&self, styles: &Styles, now: Instant) -> Option<Span<'static>> {
+    /// The notification as a span: an icon, then the text, in its role; and
+    /// whether it is held.
+    pub fn span(&self, styles: &Styles, now: Instant) -> Option<(Span<'static>, bool)> {
         let note = self.current(now)?;
-        Some(Span::styled(
+        let span = Span::styled(
             format!("{} {}", note.severity.icon(), note.text),
             styles.of(note.severity.role()),
-        ))
+        );
+        Some((span, note.held))
     }
 }
