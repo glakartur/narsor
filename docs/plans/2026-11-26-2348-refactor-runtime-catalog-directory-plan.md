@@ -14,14 +14,14 @@ execution: code
 
 - **Objective:** An operator finds everything that defines the Docker task image (the runtime catalogue and the component scripts it installs) in one directory of the catalogue, and an existing installation keeps working after the update.
 - **Means:** move `{catalog}/runtime.yaml` to `{catalog}/runtime/runtime.yaml` and the component scripts from `{catalog}/components/` to `{catalog}/runtime/components/`.
-- **Product authority:** the user's request of 2026-11-26. The assumptions below are agent choices that the user has not confirmed yet.
-- **Open blockers:** Q1 and Q2 in "Pytania otwarte dla użytkownika". The plan below follows the recommended option of each.
+- **Product authority:** the user's request of 2026-11-26 and their answers on the pull request: Q1 option (a); Q2 migration as part of the install script; the install script reads the work mode from the existing configuration.
+- **Open blockers:** none.
 
 ## Product Contract
 
 ### Summary
 
-The catalogue gets a `runtime/` directory that holds `runtime.yaml` and the `components/` scripts it names. Script paths in `runtime.yaml` resolve relative to the directory of `runtime.yaml`, so the existing `components/...` entries stay valid after the move. An installation that still has the old layout keeps working, with a warning, until the operator moves the files.
+The catalogue gets a `runtime/` directory that holds `runtime.yaml` and the `components/` scripts it names. Script paths in `runtime.yaml` resolve relative to the directory of `runtime.yaml`, so the existing `components/...` entries stay valid after the move. The install script moves the files of an old layout. Until then, an old layout keeps working with a warning.
 
 ### Problem Frame
 
@@ -32,7 +32,7 @@ The current script-path rule is also tied to the catalogue root (`crates/narsor-
 ### Key Decisions
 
 - **Script paths resolve relative to the directory of `runtime.yaml`, not the catalogue root.** With the file at the catalogue root this is the same rule as today, so one rule serves both layouts. Governs R3, R4.
-- **The old layout stays readable for a transition period; it is not migrated automatically.** The server does not move operator files; a mounted catalogue can be read-only. Governs R5, R6, R7.
+- **The old layout stays readable for a transition period. The install script migrates it; the server and `narsor-cli init` do not.** The server does not move operator files; a mounted catalogue can be read-only. Governs R5, R6, R7, R13.
 - **Sealed task images do not change.** A sealed `TaskImage` holds script text, not paths (`crates/narsor-model/src/domain/environment.rs`, `TaskImageComponent`), so the move changes no `environment_identity` when the script text stays the same. Governs R9.
 
 ### Requirements
@@ -59,6 +59,11 @@ The current script-path rule is also tied to the catalogue root (`crates/narsor-
 - R9. Existing tasks keep their sealed task image and environment identity; an environment refresh after the move gives the same identity when the script text did not change.
 - R10. The ConfigMap import of the catalogue (`docs/operations/remote-backends.md`, "The catalogue in a ConfigMap") places the `runtime.yaml` key at `runtime/runtime.yaml`.
 
+**Install script**
+
+- R13. `dist/install.sh` moves an old layout during install or update: `{catalog}/runtime.yaml` to `{catalog}/runtime/runtime.yaml` and `{catalog}/components/` to `{catalog}/runtime/components/`. It does not overwrite files. When both layouts exist, it stops with an error that names both paths and changes nothing.
+- R14. `dist/install.sh` reads the work mode of local tasks (`process` or `docker`) from the existing configuration and offers it as the default answer of the work-mode question. `--local-mode` still overrides it. With no existing configuration, the default stays as today.
+
 **Documentation**
 
 - R11. Operator, user and developer documents that name `{catalog}/runtime.yaml` or `components/` describe the new layout and the transition rule (at least `docs/user/local-docker.md`, `docs/operations/installation.md`, `docs/operations/remote-backends.md`, `docs/operations/updates.md`, `docs/dev/workflow-schema.md`, and the module docs in `crates/narsor-engine/src/environment/{catalog,profile,mod}.rs` and `crates/narsor-store/src/paths.rs`).
@@ -74,7 +79,7 @@ The current script-path rule is also tied to the catalogue root (`crates/narsor-
 
 ### Scope Boundaries
 
-- No automatic move of the operator's files by the server or by `narsor-cli init`.
+- No automatic move of the operator's files by the server or by `narsor-cli init`; only the install script moves them (R13).
 - No change to the `runtime.yaml` schema (`bundle`, `tools`, `task_image`) or to how the controller builds images.
 - No change to other catalogue kinds (`backends/`, `profiles/`, `workflows/`, `automations/`, `queues/`).
 - Deferred: shipping component scripts through the Kubernetes ConfigMap (today a key cannot name a file below the catalogue root other than the listed kinds); a CLI command that moves an old layout; removing the old-layout fallback in a later release.
@@ -87,22 +92,18 @@ The current script-path rule is also tied to the catalogue root (`crates/narsor-
 ### Założenia do potwierdzenia
 
 - A1. "`/catalog/`" in the request means the catalogue root (`server.catalog`) and its copy in the repository, `examples/catalog/`; the target names are `runtime/` (singular, as in the proposed tree), `runtime/runtime.yaml` and `runtime/components/`.
-- A2. Script paths in `runtime.yaml` become relative to the directory of `runtime.yaml` (Q1, recommended option), so the entries `components/...` do not change.
+- A2. Script paths in `runtime.yaml` become relative to the directory of `runtime.yaml` (Q1, answered), so the entries `components/...` do not change.
 - A3. A script must stay inside the runtime directory (R4). A script stored elsewhere in the catalogue must move into `runtime/` or become `{ inline: … }`.
-- A4. Old installations keep working with a warning (Q2, recommended option); both files present is an error, not a silent choice.
-- A5. The server does not move files itself; the operator moves them (the catalogue can be mounted read-only).
+- A4. Old installations keep working with a warning until the install script moves them (Q2, answered); both files present is an error, not a silent choice.
+- A5. The server does not move files itself; the install script does (the catalogue can be mounted read-only).
+- A8. The existing configuration holds the work mode in a form the install script can read; the plan step must find where.
 - A6. The ConfigMap key `runtime.yaml` maps to `runtime/runtime.yaml`; shipping component scripts through the ConfigMap stays out of scope.
 - A7. Sealed task images and environment identities do not change, because they hold script text, not paths.
 
 ### Pytania otwarte dla użytkownika
 
-- Q1. **Resolve Before Planning.** Relative to what do script paths in `runtime.yaml` resolve after the move?
-  - (a, recommended) Relative to the directory of `runtime.yaml`: the entries `components/...` stay as they are, and the old layout uses the same rule.
-  - (b) Relative to the catalogue root, as today: every entry must change to `runtime/components/...`.
-- Q2. **Resolve Before Planning.** What happens to an installation that still has `{catalog}/runtime.yaml` and `{catalog}/components/`?
-  - (a, recommended) It keeps working with a warning until the operator moves the files; a later release removes the fallback.
-  - (b) A hard break: the old file is ignored and the server reports a clear error that tells the operator to move it.
-  - (c) The server or `narsor-cli init` moves the files automatically.
+- Q1. Answered: option (a). Script paths resolve relative to the directory of `runtime.yaml`.
+- Q2. Answered: the install script migrates the old layout (R13); until then the old layout works with a warning (R5).
 
 ### Sources / Research
 
@@ -110,5 +111,6 @@ The current script-path rule is also tied to the catalogue root (`crates/narsor-
 - `crates/narsor-engine/src/environment/catalog.rs` — read and write of the runtime catalogue.
 - `crates/narsor-engine/src/environment/profile.rs` — `seal(catalog_root)`, `ScriptSource::text`, the path checks.
 - `crates/narsor-engine/src/launch.rs` — `seal(&self.catalog_root)` call and error messages that name `runtime.yaml`.
+- `dist/install.sh` — install and update flow; work-mode question (`--local-mode`).
 - `src/cli/init.rs` — embedded example runtime and component scripts.
 - `docs/dev/architecture.md` D81 (KTD8: "a bare string script is a path inside the catalogue"), D83 (environment refresh).
