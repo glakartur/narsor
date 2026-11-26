@@ -335,6 +335,8 @@ pub enum Action {
     Queues,
     /// Write the problem log of the last half hour to a temporary file.
     DumpProblems,
+    /// Switch the terminal's mouse reporting on or off.
+    ToggleMouse,
 }
 
 /// A key a binding listens to.
@@ -479,6 +481,13 @@ const CHOOSE_HARNESS: &str =
 /// What `L` does, in every context that has it.
 const CHOOSE_LIMIT: &str = "limit zadań równoległych: o 1 więcej albo o 1 mniej";
 
+/// What help says of `P` while the mouse is reported: that it is on.
+const MOUSE_ON_DESCRIPTION: &str =
+    "mysz włączona: kółko i kliknięcie; P wyłącza, aby zaznaczyć tekst przeciąganiem";
+
+/// What help says of `P` while the mouse is not reported.
+const MOUSE_OFF_DESCRIPTION: &str = "mysz wyłączona: przeciąganie zaznacza tekst; P włącza";
+
 /// The key map.
 pub static BINDINGS: &[Binding] = &[
     // Everywhere a context inherits them.
@@ -502,6 +511,13 @@ pub static BINDINGS: &[Binding] = &[
         Action::DumpProblems,
         "",
         "zapisz dziennik problemów z ostatnich 30 minut do pliku tymczasowego",
+    ),
+    bind(
+        Context::Global,
+        Key::char('P'),
+        Action::ToggleMouse,
+        "",
+        MOUSE_ON_DESCRIPTION,
     ),
     // The task list.
     bind(
@@ -2145,16 +2161,25 @@ pub fn render_help(frame: &mut Frame, area: Rect, stack: impl Into<Stack>, style
     render_help_entries(frame, area, entries, styles);
 }
 
-pub fn render_raw_conversation_help(
-    frame: &mut Frame,
-    area: Rect,
-    stack: impl Into<Stack>,
-    styles: &Styles,
-) {
-    render_help_entries(frame, area, raw_conversation_help_entries(stack), styles);
+/// `entries` with the row of `P` saying whether the mouse is on now.
+pub fn with_mouse_state(mut entries: Vec<HelpEntry>, captured: bool) -> Vec<HelpEntry> {
+    if !captured {
+        for entry in &mut entries {
+            if entry.description == MOUSE_ON_DESCRIPTION {
+                entry.description = MOUSE_OFF_DESCRIPTION;
+            }
+        }
+    }
+    entries
 }
 
-fn render_help_entries(frame: &mut Frame, area: Rect, entries: Vec<HelpEntry>, styles: &Styles) {
+/// Draws `entries` as the `?` help: a bordered overlay over `area`.
+pub fn render_help_entries(
+    frame: &mut Frame,
+    area: Rect,
+    entries: Vec<HelpEntry>,
+    styles: &Styles,
+) {
     let keys_width = entries
         .iter()
         .map(|entry| entry.keys.chars().count())

@@ -64,8 +64,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event as TerminalEvent, KeyEventKind,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event as TerminalEvent,
+    KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -109,6 +110,19 @@ static ENHANCEMENT_ARMED: AtomicBool = AtomicBool::new(false);
 /// off; a shell would otherwise see its pastes wrapped in `200~` / `201~`.
 static PASTE_ARMED: AtomicBool = AtomicBool::new(false);
 
+/// Whether mouse reporting was switched on in this session. It stays set when
+/// the operator switches the reporting off with a key: that change goes
+/// through the screen's writer and may not have reached the terminal when the
+/// process ends, so the restore path switches the reporting off whenever it
+/// was on once.
+static MOUSE_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Switches on reporting of button presses and the wheel, in the SGR
+/// encoding. Not drag (`?1002`) nor every move (`?1003`), which crossterm's
+/// `EnableMouseCapture` also asks for: each move would be an event and a
+/// redraw, and nothing here uses them.
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+
 /// Guards against chaining the panic hook onto itself.
 static PANIC_HOOK: Once = Once::new();
 
@@ -147,6 +161,10 @@ pub fn restore_terminal_to(out: &mut impl Write) {
     }
     if PASTE_ARMED.swap(false, Ordering::SeqCst) {
         let _ = execute!(out, DisableBracketedPaste);
+    }
+    if MOUSE_ARMED.swap(false, Ordering::SeqCst) {
+        // Switches off every mouse mode, whichever was on.
+        let _ = execute!(out, DisableMouseCapture);
     }
     keymap::set_modifiers_distinguished(false);
     let _ = disable_raw_mode();
@@ -204,7 +222,29 @@ fn take_screen() -> io::Result<Stdout> {
     execute!(stdout, EnterAlternateScreen, Hide)?;
     arm_bracketed_paste(&mut stdout);
     arm_modifier_reporting(&mut stdout);
+    arm_mouse_capture(&mut stdout);
     Ok(stdout)
+}
+
+/// Switches mouse reporting on: buttons and the wheel only.
+///
+/// A best effort, as bracketed paste: a terminal that does not report the
+/// mouse leaves the keys, which do everything the mouse does.
+pub fn arm_mouse_capture(out: &mut impl Write) {
+    if out.write_all(MOUSE_ON).and_then(|()| out.flush()).is_ok() {
+        MOUSE_ARMED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The bytes that switch mouse reporting on or off while the interface runs
+/// (`P`). They go through the screen's writer, never straight to the terminal.
+fn mouse_capture_bytes(on: bool) -> Vec<u8> {
+    if on {
+        return MOUSE_ON.to_vec();
+    }
+    let mut bytes = Vec::new();
+    let _ = execute!(bytes, DisableMouseCapture);
+    bytes
 }
 
 /// Asks the terminal whether it reports modifiers on keys that print as
@@ -281,6 +321,9 @@ pub async fn run(
     // The first read comes after the first draw: an unreachable server shows
     // "łączę z …" instead of a blank terminal.
     let mut first_read_pending = true;
+    // What the terminal was last told about mouse reporting: on since
+    // `take_screen`.
+    let mut mouse_on = true;
 
     while !app.should_quit() {
         guard
@@ -315,6 +358,11 @@ pub async fn run(
             _ = written.notified() => {}
             Some(outcome) = app.next_outcome(), if app.has_running() => app.on_outcome(outcome),
             _ = tokio::time::sleep(wait) => app.advance_animation(),
+        }
+
+        if app.mouse_captured() != mouse_on {
+            mouse_on = app.mouse_captured();
+            guard.screen().queue_control(&mouse_capture_bytes(mouse_on));
         }
 
         feed.ensure_open(&app);

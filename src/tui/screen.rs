@@ -13,6 +13,10 @@
 //! [`MAX_PENDING`] the waiting bytes are dropped as a whole and the screen is
 //! cleared and drawn again in full: the memory stays bounded however long the
 //! terminal does not read.
+//!
+//! A mode change (mouse reporting on or off) goes through the same writer, so
+//! its bytes never cut into a frame's, but it waits apart from the frames
+//! ([`Screen::queue_control`]): a full redraw would not repeat it.
 
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -36,6 +40,8 @@ type FrameTerminal = Terminal<QuietBackend<CrosstermBackend<FrameSink>>>;
 pub struct Screen {
     terminal: FrameTerminal,
     pending: Arc<Mutex<Vec<u8>>>,
+    /// Mode changes waiting for the writer; see [`Self::queue_control`].
+    control: Vec<u8>,
     writer: Writer,
 }
 
@@ -61,6 +67,7 @@ impl Screen {
         Ok(Self {
             terminal,
             pending,
+            control: Vec::new(),
             writer: Writer::spawn(out)?,
         })
     }
@@ -93,14 +100,22 @@ impl Screen {
         self.writer.wait_idle(timeout)
     }
 
+    /// Queues bytes that change a terminal mode (mouse reporting) to go
+    /// before the next frame. Unlike a frame's bytes they are never dropped
+    /// for a terminal that does not read: a full redraw does not repeat them.
+    pub fn queue_control(&mut self, bytes: &[u8]) {
+        self.control.extend_from_slice(bytes);
+        self.hand_over();
+    }
+
     fn hand_over(&mut self) {
         let mut pending = lock(&self.pending);
-        if pending.is_empty() {
+        if (pending.is_empty() && self.control.is_empty()) || self.writer.is_busy() {
             return;
         }
-        if self.writer.offer(&mut pending) {
-            pending.clear();
-        }
+        let mut batch = std::mem::take(&mut self.control);
+        batch.append(&mut pending);
+        self.writer.offer(&mut batch);
     }
 }
 
@@ -402,5 +417,28 @@ mod tests {
             received.len()
         );
         assert_eq!(shown(&received, 200), frame(steps - 1));
+    }
+
+    #[test]
+    fn a_mode_change_queued_while_the_terminal_does_not_read_survives_the_dropped_frames() {
+        const MODE: &[u8] = b"\x1b[?1000l";
+        let terminal = GatedTerminal::default();
+        let mut screen = screen(&terminal, 200);
+
+        show(&mut screen, "start");
+        screen.queue_control(MODE);
+        for step in 0..3 * MAX_PENDING / 100 {
+            show(&mut screen, &step.to_string().repeat(200));
+        }
+
+        terminal.set_reading(true);
+        assert!(screen.wait_idle(Duration::from_secs(5)));
+        show(&mut screen, "end");
+        assert!(screen.wait_idle(Duration::from_secs(5)));
+        let received = terminal.received();
+        assert!(
+            received.windows(MODE.len()).any(|window| window == MODE),
+            "the mode change reached the terminal"
+        );
     }
 }

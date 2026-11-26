@@ -84,6 +84,7 @@ mod timeline;
 mod tui_background;
 mod tui_conversation;
 mod tui_form;
+mod tui_mouse;
 mod tui_panel;
 mod tui_problems;
 mod tui_queues;

@@ -200,11 +200,15 @@ pub fn render_at(
         crate::tui::form::confirm::render(frame, body, styles);
     }
     if app.is_help_open() {
-        if app.active_agent_transcript_mode() == Some(crate::tui::transcript::DisplayMode::Raw) {
-            keymap::render_raw_conversation_help(frame, body, app.key_context(), styles);
+        let entries = if app.active_agent_transcript_mode()
+            == Some(crate::tui::transcript::DisplayMode::Raw)
+        {
+            keymap::raw_conversation_help_entries(app.key_context())
         } else {
-            keymap::render_help(frame, body, app.key_context(), styles);
-        }
+            keymap::help_entries(app.key_context())
+        };
+        let entries = keymap::with_mouse_state(entries, app.mouse_captured());
+        keymap::render_help_entries(frame, body, entries, styles);
     }
 }
 
@@ -513,10 +517,33 @@ pub fn render_bar(
     }
 }
 
+/// What the bar says while the mouse is not reported, before what else is on
+/// its right: the operator switched it off and `P` gives it back.
+const MOUSE_OFF_MARK: &str = "mysz wył. [P] ";
+
 /// The right of the bar in at most `room` columns: the notification, cut
 /// with `…` when longer (a held one, which may end in a path, from the
-/// directory side), or else the usage limits.
+/// directory side), or else the usage limits; after the mouse-off mark when
+/// the mouse is off.
 fn bar_right(
+    app: &TaskApp,
+    styles: &Styles,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+    room: usize,
+) -> Line<'static> {
+    if app.mouse_captured() {
+        return bar_news(app, styles, now, now_utc, room);
+    }
+    let mark = Span::styled(MOUSE_OFF_MARK, styles.of(Role::Attention));
+    let rest = room.saturating_sub(mark.width());
+    let mut line = bar_news(app, styles, now, now_utc, rest);
+    line.spans.insert(0, mark);
+    line
+}
+
+/// The notification or the usage limits, in at most `room` columns.
+fn bar_news(
     app: &TaskApp,
     styles: &Styles,
     now: Instant,
