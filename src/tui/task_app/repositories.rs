@@ -351,9 +351,6 @@ impl TaskApp {
         }
     }
 
-    /// A notch or a click on the repositories: the list drawn, or the list
-    /// of the form that adds one, moves or highlights the entry under the
-    /// pointer. Nothing is chosen.
     pub(super) fn on_repositories_mouse(&mut self, mouse: ListMouse, column: u16, row: u16) {
         let View::Repositories(repositories) = &mut self.view else {
             return;

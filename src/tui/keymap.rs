@@ -335,7 +335,6 @@ pub enum Action {
     Queues,
     /// Write the problem log of the last half hour to a temporary file.
     DumpProblems,
-    /// Switch the terminal's mouse reporting on or off.
     ToggleMouse,
 }
 
@@ -481,11 +480,9 @@ const CHOOSE_HARNESS: &str =
 /// What `L` does, in every context that has it.
 const CHOOSE_LIMIT: &str = "limit zadań równoległych: o 1 więcej albo o 1 mniej";
 
-/// What help says of `P` while the mouse is reported: that it is on.
 const MOUSE_ON_DESCRIPTION: &str =
     "mysz włączona: kółko i kliknięcie; P wyłącza, aby zaznaczyć tekst przeciąganiem";
 
-/// What help says of `P` while the mouse is not reported.
 const MOUSE_OFF_DESCRIPTION: &str = "mysz wyłączona: przeciąganie zaznacza tekst; P włącza";
 
 /// The key map.
@@ -2028,6 +2025,7 @@ pub fn check_consistency(bindings: &[Binding]) -> Result<(), Vec<String>> {
 pub struct HelpEntry {
     /// The context the keys belong to.
     pub context: Context,
+    pub action: Action,
     /// The keys, as written (`j/k`, `Ctrl+J`).
     pub keys: String,
     /// The label for the bar; empty when the row is help-only.
@@ -2092,6 +2090,7 @@ fn help_entries_matching(
         .into_iter()
         .map(|(context, action, keys, binding)| HelpEntry {
             context,
+            action,
             keys: if action == Action::Newline {
                 newline_keys().join("/")
             } else {
@@ -2161,11 +2160,10 @@ pub fn render_help(frame: &mut Frame, area: Rect, stack: impl Into<Stack>, style
     render_help_entries(frame, area, entries, styles);
 }
 
-/// `entries` with the row of `P` saying whether the mouse is on now.
 pub fn with_mouse_state(mut entries: Vec<HelpEntry>, captured: bool) -> Vec<HelpEntry> {
     if !captured {
         for entry in &mut entries {
-            if entry.description == MOUSE_ON_DESCRIPTION {
+            if entry.action == Action::ToggleMouse {
                 entry.description = MOUSE_OFF_DESCRIPTION;
             }
         }
@@ -2173,7 +2171,6 @@ pub fn with_mouse_state(mut entries: Vec<HelpEntry>, captured: bool) -> Vec<Help
     entries
 }
 
-/// Draws `entries` as the `?` help: a bordered overlay over `area`.
 pub fn render_help_entries(
     frame: &mut Frame,
     area: Rect,

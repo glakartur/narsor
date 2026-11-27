@@ -577,6 +577,17 @@ pub enum Overlay {
 }
 
 impl Overlay {
+    /// The chooser of the windows that are one list.
+    fn chooser_mut(&mut self) -> Option<&mut Chooser> {
+        match self {
+            Self::Links(list) => Some(&mut list.chooser),
+            Self::Comment(form) => Some(&mut form.chooser),
+            Self::Harness(list) => Some(list.chooser_mut()),
+            Self::Limit(list) => Some(list.chooser_mut()),
+            Self::Actions(_) | Self::Confirm(_) => None,
+        }
+    }
+
     /// Whether it is about a task of the list: one that left the list takes it
     /// away. The window that removes a repository is about none.
     pub fn is_task_bound(&self) -> bool {
@@ -1036,28 +1047,13 @@ impl TaskApp {
         }
     }
 
-    /// A notch or a click inside what sits over the screen: its list moves
-    /// or highlights the entry under the pointer. Nothing is chosen; the
-    /// `y` / `n` window has no list.
+    /// Nothing is chosen; the `y` / `n` window has no list.
     pub(super) fn on_overlay_mouse(&mut self, mouse: ListMouse, column: u16, row: u16) {
-        match &mut self.overlay {
-            Some(Overlay::Actions(panel)) => {
-                panel.sync_generation();
-                panel.form.on_choice_mouse(mouse, column, row);
-            }
-            Some(Overlay::Links(list)) => {
-                list.chooser.on_mouse(mouse, column, row);
-            }
-            Some(Overlay::Comment(form)) => {
-                form.chooser.on_mouse(mouse, column, row);
-            }
-            Some(Overlay::Harness(list)) => {
-                list.chooser_mut().on_mouse(mouse, column, row);
-            }
-            Some(Overlay::Limit(list)) => {
-                list.chooser_mut().on_mouse(mouse, column, row);
-            }
-            Some(Overlay::Confirm(_)) | None => {}
+        if let Some(Overlay::Actions(panel)) = &mut self.overlay {
+            panel.sync_generation();
+            panel.form.on_choice_mouse(mouse, column, row);
+        } else if let Some(chooser) = self.overlay.as_mut().and_then(Overlay::chooser_mut) {
+            chooser.on_mouse(mouse, column, row);
         }
     }
 

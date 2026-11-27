@@ -16,7 +16,7 @@
 
 use std::time::Instant;
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -71,7 +71,6 @@ pub struct Events {
     top: usize,
     detail_open: bool,
     detail_scroll: usize,
-    /// Where the last frame drew the detail of the event, when it drew it.
     detail_window: Option<Rect>,
     raw: bool,
     height: usize,
@@ -257,11 +256,9 @@ impl Events {
         }
     }
 
-    /// Whether the last frame drew the detail of the event at `column`,
-    /// `row`.
     pub fn detail_at(&self, column: u16, row: u16) -> bool {
         self.detail_window
-            .is_some_and(|area| area.contains(ratatui::layout::Position::new(column, row)))
+            .is_some_and(|area| area.contains(Position::new(column, row)))
     }
 
     /// The wheel over the detail of the event: `lines` lines along. The next

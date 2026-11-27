@@ -1362,13 +1362,9 @@ pub(super) struct ViewOptions {
     pub(super) axis_rows: AxisRows,
 }
 
-/// Where [`render_view`] drew what the wheel and a click reach.
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct Drawn {
-    /// The tab's content, when the tabs were drawn.
+pub(super) struct ViewAreas {
     pub(super) content: Option<Rect>,
-    /// The place under the tab: the answer panel, or the action panel in
-    /// its place, when one was drawn there.
     pub(super) panel: Option<Rect>,
 }
 
@@ -1382,7 +1378,7 @@ pub(super) fn render_view(
     styles: &Styles,
     options: ViewOptions,
     actions: Option<&mut ActionPanel>,
-) -> Drawn {
+) -> ViewAreas {
     let ViewOptions {
         frame_focused,
         stale,
@@ -1479,7 +1475,7 @@ pub(super) fn render_view(
             )),
             message,
         );
-        return Drawn::default();
+        return ViewAreas::default();
     }
     let tabs_content = Rect::new(
         parts.tabs.x.saturating_add(2),
@@ -1544,7 +1540,7 @@ pub(super) fn render_view(
             )),
             content,
         );
-        return Drawn {
+        return ViewAreas {
             content: Some(parts.content),
             panel: None,
         };
@@ -1677,7 +1673,7 @@ pub(super) fn render_view(
             view.task.as_of,
         );
     }
-    Drawn {
+    ViewAreas {
         content: Some(parts.content),
         panel: parts.panel,
     }

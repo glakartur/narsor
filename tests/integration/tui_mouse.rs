@@ -132,7 +132,6 @@ mod toggle {
 
     #[test]
     fn p_typed_into_a_field_is_text_and_leaves_the_mouse_as_it_was() {
-        // The answer panel's text field.
         let mut app = asking_app();
         key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Char('P'));
@@ -140,7 +139,6 @@ mod toggle {
         let draft = app.detail().view("a").unwrap().draft_text();
         assert!(draft.contains('P'), "{draft:?}");
 
-        // The list filter.
         let mut app = listed(1);
         key(&mut app, KeyCode::Char('/'));
         key(&mut app, KeyCode::Char('P'));
@@ -249,7 +247,6 @@ mod routing {
     fn in_the_narrow_layout_the_mouse_reaches_only_the_panel_on_screen() {
         let mut app = queue();
         draw(&mut app, 90, 30);
-        // Where the details would be in the split layout.
         click(&mut app, 60, 10);
         assert_eq!(app.focus(), Focus::List);
     }
@@ -277,23 +274,44 @@ mod routing {
     }
 
     #[test]
-    fn while_the_filter_is_typed_or_a_task_is_moved_the_mouse_does_nothing() {
+    fn while_a_dialog_a_filter_or_a_move_is_open_the_mouse_does_nothing() {
         let mut filtering = queue();
         key(&mut filtering, KeyCode::Char('/'));
         key(&mut filtering, KeyCode::Char('N'));
         let mut moving = queue();
         key(&mut moving, KeyCode::Char('m'));
         assert!(moving.list().moving().is_some());
+        let mut help = queue();
+        key(&mut help, KeyCode::Char('?'));
+        assert!(help.is_help_open());
+        let mut quitting = queue();
+        key(&mut quitting, KeyCode::Char('q'));
+        let mut confirming = asking_app();
+        key(&mut confirming, KeyCode::Esc);
+        for character in "ok".chars() {
+            key(&mut confirming, KeyCode::Char(character));
+        }
+        key(&mut confirming, KeyCode::Enter);
+        assert!(confirming.form_confirming());
 
-        for mut app in [filtering, moving] {
-            let buffer = draw(&mut app, 120, 30);
-            let (column, y) = find(&buffer, "NAR-3");
-            let before = what_the_operator_sees(&app);
-            wheel_down(&mut app, column, y);
-            wheel_up(&mut app, column, y);
-            click(&mut app, column, y);
-            click(&mut app, 60, 10);
-            assert_eq!(what_the_operator_sees(&app), before);
+        let task_cell = find(&draw(&mut queue(), 120, 30), "NAR-3");
+        let answer_cell = find(&draw(&mut asking_app(), 120, 30), "NAR-12");
+        let cases = [
+            (filtering, task_cell),
+            (moving, task_cell),
+            (help, task_cell),
+            (quitting, task_cell),
+            (confirming, answer_cell),
+        ];
+        for (mut app, (column, y)) in cases {
+            draw(&mut app, 120, 30);
+            let before = (what_the_operator_sees(&app), app.form_confirming());
+            for (x, y) in [(column, y), (60, 10), (100, 25)] {
+                wheel_down(&mut app, x, y);
+                wheel_up(&mut app, x, y);
+                click(&mut app, x, y);
+            }
+            assert_eq!((what_the_operator_sees(&app), app.form_confirming()), before);
         }
     }
 
@@ -330,7 +348,6 @@ mod list {
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.focus(), Focus::Details);
         let buffer = draw(&mut app, 120, 30);
-        // The details show the selected NAR-1 too; NAR-2 is only in the list.
         let (column, y) = find(&buffer, "NAR-2");
 
         wheel_down(&mut app, column, y);
@@ -339,7 +356,6 @@ mod list {
         assert_eq!(app.list().selected_id(), Some("t3"));
         assert_eq!(app.focus(), Focus::Details);
         let buffer = draw(&mut app, 120, 30);
-        // The details begin where the frame of the list ends.
         let details = right_of(&buffer, find(&buffer, "╮╭").0 + 1);
         assert!(details.contains("NAR-3"), "{details}");
     }
@@ -364,7 +380,6 @@ mod list {
     fn a_click_on_any_row_of_a_task_selects_it_and_keeps_the_focus_on_the_list() {
         let mut app = queue();
         let buffer = draw(&mut app, 120, 30);
-        // A task takes three rows; its title is on the second.
         let (column, y) = find(&buffer, "NAR-3");
         assert_eq!(find(&buffer, "t3").1 + 1, y, "the title is the second row");
 
@@ -555,7 +570,6 @@ mod details {
     fn a_click_on_an_entry_of_the_conversation_selects_it_and_focuses_the_details() {
         let mut app = talking_app();
         let buffer = draw(&mut app, 120, 30);
-        // The cursor is on the newest entry, 30; 28 is drawn above it.
         let (column, y) = find(&buffer, "line 28");
 
         click(&mut app, column, y);
@@ -575,7 +589,6 @@ mod details {
         open_tab(&mut app, DetailTab::Info);
         key(&mut app, KeyCode::Esc);
         assert_eq!(app.focus(), Focus::List);
-        // A low screen, so the sheet is taller than its window.
         let buffer = draw(&mut app, 120, 20);
         let (column, y) = find(&buffer, "Info");
 
@@ -765,8 +778,6 @@ mod progress {
         assert_eq!(app.step_focus(), StepFocus::Axis);
         assert_eq!(selected_step(&app).as_deref(), Some("review_api #1"));
 
-        // From the step's conversation a click on another step goes back to
-        // the axis too.
         click_on(&mut app, "line 02");
         assert_eq!(app.step_focus(), StepFocus::Conversation);
         click_on(&mut app, "plan");
@@ -907,7 +918,6 @@ mod choosers {
         wheel_down(&mut app, column, y);
         assert_eq!(menu_selected(&app), 1);
 
-        // Over the details above the menu.
         let (above, row) = find(&buffer, "brak kroków");
         wheel_down(&mut app, above, row);
         assert_eq!(menu_selected(&app), 1);

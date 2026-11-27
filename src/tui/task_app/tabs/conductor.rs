@@ -113,8 +113,6 @@ pub struct Conductor {
     read_at: Option<Instant>,
     transcript: TranscriptState,
     composer: Chooser,
-    /// Where the last frame drew the history, when it drew it: a click
-    /// finds the entry under it there.
     window: Option<Rect>,
 }
 
@@ -332,13 +330,10 @@ impl Conductor {
         transcript_action(&mut self.transcript, action);
     }
 
-    /// The wheel: the history `lines` lines along.
     pub fn scroll_by(&mut self, lines: isize) {
         self.transcript.scroll_by(lines);
     }
 
-    /// A click at `column`, `row`: the entry of the history drawn there gets
-    /// the cursor, as the line keys give it.
     pub fn click(&mut self, column: u16, row: u16) {
         select_drawn(&mut self.transcript, self.window, column, row);
     }

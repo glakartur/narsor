@@ -40,7 +40,6 @@ type FrameTerminal = Terminal<QuietBackend<CrosstermBackend<FrameSink>>>;
 pub struct Screen {
     terminal: FrameTerminal,
     pending: Arc<Mutex<Vec<u8>>>,
-    /// Mode changes waiting for the writer; see [`Self::queue_control`].
     control: Vec<u8>,
     writer: Writer,
 }

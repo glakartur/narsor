@@ -565,7 +565,6 @@ pub struct TaskApp {
     /// Whether the operator wants the terminal to report the mouse: on at
     /// start, `P` switches it. The loop tells the terminal.
     mouse_captured: bool,
-    /// Where the last frame drew its panels, for the mouse.
     panels: mouse::Panels,
 }
 
@@ -730,7 +729,6 @@ impl TaskApp {
         self.quit
     }
 
-    /// Whether the terminal should report the mouse ([`Action::ToggleMouse`]).
     pub fn mouse_captured(&self) -> bool {
         self.mouse_captured
     }

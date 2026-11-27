@@ -122,8 +122,6 @@ pub struct Progress {
     paused: bool,
     /// The first step in view on the axis, kept between frames.
     top: usize,
-    /// Where the last frame drew the axis, the selected step and its
-    /// conversation: the wheel and a click find what is under them there.
     drawn: Drawn,
     /// The conversation of every entry into a step that was put together,
     /// by `(state, visit)`.
@@ -390,7 +388,6 @@ impl Progress {
             .position(|position| position.label == label)
     }
 
-    /// What the last frame drew at `column`, `row`.
     pub fn spot_at(&self, column: u16, row: u16) -> Option<Spot> {
         let point = ratatui::layout::Position::new(column, row);
         if self.drawn.axis.is_some_and(|axis| axis.contains(point)) {
@@ -402,23 +399,18 @@ impl Progress {
             .then_some(Spot::Step)
     }
 
-    /// Selects the step at `index` of the axis, as `j` and `k` select it.
     pub fn select(&mut self, index: usize) {
         if index < self.positions().len() {
             self.select_index(index);
         }
     }
 
-    /// The wheel over the selected step's conversation: its reader `lines`
-    /// lines along, as far as its page keys take it.
     pub fn scroll_step(&mut self, lines: isize) {
         if let Some(view) = self.step_view_mut() {
             view.transcript_mut().scroll_by(lines);
         }
     }
 
-    /// A click at `column`, `row` on the selected step's conversation: the
-    /// entry drawn there gets the cursor, as the line keys give it.
     pub fn click_step_entry(&mut self, column: u16, row: u16) {
         let window = self.drawn.transcript;
         if let Some(view) = self.step_view_mut() {
@@ -435,23 +427,17 @@ impl Progress {
     }
 }
 
-/// What the last frame of *Przebieg* drew where.
 #[derive(Debug, Clone, Default)]
 struct Drawn {
     axis: Option<Rect>,
     axis_rows: DrawnItems,
-    /// The selected step: its facts and its conversation.
     step: Option<Rect>,
-    /// The selected step's conversation reader.
     transcript: Option<Rect>,
 }
 
-/// What is drawn at a point of *Przebieg*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spot {
-    /// The axis, on the step at that index or between and below them.
     Axis(Option<usize>),
-    /// The selected step: its facts or its conversation.
     Step,
 }
 

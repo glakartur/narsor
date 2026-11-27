@@ -551,7 +551,6 @@ fn bar_right(
     line
 }
 
-/// The notification or the usage limits, in at most `room` columns.
 fn bar_news(
     app: &TaskApp,
     styles: &Styles,

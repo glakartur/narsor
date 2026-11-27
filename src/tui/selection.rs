@@ -35,7 +35,7 @@
 //! Transcripts and *Zdarzenia* share only the left bar ([`bar_prefix`]),
 //! without rules (R15, R16).
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
@@ -181,7 +181,6 @@ pub fn render_barred_list(
 /// without the rules around the selected one. What a click on a row reaches.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DrawnItems {
-    /// Per drawn item: its index and its rows, as a rectangle on the screen.
     items: Vec<(usize, Rect)>,
 }
 
@@ -200,14 +199,13 @@ impl DrawnItems {
     /// The index of the item drawn at `column`, `row` of the screen; `None`
     /// on a rule, below the last item or outside the list.
     pub fn item_at(&self, column: u16, row: u16) -> Option<usize> {
-        let point = ratatui::layout::Position::new(column, row);
+        let point = Position::new(column, row);
         self.items
             .iter()
             .find(|(_, rows)| rows.contains(point))
             .map(|&(index, _)| index)
     }
 
-    /// Item `index` took `height` rows of `area` from row `first` of it.
     fn push(&mut self, index: usize, area: Rect, first: usize, height: usize) {
         if height == 0 {
             return;

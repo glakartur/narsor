@@ -569,8 +569,6 @@ pub struct TaskList {
     /// The first row in view, kept between frames so that a refresh does not
     /// scroll the list.
     top: usize,
-    /// Where the last frame drew its rows, and the id of each row by its
-    /// index there: what a click on a row selects.
     drawn: DrawnItems,
     drawn_ids: Vec<String>,
     /// A mark in the title while the list is read again, with the rows kept.
@@ -967,8 +965,6 @@ impl TaskList {
         self.selected = shown.get(target).cloned();
     }
 
-    /// The id of the row the last frame drew at `column`, `row` of the
-    /// screen; `None` on a row of no task.
     pub(super) fn id_at(&self, column: u16, row: u16) -> Option<&str> {
         let index = self.drawn.item_at(column, row)?;
         self.drawn_ids.get(index).map(String::as_str)

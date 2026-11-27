@@ -633,12 +633,10 @@ pub enum ChooserFocus {
     Fields,
 }
 
-/// What the mouse did over the list of a chooser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListMouse {
-    /// A wheel notch: `-1` up the list, `1` down it.
-    Wheel(isize),
-    /// A left click.
+    WheelUp,
+    WheelDown,
     Click,
 }
 
@@ -691,8 +689,6 @@ pub struct Chooser {
     growth: Cell<Option<Growth>>,
     /// The width the fields were last drawn in.
     area_width: Cell<usize>,
-    /// Where the last frame drew the list: its rows inside the pane, and
-    /// each entry's row. A list not drawn in the last frame has none.
     list_area: Rect,
     drawn: DrawnItems,
 }
@@ -1041,29 +1037,32 @@ impl Chooser {
         }
     }
 
-    /// Folds a mouse event at `column`, `row` into the list, as the last
-    /// frame drew it: a notch over the list moves the highlight one entry,
-    /// stopping at the first and the last, as `↓` / `↑` do; a click on an
-    /// entry highlights it. Neither chooses the entry. Returns whether the
+    /// Neither a notch nor a click chooses the entry. Returns whether the
     /// event was over the list and so reached it.
     pub fn on_mouse(&mut self, mouse: ListMouse, column: u16, row: u16) -> bool {
-        match mouse {
-            ListMouse::Wheel(by) => {
-                if self.items.is_empty() || !self.list_area.contains(Position::new(column, row)) {
-                    return false;
-                }
-                let last = self.items.len().saturating_sub(1);
-                self.select(self.selected.saturating_add_signed(by).min(last));
-                true
+        let by = match mouse {
+            ListMouse::WheelUp => -1,
+            ListMouse::WheelDown => 1,
+            ListMouse::Click => {
+                return match self.drawn.item_at(column, row) {
+                    Some(index) => {
+                        self.select(index);
+                        true
+                    }
+                    None => false,
+                };
             }
-            ListMouse::Click => match self.drawn.item_at(column, row) {
-                Some(index) => {
-                    self.select(index);
-                    true
-                }
-                None => false,
-            },
+        };
+        if self.items.is_empty() || !self.list_area.contains(Position::new(column, row)) {
+            return false;
         }
+        self.step_selection(by);
+        true
+    }
+
+    fn step_selection(&mut self, by: isize) {
+        let last = self.items.len().saturating_sub(1);
+        self.select(self.selected.saturating_add_signed(by).min(last));
     }
 
     /// The list was not drawn in this frame: no mouse event reaches it.
@@ -1153,13 +1152,12 @@ impl Chooser {
     }
 
     fn on_actions_key(&mut self, event: KeyEvent) -> ChooserAction {
-        let total = self.items.len();
         let Some(action) = lookup(Context::Panel, &event) else {
             return ChooserAction::None;
         };
         match action {
-            Action::Down => self.select((self.selected + 1).min(total.saturating_sub(1))),
-            Action::Up => self.select(self.selected.saturating_sub(1)),
+            Action::Down => self.step_selection(1),
+            Action::Up => self.step_selection(-1),
             Action::Pick => {
                 if let Some(digit) = digit_of(&event) {
                     self.select(usize::from(digit) - 1);
@@ -1754,7 +1752,6 @@ fn render_list(
         Paragraph::new(items).scroll((chooser.top.min(u16::MAX as usize) as u16, 0)),
         inner,
     );
-    // One row per entry, from the first in view.
     let shown = chooser.items.len().saturating_sub(chooser.top);
     chooser.drawn = DrawnItems::one_row_each(inner, chooser.top, shown);
     chooser.list_area = inner;

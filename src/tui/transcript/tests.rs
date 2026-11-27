@@ -777,8 +777,6 @@ fn following_in_raw_view_does_not_move_the_auto_expansion() {
     assert!(shown(&transcript, "a more 6"));
 }
 
-/// Six two-line utterances `u0`..`u5` in a five-row window: 17 lines with
-/// the gaps between entries, so the last offset is 12.
 fn six_short_utterances() -> TranscriptState {
     let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
     transcript.set_viewport(5);
@@ -823,7 +821,6 @@ fn a_visible_row_names_the_entry_drawn_on_it() {
     let mut transcript = six_short_utterances();
     transcript.scroll_by(-100);
     transcript.scroll_by(1);
-    // From offset 1: the body of u0, the gap after it, then u1's header.
     assert_eq!(
         transcript.entry_at_row(0),
         Some(TranscriptEntryId::from("u0"))

@@ -85,7 +85,6 @@ pub struct History {
     /// The first row of the list in view, kept between frames so that a new
     /// read does not scroll the list.
     top: usize,
-    /// Where the last frame drew the entries: what a click on a row selects.
     drawn: DrawnItems,
 }
 
@@ -172,8 +171,6 @@ impl History {
         }
     }
 
-    /// The index of the entry the last frame drew at `column`, `row` of the
-    /// screen; `None` on a row of no entry.
     pub(super) fn index_at(&self, column: u16, row: u16) -> Option<usize> {
         self.drawn.item_at(column, row)
     }
@@ -185,7 +182,6 @@ impl History {
         }
     }
 
-    /// A notch of the wheel over the content of the selected entry's details.
     pub(super) fn on_detail_wheel(&mut self, by: isize, column: u16, row: u16) {
         let tab = self.tab;
         if let Some(detail) = self.selected_detail_mut() {

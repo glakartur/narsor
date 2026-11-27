@@ -519,8 +519,6 @@ pub struct Conversation {
     /// Some attempt was last read from the task's record: when the newest
     /// such record was written.
     record: Option<Option<DateTime<Utc>>>,
-    /// Where the last frame drew the reader, when it drew it: a click finds
-    /// the entry under it there.
     window: Option<Rect>,
 }
 
