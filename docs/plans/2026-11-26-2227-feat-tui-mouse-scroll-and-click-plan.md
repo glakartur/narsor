@@ -90,7 +90,7 @@ Deferred for later:
 - Right-click menus, hover highlight, middle-click paste.
 - A setting in the configuration file that turns the mouse on or off. The key of R1a is the only switch.
 
-### Założenia do potwierdzenia
+### Assumptions to confirm
 
 - Z1. (Confirmed by the person, Q1 option 1.) Mouse capture is on by default every time the TUI starts, and a key toggles it (R1a). Most terminals still allow native text selection with `Shift`+drag (or `Option`/`Fn` on macOS) while capture is on; `docs/user/tui.md` says so.
 - Z2. "Jump through list options" means the wheel moves the selected item, not only the visible window (R3). Where a list has no selection (read-only content), the wheel scrolls the content (R4).
@@ -111,7 +111,7 @@ Deferred to Planning (answered in the Planning Contract):
 - The exact line step of R4 and whether fast wheel bursts need coalescing: KTD5, KTD7.
 - How to test mouse routing without a terminal: the Verification Contract and U2.
 
-### Pytania otwarte dla użytkownika
+### Open questions for the user
 
 None. Q1 was answered: option 1 (mouse on by default, a key toggles it, `Shift`+drag documented).
 
