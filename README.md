@@ -19,33 +19,55 @@ audited).
 
 ## Features
 
-- **YAML workflows** — states, actions, decisions and transitions, validated
-  before they run; a built-in `template` workflow ships with the binary.
-- **AI agent steps** — run Claude Code, Codex, OpenCode or GitHub Copilot as the
-  harness of a state, with per-state permissions and read-only repositories.
-- **Human steps and approvals** — a workflow can pause and ask a person for
-  input, an approval or a decision.
-- **CLI and full-screen TUI** — `narsor-cli` for scripting, `narsor` for an
-  interactive view of tasks, events and conversations.
-- **Browser interface** — the functions of the TUI in a web browser, served by
-  `narsor-web`, which passes the API on to the local daemon or a remote server.
-- **Resume and recover** — interrupted or failed executions can be resumed or
-  recovered, and every event is kept for audit.
-- **Agent conversation** — read and continue the conversation with an agent at
-  any step that is waiting.
-- **Conductor** — a per-execution assistant that proposes actions you confirm
-  or reject.
-- **Multi-repository workflows** — a workflow (`schema: v2`) declares several
-  repositories, and each step says which ones an agent or script may write,
-  which it may only read, and which is its working directory. Every repository
-  is checkpointed separately.
-- **Repositories and workspaces** — a registry of repositories; each task gets
-  its own git or directory workspace.
-- **Remote backends and a server** — run tasks on registered backends
-  (Kubernetes, or a local one) controlled through `narsor-server` with OIDC
-  authentication.
-- **Harness usage limits** — subscription limits of the agent harnesses are
-  tracked and shown.
+### What makes Narsor different
+
+- **The conductor: an AI supervisor for each task** — every task has its own
+  assistant that watches the run and acts on its own when it is sure. It
+  chooses the output of an agent step that gave no usable answer, restarts a
+  failed step when that is safe, decides `decision` steps marked
+  `by: conductor`, and answers questions of agents (`autopilot: on` or
+  `best-effort`). When it is not sure, it gives the decision to a person,
+  with its analysis and a proposal. Each decision is recorded with its
+  confidence and rationale. You can also talk to it about the task in a chat.
+- **Model and effort chosen per step** — a step asks for a model tier
+  (`small` … `max`) and an effort (`low` … `max`); each harness maps the tier
+  to its own model. A `profile` step lets an agent decide how strong a model
+  the next steps need, and repeated failures of a step raise its tier and
+  effort up to a `ceiling`. Simple steps stay cheap, and hard steps get a
+  stronger model.
+- **Multi-repository tasks** — one workflow works on several repositories.
+  Each step says which repositories it may change, which it may only read,
+  and where it starts. You choose the repositories and branches when you
+  create the task.
+- **Automations and queues** — shell scripts in the catalogue connect Narsor
+  to Jira, GitHub, GitLab or any other source. They create tasks from new
+  items (for example, new Jira issues), and they move a waiting workflow on
+  when something happens outside (for example, when the reviewer of a merge
+  request is done).
+- **One system, from a laptop to a cluster** — the same workflows run:
+  - fully on one machine, with each task as a local process or in its own
+    Docker container;
+  - on a server, with task runners on Kubernetes;
+  - with the TUI, CLI or browser interface on your machine, connected to a
+    remote server that authenticates users with OIDC.
+- **Cost under control** — tokens and cost are counted for each step and
+  each task, and the subscription limits of Claude Code and GitHub Copilot
+  are shown in the interface.
+
+### Also included
+
+- **Four agent harnesses** — Claude Code, Codex, OpenCode and GitHub
+  Copilot. A workflow can name one per step, or use the installation's
+  default.
+- **YAML workflows** — agent, script, human and decision steps connected by
+  labeled transitions, validated before they run.
+- **People in the loop** — a workflow stops for an approval or a decision,
+  an agent can ask a question, and you can write to the agent of a waiting
+  or failed step.
+- **Full history** — the state and every event of a task are persisted, so a
+  task can be resumed after a restart and audited later.
+- **CLI, TUI and browser interface** — `narsor-cli` for scripts, `narsor`
+  in the terminal, `narsor-web` in a browser.
 
 ## Install
 

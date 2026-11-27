@@ -874,7 +874,7 @@ pub fn detail_lines(
                     ),
                     Tone::Normal,
                 ));
-                if let Some(usage) = task_usage_text::sum(&steps.positions)
+                if let Some(usage) = task_usage_text::sum(steps)
                     .and_then(|usage| task_usage_text::line(&usage, true))
                 {
                     lines.push(ToneLine::new(format!("Usage      {usage}"), Tone::Normal));

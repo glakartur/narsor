@@ -4,14 +4,15 @@ The conductor is the per-execution assistant that talks to the running workflow 
 
 ## The conductor
 
-The daemon runs a **conductor** beside every execution: an assistant on the
+Each task's runner runs a **conductor** beside its execution, when the
+harness binary is available in the task's environment: an assistant on the
 installation's default harness (the operator's choice — `h` in the interface,
 `narsor-cli harness default set` — or else the one `server.agent_harness` names) that
 reads the task and never writes it. There is no per-task choice: a changed
 default reaches the conductor of every task, running ones included, from its
 next invocation; the *Dyrygent* tab names the harness it runs on. It has one history per
-execution, with its chat, kept under the daemon's data directory, so it
-survives a restart of the daemon and of the interface.
+execution, with its chat, kept on the task's storage beside the execution, so
+it survives a restart of the runner, the server and the interface.
 
 It steps in on its own in five places, each with fixed limits:
 
@@ -20,7 +21,7 @@ It steps in on its own in five places, each with fixed limits:
   reads the answers and either chooses the output (with the `data` and
   `variables` it needs), asks the agent once more itself, or hands the step to
   the operator as a **problem** with its analysis. At most two extra questions
-  reach the agent in total. A choice it made can be undone.
+  reach the agent in total.
 * **A step that failed** after its `retry_policy` ran out. The execution stays
   `failed`. The conductor diagnoses the failure and proposes what to do; it may
   restart the step once by itself, with a note, and only when no attempt of the
@@ -32,7 +33,7 @@ It steps in on its own in five places, each with fixed limits:
   step, whatever `autopilot` says. It gets the message of the step, the choices
   and what each choice requires. When it is sure, it picks a label and gives the
   values that label requires. The workflow then takes the transition, and `set`
-  of the label applies. You can undo that choice. When the conductor is not sure,
+  of the label applies. When the conductor is not sure,
   when it fails, or when no conductor is attached, the operator decides. The form
   shows the conductor's proposal, already filled in. A `by: human` decision
   always waits for the operator.
@@ -45,16 +46,16 @@ It steps in on its own in five places, each with fixed limits:
   [`AgentAction`](agents.md#agentaction--running-an-ai-agent).
 
 Every decision it takes is an event with its confidence and rationale
-(`narsor events`). For an answer to an agent, the rationale is also in the
+(`narsor-cli events <id>`). For an answer to an agent, the rationale is also in the
 conversation of the step, under *ODPOWIEDŹ DYRYGENTA*.
 
 **Cost.** What the conductor uses is counted apart from the agents. The tokens
 and the cost of a conductor run go to the step it decided in. The agent numbers
-never include them. The usage line of a task ends with `· dyrygent $0.05 · razem
-$1.25` when the conductor reported any use: the first numbers are the agents'
-alone, and `razem` is the sum. In the step list of *Przebieg*, a `dyr.` value
+never include them. The usage line of a task starts with `razem` (the sum), then
+`✨` with the agents' numbers alone and `⚡` with the conductor's, when it
+reported any use. In the step list of *Przebieg*, a `dyr.` value
 shows the conductor's part of a step. If the conductor itself cannot answer, its invocation is
-repeated once — also across a daemon restart — and then the operator gets a
+repeated once — also across a restart of the runner — and then the operator gets a
 problem with the raw error; a failure of the conductor never triggers the
 conductor again.
 
@@ -62,9 +63,8 @@ conductor again.
 you ask about the task. Whatever it proposes — answering the pending input,
 telling the agent something, restarting the failed step, taking a transition,
 cancelling — happens only once you confirm it (`narsor-cli task conductor confirm`,
-`reject`, `undo`). A proposal about a moment the execution has moved on from
-is refused (`409`). Only the conductor's latest choice of an output can be
-undone, and never on a cancelled execution.
+`reject`). A proposal about a moment the execution has moved on from
+is refused (`409`).
 
 **Read-only, per harness.** On `claude-code` and `codex` the conductor runs in
 the task's workspace in the harness's own read-only mode (`plan`,

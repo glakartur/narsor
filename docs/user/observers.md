@@ -671,7 +671,8 @@ hand first, with a token that can only read where you can, and set a low
 
 ## 13. Update from stored observers
 
-Earlier versions kept observers in the state (`{state}/observers/`), with
+Earlier versions kept observers in `observers/` below the old state root
+(`global.root` with the built-in values), with
 script versions and approvals, and managed them with `narsor-cli observer
 …` and the forms of the TUI and the WebUI. That is removed: Narsor no
 longer reads those records, and the server logs one warning at start while

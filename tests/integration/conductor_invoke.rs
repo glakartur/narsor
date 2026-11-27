@@ -1201,6 +1201,95 @@ async fn the_use_a_conductor_reports_goes_to_the_sink_as_the_conductors_own() {
     assert_eq!(reading.total, None);
 }
 
+/// A Claude Code `result` line carrying `answer`, which reports `cost` and
+/// spawned `subagents`.
+fn claude_answer_costing(answer: Value, cost: f64, subagents: u32) -> String {
+    let line = json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "conductor-session",
+        "result": answer.to_string(),
+        "total_cost_usd": cost,
+        "usage": { "input_tokens": 300, "output_tokens": 40 },
+        "subagent_stats": { "spawned": subagents, "completed": subagents },
+    });
+    format!("{line}\n")
+}
+
+/// An invocation without an episode: a chat reply or a title.
+fn without_episode(fixture: &Fixture, id: &str, purpose: ConductorPurpose) -> Invocation {
+    let trigger = match purpose {
+        ConductorPurpose::GenerateTitle => ConductorTrigger::Title,
+        _ => ConductorTrigger::Chat,
+    };
+    Invocation {
+        invocation_id: id.to_string(),
+        request: QueuedRequest::new(trigger, purpose),
+        ..fixture.rescue()
+    }
+}
+
+#[tokio::test]
+async fn a_run_without_an_episode_counts_on_the_task_under_its_own_key() {
+    let fixture = Fixture::new();
+    let reply = json!({"decision": "reply", "message": "Hello.", "confidence": "high"});
+    let title = json!({"decision": "title", "title": "Fix the login", "confidence": "high"});
+    fixture
+        .claude
+        .answers(&claude_answer_costing(reply, 0.05, 2));
+    let sink = Arc::new(RecordedReadings::default());
+    let invoker = fixture
+        .invoker("claude-code")
+        .with_reading_sink(sink.clone());
+
+    let chat = without_episode(&fixture, "chat-1", ConductorPurpose::ReplyToChat);
+    answered(
+        invoker.invoke_once(&chat).await,
+        ConductorPurpose::ReplyToChat,
+    );
+    fixture
+        .claude
+        .answers(&claude_answer_costing(title, 0.01, 0));
+    let titled = without_episode(&fixture, "title-1", ConductorPurpose::GenerateTitle);
+    answered(
+        invoker.invoke_once(&titled).await,
+        ConductorPurpose::GenerateTitle,
+    );
+
+    let readings = sink.0.lock().unwrap();
+    let keys: Vec<&str> = readings.iter().map(|(_, key, _)| key.as_str()).collect();
+    assert_eq!(keys, ["conductor:chat-1", "conductor:title-1"]);
+    let (_, _, reading) = &readings[0];
+    assert_eq!(reading.conductor_cost_usd, Some(0.05));
+    assert_eq!(
+        reading.conductor_subagent_stats.map(|stats| stats.spawned),
+        Some(2)
+    );
+    assert_eq!((reading.cost_usd, reading.total), (None, None));
+    assert_eq!(reading.subagent_stats, None);
+}
+
+#[tokio::test]
+async fn a_chat_reply_that_fails_before_any_use_report_records_nothing() {
+    let fixture = Fixture::new();
+    fixture.claude.fails(1, "authentication failed");
+    let sink = Arc::new(RecordedReadings::default());
+
+    let outcome = fixture
+        .invoker("claude-code")
+        .with_reading_sink(sink.clone())
+        .invoke_once(&without_episode(
+            &fixture,
+            "chat-1",
+            ConductorPurpose::ReplyToChat,
+        ))
+        .await;
+
+    failed(outcome);
+    assert!(sink.0.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn an_answer_without_a_use_report_is_still_an_answer_and_records_nothing() {
     let fixture = Fixture::new();

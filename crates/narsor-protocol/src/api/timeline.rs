@@ -174,6 +174,10 @@ pub struct PositionUsage {
     /// The cost of those conductor runs, in US dollars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conductor_cost_usd: Option<f64>,
+    /// The subagents of those conductor runs; their cost is in
+    /// `conductor_cost_usd`. Never part of the agent's subagents above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conductor_subagent_stats: Option<SubagentStats>,
 }
 
 /// Outcome of one timeline position.
@@ -210,6 +214,27 @@ pub struct Timeline {
     pub positions: Vec<Position>,
     pub links: BTreeMap<u64, EventLink>,
     pub default_position: Option<String>,
+    /// What the conductor used in runs that belong to no position (chat
+    /// replies, titles). It counts on the task and on no position; `None`
+    /// when there were no such runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conductor_usage: Option<ConductorUsage>,
+}
+
+/// What the conductor used in the runs of a task that belong to no
+/// timeline position. A part the harness did not report is `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConductorUsage {
+    /// All tokens in and out, its subagents' included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<TokenCounts>,
+    /// The cost the harness reported, in US dollars; the subagents' cost
+    /// is in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// The conductor's subagents, all runs together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_stats: Option<SubagentStats>,
 }
 
 impl Timeline {

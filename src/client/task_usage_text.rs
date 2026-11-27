@@ -7,9 +7,13 @@
 //!
 //! What the conductor used is reported apart from what the agents used, and
 //! stays apart: the agent's numbers never include it, and the combined
-//! numbers are the sum of the two, made here.
+//! numbers are the sum of the two, made here. The conductor's part is what
+//! it used on the positions plus what it used in runs without a position
+//! (chat replies, titles), which the timeline keeps for the whole task. Its
+//! subagents are counted apart from the agents' subagents and add no cost:
+//! the conductor's cost already includes theirs.
 
-use narsor_protocol::api::{Position, PositionUsage, TokenCounts};
+use narsor_protocol::api::{PositionUsage, SubagentStats, Timeline, TokenCounts};
 
 /// The icon of the subagents, in the task header and in every step row.
 pub const SUBAGENTS_ICON: &str = "👥";
@@ -32,15 +36,24 @@ pub struct TaskUsage {
     /// What the subagents cost, when the harness says. It never does today,
     /// so it stays `None` and the line shows no cost for them.
     pub subagent_cost_usd: Option<f64>,
-    /// What the conductor used when it decided, apart from the above.
+    /// What the conductor used, on the positions and in its runs without a
+    /// position, apart from the above.
     pub conductor_total: Option<TokenCounts>,
     pub conductor_cost_usd: Option<f64>,
+    /// How many subagents the conductor started; their cost is in
+    /// `conductor_cost_usd`.
+    pub conductor_subagent_count: Option<u32>,
+    /// The tokens of the conductor's subagents together.
+    pub conductor_subagent_tokens: Option<u64>,
 }
 
 impl TaskUsage {
     /// Whether the conductor reported anything.
     pub fn has_conductor(&self) -> bool {
-        self.conductor_total.is_some() || self.conductor_cost_usd.is_some()
+        self.conductor_total.is_some()
+            || self.conductor_cost_usd.is_some()
+            || self.conductor_subagent_count.is_some()
+            || self.conductor_subagent_tokens.is_some()
     }
 
     /// The cost of the agents and the conductor together; `None` when
@@ -62,10 +75,30 @@ pub fn subagent_count_of(usage: &PositionUsage) -> Option<u32> {
     })
 }
 
-/// The sum of the usage of `positions`; `None` when no position reported any.
-pub fn sum(positions: &[Position]) -> Option<TaskUsage> {
+/// The tokens of subagents that ran, when the harness gave them.
+fn spawned_tokens(stats: Option<SubagentStats>) -> Option<u64> {
+    stats
+        .filter(|stats| stats.spawned > 0 && stats.tokens > 0)
+        .map(|stats| stats.tokens)
+}
+
+/// How many subagents ran, when above zero.
+fn spawned_count(stats: Option<SubagentStats>) -> Option<u32> {
+    stats
+        .map(|stats| stats.spawned)
+        .filter(|spawned| *spawned > 0)
+}
+
+/// The sum of the usage of the positions of `timeline` and of what its
+/// conductor used in runs without a position; `None` when nothing reported
+/// any.
+pub fn sum(timeline: &Timeline) -> Option<TaskUsage> {
     let mut sum: Option<TaskUsage> = None;
-    for usage in positions.iter().filter_map(|position| position.usage) {
+    for usage in timeline
+        .positions
+        .iter()
+        .filter_map(|position| position.usage)
+    {
         let so_far = sum.unwrap_or_default();
         sum = Some(TaskUsage {
             total: add(so_far.total, usage.total, TokenCounts::plus),
@@ -77,25 +110,26 @@ pub fn sum(positions: &[Position]) -> Option<TaskUsage> {
             ),
             subagent_tokens: add(
                 so_far.subagent_tokens,
-                usage
-                    .subagent_stats
-                    .filter(|stats| stats.spawned > 0 && stats.tokens > 0)
-                    .map(|stats| stats.tokens),
+                spawned_tokens(usage.subagent_stats),
                 u64::saturating_add,
             ),
             cost_usd: add(so_far.cost_usd, usage.cost_usd, |a, b| a + b),
             subagent_cost_usd: None,
-            conductor_total: add(
-                so_far.conductor_total,
+            ..with_conductor(
+                so_far,
                 usage.conductor_total,
-                TokenCounts::plus,
-            ),
-            conductor_cost_usd: add(
-                so_far.conductor_cost_usd,
                 usage.conductor_cost_usd,
-                |a, b| a + b,
-            ),
+                usage.conductor_subagent_stats,
+            )
         });
+    }
+    if let Some(bucket) = timeline.conductor_usage {
+        sum = Some(with_conductor(
+            sum.unwrap_or_default(),
+            bucket.total,
+            bucket.cost_usd,
+            bucket.subagent_stats,
+        ));
     }
     sum.filter(|usage| {
         usage.total.is_some()
@@ -107,6 +141,30 @@ pub fn sum(positions: &[Position]) -> Option<TaskUsage> {
     })
 }
 
+/// `so_far` with one more reading of the conductor's use added.
+fn with_conductor(
+    so_far: TaskUsage,
+    total: Option<TokenCounts>,
+    cost_usd: Option<f64>,
+    stats: Option<SubagentStats>,
+) -> TaskUsage {
+    TaskUsage {
+        conductor_total: add(so_far.conductor_total, total, TokenCounts::plus),
+        conductor_cost_usd: add(so_far.conductor_cost_usd, cost_usd, |a, b| a + b),
+        conductor_subagent_count: add(
+            so_far.conductor_subagent_count,
+            spawned_count(stats),
+            u32::saturating_add,
+        ),
+        conductor_subagent_tokens: add(
+            so_far.conductor_subagent_tokens,
+            spawned_tokens(stats),
+            u64::saturating_add,
+        ),
+        ..so_far
+    }
+}
+
 fn add<T: Copy>(a: Option<T>, b: Option<T>, plus: impl Fn(T, T) -> T) -> Option<T> {
     match (a, b) {
         (Some(a), Some(b)) => Some(plus(a, b)),
@@ -114,30 +172,48 @@ fn add<T: Copy>(a: Option<T>, b: Option<T>, plus: impl Fn(T, T) -> T) -> Option<
     }
 }
 
-/// `razem $68.30 · ✨ $34.15 ↑304 ↓72k (👥 2 $12 ↑100 ↓20k) · ⚡ $34.15 ↑304 ↓72k`:
+/// `razem $68.30 · ✨ $34.15 ↑304 ↓72k (👥 2 $12 ↑100 ↓20k) · ⚡ $34.15 ↑304 ↓72k (👥 1 ↕3k)`:
 /// the cost of all, then each group with its cost and its tokens in (`↑`) and
 /// out (`↓`): `✨` the agents (their numbers include the subagents'), `👥` the
 /// subagents in brackets after them — their count first, then their tokens in
-/// and out (`↑` `↓`) or together (`↕`) — and `⚡` the
-/// conductor. A group or a part nobody reported is left out, so the line has
-/// no placeholder; `None` when there is nothing to say. The subagents are
-/// left out when not `with_subagents`.
+/// and out (`↑` `↓`) or together (`↕`) — and `⚡` the conductor, with its own
+/// subagents in brackets after it (their cost is in the conductor's). A group
+/// or a part nobody reported is left out, so the line has no placeholder;
+/// `None` when there is nothing to say. The subagents are left out when not
+/// `with_subagents`.
 pub fn line(usage: &TaskUsage, with_subagents: bool) -> Option<String> {
-    let subagents = with_subagents.then(|| subagents_block(usage)).flatten();
-    let agents = parts_of(usage.cost_usd, usage.total);
-    let agents_group = match (agents.is_empty(), subagents) {
-        (true, None) => None,
-        (true, Some(subagents)) => Some(format!("({subagents})")),
-        (false, None) => Some(format!("✨ {agents}")),
-        (false, Some(subagents)) => Some(format!("✨ {agents} ({subagents})")),
-    };
-    let conductor = parts_of(usage.conductor_cost_usd, usage.conductor_total);
+    let subagents = with_subagents
+        .then(|| {
+            subagents_block(
+                usage.subagent_count,
+                usage.subagents,
+                usage.subagent_cost_usd,
+                usage.subagent_tokens,
+            )
+        })
+        .flatten();
+    let agents_group = group(None, parts_of(usage.cost_usd, usage.total), subagents);
+    let conductor_subagents = with_subagents
+        .then(|| {
+            subagents_block(
+                usage.conductor_subagent_count,
+                None,
+                None,
+                usage.conductor_subagent_tokens,
+            )
+        })
+        .flatten();
+    let conductor_group = group(
+        Some("⚡"),
+        parts_of(usage.conductor_cost_usd, usage.conductor_total),
+        conductor_subagents,
+    );
     let groups: Vec<String> = [
         usage
             .combined_cost_usd()
             .map(|cost| format!("razem {}", money(cost))),
         agents_group,
-        (!conductor.is_empty()).then(|| format!("⚡ {conductor}")),
+        conductor_group,
     ]
     .into_iter()
     .flatten()
@@ -145,29 +221,49 @@ pub fn line(usage: &TaskUsage, with_subagents: bool) -> Option<String> {
     (!groups.is_empty()).then(|| groups.join(" · "))
 }
 
+/// One group of the line: its icon and parts, then its subagents in
+/// brackets. The agents' icon is left out when they have only subagents to
+/// show; the conductor's always stands, so its subagents read as its own.
+fn group(icon: Option<&str>, parts: String, subagents: Option<String>) -> Option<String> {
+    let icon = match icon {
+        Some(icon) => Some(icon),
+        None => (!parts.is_empty()).then_some("✨"),
+    };
+    let text: Vec<String> = [
+        icon.map(str::to_string),
+        (!parts.is_empty()).then_some(parts),
+        subagents.map(|subagents| format!("({subagents})")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let has_data = text.len() > usize::from(icon.is_some());
+    has_data.then(|| text.join(" "))
+}
+
 /// `👥 2 $12 ↑100 ↓20k`: the subagents' count, cost and tokens, each part
 /// only when known. Tokens are `↑` `↓` when the harness split them, else `↕`
 /// for their sum. A count alone is a block; subagents without a count, a cost
 /// or tokens are not.
-fn subagents_block(usage: &TaskUsage) -> Option<String> {
-    let split = usage
-        .subagents
-        .filter(|counts| counts.input + counts.output > 0);
+fn subagents_block(
+    count: Option<u32>,
+    split: Option<TokenCounts>,
+    cost: Option<f64>,
+    together: Option<u64>,
+) -> Option<String> {
+    let split = split.filter(|counts| counts.input + counts.output > 0);
     let used = match split {
-        Some(_) => parts_of(usage.subagent_cost_usd, split),
+        Some(_) => parts_of(cost, split),
         None => [
-            usage.subagent_cost_usd.map(money),
-            usage
-                .subagent_tokens
-                .map(|tokens| format!("↕{}", scaled(tokens))),
+            cost.map(money),
+            together.map(|tokens| format!("↕{}", scaled(tokens))),
         ]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
         .join(" "),
     };
-    let count = usage
-        .subagent_count
+    let count = count
         .filter(|count| *count > 0)
         .map(|count| count.to_string());
     let parts: Vec<String> = count
@@ -292,7 +388,10 @@ fn unit(count: u64, divisor: u64, suffix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use narsor_protocol::api::{ConversationState, PositionStatus, PositionUsage, SubagentStats};
+    use narsor_protocol::api::{
+        ConductorUsage, ConversationState, Position, PositionStatus, PositionUsage, SubagentStats,
+        Timeline,
+    };
 
     use super::*;
 
@@ -341,6 +440,98 @@ mod tests {
         }
     }
 
+    fn sum_of(positions: &[Position]) -> Option<TaskUsage> {
+        sum(&Timeline {
+            positions: positions.to_vec(),
+            ..Timeline::default()
+        })
+    }
+
+    /// A task bucket of the conductor's runs without a position.
+    fn bucket(cost: f64, subagents: Option<(u32, u64)>) -> ConductorUsage {
+        ConductorUsage {
+            total: Some(counts(2_000, 400)),
+            cost_usd: Some(cost),
+            subagent_stats: subagents.map(|(spawned, tokens)| SubagentStats {
+                spawned,
+                tokens,
+                ..SubagentStats::default()
+            }),
+        }
+    }
+
+    fn timeline_with(positions: Vec<Position>, bucket: ConductorUsage) -> Timeline {
+        Timeline {
+            positions,
+            conductor_usage: Some(bucket),
+            ..Timeline::default()
+        }
+    }
+
+    #[test]
+    fn the_conductors_task_bucket_adds_to_its_part_and_to_the_total() {
+        let mut step = used((80_000, 5_000), None, 1.0);
+        step.conductor_cost_usd = Some(0.1);
+        let timeline = timeline_with(vec![position(Some(step))], bucket(0.05, None));
+
+        let line = text(&sum(&timeline).unwrap(), true);
+
+        assert!(line.starts_with("razem $1.15 · "), "{line}");
+        assert!(line.ends_with(" · ⚡ $0.15 ↑2k ↓400"), "{line}");
+    }
+
+    #[test]
+    fn a_task_with_only_the_conductors_task_bucket_has_a_line() {
+        let timeline = timeline_with(vec![position(None)], bucket(0.05, None));
+
+        let usage = sum(&timeline).unwrap();
+
+        assert_eq!(text(&usage, true), "razem $0.05 · ⚡ $0.05 ↑2k ↓400");
+    }
+
+    #[test]
+    fn the_conductors_subagents_have_a_block_of_their_own_in_its_group() {
+        let step = used((80_000, 5_000), Some((30_000, 2_000)), 1.0);
+        let timeline = timeline_with(vec![position(Some(step))], bucket(0.05, Some((2, 3_000))));
+
+        let usage = sum(&timeline).unwrap();
+
+        assert_eq!(
+            text(&usage, true),
+            "razem $1.05 · ✨ $1.00 ↑80k ↓5k (👥 1 ↑30k ↓2k) · ⚡ $0.05 ↑2k ↓400 (👥 2 ↕3k)"
+        );
+        assert_eq!(
+            text(&usage, false),
+            "razem $1.05 · ✨ $1.00 ↑80k ↓5k · ⚡ $0.05 ↑2k ↓400"
+        );
+    }
+
+    #[test]
+    fn the_conductors_subagents_of_steps_and_of_the_task_add_up_and_leave_the_step_cells() {
+        let agent_step = used((80_000, 5_000), Some((30_000, 2_000)), 1.0);
+        let mut gate = PositionUsage {
+            conductor_cost_usd: Some(0.1),
+            ..PositionUsage::default()
+        };
+        let cells_without = step_cells(Some(&gate));
+        gate.conductor_subagent_stats = Some(SubagentStats {
+            spawned: 1,
+            tokens: 1_000,
+            ..SubagentStats::default()
+        });
+        let timeline = timeline_with(
+            vec![position(Some(agent_step)), position(Some(gate))],
+            bucket(0.05, Some((2, 3_000))),
+        );
+
+        let usage = sum(&timeline).unwrap();
+
+        assert_eq!(usage.conductor_subagent_count, Some(3));
+        assert_eq!(usage.conductor_subagent_tokens, Some(4_000));
+        assert_eq!(usage.subagent_count, Some(1));
+        assert_eq!(step_cells(Some(&gate)), cells_without);
+    }
+
     /// The line, which has to exist.
     fn text(usage: &TaskUsage, with_subagents: bool) -> String {
         line(usage, with_subagents).expect("a line")
@@ -356,6 +547,7 @@ mod tests {
             subagent_cost_usd: Some(12.0),
             conductor_total: Some(counts(304, 72_000)),
             conductor_cost_usd: Some(34.15),
+            ..TaskUsage::default()
         }
     }
 
@@ -436,7 +628,7 @@ mod tests {
             position(None),
             position(Some(used((40_000, 3_000), Some((10_000, 1_000)), 0.4))),
         ];
-        let usage = sum(&positions).unwrap();
+        let usage = sum_of(&positions).unwrap();
         assert_eq!(
             text(&usage, true),
             "razem $1.20 · ✨ $1.20 ↑120k ↓8k (👥 2 ↑40k ↓3k)"
@@ -446,9 +638,9 @@ mod tests {
 
     #[test]
     fn a_task_without_any_report_has_no_usage() {
-        assert_eq!(sum(&[]), None);
-        assert_eq!(sum(&[position(None)]), None);
-        assert_eq!(sum(&[position(Some(PositionUsage::default()))]), None);
+        assert_eq!(sum_of(&[]), None);
+        assert_eq!(sum_of(&[position(None)]), None);
+        assert_eq!(sum_of(&[position(Some(PositionUsage::default()))]), None);
     }
 
     #[test]
@@ -462,11 +654,11 @@ mod tests {
             ..PositionUsage::default()
         };
         assert_eq!(
-            text(&sum(&[position(Some(only_cost))]).unwrap(), true),
+            text(&sum_of(&[position(Some(only_cost))]).unwrap(), true),
             "razem $0.50 · ✨ $0.50"
         );
         assert_eq!(
-            text(&sum(&[position(Some(only_tokens))]).unwrap(), true),
+            text(&sum_of(&[position(Some(only_tokens))]).unwrap(), true),
             "✨ ↑1.5k ↓20"
         );
     }
@@ -475,9 +667,9 @@ mod tests {
     fn subagents_that_used_nothing_show_their_count_only() {
         let none = used((1_000, 100), None, 0.1);
         let zero = used((1_000, 100), Some((0, 0)), 0.1);
-        let usage = sum(&[position(Some(none))]).unwrap();
+        let usage = sum_of(&[position(Some(none))]).unwrap();
         assert_eq!(text(&usage, true), "razem $0.10 · ✨ $0.10 ↑1k ↓100");
-        let usage = sum(&[position(Some(zero))]).unwrap();
+        let usage = sum_of(&[position(Some(zero))]).unwrap();
         assert_eq!(text(&usage, true), "razem $0.10 · ✨ $0.10 ↑1k ↓100 (👥 1)");
     }
 
@@ -500,26 +692,26 @@ mod tests {
             spawned: 3,
             ..SubagentStats::default()
         });
-        let usage = sum(&[position(Some(step))]).unwrap();
+        let usage = sum_of(&[position(Some(step))]).unwrap();
         assert_eq!(
             text(&usage, true),
             "razem $1.20 · ✨ $1.20 ↑120k ↓8k (👥 3)"
         );
-        let only = sum(&[position(Some(stats_usage(3, 0)))]).unwrap();
+        let only = sum_of(&[position(Some(stats_usage(3, 0)))]).unwrap();
         assert_eq!(text(&only, true), "(👥 3)");
-        assert!(sum(&[position(Some(stats_usage(0, 0)))]).is_none());
+        assert!(sum_of(&[position(Some(stats_usage(0, 0)))]).is_none());
     }
 
     /// Covers AE4 and the header of a harness that gives tokens together.
     #[test]
     fn the_tokens_of_subagents_together_are_added_up_in_the_header() {
-        let usage = sum(&[
+        let usage = sum_of(&[
             position(Some(stats_usage(2, 50_000))),
             position(Some(stats_usage(1, 36_000))),
         ])
         .unwrap();
         assert_eq!(text(&usage, true), "(👥 3 ↕86k)");
-        let copilot = sum(&[position(Some(stats_usage(2, 7_978)))]).unwrap();
+        let copilot = sum_of(&[position(Some(stats_usage(2, 7_978)))]).unwrap();
         assert_eq!(text(&copilot, true), "(👥 2 ↕8k)");
     }
 
@@ -539,7 +731,7 @@ mod tests {
     #[test]
     fn the_header_is_the_sum_of_the_rows() {
         let steps = [stats_usage(2, 50_000), stats_usage(1, 36_000)];
-        let usage = sum(&steps.map(|step| position(Some(step)))).unwrap();
+        let usage = sum_of(&steps.map(|step| position(Some(step)))).unwrap();
         let cells: Vec<StepCells> = steps.iter().map(|step| step_cells(Some(step))).collect();
         assert_eq!(cells[0].subagent_count, "👥 2");
         assert_eq!(cells[1].subagent_total, "↕36k");
@@ -568,7 +760,7 @@ mod tests {
     #[test]
     fn the_cost_is_rounded_to_cents() {
         let at = |cost| {
-            let usage = sum(&[position(Some(used((1, 1), None, cost)))]).unwrap();
+            let usage = sum_of(&[position(Some(used((1, 1), None, cost)))]).unwrap();
             text(&usage, false)
         };
         assert!(at(0.004).starts_with("razem $0.00 "));
@@ -586,7 +778,7 @@ mod tests {
             }),
             ..PositionUsage::default()
         };
-        let usage = sum(&[position(Some(cached))]).unwrap();
+        let usage = sum_of(&[position(Some(cached))]).unwrap();
         assert_eq!(text(&usage, true), "✨ ↑2k ↓100");
     }
 
@@ -714,7 +906,7 @@ mod tests {
         second.conductor_cost_usd = Some(0.25);
         second.conductor_total = Some(counts(500, 50));
 
-        let task = sum(&[position(Some(first)), position(Some(second))]).unwrap();
+        let task = sum_of(&[position(Some(first)), position(Some(second))]).unwrap();
 
         assert_eq!(task.cost_usd, Some(1.0));
         assert_eq!(task.total, Some(counts(100_000, 6_000)));
@@ -730,7 +922,7 @@ mod tests {
             ..PositionUsage::default()
         };
 
-        let task = sum(&[position(Some(only_conductor))]).unwrap();
+        let task = sum_of(&[position(Some(only_conductor))]).unwrap();
 
         assert_eq!(task.cost_usd, None);
         assert_eq!(task.combined_cost_usd(), Some(0.1));

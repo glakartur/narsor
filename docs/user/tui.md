@@ -17,7 +17,7 @@ narsor · local ● live             harness claude-code (konfiguracja) · sloty
 ╭▸ Zadania ────────────────╮╭ Zmiana API zamówień ─────────────────────────────────────────╮
 │  ●  NAR-14 Edycja pars…  ││ Zmiana API zamówień · NAR-12                    implement v3 │
 │     edit · 14m           ││ Jira NAR-12 ↗   PR !482 ↗   running · krok 3/5 · 14m         │
-│──────────────────────────││ Przebieg  Rozmowa  Zdarzenia  Dyrygent  Stan  Info           │
+│──────────────────────────││ Rozmowa  Przebieg  Zdarzenia  Dyrygent  Stan  Info           │
 ││ ?  Zmiana API zamówień  ││───────────────────│   Read src/api.rs                        │
 ││    3m                   │││ ● review_api     │   Edit src/api.rs  +12 −3                │
 │──────────────────────────││───────────────────│ │ assistant: Zmieniam sygnaturę…         │
@@ -95,14 +95,15 @@ always thin: cyan where the keys are, grey elsewhere (bold and dim without
 colour). The history, the steps on *Przebieg* and every list of choices (the
 menu, the answer panel, the new task, the repositories) mark their selection
 the same way; a conversation and *Zdarzenia* keep only the bar. `z` hides
-finished and archived tasks as a filter; `a` archives one. The selection follows
+finished and archived tasks as a filter; *Archiwizuj* in the action panel
+(`Ctrl+.` / `.`) archives one. The selection follows
 the task, not the row, through every refresh. Activity time advances on redraw;
 tasks without a known start time and finished tasks show no time.
 `/` filters by ticket, title or full id without
 changing server order; state changes and refreshes likewise keep rows in place,
 and only an explicit queue move reorders them. `Esc` cancels filter editing.
 
-**The details** show the header and five tabs. The header has a fixed layout that
+**The details** show the header and six tabs. The header has a fixed layout that
 the workflow does not change. The title is on the top edge of the frame; when
 the edge has to cut it, the header's first row says it in full. Then come the
 status row (`● running · krok 3 implement · code-review v3 · 14m`) and one row
@@ -112,9 +113,11 @@ changed lines `+N −M` against the base branch and the pull request (`PR #42 �
 a link in terminals that support them; `—` when there is none). A narrow
 terminal cuts the rows in this order: the base branch, the changed lines, the
 branch, the repository; the workspace name and the pull request stay. Once a
-harness reported any usage, a last row shows it: `razem $1.25 · agenci $1.20
-↑120k ↓8k (subagenci ↑40k ↓3k ×2) · dyrygent $0.05 ↑9k ↓1k`, where `↑` is the
-tokens in and `↓` the tokens out; a part nobody reported reads `—`. and five tabs: *Przebieg* (the steps and the selected one; each step's first row is its glyph
+harness reported any usage, a last row shows it: `razem $1.25 · ✨ $1.20 ↑120k
+↓8k (👥 2 ↑40k ↓3k) · ⚡ $0.05 ↑9k ↓1k`, where `✨` is the agents, `👥` their
+subagents, `⚡` the conductor, `↑` the tokens in and `↓` the tokens out; a
+part nobody reported is left out. The tabs are *Rozmowa* (the agent's conversation, one step at a time; the
+details open on it), *Przebieg* (the steps and the selected one; each step's first row is its glyph
 (`✓` done, `✗` failed or interrupted, `●` running, `?` waiting for a decision),
 its name, when it started and how long it ran; the axis never spells the status
 out. The steps show only this first row by default; `v` on the steps (in the
@@ -127,7 +130,7 @@ row, only for a step that has them, gives its model, effort and harness. The
 selected step has a bracket, no fill. On a narrow axis the name is cut first, then
 the duration goes, then the start time. The columns stand three spaces apart. The step list may take up to 75% of a
 tab at least 100 columns wide (70% of a narrower one), and a step that reported nothing leaves those fields empty),
-*Rozmowa* (the agent's conversation), *Zdarzenia*, *Dyrygent* (the conductor's
+*Zdarzenia*, *Dyrygent* (the conductor's
 chat and decisions; its status line names the harness the conductor runs on),
 *Stan* (the execution state, see below) and *Info* (the sealed inputs, the observations with their age, the runner and
 the controller). `[` / `]` switch the tabs. *Przebieg* has two levels of
@@ -151,8 +154,7 @@ conductor and the state went away with the storage, so their tabs are not
 shown. Pick a step with `j` / `k` (`↓` / `↑`) and `g` / `G`; the list scrolls
 to keep it in view, and each entry keeps its step. The steps cannot be opened,
 and nothing is followed. The right side shows the facts of the step and the
-line `rozmowa usunięta przy archiwizacji`. *Przebieg* says
-`storage usunięty przy archiwizacji` only when the task has no kept run at all. When the read of the run
+line `rozmowa usunięta przy archiwizacji`. When the read of the run
 fails, *Przebieg* shows why; select the entry again to read it again.
 
 **The *Stan* tab** shows every value the workflow sees now, as one sorted list
@@ -168,8 +170,7 @@ the conversation move the cursor from row to row; `Enter` unfolds the row
 than the screen, the movement keys first scroll it, and go to the next row
 only at its first or last line. Unfolded rows stay unfolded after `Ctrl+R`.
 When the state cannot be read, the tab says why; while a stopped task's
-read-only runner starts, it asks again by itself. In the history, *Stan* says
-`storage usunięty przy archiwizacji`. The same list prints with
+read-only runner starts, it asks again by itself. The same list prints with
 `narsor-cli task state TASK_ID` (`--json` for the state unflattened).
 
 In the conversation, the entries of one subagent form **one collapsed group**,
@@ -210,8 +211,9 @@ conductor's next invocation (see [`AgentAction`](agents.md#agentaction--running-
 kind of waiting: a question or a `human` gate, an approval, a problem, a failed
 step (with the conductor's diagnosis and proposals, or the raw error), a
 proposal of the conductor's, a failed provisioning. Every choice is a list with
-a description of its effect next to it; `Tab` moves between the choices and
-their fields, `Enter` sends, `Esc` folds the panel and keeps what was typed.
+a description of its effect next to it; `↓` / `↑` move between the choices
+and their fields, `Enter` sends (or goes to the first required field), `Tab`
+gives the keys back to the details, `Esc` folds the panel and keeps what was typed.
 Action 0, `Napisz do agenta`, is the first choice of every panel: type a
 message and send it. The panel keeps the text when the send fails and empties
 the field when it succeeds.
@@ -323,14 +325,13 @@ itself. It goes on by a comment (agent), *Uruchom od nowa* (script step) or
 | `o` | open a pull request link of a workspace in the browser | — |
 | `c` | write to the agent, in one step; it is the conversation's, not the panel's: the server picks what it does by the way the task is stopped — a question: a message in the same session; an approval or a permission: a refusal with your note, never an approval; a stop: the note goes to the agent and the task resumes. A text that was not sent stays as a draft of the task | — |
 | `c` (*Dyrygent*) | write to the conductor | `narsor-cli task conductor chat` |
-| `u` (*Dyrygent*) | undo a decision of the conductor (`!`) | `narsor-cli task conductor undo` |
 | `Ctrl+R` (*Stan*) | read the execution state again | `narsor-cli task state` |
 | the panel | confirm / reject a proposal, restart a failed step with a note | `narsor-cli task conductor confirm` / `reject`, `narsor-cli task restart-step` |
-| `n` | new task (a catalogue workflow, or the path of a definition); each repository input has a branch field next to it, preselected with the repository's default branch, with the branches of the remote as suggestions (you can always type another one) | `narsor-cli task create <workflow> [--branch INPUT=BRANCH]`, `narsor-cli task create --file <path>`; the catalogue is `narsor-cli task workflows`, the check of a file `narsor-cli task validate <path>` |
-| `i` / the panel | answer what waits: fields, `artifacts`, `variables`, label, comment | `narsor-cli task input <task> --field … --artifact … --variable … [--waiting-id ID]` |
+| `n` | new task (a catalogue workflow, or the path of a definition); each workspace the workflow leaves open has a repository field and a branch field, preselected with the repository's default branch, with the branches of the remote as suggestions (you can always type another one) | `narsor-cli task create <workflow> [--repository WORKSPACE=ID] [--branch WORKSPACE=BRANCH]`, `narsor-cli task create --file <path>`; the catalogue is `narsor-cli task workflows`, the check of a file `narsor-cli task validate <path>` |
+| the panel | answer what waits: fields, `artifacts`, `variables`, label, comment | `narsor-cli task input <task> --field … --artifact … --variable … [--waiting-id ID]` |
 | `Space` | the next task that waits | `narsor-cli task show` ends with `Next       waiting: <task>` |
 | `H` | history: archived tasks | `narsor-cli task list --archived` |
-| `R` | repositories: `a` registers, `d` removes (`!`) | `narsor-cli task repo list` / `add` / `remove` (the same registry on any server; `narsor-cli repo …` is the local one) |
+| `R` | repositories: `a` registers, `d` removes (`!`) | `narsor-cli task repo list` / `add` / `remove` (`narsor-cli repo …` is the same set of commands at the top level) |
 | `h` | the installation's default agent harness: choose one, or go back to the configured one | `narsor-cli harness default set <harness>` / `reset` (`narsor-cli harness default` shows it) |
 | `L` | the limit of tasks processed at once: one more or one less, until the daemon restarts (then `server.max_concurrent_tasks` applies again) | `server.max_concurrent_tasks` in the configuration |
 | `O` | automation queues, read-only: the queues of the catalogue with their number of entries, a mark on a queue that does not run, and the catalogue files that cannot be used; in a queue its automations (description, scripts, state, runs, errors) and the tasks that wait on it. A task with a queue entry has one mark on its row. See [Automations and queues](observers.md#9-queue-views) | `narsor-cli queue list` / `show`; to change a queue or an automation, change its catalogue file |
@@ -355,8 +356,8 @@ server and for every backend.
 
 `n` opens the catalogue of workflows (built-in, user and root ones, with the
 source of each and what a copy overrides) with the inputs of the highlighted
-one as the form: the declared `type` decides what a value is (`boolean` and
-`repository` are choices, `integer` is checked) and a missing required input
+one as the form: the declared `type` decides what a value is (`boolean` is a
+choice, `integer` is checked, `text` is a large field) and a missing required input
 is reported next to the field. The last entry takes the path of a definition
 you are writing — validated first, every violation listed, as
 `narsor-cli validate` does — which only a local server accepts. A new task is a
@@ -382,17 +383,18 @@ the current step or a draft.
 
 | Where | Keys |
 |---|---|
-| Everywhere | `?` help, `q` quit (asks when a draft would be lost), `D` write the problem log to a file (not while you type in a field), `P` mouse on / off (not while you type in a field) |
-| List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `Ctrl+.` (or `.`) action panel, `n` `z` `H` `R`, `Ctrl+↑` `Ctrl+↓` `m`, `o` `c` `r`, `h` default harness, `L` task limit |
-| Details | `[` / `]` tabs, `Tab` content ↔ panel, `Ctrl+.` (or `.`) action panel, `h` default harness, `L` task limit (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
+| Everywhere | `?` help, `q` quit (press `q` again to confirm, `Esc` to stay), `D` write the problem log to a file (not while you type in a field), `P` mouse on / off (not while you type in a field) |
+| List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `Ctrl+.` (or `.`) action panel, `n` `z` `H` `R` `O` (queues), `Tab` details, `Ctrl+↑` `Ctrl+↓` `m`, `o` `c` `r`, `h` default harness, `L` task limit |
+| Details | `[` / `]` tabs, `Tab` content ↔ panel, `Ctrl+.` (or `.`) action panel, `h` default harness, `L` task limit (the history's details: `[` / `]`, `Tab`, `h`); then by where the keys are: |
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step, `v` one row or full rows per step |
 | — *Przebieg* in the history | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `v` one row or full rows per step (the steps of an archived run cannot be opened or followed) |
-| — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry (a subagent's group `▸` / `▾` too), `v` raw entry, `Ctrl+V` raw all |
-| — the other tabs | `Esc` list, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` to the end and follow |
-| Panel | `Tab` actions ↔ fields, `Enter` send, `Ctrl+J` new line (also `Shift+Enter` / `Alt+Enter` where the terminal reports modifiers), `Esc` fold (with the server's forms: next form), `1`–`9` choose, `[` / `]` previous / next waiting (not with the server's forms) |
+| — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry (a subagent's group `▸` / `▾` too), `v` next view (rendered → chronology → raw), `r` raw source of the entry, `Home` / `End` start / end |
+| — *Rozmowa* | `←` / `→` newer / older step on the step strip, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` next view, `r` raw source of the entry, `f` follow the newest step |
+| — *Zdarzenia*, *Dyrygent*, *Stan*, *Info* | `Esc` list, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` to the end and follow |
+| Panel | `↓` / `↑` actions and fields, `Tab` back to the details, `Enter` send, `Ctrl+J` new line (also `Shift+Enter` / `Alt+Enter` where the terminal reports modifiers), `Esc` fold (with the server's forms: next form), `1`–`9` choose, `[` / `]` previous / next waiting (not with the server's forms) |
 | Menu | `j` / `k`, `1`–`9`, `Enter`, `Esc` and the shortcuts above |
 | Confirmation | `y` confirm, `n` / `Esc` take it back |
-| Forms | `Tab` / `Shift+Tab`, `←` / `→`, `Enter` send, `Ctrl+J` new line, `Esc` back (from a new-task field to the list, then close; what was typed stays) |
+| Forms | `↓` / `↑` fields, `←` / `→` options or cursor, `Tab` the neighbouring panel, `Enter` send, `Ctrl+J` new line, `Esc` back (from a new-task field to the list, then close; what was typed stays) |
 
 **Mouse.** The mouse adds a way in; every action still has its key. While the
 TUI runs, the terminal reports the mouse buttons and the wheel (not pointer

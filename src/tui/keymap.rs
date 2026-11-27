@@ -3,7 +3,7 @@
 //! A key means one thing in one context, and the table below is the single
 //! source of three things that used to be able to drift apart: what a key
 //! *does* ([`lookup`]), the shortcut bar at the bottom of the screen
-//! ([`hint_line`]) and the `?` help ([`help_entries`], [`render_help`]).
+//! ([`hint_line`]) and the `?` help ([`help_entries`], [`render_help_entries`]).
 //! Handlers match on [`Action`], never on a raw key.
 //!
 //! # Contexts
@@ -2152,12 +2152,6 @@ fn hint_line_from(
         spans.push(Span::raw(format!("{label} ")));
     }
     Line::from(spans)
-}
-
-/// Draws the `?` help for `stack` as a bordered overlay over `area`.
-pub fn render_help(frame: &mut Frame, area: Rect, stack: impl Into<Stack>, styles: &Styles) {
-    let entries = help_entries(stack);
-    render_help_entries(frame, area, entries, styles);
 }
 
 pub fn with_mouse_state(mut entries: Vec<HelpEntry>, captured: bool) -> Vec<HelpEntry> {

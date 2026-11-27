@@ -751,6 +751,7 @@ mod tests {
             }],
             links: BTreeMap::from([(7, EventLink::Position("review #1".into()))]),
             default_position: Some("review #1".into()),
+            conductor_usage: None,
         };
         let value = serde_json::to_value(timeline).unwrap();
         assert_eq!(value["positions"][0]["status"], "awaiting_decision");
@@ -765,6 +766,53 @@ mod tests {
         assert_eq!(value["positions"][0]["usage"]["total"]["output"], 4);
         assert_eq!(value["positions"][0]["usage"]["subagent_count"], 2);
         assert_eq!(value["positions"][0]["usage"]["cost_usd"], 0.5);
+    }
+
+    #[test]
+    fn a_timeline_written_before_the_conductor_bucket_reads_and_writes_back_unchanged() {
+        let older = serde_json::json!({
+            "positions": [],
+            "links": {},
+            "default_position": null,
+        });
+
+        let timeline: Timeline = serde_json::from_value(older.clone()).unwrap();
+
+        assert_eq!(timeline.conductor_usage, None);
+        assert_eq!(serde_json::to_value(&timeline).unwrap(), older);
+    }
+
+    #[test]
+    fn the_conductor_bucket_survives_the_timeline_response() {
+        let response = crate::controller::TimelineResponse {
+            task_id: "task-1".into(),
+            freshness: crate::controller::Freshness::Live,
+            observed_at: None,
+            timeline: Some(Timeline {
+                conductor_usage: Some(super::ConductorUsage {
+                    total: Some(super::TokenCounts {
+                        input: 300,
+                        output: 40,
+                        ..Default::default()
+                    }),
+                    cost_usd: Some(0.05),
+                    subagent_stats: Some(super::SubagentStats {
+                        spawned: 2,
+                        tokens: 3_000,
+                        ..Default::default()
+                    }),
+                }),
+                ..Timeline::default()
+            }),
+            execution_status: None,
+            current_state: None,
+            current_position: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let back: crate::controller::TimelineResponse = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back, response);
     }
 
     #[test]

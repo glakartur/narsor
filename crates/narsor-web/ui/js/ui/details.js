@@ -107,7 +107,7 @@ function DetailsBody({ store, state, task, now, onBack, onActions, onQueue }) {
     `${task.task_id}:${task.revision}:${started}`,
   );
   const timeline = timelineRead.data?.task_id === task.task_id ? timelineRead.data.timeline : null;
-  const usage = usageLine(sumUsage(timeline?.positions));
+  const usage = usageLine(sumUsage(timeline));
   const tab = state.tab;
 
   let content;

@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use narsor_protocol::api::{PositionUsage, SubagentStats, TokenCounts};
+use narsor_protocol::api::{ConductorUsage, PositionUsage, SubagentStats, TokenCounts};
 use narsor_protocol::chat::ChatElement;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -46,6 +46,18 @@ use crate::persistence::{read_json, write_json_atomic, ExecutionStore};
 
 /// The file's name, in the execution's directory.
 pub const TIMELINE_FILE: &str = "timeline.json";
+
+/// The start of the key a conductor run without a timeline position (a chat
+/// reply, a title) records its reading under, in place of an attempt id.
+/// Attempt ids are UUIDs, so no attempt has such a key.
+const TASK_CONDUCTOR_KEY_PREFIX: &str = "conductor:";
+
+/// The key the reading of the conductor invocation `invocation_id` goes
+/// under when the invocation has no timeline position: its use counts on
+/// the task and not on a step.
+pub fn task_conductor_key(invocation_id: &str) -> String {
+    format!("{TASK_CONDUCTOR_KEY_PREFIX}{invocation_id}")
+}
 
 const VERSION: u32 = 1;
 
@@ -92,15 +104,22 @@ pub struct UsageReading {
     pub conductor_total: Option<TokenCounts>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conductor_cost_usd: Option<f64>,
+    /// The subagents of those conductor runs. Each run is a harness process
+    /// of its own, so the stats of the runs add up. Their cost is already in
+    /// `conductor_cost_usd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conductor_subagent_stats: Option<SubagentStats>,
 }
 
 impl UsageReading {
     /// What the conductor's own harness run reported, as the use of the
-    /// conductor: tokens and cost only, kept apart from the agent's.
+    /// conductor: tokens, cost and subagents only, kept apart from the
+    /// agent's.
     pub fn of_conductor(run: UsageReading) -> UsageReading {
         UsageReading {
             conductor_total: run.total,
             conductor_cost_usd: run.cost_usd,
+            conductor_subagent_stats: run.subagent_stats,
             ..UsageReading::default()
         }
     }
@@ -114,13 +133,20 @@ impl UsageReading {
     }
 
     fn is_empty(&self) -> bool {
-        !self.has_agent_use() && self.conductor_total.is_none() && self.conductor_cost_usd.is_none()
+        !self.has_agent_use()
+            && self.conductor_total.is_none()
+            && self.conductor_cost_usd.is_none()
+            && self.conductor_subagent_stats.is_none()
     }
 
     /// Puts a later reading of the same attempt on this one.
     fn absorb(&mut self, later: UsageReading) {
         self.conductor_total = plus(self.conductor_total, later.conductor_total);
         self.conductor_cost_usd = plus_cost(self.conductor_cost_usd, later.conductor_cost_usd);
+        self.conductor_subagent_stats = plus_stats(
+            self.conductor_subagent_stats,
+            later.conductor_subagent_stats,
+        );
         // A reading of the conductor alone says nothing about the agent: it
         // must not change the basis or the harness of what the agent used.
         if !later.has_agent_use() {
@@ -154,6 +180,13 @@ impl UsageReading {
 }
 
 fn plus(a: Option<TokenCounts>, b: Option<TokenCounts>) -> Option<TokenCounts> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.plus(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn plus_stats(a: Option<SubagentStats>, b: Option<SubagentStats>) -> Option<SubagentStats> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.plus(b)),
         (a, b) => a.or(b),
@@ -423,9 +456,12 @@ fn apply_sessions(timeline: &mut Timeline, sessions: &BTreeMap<String, ReportedS
     }
 }
 
-/// Puts what `readings` say on the positions of `timeline`.
+/// Puts what `readings` say on the positions of `timeline`, and what the
+/// conductor used in readings of no position on the task
+/// (`Timeline::conductor_usage`).
 ///
-/// Pure: the usage of every position is made from the readings alone, so
+/// Pure: the usage of every position and of the task is made from the
+/// readings alone, so
 /// calling it again with more readings gives the same as calling it once.
 pub fn apply_usage(timeline: &mut Timeline, readings: &BTreeMap<String, UsageReading>) {
     type Total = (TokenCounts, TokenCounts, f64, u32);
@@ -442,14 +478,12 @@ pub fn apply_usage(timeline: &mut Timeline, readings: &BTreeMap<String, UsageRea
         let mut count: Option<u32> = None;
         let mut stats: Option<SubagentStats> = None;
         let mut cost: Option<f64> = None;
-        let mut conductor_total: Option<TokenCounts> = None;
-        let mut conductor_cost: Option<f64> = None;
+        let mut conductor = ConductorUsage::default();
         for attempt in attempts {
             let Some(reading) = readings.get(&attempt) else {
                 continue;
             };
-            conductor_total = plus(conductor_total, reading.conductor_total);
-            conductor_cost = plus_cost(conductor_cost, reading.conductor_cost_usd);
+            add_conductor_part(&mut conductor, reading);
             if let Some(model) = &reading.model {
                 position.model = Some(model.clone());
             }
@@ -501,18 +535,50 @@ pub fn apply_usage(timeline: &mut Timeline, readings: &BTreeMap<String, UsageRea
             || count.is_some()
             || stats.is_some()
             || cost.is_some()
-            || conductor_total.is_some()
-            || conductor_cost.is_some())
+            || conductor != ConductorUsage::default())
         .then_some(PositionUsage {
             total,
             subagents,
             subagent_count: count,
             subagent_stats: stats,
             cost_usd: cost,
-            conductor_total,
-            conductor_cost_usd: conductor_cost,
+            conductor_total: conductor.total,
+            conductor_cost_usd: conductor.cost_usd,
+            conductor_subagent_stats: conductor.subagent_stats,
         });
     }
+    timeline.conductor_usage = task_conductor_usage(timeline, readings);
+}
+
+/// Adds the conductor part of one reading to `usage`.
+fn add_conductor_part(usage: &mut ConductorUsage, reading: &UsageReading) {
+    usage.total = plus(usage.total, reading.conductor_total);
+    usage.cost_usd = plus_cost(usage.cost_usd, reading.conductor_cost_usd);
+    usage.subagent_stats = plus_stats(usage.subagent_stats, reading.conductor_subagent_stats);
+}
+
+/// What the conductor used in the readings that are no attempt of any
+/// position: its runs without a position (chat replies, titles) and those
+/// of an episode no position has. The agent part of such a reading is
+/// nobody's and is not counted. `None` when no such reading has conductor
+/// use.
+fn task_conductor_usage(
+    timeline: &Timeline,
+    readings: &BTreeMap<String, UsageReading>,
+) -> Option<ConductorUsage> {
+    let on_positions: HashSet<&str> = timeline
+        .positions
+        .iter()
+        .flat_map(|position| position.attempt_ids())
+        .collect();
+    let mut usage = ConductorUsage::default();
+    for (_, reading) in readings
+        .iter()
+        .filter(|(key, _)| !on_positions.contains(key.as_str()))
+    {
+        add_conductor_part(&mut usage, reading);
+    }
+    (usage != ConductorUsage::default()).then_some(usage)
 }
 
 /// What a conversation element says about use, when it says any: the model
@@ -780,5 +846,26 @@ mod tests {
 
         assert!(!conductor.has_agent_use());
         assert!(!conductor.is_empty());
+    }
+
+    #[test]
+    fn the_subagents_of_conductor_runs_are_kept_and_add_up_apart_from_the_agents() {
+        let run = |spawned| UsageReading {
+            subagent_stats: Some(SubagentStats {
+                spawned,
+                tokens: 1_000,
+                ..SubagentStats::default()
+            }),
+            ..UsageReading::default()
+        };
+        let mut agent = reading(ReadingBasis::Increment, 10, 4, 1.0);
+        agent.subagent_stats = run(5).subagent_stats;
+
+        agent.absorb(UsageReading::of_conductor(run(1)));
+        agent.absorb(UsageReading::of_conductor(run(2)));
+
+        let conductor = agent.conductor_subagent_stats.expect("conductor subagents");
+        assert_eq!((conductor.spawned, conductor.tokens), (3, 2_000));
+        assert_eq!(agent.subagent_stats.map(|stats| stats.spawned), Some(5));
     }
 }

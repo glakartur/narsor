@@ -86,35 +86,34 @@ The full rules are in [the workflow schema](../dev/workflow-schema.md).
 
 ## Workflows: built in, by name, overridable
 
-The `template` workflow is compiled into `narsor-cli`; install the workspace
-process binaries as shown under [Building and testing](../dev/building-and-testing.md#building-and-testing)
-to run it from anywhere:
+The `template` workflow is compiled into the server; `narsor-cli` runs it by
+name from the server's catalogue, from any directory:
 
 ```bash
 narsor-cli run template --input example_text="Hello, engine"
 ```
 
-`run`, `validate` and `--file` take a *workflow reference*: a path, or a name
-with or without a `.yaml` / `.yml` suffix. It is resolved in this order, first
-hit wins:
+`run` and `validate` take a *workflow reference*: a path, or the name of a
+workflow in the server's catalogue (`workflow show` and `eject` also accept a
+`.yaml` / `.yml` suffix). The server resolves a name in this order, first hit
+wins:
 
 | # | Where | Source shown as |
 |---|-------|-----------------|
 | 1 | an existing file at that exact path | `file` |
-| 2 | `{root}/workflows/<name>.yaml` (then `.yml`) | `root` |
+| 2 | `{catalog}/workflows/<name>.yaml` (then `.yml`); `server.catalog` defaults to the root | `root` |
 | 3 | `$XDG_CONFIG_HOME/narsor/workflows/<name>.yaml`, else `$HOME/.config/narsor/workflows/<name>.yaml` | `user` |
 | 4 | the workflow built into the binary | `built-in` |
 
 A path always wins, so `narsor-cli run ./draft.yaml` keeps meaning exactly
 that file. A copy in one of the directories **overrides** the built-in of the
-same name. When nothing matches, the error lists every place that was tried and
-names the built-ins.
+same name. When nothing matches, the error names the built-ins.
 
 ### Looking at what is reachable
 
 ```bash
-narsor workflow list          # every workflow, its source, its description
-narsor workflow show NAME     # the YAML that would run (stdout); the source on stderr
+narsor-cli workflow list          # every workflow, its source, its description
+narsor-cli workflow show NAME     # the YAML that would run (stdout); the source on stderr
 ```
 
 `list` prints one row per name and marks an override rather than listing the
@@ -124,14 +123,13 @@ same name twice:
 NAME                         SOURCE     DESCRIPTION
 template                     user       A safe, runnable tour of Narsor workflow features.
                                         overrides: built-in
-                                        path: /home/you/.config/narsor/workflows/template.yaml
 ```
 
 ### Making a built-in your own
 
 ```bash
-narsor workflow eject template        # → the user directory
-narsor workflow eject template --to ./workflows
+narsor-cli workflow eject template    # → the user directory
+narsor-cli workflow eject template --to ./workflows
 ```
 
 `eject` writes the built-in out as a file, creating the directory if needed, and
@@ -156,13 +154,11 @@ daemon only; the path is validated first and every violation is listed).
 
 ### Resuming what a built-in started
 
-An execution records both the definition's path (when it came from a file) and
-its workflow name, in `metadata.cli.definition_path` and
-`metadata.cli.definition_name`. A built-in has no path, so the name is what makes
-`narsor-cli input` — and the interface — find the
-definition again in a later process. The path is used first when it is still
-there, so executions created before this existed keep resolving unchanged;
-`--file <WORKFLOW>` overrides both and accepts a name as well as a path.
+An execution pins its definition (`definition.yaml`, D31), and that copy is
+used first. The definition's path and workflow name, in
+`metadata.cli.definition_path` and `metadata.cli.definition_name`, are
+fallbacks for older executions. `narsor-cli input` takes no `--file`: the
+workflow always comes from the execution's own record.
 
 ---
 
