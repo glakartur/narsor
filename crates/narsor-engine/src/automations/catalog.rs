@@ -16,7 +16,7 @@
 //!     condition: {}                       # optional, handed to the scripts
 //!     tasks:                              # optional, `always` queues only
 //!       workflow_id: triage               # must be in the workflow catalogue
-//!       mapping: {summary: title}
+//!       mapping: {summary: title, task.ticket: key}   # task.ticket/task.title: task fields
 //! ```
 //!
 //! The directory or file name is the identifier, as in the environment

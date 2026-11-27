@@ -123,6 +123,7 @@ tasks:                             # mode always only: the scripts may create ta
   backend_id: k8s                  # optional: the default backend by default
   profile: default                 # optional
   mapping: {ticket: key}           # workflow input: field of the task data
+                                   # task.ticket / task.title: the task's ticket and title
   task_limit_per_run: 10           # 1-1000, default 10
   import_backlog: false            # the first run imports what already matches
 ```
@@ -443,6 +444,11 @@ narsor-cli task create --data "$JSON" </dev/null >&2
   backend and the profile come from `tasks` of the queue file, not from the
   script. The data has only the fields that `tasks.mapping` maps to
   workflow inputs. Narsor refuses a field that is not in the map.
+- **Ticket and title.** The mapping keys `task.ticket` and `task.title`
+  set the task's ticket and title (`{{ task.ticket }}`, `{{ task.title }}`
+  in the workflow), not an input. For example, `task.ticket: key` gives the
+  Jira key as the ticket. The value must be text; Narsor checks its form as
+  for a task that a person creates. No other `task.` key is allowed.
 - **Task limit.** A run can create at most `tasks.task_limit_per_run`
   tasks. Narsor refuses the next one, the command exits with `1`, and the
   pair stops in the state `needs_attention` (section 8).

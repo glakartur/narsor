@@ -353,9 +353,21 @@ pub struct CreateTaskEffect {
     /// Environment profile; the owner's default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
-    /// Workflow input name → field name in the effect data.
+    /// Workflow input name → field name in the effect data. The keys
+    /// [`TASK_TICKET_KEY`] and [`TASK_TITLE_KEY`] set the task's ticket and
+    /// title instead of an input.
     #[serde(default)]
     pub mapping: BTreeMap<String, String>,
+}
+
+/// Mapping key that sets the task's ticket (`{{ task.ticket }}`).
+pub const TASK_TICKET_KEY: &str = "task.ticket";
+/// Mapping key that sets the task's title (`{{ task.title }}`).
+pub const TASK_TITLE_KEY: &str = "task.title";
+const TASK_FIELD_PREFIX: &str = "task.";
+
+fn is_task_field(mapping_key: &str) -> bool {
+    mapping_key.starts_with(TASK_FIELD_PREFIX)
 }
 
 impl CreateTaskEffect {
@@ -378,17 +390,27 @@ impl CreateTaskEffect {
                     "input names and data field names must not be empty",
                 ));
             }
+            if is_task_field(input) && input != TASK_TICKET_KEY && input != TASK_TITLE_KEY {
+                return Err(ObserverError::invalid(
+                    "effect.mapping",
+                    format!(
+                        "'{input}' is not a task field: use '{TASK_TICKET_KEY}' or '{TASK_TITLE_KEY}'"
+                    ),
+                ));
+            }
         }
         Ok(())
     }
 
     /// The create request of the task the effect `data` yields (R3): this
     /// effect's workflow, repositories, backend and profile, a random task
-    /// id, and as inputs the data fields the mapping names.
+    /// id, as inputs the data fields the mapping names, and as ticket and
+    /// title the fields mapped to [`TASK_TICKET_KEY`] and [`TASK_TITLE_KEY`].
     ///
     /// The data must be a JSON object (or absent) holding no field the
     /// mapping does not name: the script cannot smuggle in inputs. A mapped
-    /// field missing from the data is left out of the inputs.
+    /// field missing from the data is left out of the inputs. A ticket or
+    /// title must be text; the task create checks its form.
     pub fn task_request(&self, data: &serde_json::Value) -> Result<CreateTaskRequest> {
         let empty = serde_json::Map::new();
         let fields = match data {
@@ -419,12 +441,15 @@ impl CreateTaskEffect {
         let inputs: serde_json::Map<String, serde_json::Value> = self
             .mapping
             .iter()
+            .filter(|(input, _)| !is_task_field(input))
             .filter_map(|(input, field)| {
                 fields
                     .get(field)
                     .map(|value| (input.clone(), value.clone()))
             })
             .collect();
+        let ticket = self.task_field_text(fields, TASK_TICKET_KEY)?;
+        let title = self.task_field_text(fields, TASK_TITLE_KEY)?;
         Ok(CreateTaskRequest {
             task_id: None,
             backend_id: self.backend_id.clone(),
@@ -436,10 +461,30 @@ impl CreateTaskEffect {
                 profile: self.profile.clone(),
                 harness: None,
                 resources: None,
-                ticket: None,
-                title: None,
+                ticket,
+                title,
             },
         })
+    }
+
+    /// The text of the data field mapped to the task field `task_key`, if
+    /// the mapping names one and the data has it.
+    fn task_field_text(
+        &self,
+        fields: &serde_json::Map<String, serde_json::Value>,
+        task_key: &str,
+    ) -> Result<Option<String>> {
+        let Some(field) = self.mapping.get(task_key) else {
+            return Ok(None);
+        };
+        match fields.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(text)) => Ok(Some(text.clone())),
+            Some(_) => Err(ObserverError::invalid(
+                "effect data",
+                format!("field '{field}' is mapped to {task_key} and must be text"),
+            )),
+        }
     }
 
     /// Checks the effect against the workflow it names: same id and version,
@@ -463,7 +508,7 @@ impl CreateTaskEffect {
             .mapping
             .keys()
             .map(String::as_str)
-            .filter(|input| !declared.contains(input))
+            .filter(|input| !is_task_field(input) && !declared.contains(input))
             .collect();
         if unknown.is_empty() {
             Ok(())
@@ -1084,6 +1129,43 @@ mod tests {
             queue_entry_id(&TaskId::parse("task-2").unwrap(), "input-1")
         );
         assert_eq!(first.len(), 64);
+    }
+
+    fn effect_mapping(mapping: &[(&str, &str)]) -> CreateTaskEffect {
+        CreateTaskEffect {
+            workflow_id: "triage".into(),
+            workflow_version: 1,
+            workspaces: BTreeMap::new(),
+            backend_id: None,
+            profile: None,
+            mapping: mapping
+                .iter()
+                .map(|(key, field)| (key.to_string(), field.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_queue_task_takes_its_ticket_and_title_from_mapped_fields() {
+        let effect = effect_mapping(&[
+            ("description", "text"),
+            (TASK_TICKET_KEY, "key"),
+            (TASK_TITLE_KEY, "summary"),
+        ]);
+        let data = serde_json::json!({"key": "WRUW-7", "summary": "Fix login", "text": "body"});
+
+        let launch = effect.task_request(&data).unwrap().launch;
+
+        assert_eq!(launch.ticket.as_deref(), Some("WRUW-7"));
+        assert_eq!(launch.title.as_deref(), Some("Fix login"));
+        assert_eq!(launch.inputs, serde_json::json!({"description": "body"}));
+    }
+
+    #[test]
+    fn a_task_field_mapping_refuses_unknown_fields_and_non_text_values() {
+        assert!(effect_mapping(&[("task.owner", "key")]).validate().is_err());
+        let effect = effect_mapping(&[(TASK_TICKET_KEY, "key")]);
+        assert!(effect.task_request(&serde_json::json!({"key": 7})).is_err());
     }
 
     #[test]
