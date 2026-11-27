@@ -30,6 +30,13 @@
 # they keep running, the migration is skipped and the command is printed.
 # Interactive: narsor-migrate shows its plan and asks. --non-interactive: it
 # migrates (with --yes) only with --migrate; otherwise it prints the command.
+# Then it runs `narsor-migrate runtime-catalog`, which moves an old runtime
+# catalogue ({catalog}/runtime.yaml and {catalog}/components/) into
+# {catalog}/runtime/ by renaming, without a backup or a question. While Narsor
+# still runs, it offers once more (interactive) to stop it; otherwise the move
+# is skipped with the command to run, and the old place keeps working. When
+# both layouts exist or a rename fails, it prints the step, then fails with
+# --non-interactive and continues otherwise.
 set -euo pipefail
 
 repository="glakartur/narsor"
@@ -69,6 +76,8 @@ Instalacja:
              (init options include --local-mode process|docker for the local role)
              (--migrate: with --non-interactive, move the data of an older
               version with narsor-migrate --yes; see docs/operations/updates.md)
+             (an old runtime catalogue moves to {catalog}/runtime/ on every
+              install or update; see docs/operations/updates.md)
 Odinstalowanie:
   install.sh --uninstall [--purge] [--bin-dir KATALOG]
              [--data-dir KATALOG] [--config-file PLIK] [--non-interactive]
@@ -345,6 +354,58 @@ run_migration() {
     fi
 }
 
+# Moves an old runtime catalogue ({catalog}/runtime.yaml and components/) into
+# {catalog}/runtime/ with narsor-migrate runtime-catalog. It only renames, so
+# there is no backup and no question; it needs Narsor stopped. Only for the
+# roles whose configuration names the catalogue the server reads.
+move_runtime_catalog() {
+    local migrate="$bin_dir/narsor-migrate" status=0 command arg answer line
+    local -a scope lines=() pids=()
+    case "$role" in local|server) ;; *) return 0 ;; esac
+    [[ -x "$migrate" ]] || return 0
+    step "Runtime catalogue"
+    mapfile -t scope < <(migrate_scope_args)
+    command="$(shell_quote "$migrate")"
+    for arg in ${scope[@]+"${scope[@]}"}; do
+        command+=" $(shell_quote "$arg")"
+    done
+    command+=" runtime-catalog"
+    if ((narsor_running && interactive)); then
+        answer="$(ask 'Narsor still runs. Stop it now to move an old runtime catalogue? Running tasks are interrupted. [y/N]: ')"
+        case "${answer,,}" in
+            y|yes)
+                mapfile -t lines < <(running_narsor_processes)
+                for line in ${lines[@]+"${lines[@]}"}; do
+                    pids+=("${line%%$'\t'*}")
+                done
+                if ((${#pids[@]})); then
+                    stop_processes "${pids[@]}"
+                    printf 'Stopped %d process(es).\n' "${#pids[@]}"
+                fi
+                narsor_running=0
+                ;;
+        esac
+    fi
+    if ((narsor_running)); then
+        warn_loudly "An old runtime catalogue was NOT moved to {catalog}/runtime/: Narsor is still running. Tasks keep using the old place until it moves. Stop every Narsor process, then run: $command"
+        return 0
+    fi
+    "$migrate" ${scope[@]+"${scope[@]}"} runtime-catalog || status=$?
+    case "$status" in
+        0) ;;
+        5)
+            warn_loudly "An old runtime catalogue was NOT moved to {catalog}/runtime/: a Narsor program still runs. Tasks keep using the old place until it moves. Stop every Narsor process, then run: $command"
+            ;;
+        2)
+            warn_loudly "narsor-migrate cannot read the configuration, so an old runtime catalogue was not moved; correct it, then run: $command"
+            ;;
+        *)
+            warn_loudly "The runtime catalogue was NOT moved (exit status $status). See the message above, correct it, then run: $command"
+            ((interactive)) || fail "the runtime catalogue move did not complete"
+            ;;
+    esac
+}
+
 install_binaries() {
     local source_dir=$1 destination=$2 name
     shift 2
@@ -485,6 +546,7 @@ install() {
     install_binaries "$work_dir" "$bin_dir" "${binaries[@]}"
     printf 'Installed: %s\n' "${binaries[*]}"
     run_migration
+    move_runtime_catalog
 
     if ! path_contains "$bin_dir"; then
         step "PATH"
