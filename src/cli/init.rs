@@ -167,9 +167,14 @@ fn run_with(
         options.data_dir.clone(),
         options.non_interactive || keep_existing,
     )?;
+    // What an existing file sets stays the default of an update: its work
+    // mode and the catalogue it names. Values that do not hold up are
+    // skipped here; the file itself is left unchanged.
+    let existing = keep_existing.then(|| config::file::load(&config_path, &Scope::ALL).values);
     let local_mode = select_local_mode(
         role,
         options.local_mode,
+        existing.as_ref().and_then(existing_local_mode),
         options.non_interactive,
         docker_check,
     )?;
@@ -177,7 +182,8 @@ fn run_with(
     let mut config = Value::Mapping(Mapping::new());
     set_root_paths(&mut config, &data_dir)?;
     let parsed = validate_config(&target, &config)?.1;
-    // Docker mode needs its task image in the catalogue the file names.
+    // Docker mode needs its task image in the catalogue the file in force
+    // names: the existing one when it is kept.
     let docker_catalog = match local_mode {
         LocalWorkMode::Docker => {
             insert_text(
@@ -187,7 +193,10 @@ fn run_with(
                 SettingKey::LocalMode,
                 "docker",
             );
-            Some(resolved_directory(&parsed, SettingKey::CatalogDir)?)
+            Some(resolved_directory(
+                existing.as_ref().unwrap_or(&parsed),
+                SettingKey::CatalogDir,
+            )?)
         }
         LocalWorkMode::Process => None,
     };
@@ -253,11 +262,16 @@ fn path_exists(path: &Path) -> Result<bool> {
 /// network server, which the docker work mode refuses (it needs the local
 /// daemon as the control plane).
 ///
+/// Without `--local-mode`, the mode the existing configuration sets
+/// (`existing`) is the default: preselected at the prompt and used as it
+/// is without one. With neither, it is `process`.
+///
 /// An explicit `--local-mode docker` is kept when Docker is not ready (with
 /// a warning); a docker mode chosen at the prompt is confirmed first.
 fn select_local_mode(
     role: InitRole,
     selected: Option<LocalWorkMode>,
+    existing: Option<LocalWorkMode>,
     non_interactive: bool,
     docker_check: DockerCheck<'_>,
 ) -> Result<LocalWorkMode> {
@@ -295,9 +309,13 @@ fn select_local_mode(
             ];
             let items: Vec<(&str, &str)> =
                 modes.iter().map(|(_, name, text)| (*name, *text)).collect();
-            modes[prompt::select("Work mode for local tasks", &items)?].0
+            let start = modes
+                .iter()
+                .position(|(mode, _, _)| Some(*mode) == existing)
+                .unwrap_or(0);
+            modes[prompt::select("Work mode for local tasks", &items, start)?].0
         }
-        None => LocalWorkMode::Process,
+        None => existing.unwrap_or(LocalWorkMode::Process),
     };
     if mode == LocalWorkMode::Process {
         return Ok(mode);
@@ -317,7 +335,7 @@ fn select_local_mode(
                 ),
             ];
             Ok(
-                match prompt::select("Write docker mode anyway?", &choices)? {
+                match prompt::select("Write docker mode anyway?", &choices, 0)? {
                     1 => LocalWorkMode::Docker,
                     _ => LocalWorkMode::Process,
                 },
@@ -330,6 +348,21 @@ fn select_local_mode(
             );
             Ok(LocalWorkMode::Docker)
         }
+    }
+}
+
+/// The work mode of local tasks an existing configuration sets: the
+/// environment variable first, then the file. A value that does not name
+/// a mode is ignored.
+fn existing_local_mode(file: &config::FileValues) -> Option<LocalWorkMode> {
+    let value = environment_setting(SettingKey::LocalMode)
+        .ok()
+        .flatten()
+        .or_else(|| file.get(SettingKey::LocalMode).cloned())?;
+    match value {
+        SettingValue::Text(text) if text == "docker" => Some(LocalWorkMode::Docker),
+        SettingValue::Text(text) if text == "process" => Some(LocalWorkMode::Process),
+        _ => None,
     }
 }
 
@@ -457,7 +490,7 @@ fn select_role(role: Option<InitRole>, non_interactive: bool) -> Result<InitRole
         ),
     ];
     let items: Vec<(&str, &str)> = roles.iter().map(|(_, name, text)| (*name, *text)).collect();
-    Ok(roles[prompt::select("Role", &items)?].0)
+    Ok(roles[prompt::select("Role", &items, 0)?].0)
 }
 
 /// The root directory for all Narsor data. Without `--data-dir` it is asked
@@ -2056,8 +2089,11 @@ mod tests {
         );
         for existing in ["runtime.yaml", "runtime/runtime.yaml"] {
             let install = Installation::new("rerun");
-            fs::write(install.config(), "global:\n  root: /elsewhere\n").unwrap();
-            let file = install.catalog().join(existing);
+            // The catalogue the existing file names, not the default one.
+            let catalog = install.root.join("elsewhere");
+            let config = format!("server:\n  catalog: {}\n", catalog.display());
+            fs::write(install.config(), &config).unwrap();
+            let file = catalog.join(existing);
             fs::create_dir_all(file.parent().unwrap()).unwrap();
             let custom = b"task_image:\n  base: alpine:3\n  components: []\n";
             fs::write(&file, custom).unwrap();
@@ -2067,7 +2103,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(fs::read(&file).unwrap(), custom, "{existing}");
-            let mut entries: Vec<_> = fs::read_dir(install.catalog())
+            let mut entries: Vec<_> = fs::read_dir(&catalog)
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name())
                 .collect();
@@ -2078,14 +2114,43 @@ mod tests {
                 [first.as_os_str()],
                 "{existing}: nothing else written"
             );
-            assert_eq!(
-                fs::read_to_string(install.config()).unwrap(),
-                "global:\n  root: /elsewhere\n"
-            );
+            assert!(!install.catalog().exists(), "{existing}: default catalogue");
+            assert_eq!(fs::read_to_string(install.config()).unwrap(), config);
             assert_eq!(
                 install.written_mode(&install.root.join("config.yaml.new")),
                 Some(SettingValue::Text("docker".to_string()))
             );
+        }
+    }
+
+    #[test]
+    fn rerun_defaults_to_the_work_mode_of_the_existing_configuration() {
+        let docker = Some(SettingValue::Text("docker".to_string()));
+        for (flag, written) in [(None, docker), (Some(LocalWorkMode::Process), None)] {
+            let install = Installation::new("existing-mode");
+            let catalog = install.root.join("elsewhere");
+            fs::write(
+                install.config(),
+                format!(
+                    "server:\n  catalog: {}\ncontroller:\n  local:\n    mode: docker\n",
+                    catalog.display()
+                ),
+            )
+            .unwrap();
+
+            install.init(InitRole::Local, flag, &docker_ready).unwrap();
+
+            assert_eq!(
+                install.written_mode(&install.root.join("config.yaml.new")),
+                written,
+                "{flag:?}"
+            );
+            assert_eq!(
+                catalog.join("runtime/runtime.yaml").is_file(),
+                flag.is_none(),
+                "{flag:?}"
+            );
+            assert!(!install.catalog().exists(), "{flag:?}: default catalogue");
         }
     }
 
