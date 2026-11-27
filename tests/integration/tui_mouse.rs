@@ -211,7 +211,6 @@ mod routing {
 
     #[test]
     fn a_click_on_a_task_behind_the_action_menu_changes_nothing_behind_it() {
-        // AE5
         let mut app = queue();
         key(&mut app, KeyCode::Char('.'));
         assert!(app.overlay().is_some());

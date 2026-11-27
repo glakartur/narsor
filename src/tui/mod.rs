@@ -3,21 +3,23 @@
 //! A windowed, `lazygit`-shaped console: the alternate screen is taken over
 //! entirely, bordered panels fill it, one of them holds focus, and a bar of
 //! context-sensitive shortcuts sits at the bottom. Navigation is vim-flavoured
-//! (`j`/`k`, `g`/`G`, `q`) and nothing depends on a mouse.
+//! (`j`/`k`, `g`/`G`, `q`). The mouse adds a way in — the wheel and a left
+//! click on the panel under the pointer ([`task_app::mouse`]) — and the keys
+//! stay complete: nothing needs the mouse.
 //!
 //! There is one mode and one application, [`task_app::TaskApp`]: the tasks of
 //! the control plane (`/control/v1`) of whichever backend the configuration
 //! names — the local daemon, launched when none runs, or a remote server. This
 //! module is the terminal runner state and the event loop that joins the
-//! application to the terminal: keys and pastes in, control-plane events in,
-//! a redraw out.
+//! application to the terminal: keys, pastes and mouse events in,
+//! control-plane events in, a redraw out.
 //!
 //! # Why the terminal is restored twice over
 //!
-//! Raw mode, the alternate screen, the keyboard enhancement flags and
-//! bracketed paste are terminal state that a crashing program does not clean
-//! up by itself. An operator whose first panic leaves
-//! them with an unusable console will not trust the tool again, so restoration
+//! Raw mode, the alternate screen, the keyboard enhancement flags, bracketed
+//! paste and mouse reporting are terminal state that a crashing program does
+//! not clean up by itself. An operator whose first panic leaves them with an
+//! unusable console will not trust the tool again, so restoration
 //! is arranged on two independent paths: [`TerminalGuard`] restores on every
 //! exit from [`run`], normal or unwinding, and [`install_panic_hook`] restores
 //! from inside the panic hook, before the default hook prints anything. Both
@@ -142,8 +144,8 @@ pub fn install_panic_hook() {
     });
 }
 
-/// Leaves the alternate screen, disables raw mode and bracketed paste, and
-/// shows the cursor.
+/// Leaves the alternate screen, disables raw mode, bracketed paste and mouse
+/// reporting, and shows the cursor.
 ///
 /// Every failure is deliberately swallowed: this runs on the way out, often
 /// from a panic hook, and there is nowhere left to report to. It is safe to
