@@ -86,13 +86,18 @@ installation of an older version is moved to this layout once by
 For the `local` role, `narsor-cli init` also asks for the **work mode for
 local tasks**: `process` (the default: tasks run on the host as your user) or
 `docker` (tasks run in a hardened container; needs rootful Docker). Pass
-`--local-mode process|docker` to answer without the question; in
-non-interactive mode without the option the mode stays `process` and nothing
-is written. When you choose `docker`, `init` checks the Docker daemon, writes
-`controller.local.mode: docker` and, when the catalogue has no
-`runtime.yaml` yet, creates one with the example task image (Debian with
-`base-tools` and `claude-code`) and its component scripts. An existing
-`runtime.yaml` is never changed. If Docker is not ready, the interactive
+`--local-mode process|docker` to answer without the question. When `init`
+keeps an existing configuration (an update), the mode that configuration
+sets is the default answer; in non-interactive mode without the option
+`init` uses that mode, or `process` when there is no existing configuration.
+When you choose `docker`, `init` checks the Docker daemon, writes
+`controller.local.mode: docker` and, when the catalogue has no runtime
+catalogue yet, creates `{catalog}/runtime/runtime.yaml` with the example
+task image (Debian with `base-tools` and `claude-code`) and its component
+scripts in `{catalog}/runtime/components/`. On an update it takes the
+catalogue from the existing configuration. An existing `runtime.yaml`, in
+`{catalog}/runtime/` or at the old place `{catalog}/runtime.yaml`, is never
+changed. If Docker is not ready, the interactive
 question asks whether to write the docker mode anyway (default: no, use
 `process`); an explicit `--local-mode docker` is written with a warning. The
 `server` role refuses `--local-mode docker`: its workstation controller serves
@@ -180,6 +185,17 @@ also pass `--migrate` (which answers its question); without `--migrate` the
 installer prints the plan and the command. Until the data is migrated, the new
 `narsor-server` refuses to start and names the same command. A migration that
 stops makes a non-interactive installation fail.
+
+Next, for the same roles, the installer runs `narsor-migrate runtime-catalog`.
+This step moves an old runtime catalogue (`{catalog}/runtime.yaml` and
+`{catalog}/components/`) into `{catalog}/runtime/`. It only renames files,
+so it makes no backup and asks no question. When Narsor still runs, an
+interactive installer offers once more to stop it. Otherwise the installer
+skips the move, prints the command in a highlighted line, and continues. The
+old place keeps working until the move. When both layouts exist, or a rename
+fails, the installer prints the step. A non-interactive installation then
+fails; an interactive one continues (see
+[Updates](updates.md#update-to-the-runtime-directory)).
 
 `--progress` shows a progress bar while the release archive downloads
 (`curl --progress-bar`, or `wget --show-progress`); without it the download is
