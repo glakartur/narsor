@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use narsor_migrate::runtime_catalog::{self, Failure, Outcome, RuntimeCatalogMove};
-use narsor_migrate::{EXIT_REFUSED, EXIT_RUNNING};
+use narsor_migrate::{EXIT_FAILED, EXIT_REFUSED, EXIT_RUNNING};
 use narsor_shared::config::resolve::{resolve_with, Environment, Flags};
 use narsor_shared::config::{ConfigCascade, Scope};
 
@@ -220,11 +220,36 @@ fn nothing_changes_on_a_collision_a_running_program_or_a_dry_run() {
             "daemon.instance.lock",
         ),
         (
+            "a lock that cannot be opened",
+            Box::new(|dir: &TempDir| {
+                // A directory at the lock path: open for writing fails (EISDIR).
+                fs::create_dir_all(dir.0.join("state/narsor-server/daemon.instance.lock")).unwrap();
+                None
+            }),
+            false,
+            Some(EXIT_FAILED),
+            "cannot open",
+        ),
+        (
             "dry run",
             Box::new(|_: &TempDir| None),
             true,
             None,
             "Would move",
+        ),
+        (
+            "dry run with a script outside components",
+            Box::new(|dir: &TempDir| {
+                dir.write(
+                    "runtime.yaml",
+                    "task_image:\n  base: debian:trixie-slim\n  components:\n    \
+                     - { name: x, install: tools/x.sh }\n",
+                );
+                None
+            }),
+            true,
+            None,
+            "warning (after the move): task_image.components[0].install",
         ),
     ];
     for (name, arrange, dry_run, exit, text) in cases {

@@ -62,6 +62,7 @@ fn read_key() -> Result<KeyEvent> {
     }
 }
 
+/// Lets the user pick one item with the arrow keys (or `j`/`k`) and Enter.
 /// Items are `(name, description)`; the item at `start` is selected first.
 /// Returns the index of the chosen one.
 pub fn select(label: &str, items: &[(&str, &str)], start: usize) -> Result<usize> {

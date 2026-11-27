@@ -509,7 +509,7 @@ pub fn run(
     }
     let locks = refusal::check(&target.checks(), probe, options.assume_containers_stopped);
     if let Err(reason) = &locks {
-        refusals.push(reason.clone());
+        refusals.push(reason.reason.clone());
     }
     if !refusals.is_empty() {
         return Err(Failure::Refused(refusals.join("\n")));

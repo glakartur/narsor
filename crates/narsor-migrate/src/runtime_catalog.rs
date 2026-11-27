@@ -130,22 +130,29 @@ pub fn run(
         locks: target.locks.clone(),
         ..refusal::Checks::default()
     };
-    let _locks = refusal::check(&checks, &NoContainers, true).map_err(Failure::Running)?;
+    let _locks = refusal::check(&checks, &NoContainers, true).map_err(|refusal| {
+        if refusal.only_held_locks {
+            Failure::Running(refusal.reason)
+        } else {
+            Failure::Failed(refusal.reason)
+        }
+    })?;
+    let runtime_dir = catalog.runtime_dir();
+    let warnings = outside_components(&old_file, &runtime_dir);
 
     for (from, to) in &renames {
         let verb = if dry_run { "Would move" } else { "Moving" };
         writeln!(out, "{verb} {} -> {}", from.display(), to.display()).map_err(failed)?;
     }
     if dry_run {
+        for warning in &warnings {
+            writeln!(out, "warning (after the move): {warning}").map_err(failed)?;
+        }
         return Ok(Outcome::DryRun);
     }
-    let warnings = outside_components(&old_file, &catalog.runtime_dir());
 
-    std::fs::create_dir_all(catalog.runtime_dir()).map_err(|error| {
-        Failure::Failed(format!(
-            "cannot create {}: {error}",
-            catalog.runtime_dir().display()
-        ))
+    std::fs::create_dir_all(&runtime_dir).map_err(|error| {
+        Failure::Failed(format!("cannot create {}: {error}", runtime_dir.display()))
     })?;
     for (from, to) in &renames {
         // A rename replaces an existing target on Linux: check right before.

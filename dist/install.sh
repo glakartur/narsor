@@ -359,7 +359,7 @@ run_migration() {
 # there is no backup and no question; it needs Narsor stopped. Only for the
 # roles whose configuration names the catalogue the server reads.
 move_runtime_catalog() {
-    local migrate="$bin_dir/narsor-migrate" status=0 command arg answer line
+    local migrate="$bin_dir/narsor-migrate" status=0 command arg answer line output
     local -a scope lines=() pids=()
     case "$role" in local|server) ;; *) return 0 ;; esac
     [[ -x "$migrate" ]] || return 0
@@ -370,6 +370,13 @@ move_runtime_catalog() {
         command+=" $(shell_quote "$arg")"
     done
     command+=" runtime-catalog"
+    # Probe first: with nothing to move, neither a question nor a warning.
+    output="$("$migrate" ${scope[@]+"${scope[@]}"} runtime-catalog --dry-run 2>&1)" || status=$?
+    if ((status == 0)) && [[ "$output" == "No runtime catalogue at the old place"* ]]; then
+        printf 'No old runtime catalogue to move.\n'
+        return 0
+    fi
+    status=0
     if ((narsor_running && interactive)); then
         answer="$(ask 'Narsor still runs. Stop it now to move an old runtime catalogue? Running tasks are interrupted. [y/N]: ')"
         case "${answer,,}" in
