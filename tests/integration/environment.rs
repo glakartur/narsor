@@ -307,16 +307,16 @@ fn a_local_backend_needs_no_image_and_no_runtime_bundle() {
 // Global task image (KTD8, KTD9)
 // ---------------------------------------------------------------------------
 
-/// Writes `runtime.yaml` with the seeded bundle and `task_image`.
+/// Writes `runtime/runtime.yaml` with the seeded bundle and `task_image`.
 fn write_task_image(root: &TempRoot, task_image: &str) {
     fs::write(
-        root.path().join("runtime.yaml"),
+        root.path().join("runtime/runtime.yaml"),
         format!(
             "bundle: ghcr.io/narsor/runtime@{}\ntask_image:\n{task_image}",
             digest('b')
         ),
     )
-    .expect("write runtime.yaml");
+    .expect("write runtime/runtime.yaml");
 }
 
 fn on_local(workflow: &str) -> LaunchIntent {
@@ -333,9 +333,9 @@ fn a_local_task_seals_the_global_task_image_with_its_script_text() {
     let without = root.resolve(&on_local("bare")).unwrap().spec.environment;
     assert!(without.task_image.is_none());
 
-    fs::create_dir_all(root.path().join("components")).unwrap();
+    fs::create_dir_all(root.path().join("runtime/components")).unwrap();
     fs::write(
-        root.path().join("components/glab.sh"),
+        root.path().join("runtime/components/glab.sh"),
         "apt-get install -y glab\n",
     )
     .unwrap();
@@ -380,10 +380,11 @@ fn a_local_task_seals_the_global_task_image_with_its_script_text() {
     );
     assert_ne!(environment.identity, without.identity);
 
-    // A script that leaves the catalogue through a link is refused.
-    let outside = std::env::temp_dir().join(format!("narsor-outside-{}.sh", uuid::Uuid::new_v4()));
+    // A script that leaves the runtime directory through a link is refused,
+    // also when the link stays inside the catalogue.
+    let outside = root.path().join("outside.sh");
     fs::write(&outside, "echo outside\n").unwrap();
-    std::os::unix::fs::symlink(&outside, root.path().join("components/link.sh")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.path().join("runtime/components/link.sh")).unwrap();
     write_task_image(
         &root,
         "  base: debian:trixie-slim\n  components:\n    \
@@ -392,13 +393,59 @@ fn a_local_task_seals_the_global_task_image_with_its_script_text() {
     let error = root
         .resolve(&on_local("bare"))
         .expect_err("escaping script");
-    let _ = fs::remove_file(&outside);
     assert_eq!(error.code(), "invalid_runtime", "{error}");
     assert!(
         error
             .to_string()
-            .contains("task_image.components[0].install"),
+            .contains("task_image.components[0].install")
+            && error.to_string().contains("outside the runtime directory"),
         "{error}"
+    );
+}
+
+/// The scripts of `runtime.yaml` at the old place, the catalogue root,
+/// resolve from the root, as they did before the runtime directory.
+#[test]
+fn an_old_runtime_catalogue_seals_as_before_and_one_in_both_places_is_refused() {
+    let root = TempRoot::new();
+    root.write_workflow("bare", &workflow_yaml("bare", None));
+    fs::remove_dir_all(root.path().join("runtime")).unwrap();
+    fs::create_dir_all(root.path().join("components")).unwrap();
+    fs::write(
+        root.path().join("components/glab.sh"),
+        "apt-get install -y glab\n",
+    )
+    .unwrap();
+    let runtime = format!(
+        "bundle: ghcr.io/narsor/runtime@{}\ntask_image:\n  base: debian:trixie-slim\n  \
+         components:\n    - {{ name: glab, install: components/glab.sh }}\n",
+        digest('b')
+    );
+    fs::write(root.path().join("runtime.yaml"), &runtime).unwrap();
+
+    let environment = root.resolve(&on_local("bare")).unwrap().spec.environment;
+    let task_image = environment.task_image.expect("sealed task image");
+    assert_eq!(
+        task_image.components[0].install,
+        "apt-get install -y glab\n"
+    );
+
+    fs::create_dir_all(root.path().join("runtime")).unwrap();
+    fs::write(root.path().join("runtime/runtime.yaml"), &runtime).unwrap();
+    let error = root
+        .resolve(&on_local("bare"))
+        .expect_err("two runtime files");
+    let text = error.to_string();
+    assert!(
+        text.contains(&root.path().join("runtime.yaml").display().to_string())
+            && text.contains(
+                &root
+                    .path()
+                    .join("runtime/runtime.yaml")
+                    .display()
+                    .to_string()
+            ),
+        "{text}"
     );
 }
 
@@ -1915,7 +1962,7 @@ fn a_refresh_on_an_image_backend_takes_a_new_bundle_and_seals_no_task_image() {
     let launch = root.resolve(&intent("wf")).unwrap();
 
     fs::write(
-        root.path().join("runtime.yaml"),
+        root.path().join("runtime/runtime.yaml"),
         format!(
             "bundle: ghcr.io/narsor/runtime@{}\ntask_image:\n  base: debian:trixie-slim\n",
             digest('d')
@@ -1952,7 +1999,7 @@ fn a_refresh_against_a_broken_catalogue_is_refused_like_a_create() {
     let root = TempRoot::new();
     let launch = root.resolve(&intent("wf")).unwrap();
     fs::write(
-        root.path().join("runtime.yaml"),
+        root.path().join("runtime/runtime.yaml"),
         "bundle: ghcr.io/narsor/runtime:latest\n",
     )
     .unwrap();

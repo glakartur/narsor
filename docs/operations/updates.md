@@ -6,6 +6,117 @@ listed here need no special order. The update notes of the remote backends
 (automatic resume, the read-only runner) are in
 [Remote execution backends](remote-backends.md).
 
+## Update to the runtime directory
+
+This update moves the runtime catalogue and the component scripts it names
+into one directory of the catalogue, `{catalog}/runtime/`:
+
+```text
+{catalog}/runtime.yaml   ->  {catalog}/runtime/runtime.yaml
+{catalog}/components/    ->  {catalog}/runtime/components/
+```
+
+A bare-string script path in `runtime.yaml` (`install`, `version`) is now
+relative to the directory of `runtime.yaml`, and must stay inside that
+directory. With the file at the catalogue root, that is the same rule as
+before, so the usual `components/...` entries do not change. A sealed task
+image holds the script text, not the path. So when you move the files
+without changing the text, every task keeps its environment identity, and
+`narsor-cli task refresh-env` reports no change.
+
+### What changes
+
+| Area | Before | After |
+|---|---|---|
+| Runtime catalogue | `{catalog}/runtime.yaml` | `{catalog}/runtime/runtime.yaml` (`.yml` also accepted) |
+| Component scripts | `{catalog}/components/` | `{catalog}/runtime/components/` |
+| Script paths | Relative to the catalogue root | Relative to the directory of `runtime.yaml` |
+| Example catalogue | `examples/catalog/runtime.yaml`, `examples/catalog/components/` | `examples/catalog/runtime/` |
+
+### The transition
+
+Until the files move, the server reads `{catalog}/runtime.yaml` at the old
+place. It resolves the scripts from the catalogue root and logs one warning
+per process with the move to make. A write of the runtime catalogue through
+the API goes to the file in use.
+
+When both `{catalog}/runtime.yaml` and `{catalog}/runtime/runtime.yaml`
+exist, neither file wins. Task creation and environment refresh fail with an
+error that names both files. Keep one of the two, and delete the other.
+
+A later release removes the old place. Its update notes will say so.
+
+### The installer moves the files
+
+For the `local` and `server` roles, the installer moves the files after the
+data migration. First it runs `narsor-migrate runtime-catalog`, which only
+plans: it reads the same configuration as `narsor-server` (`--config-file`
+or `--config`, else the one the server finds), checks for a running
+program and for a collision, and prints the moves. Then bash does each move
+with `mv -n`: `components/` first, then `runtime.yaml`. Right before each
+move, the installer checks again that nothing exists at the target (for
+`runtime.yaml`, also `runtime.yml`), and afterwards that the source is gone.
+It never copies, deletes or overwrites a file, so it makes no backup and
+asks no question. A rerun after a crash between the two moves finishes the
+move.
+
+- **Narsor still runs.** An interactive installer offers once more to stop
+  it. When you decline, or with `--non-interactive`, the installer skips
+  the move, prints in a highlighted line what to do, and continues. Stop
+  Narsor, then run the installer again. The same happens when a program
+  that the installer did not see holds a lock of the installation.
+- **Both layouts exist** (`runtime/runtime.yaml` is already there, or both
+  `components/` and `runtime/components/` exist), **or a move fails** (for
+  example, the catalogue is read-only, or a file appears at the target
+  after the check). The installer prints both paths or the failed move.
+  It overwrites nothing. A non-interactive installation then
+  fails; an interactive one continues.
+
+### Scripts outside `components/`
+
+A bare-string script outside `components/` (for example
+`install: tools/x.sh`) moves with the rest. The installer prints a warning
+that names the entry, after the move. After the move, that script is looked up in
+`{catalog}/runtime/`, where it is not. A Docker-mode task does not start
+until you move the script into `{catalog}/runtime/` (here
+`{catalog}/runtime/tools/x.sh`) or make it inline (`{ inline: "…" }`).
+
+### Run it by hand
+
+Run the installer again after you stop Narsor. Or move the files
+yourself with a no-clobber `mv`. Stop Narsor first:
+
+```console
+$ narsor-migrate runtime-catalog              # print the plan; changes nothing
+$ mkdir -p {catalog}/runtime
+$ mv -nT {catalog}/components {catalog}/runtime/components   # when it exists
+$ mv -nT {catalog}/runtime.yaml {catalog}/runtime/runtime.yaml
+```
+
+`mv -n` does not fail when it skips a file, so check that the old path is gone.
+Pass `--config FILE` or `--root DIRECTORY` before `runtime-catalog` when the
+server uses them. Exit status of `runtime-catalog`: 0 planned, or nothing to
+move; 1 the check could not run; 2 usage or configuration error; 3 the
+runtime directory already holds what would move; 5 a Narsor program still
+runs.
+
+### The catalogue in a ConfigMap
+
+The `runtime.yaml` key of a catalogue ConfigMap now maps to
+`runtime/runtime.yaml` (see
+[The catalogue in a ConfigMap](remote-backends.md#the-catalogue-in-a-configmap)).
+If you keep your own copy of the init script, change that mapping. Also make
+the script delete `{catalog}/runtime.yaml` before the copy, as it already
+empties `automations/` and `queues/`. Otherwise, on a catalogue that
+persists between Pod starts, the old file stays beside the new one and stops
+every task. Until you change the mapping, the old place keeps working.
+
+### Rollback
+
+An older version reads only `{catalog}/runtime.yaml`. Before you go back,
+move `{catalog}/runtime/runtime.yaml` to `{catalog}/runtime.yaml` and
+`{catalog}/runtime/components/` to `{catalog}/components/`.
+
 ## Update to the fixed queue order (D84)
 
 This update keeps every task at its place in its backend's queue until the

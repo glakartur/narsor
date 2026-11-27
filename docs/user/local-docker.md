@@ -38,11 +38,15 @@ The installer can do steps 1 and 3 for you: for the `local` role,
 `docker`), or takes `--local-mode docker`
 (`install.sh --role local --local-mode docker`, or
 `narsor-cli init --role local --local-mode docker`). It checks Docker, writes
-`controller.local.mode: docker` and, when `{catalog}/runtime.yaml` does not
-exist, creates it with the example task image (`base-tools` and
-`claude-code`) and copies the component scripts into
-`{catalog}/components/`. An existing `runtime.yaml` is left unchanged. Then
-store the Claude Code token (step 2):
+`controller.local.mode: docker` and, when the catalogue has no runtime
+catalogue yet, creates `{catalog}/runtime/runtime.yaml` with the example
+task image (`base-tools` and `claude-code`) and copies the component scripts
+into `{catalog}/runtime/components/`. An existing `runtime.yaml`, in
+`{catalog}/runtime/` or at the old place `{catalog}/runtime.yaml`, is left
+unchanged. When `init` keeps an existing configuration (an update), the work
+mode that configuration sets is the default answer, and
+`--non-interactive` uses it unless `--local-mode` is given. Then store the
+Claude Code token (step 2):
 
 ```console
 $ claude setup-token                              # prints a long-lived token
@@ -51,10 +55,10 @@ $ narsor-cli secret set claude-token < token-file
 
 By hand:
 
-1. Define the task image in the catalogue, `{catalog}/runtime.yaml` (see
-   [The task image](#the-task-image)). The example catalogue has one:
-   `examples/catalog/runtime.yaml` with scripts in
-   `examples/catalog/components/`.
+1. Define the task image in the catalogue, `{catalog}/runtime/runtime.yaml`
+   (see [The task image](#the-task-image)). The example catalogue has one:
+   `examples/catalog/runtime/runtime.yaml` with scripts in
+   `examples/catalog/runtime/components/`.
 2. Store the tokens the components need (see [Tokens](#tokens)):
 
    ```console
@@ -84,19 +88,28 @@ storage. When `controller.local.home` is not set, Docker mode uses
 
 ## The task image
 
-The task image is defined once, in `runtime.yaml` under `task_image`: a base
-image, a list of components installed on it, in order, and optionally
-secrets for every task of the image.
+The task image is defined once, in `{catalog}/runtime/runtime.yaml` under
+`task_image`: a base image, a list of components installed on it, in order,
+and optionally secrets for every task of the image. The scripts it names sit
+beside it, in `{catalog}/runtime/components/`.
+
+Older catalogues keep `runtime.yaml` and `components/` at the catalogue
+root. Narsor still reads them there, resolves their scripts from the
+catalogue root, and logs a warning once per process. The installer moves
+them into `runtime/` on an update (see [Updates](../operations/updates.md)).
+A catalogue with both `{catalog}/runtime.yaml` and
+`{catalog}/runtime/runtime.yaml` is refused: task creation and environment
+refresh fail with an error that names both files.
 
 ```yaml
-# {catalog}/runtime.yaml
+# {catalog}/runtime/runtime.yaml
 task_image:
   base: debian:trixie-slim
   secrets:                                   # for every task, no component
     - { name: db-password, env: DATABASE_PASSWORD }
   components:
     - name: base-tools                       # [a-z0-9][a-z0-9-]*, unique
-      install: components/base-tools.sh      # a path inside the catalogue
+      install: components/base-tools.sh      # relative to the runtime/ directory
     - name: claude-code
       install: components/claude-code/install.sh
       version: components/claude-code/version.sh
@@ -112,7 +125,8 @@ task_image:
   check; pin a digest (`debian:trixie-slim@sha256:…`) for repeatable builds.
 - **`install`** — a shell script, run with `sh` as root during the build, one
   image layer per component. A bare string is a path relative to the
-  catalogue directory (it must stay inside it); `{ inline: "…" }` is the
+  directory of `runtime.yaml`, `{catalog}/runtime/` (it must stay inside
+  it, also through symbolic links); `{ inline: "…" }` is the
   script text itself. The scripts are read when a task is created and sealed
   into the task, so a later edit affects only new tasks and tasks whose
   environment you refresh (see "Refresh the environment of a task").
@@ -151,11 +165,12 @@ The build adds a passwd and group entry for your uid and gid (named
 The scripts of the example are a starting point, not a supported
 distribution:
 
-- `components/claude-code/` installs Claude Code system-wide in
+- `runtime/components/claude-code/` installs Claude Code system-wide in
   `/usr/local/bin` from the official release bucket (checksum verified) and
   turns its self-update off (`DISABLE_AUTOUPDATER` in
   `/etc/claude-code/managed-settings.json`): the image decides the version.
-- `components/glab/` installs the GitLab CLI from its release package.
+- `runtime/components/glab/` installs the GitLab CLI from its release
+  package.
 
 ### Updates
 
@@ -202,7 +217,8 @@ refuses it:
 
 ```text
 the docker work mode needs a task image, and this task has none: define
-`task_image` in runtime.yaml, then run `narsor-cli task refresh-env <task>` …
+`task_image` in runtime/runtime.yaml of the catalogue, then run
+`narsor-cli task refresh-env <task>` …
 ```
 
 To fix it, define `task_image`, stop the task if it runs, and refresh its
@@ -284,7 +300,7 @@ $ narsor-cli secret set db-password          # paste it, then Ctrl-D
 ```
 
 ```yaml
-# {catalog}/runtime.yaml
+# {catalog}/runtime/runtime.yaml
 task_image:
   base: debian:trixie-slim
   secrets:

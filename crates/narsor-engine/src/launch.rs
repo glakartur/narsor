@@ -63,11 +63,11 @@ use crate::workspace::provisioner::check_ref;
 use narsor_protocol::display::without_unsafe_chars;
 
 use crate::environment::backend::{BackendRecord, SlotReleaseTimings};
-use crate::environment::catalog::EnvironmentCatalog;
+use crate::environment::catalog::{EnvironmentCatalog, LocatedRuntime};
 use crate::environment::image::NoTagResolution;
 
 use crate::environment::image::ImageResolver;
-use crate::environment::profile::{ProfileRecord, RuntimeCatalog, DEFAULT_PROFILE};
+use crate::environment::profile::{ProfileRecord, DEFAULT_PROFILE};
 use crate::environment::resolver::{LaunchError, LaunchIntent, LaunchResolver, ResolvedLaunch};
 
 /// The harness registry and the live default harness.
@@ -354,10 +354,11 @@ impl CatalogLaunchResolver {
         Ok(record)
     }
 
-    fn runtime(&self) -> Result<Option<RuntimeCatalog>, LaunchError> {
+    /// The runtime catalogue in use, refused when it has problems.
+    fn runtime(&self) -> Result<Option<LocatedRuntime>, LaunchError> {
         let runtime = self.catalog.runtime()?;
         if let Some(runtime) = &runtime {
-            let problems = runtime.problems();
+            let problems = runtime.catalog.problems();
             if !problems.is_empty() {
                 return Err(LaunchError::InvalidRuntime(problems));
             }
@@ -799,10 +800,9 @@ impl CatalogLaunchResolver {
             absent_is_empty,
             mut secrets,
         } = request;
-        let runtime = self.runtime()?;
-        let task_image = runtime
-            .as_ref()
-            .and_then(|runtime| runtime.task_image.as_ref());
+        let located = self.runtime()?;
+        let runtime = located.as_ref().map(|located| &located.catalog);
+        let task_image = runtime.and_then(|runtime| runtime.task_image.as_ref());
         let base_image = match (&definition.globals.image, repository) {
             (Some(image), _) => Some(self.resolve_image(
                 "globals.image",
@@ -860,10 +860,10 @@ impl CatalogLaunchResolver {
         // The local controller builds its Docker-mode image from the sealed
         // definition, so a local task carries it whatever the mode is now:
         // a later mode switch still finds it (KTD8).
-        let sealed_task_image = match task_image {
-            Some(global) if !backend.kind.runs_container_images() => Some(
+        let sealed_task_image = match (task_image, &located) {
+            (Some(global), Some(located)) if !backend.kind.runs_container_images() => Some(
                 global
-                    .seal(&self.catalog_root)
+                    .seal(&located.script_dir)
                     .map_err(LaunchError::InvalidRuntime)?,
             ),
             _ => None,
@@ -887,7 +887,7 @@ impl CatalogLaunchResolver {
         }
 
         let profile = self.profile(profile_id, absent_is_empty)?;
-        let bundle = runtime.as_ref().and_then(|runtime| runtime.bundle.as_ref());
+        let bundle = runtime.and_then(|runtime| runtime.bundle.as_ref());
         let runtime_bundle = match (bundle, backend.kind.runs_container_images()) {
             (Some(bundle), true) => Some(self.resolve_image(
                 "runtime.yaml bundle",
@@ -900,7 +900,6 @@ impl CatalogLaunchResolver {
         let mut tools = BTreeMap::new();
         for tool in &profile.tools {
             let spec = runtime
-                .as_ref()
                 .and_then(|runtime| runtime.tools.get(tool))
                 .ok_or_else(|| LaunchError::UnknownTool {
                     profile: profile.id.clone(),

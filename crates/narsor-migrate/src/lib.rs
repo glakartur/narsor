@@ -33,6 +33,7 @@ pub mod backup;
 pub mod controller;
 pub mod mover;
 pub mod refusal;
+pub mod runtime_catalog;
 pub mod server;
 #[cfg(test)]
 mod test_support;
@@ -54,6 +55,9 @@ pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_REFUSED: i32 = 3;
 /// Exit status: the move was not confirmed; nothing changed.
 pub const EXIT_NOT_CONFIRMED: i32 = 4;
+/// Exit status of `runtime-catalog`: a program of the installation runs;
+/// nothing changed.
+pub const EXIT_RUNNING: i32 = 5;
 
 /// What to move.
 #[derive(Debug, Clone)]
@@ -114,6 +118,23 @@ impl Installation {
             old,
             root: config.root().to_path_buf(),
         }
+    }
+
+    /// The locks a running program of this installation holds: old and new
+    /// daemon, old and new local controller.
+    pub fn locks(&self) -> Vec<refusal::Lock> {
+        let mut locks = self.controller.checks().locks;
+        locks.extend([
+            refusal::Lock {
+                path: self.old.state.join(server::OLD_INSTANCE_LOCK),
+                holder: "an old narsor daemon (stop it with the old `narsor-server stop`)",
+            },
+            refusal::Lock {
+                path: self.server.daemon_instance_lock_file(),
+                holder: "a narsor-server of the new version",
+            },
+        ]);
+        locks
     }
 }
 
@@ -294,16 +315,7 @@ impl Target {
             Target::Installation(installation) => {
                 let old = &installation.old;
                 let mut checks = installation.controller.checks();
-                checks.locks.extend([
-                    refusal::Lock {
-                        path: old.state.join(server::OLD_INSTANCE_LOCK),
-                        holder: "an old narsor daemon (stop it with the old `narsor-server stop`)",
-                    },
-                    refusal::Lock {
-                        path: installation.server.daemon_instance_lock_file(),
-                        holder: "a narsor-server of the new version",
-                    },
-                ]);
+                checks.locks = installation.locks();
                 checks
                     .sources
                     .extend(OLD_SERVER_ENTRIES.iter().map(|name| old.state.join(name)));
@@ -497,7 +509,7 @@ pub fn run(
     }
     let locks = refusal::check(&target.checks(), probe, options.assume_containers_stopped);
     if let Err(reason) = &locks {
-        refusals.push(reason.clone());
+        refusals.push(reason.reason.clone());
     }
     if !refusals.is_empty() {
         return Err(Failure::Refused(refusals.join("\n")));

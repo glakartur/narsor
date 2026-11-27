@@ -63,11 +63,12 @@ fn read_key() -> Result<KeyEvent> {
 }
 
 /// Lets the user pick one item with the arrow keys (or `j`/`k`) and Enter.
-/// Items are `(name, description)`; returns the index of the chosen one.
-pub fn select(label: &str, items: &[(&str, &str)]) -> Result<usize> {
+/// Items are `(name, description)`; the item at `start` is selected first.
+/// Returns the index of the chosen one.
+pub fn select(label: &str, items: &[(&str, &str)], start: usize) -> Result<usize> {
     let mut err = io::stderr();
     let _raw = RawMode::enter()?;
-    let mut index = 0;
+    let mut index = start.min(items.len().saturating_sub(1));
     let width = items.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
     queue!(
         err,

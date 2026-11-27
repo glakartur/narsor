@@ -3,7 +3,8 @@
 //! ```text
 //! {catalog}/backends/{id}.yaml   -- one execution backend per file
 //! {catalog}/profiles/{id}.yaml   -- one user profile per file
-//! {catalog}/runtime.yaml         -- runtime bundle and tool packages
+//! {catalog}/runtime/runtime.yaml -- runtime bundle, tool packages, task image
+//! {catalog}/runtime/components/  -- the scripts the task image names
 //! ```
 //!
 //! The same layout and the same reasons as the repository registry
@@ -57,6 +58,18 @@ pub enum CatalogError {
         id: String,
         /// Every problem found.
         problems: Vec<String>,
+    },
+    /// The runtime catalogue exists at its place and at the old place.
+    #[error(
+        "the runtime catalogue is defined twice, in '{current}' and in '{legacy}'; keep only \
+         '{current}' (move what you need from the old file and its components/ directory into \
+         the runtime directory, then delete '{legacy}')"
+    )]
+    RuntimeInTwoPlaces {
+        /// `{catalog}/runtime/runtime.yaml` (or `.yml`).
+        current: PathBuf,
+        /// `{catalog}/runtime.yaml`.
+        legacy: PathBuf,
     },
 }
 
@@ -145,15 +158,109 @@ impl EnvironmentCatalog {
         )
     }
 
-    /// The runtime catalogue, or `None` when the file does not exist.
-    pub fn runtime(&self) -> Result<Option<RuntimeCatalog>, CatalogError> {
-        read_file(&self.paths.runtime_file())
+    /// The runtime catalogue with the place it was read from, or `None`
+    /// when there is none.
+    ///
+    /// It is `{catalog}/runtime/runtime.yaml` (then `.yml`). An older
+    /// catalogue keeps it at `{catalog}/runtime.yaml`: that file is read
+    /// while the new one does not exist, with one warning per process. Both
+    /// at once is refused, so neither wins silently.
+    pub fn runtime(&self) -> Result<Option<LocatedRuntime>, CatalogError> {
+        let Some((file, legacy)) = self.locate_runtime()? else {
+            return Ok(None);
+        };
+        let Some(catalog) = read_file::<RuntimeCatalog>(&file)? else {
+            return Ok(None);
+        };
+        let script_dir = if legacy {
+            warn_about_legacy_runtime(&file, &self.paths.runtime_file());
+            self.paths.root().to_path_buf()
+        } else {
+            self.paths.runtime_dir()
+        };
+        Ok(Some(LocatedRuntime {
+            catalog,
+            file,
+            script_dir,
+            legacy,
+        }))
     }
 
-    /// Stores the runtime catalogue after validating it.
+    /// Stores the runtime catalogue after validating it, into the file in
+    /// use, else into `{catalog}/runtime/runtime.yaml`.
     pub fn save_runtime(&self, runtime: &RuntimeCatalog) -> Result<(), CatalogError> {
         refuse_problems("runtime", runtime.problems())?;
-        write_entry(&self.paths.runtime_file(), runtime)
+        let file = match self.locate_runtime()? {
+            Some((file, _)) => file,
+            None => self.paths.runtime_file(),
+        };
+        write_entry(&file, runtime)
+    }
+
+    /// The runtime catalogue file in use and whether it is at the old place.
+    fn locate_runtime(&self) -> Result<Option<(PathBuf, bool)>, CatalogError> {
+        let mut current = None;
+        for extension in EXTENSIONS {
+            let file = self
+                .paths
+                .runtime_dir()
+                .join(format!("runtime.{extension}"));
+            if file_exists(&file)? {
+                current = Some(file);
+                break;
+            }
+        }
+        let legacy = self.paths.legacy_runtime_file();
+        match (current, file_exists(&legacy)?) {
+            (Some(current), true) => Err(CatalogError::RuntimeInTwoPlaces { current, legacy }),
+            (Some(current), false) => Ok(Some((current, false))),
+            (None, true) => Ok(Some((legacy, true))),
+            (None, false) => Ok(None),
+        }
+    }
+}
+
+/// The runtime catalogue and where it was read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedRuntime {
+    /// The catalogue itself.
+    pub catalog: RuntimeCatalog,
+    /// The file it was read from.
+    pub file: PathBuf,
+    /// The directory its script paths resolve from: the directory of
+    /// `file`.
+    pub script_dir: PathBuf,
+    /// Whether `file` is at the old place, `{catalog}/runtime.yaml`.
+    pub legacy: bool,
+}
+
+/// Logs, once per process, that the runtime catalogue is at the old place:
+/// it is read on every task creation, so a warning per read would flood
+/// the log.
+fn warn_about_legacy_runtime(legacy: &Path, current: &Path) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        let dir = current.parent().unwrap_or(current);
+        tracing::warn!(
+            old = %legacy.display(),
+            new = %current.display(),
+            "the runtime catalogue is at its old place '{}'; move it to '{}' and its \
+             components/ directory into '{}' (the installer does this on update)",
+            legacy.display(),
+            current.display(),
+            dir.display()
+        );
+    });
+}
+
+fn file_exists(path: &Path) -> Result<bool, CatalogError> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(CatalogError::Storage {
+            path: path.to_path_buf(),
+            source: PersistenceError::io(path, source),
+        }),
     }
 }
 
@@ -210,4 +317,110 @@ fn write_entry<T: Serialize>(path: &Path, entry: &T) -> Result<(), CatalogError>
         path: path.to_path_buf(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A catalogue root in the temp directory, removed on drop.
+    struct Root(PathBuf);
+
+    impl Root {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("narsor-runtime-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).expect("catalogue root");
+            Self(root)
+        }
+
+        fn write(&self, relative: &str, text: &str) {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, text).expect("write");
+        }
+
+        fn catalog(&self) -> EnvironmentCatalog {
+            EnvironmentCatalog::new(&self.0)
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const RUNTIME: &str = "task_image:\n  base: debian:trixie-slim\n";
+
+    fn empty_runtime() -> RuntimeCatalog {
+        RuntimeCatalog {
+            bundle: None,
+            tools: Default::default(),
+            task_image: None,
+        }
+    }
+
+    #[test]
+    fn the_runtime_catalogue_is_read_from_the_runtime_directory_or_the_old_place() {
+        // (file present, directory its scripts resolve from, old place)
+        let cases = [
+            ("runtime/runtime.yaml", "runtime", false),
+            ("runtime/runtime.yml", "runtime", false),
+            ("runtime.yaml", "", true),
+        ];
+        for (file, script_dir, legacy) in cases {
+            let root = Root::new();
+            root.write(file, RUNTIME);
+
+            let located = root
+                .catalog()
+                .runtime()
+                .expect(file)
+                .unwrap_or_else(|| panic!("{file} is found"));
+
+            assert!(located.catalog.task_image.is_some(), "{file}");
+            assert_eq!(located.file, root.0.join(file), "{file}");
+            assert_eq!(located.script_dir, root.0.join(script_dir), "{file}");
+            assert_eq!(located.legacy, legacy, "{file}");
+        }
+        assert!(Root::new().catalog().runtime().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_runtime_catalogue_in_both_places_is_refused_for_reads_and_writes() {
+        let root = Root::new();
+        root.write("runtime.yaml", RUNTIME);
+        root.write("runtime/runtime.yaml", RUNTIME);
+        let names_both = |error: CatalogError| {
+            let text = error.to_string();
+            assert!(
+                text.contains(&root.0.join("runtime.yaml").display().to_string())
+                    && text.contains(&root.0.join("runtime/runtime.yaml").display().to_string()),
+                "{text}"
+            );
+        };
+
+        names_both(root.catalog().runtime().expect_err("read"));
+        names_both(
+            root.catalog()
+                .save_runtime(&empty_runtime())
+                .expect_err("write"),
+        );
+    }
+
+    #[test]
+    fn a_runtime_write_goes_to_the_file_in_use_or_else_the_runtime_directory() {
+        let fresh = Root::new();
+        fresh.catalog().save_runtime(&empty_runtime()).unwrap();
+        assert!(fresh.0.join("runtime/runtime.yaml").is_file());
+        assert!(!fresh.0.join("runtime.yaml").exists());
+
+        let old = Root::new();
+        old.write("runtime.yaml", RUNTIME);
+        old.catalog().save_runtime(&empty_runtime()).unwrap();
+        let rewritten = std::fs::read_to_string(old.0.join("runtime.yaml")).unwrap();
+        assert!(!rewritten.contains("debian"), "{rewritten}");
+        assert!(!old.0.join("runtime").exists());
+    }
 }

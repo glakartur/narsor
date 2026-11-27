@@ -15,7 +15,7 @@
 //! | owner default profile (R16) | setting `server.defaults.profile` |
 //! | backends (R3) | `{catalog}/backends/{id}.yaml` — [`BackendRecord`] |
 //! | profiles (R16) | `{catalog}/profiles/{id}.yaml` — [`ProfileRecord`] |
-//! | runtime bundle, tools (R20) | `{catalog}/runtime.yaml` — [`RuntimeCatalog`] |
+//! | runtime bundle, tools, task image (R20) | `{catalog}/runtime/runtime.yaml` (older catalogues: `{catalog}/runtime.yaml`) — [`RuntimeCatalog`]; its scripts beside it in `{catalog}/runtime/components/` |
 //! | repository base image (R15) | `{catalog}/repositories/{id}.yaml` `base_image` |
 //! | workflow / step image (R15) | workflow `globals.image`, state `image` |
 //!
@@ -40,7 +40,7 @@ pub use backend::{
     BackendCapabilities, BackendKind, BackendLimits, BackendRecord, BackendSecret,
     SecretDeliveryMode, SlotReleaseTimings, TrustScope,
 };
-pub use catalog::{CatalogError, EnvironmentCatalog};
+pub use catalog::{CatalogError, EnvironmentCatalog, LocatedRuntime};
 pub use image::{ImageResolver, NoTagResolution, StaticImageResolver};
 pub use profile::{ProfileRecord, RuntimeCatalog, DEFAULT_PROFILE};
 pub use resolver::{

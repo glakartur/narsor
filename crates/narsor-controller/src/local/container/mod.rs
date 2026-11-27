@@ -239,9 +239,9 @@ impl ContainerRunners {
         let image = spec.environment.task_image.clone().ok_or_else(|| {
             BackendError::rejected(format!(
                 "the docker work mode needs a task image, and this task has none: define \
-                 `task_image` in runtime.yaml, then run `narsor-cli task refresh-env {task}` \
-                 (a task created before that has none sealed), or set controller.local.mode \
-                 to 'process'"
+                 `task_image` in runtime/runtime.yaml of the catalogue, then run \
+                 `narsor-cli task refresh-env {task}` (a task created before that has none \
+                 sealed), or set controller.local.mode to 'process'"
             ))
         })?;
         if !spec.environment.step_images.is_empty() {

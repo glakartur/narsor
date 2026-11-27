@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use narsor_migrate::{
+    runtime_catalog::{self, RuntimeCatalogMove},
     BackupChoice, ControllerMove, DockerProbe, Installation, Options, Target, EXIT_OK, EXIT_USAGE,
 };
 use narsor_shared::config::{self, Flags};
@@ -59,6 +60,14 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Plan the move of an old runtime catalogue ({catalog}/runtime.yaml and
+    /// {catalog}/components/) into {catalog}/runtime/. Changes nothing: it
+    /// prints one `move` line per move (`dist/install.sh` runs them with
+    /// `mv -n`) and a `warning` line per script outside components/. Exit
+    /// status: 0 planned or nothing to move; 1 the check could not run; 2
+    /// usage or configuration error; 3 the runtime directory already holds
+    /// what would move; 5 a program of the installation runs.
+    RuntimeCatalog,
     /// Move the files of a controller started by hand
     /// (`narsor-controller local`) on another machine.
     Controller {
@@ -94,6 +103,20 @@ fn main() {
         .with_target(false)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
+
+    if matches!(args.command, Some(Command::RuntimeCatalog)) {
+        let target = runtime_catalog_target(&args).unwrap_or_else(|message| {
+            eprintln!("narsor-migrate: {message}");
+            std::process::exit(EXIT_USAGE);
+        });
+        match runtime_catalog::run(&target, &mut std::io::stdout()) {
+            Ok(_) => std::process::exit(EXIT_OK),
+            Err(failure) => {
+                eprintln!("narsor-migrate: {failure}");
+                std::process::exit(failure.exit_code());
+            }
+        }
+    }
 
     let target = target(&args).unwrap_or_else(|message| {
         eprintln!("narsor-migrate: {message}");
@@ -141,23 +164,10 @@ fn main() {
 /// resolves (as `narsor-server` resolves it), or a controller.
 fn target(args: &Args) -> Result<Target, String> {
     match &args.command {
-        None => {
-            let flags = Flags {
-                root: args.root.clone(),
-                config: args.config.clone(),
-            };
-            let environment = config::resolve::environment_from_process();
-            let resolved = config::resolve(&flags, &environment, config::Scope::SERVER);
-            if !resolved.is_ok() {
-                let problems: Vec<String> =
-                    resolved.errors().iter().map(ToString::to_string).collect();
-                return Err(format!(
-                    "the configuration does not hold up:\n  {}",
-                    problems.join("\n  ")
-                ));
-            }
-            Ok(Target::Installation(Installation::of(&resolved)))
-        }
+        None => Ok(Target::Installation(Installation::of(
+            &resolved_installation(args)?,
+        ))),
+        Some(Command::RuntimeCatalog) => unreachable!("handled before"),
         Some(Command::Controller {
             legacy_dir,
             legacy_work_dir,
@@ -184,6 +194,31 @@ fn target(args: &Args) -> Result<Target, String> {
             )))
         }
     }
+}
+
+/// The configuration as `narsor-server` resolves it, from `--root` and
+/// `--config`.
+fn resolved_installation(args: &Args) -> Result<narsor_shared::config::Resolved, String> {
+    let flags = Flags {
+        root: args.root.clone(),
+        config: args.config.clone(),
+    };
+    let environment = config::resolve::environment_from_process();
+    let resolved = config::resolve(&flags, &environment, config::Scope::SERVER);
+    if !resolved.is_ok() {
+        let problems: Vec<String> = resolved.errors().iter().map(ToString::to_string).collect();
+        return Err(format!(
+            "the configuration does not hold up:\n  {}",
+            problems.join("\n  ")
+        ));
+    }
+    Ok(resolved)
+}
+
+/// The runtime catalogue move of the installation the configuration
+/// resolves.
+fn runtime_catalog_target(args: &Args) -> Result<RuntimeCatalogMove, String> {
+    Ok(RuntimeCatalogMove::of(&resolved_installation(args)?))
 }
 
 /// The default state root of `narsor-controller local`.

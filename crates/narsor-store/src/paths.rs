@@ -15,6 +15,8 @@
 //! {catalog}/workflows/{name}.yaml                     mountable read-only
 //! {catalog}/automations/{name}/…     -- automation definition and scripts
 //! {catalog}/queues/{name}.yaml       -- queues served by automations
+//! {catalog}/runtime/runtime.yaml     -- runtime catalogue: bundle, tools,
+//! {catalog}/runtime/components/…        task image and the scripts it names
 //!
 //! {state}/narsor-server/…            -- ServerStatePaths: the server's own state
 //!     daemon.instance.lock            -- held by the running daemon
@@ -71,9 +73,17 @@ pub const AUTOMATIONS_DIR: &str = "automations";
 /// Directory holding queue definitions, under the catalogue root.
 pub const QUEUES_DIR: &str = "queues";
 
-/// The runtime catalogue (runtime bundle and tool packages), under the
-/// catalogue root.
+/// Directory holding the runtime catalogue and the component scripts of
+/// the task image, under the catalogue root.
+pub const RUNTIME_DIR: &str = "runtime";
+
+/// The runtime catalogue (runtime bundle, tool packages, task image), inside
+/// [`RUNTIME_DIR`]. Older catalogues keep it at the catalogue root.
 pub const RUNTIME_FILE: &str = "runtime.yaml";
+
+/// Directory holding the component scripts of the task image, inside
+/// [`RUNTIME_DIR`]. Older catalogues keep it at the catalogue root.
+pub const COMPONENTS_DIR: &str = "components";
 
 /// Directory holding every execution workspace, under the work root.
 pub const TASKS_DIR: &str = "tasks";
@@ -804,9 +814,32 @@ impl CatalogPaths {
         self.root.join(QUEUES_DIR)
     }
 
-    /// `{root}/runtime.yaml`
+    /// `{root}/runtime`: the runtime catalogue and its scripts.
+    pub fn runtime_dir(&self) -> PathBuf {
+        self.root.join(RUNTIME_DIR)
+    }
+
+    /// `{root}/runtime/runtime.yaml`
     pub fn runtime_file(&self) -> PathBuf {
+        self.runtime_dir().join(RUNTIME_FILE)
+    }
+
+    /// `{root}/runtime/components`
+    pub fn runtime_components_dir(&self) -> PathBuf {
+        self.runtime_dir().join(COMPONENTS_DIR)
+    }
+
+    /// `{root}/runtime.yaml`: where older catalogues keep the runtime
+    /// catalogue. It is read until the operator moves it into
+    /// [`Self::runtime_dir`].
+    pub fn legacy_runtime_file(&self) -> PathBuf {
         self.root.join(RUNTIME_FILE)
+    }
+
+    /// `{root}/components`: where older catalogues keep the component
+    /// scripts.
+    pub fn legacy_components_dir(&self) -> PathBuf {
+        self.root.join(COMPONENTS_DIR)
     }
 }
 

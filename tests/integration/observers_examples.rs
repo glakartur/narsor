@@ -61,21 +61,23 @@ fn the_example_catalog_loads_with_no_problems() {
     assert!(!load.automations["jira-new-issues"].has(HookPhase::In));
 }
 
-/// The example `runtime.yaml` defines a task image for the Docker work mode
+/// The example `runtime/runtime.yaml` defines a task image for the Docker work mode
 /// whose scripts are files of the catalogue: it has no problem and seals
 /// with every script's text, in the order the image installs them.
 #[test]
 fn the_example_task_image_seals_with_its_scripts() {
-    let runtime = narsor_engine::environment::EnvironmentCatalog::new(example_catalog())
+    let located = narsor_engine::environment::EnvironmentCatalog::new(example_catalog())
         .runtime()
         .expect("runtime.yaml parses")
         .expect("runtime.yaml exists");
+    assert!(!located.legacy, "the example uses the runtime directory");
+    let runtime = located.catalog;
     assert_eq!(runtime.problems(), Vec::<String>::new());
 
     let sealed = runtime
         .task_image
         .expect("a task image")
-        .seal(&example_catalog())
+        .seal(&located.script_dir)
         .expect("every script loads");
 
     let names: Vec<&str> = sealed.components.iter().map(|c| c.name.as_str()).collect();

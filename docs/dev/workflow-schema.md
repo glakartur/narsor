@@ -149,7 +149,7 @@ An optional section defining default behavior for the whole workflow.
 *   `image`: The base image in which a remote backend runs the task; it overrides the registry
     repository's `base_image` (deprecated). A step can override it with its own `image` field.
     Precedence on a backend that runs images: step > workflow > repository `base_image` > the
-    `base` of the global `task_image` in `runtime.yaml`, which counts only when it has no
+    `base` of the global `task_image` in `runtime/runtime.yaml`, which counts only when it has no
     `components` (with components the task is refused: such an image must be built, and only the
     local backend's Docker mode builds images). The local backend ignores `image` in process mode
     and refuses a step `image` in Docker mode, where every task runs in the image built from

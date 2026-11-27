@@ -206,10 +206,10 @@ keeps the workflow, inputs and workspace (see
 | --- | --- |
 | Backends | `{catalog}/backends/{id}.yaml` |
 | Profiles | `{catalog}/profiles/{id}.yaml` |
-| Runtime bundle and tool images | `{catalog}/runtime.yaml` |
+| Runtime bundle and tool images | `{catalog}/runtime/runtime.yaml` (older catalogues: `{catalog}/runtime.yaml`, see [Updates](updates.md#update-to-the-runtime-directory)) |
 | Repository base image (deprecated) | `{catalog}/repositories/{id}.yaml`, key `base_image` |
 | Workflow image | workflow `globals.image` |
-| Global task image (fallback) | `{catalog}/runtime.yaml`, key `task_image` |
+| Global task image (fallback) | `{catalog}/runtime/runtime.yaml`, key `task_image`; its scripts in `{catalog}/runtime/components/` |
 | Default backend / profile | settings `server.defaults.backend` (default `local`), `server.defaults.profile` (default `default`); the owner can override the backend at runtime |
 | Automations and queues | `{catalog}/automations/{name}/` (`automation.yaml`, `check.sh`, optional `in.sh`, `out.sh`), `{catalog}/queues/{name}.yaml`; read at every run, not sealed into a task (see [Automations and queues](../user/observers.md#2-the-catalogue-files)) |
 
@@ -248,14 +248,14 @@ version: 3                 # bump on every change: it is part of the environment
 harness: claude-code       # optional
 settings: {}               # allowed settings
 skills: []
-tools: [gh]                # tool images from runtime.yaml
+tools: [gh]                # tool images from runtime/runtime.yaml
 secrets: [github-token]    # names of backend secrets this profile may use
 ```
 
 ### Runtime catalogue
 
 ```yaml
-# {catalog}/runtime.yaml
+# {catalog}/runtime/runtime.yaml
 bundle: ghcr.io/narsor/runtime@sha256:<64 hex>
 tools:
   gh: ghcr.io/narsor/tools/gh@sha256:<64 hex>
@@ -284,7 +284,7 @@ remote: https://github.com/acme/api.git
 base_image: ghcr.io/acme/api-dev@sha256:<64 hex>      # deprecated, still read
 git_credential: github-token     # optional: backend secret used for the clone
 
-# {catalog}/runtime.yaml — the last fallback, without components here
+# {catalog}/runtime/runtime.yaml — the last fallback, without components here
 task_image:
   base: ghcr.io/acme/dev@sha256:<64 hex>
 ```
@@ -320,12 +320,18 @@ key names the target file:
 | `workflow-{name}.yaml` | `workflows/{name}.yaml` |
 | `automation-{name}--{file}` | `automations/{name}/{file}`, where `{file}` is `automation.yaml`, `check.sh`, `in.sh` or `out.sh` |
 | `queue-{name}.yaml` | `queues/{name}.yaml` |
-| any other key (`runtime.yaml`) | the same name at the catalogue root |
+| `runtime.yaml` | `runtime/runtime.yaml` |
+| any other key | the same name at the catalogue root |
 
 The init script splits an automation key at its last `--`: the file names
 have no `--`, so an automation name may have one. It empties
 `automations/` and `queues/` before the copy, so an automation or a queue
-removed from the ConfigMap is gone after the next start. A queue is used
+removed from the ConfigMap is gone after the next start. It also deletes
+`{catalog}/runtime.yaml` before the copy: on a catalogue that persists
+between starts, a runtime catalogue left at that old place beside
+`runtime/runtime.yaml` stops every task. The ConfigMap does not carry
+component scripts; a global task image there uses no components (see
+above). A queue is used
 only when every automation it names is complete; the problems are shown in
 the queue views (`narsor-cli queue list`). `deploy/kind/server.yaml` has the
 init script and the commands that make the ConfigMap from

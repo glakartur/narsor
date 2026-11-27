@@ -84,18 +84,24 @@ pub fn check(
     checks: &Checks,
     probe: &dyn ContainerProbe,
     assume_containers_stopped: bool,
-) -> Result<HeldLocks, String> {
+) -> Result<HeldLocks, Refusal> {
     let mut reasons = Vec::new();
+    let mut only_held_locks = true;
     let mut held = Vec::new();
     for lock in &checks.locks {
         match take_lock(lock) {
             Ok(Some(file)) => held.push(file),
             Ok(None) => {}
-            Err(reason) => reasons.push(reason),
+            Err(LockError::Held(reason)) => reasons.push(reason),
+            Err(LockError::Other(reason)) => {
+                only_held_locks = false;
+                reasons.push(reason);
+            }
         }
     }
     for source in &checks.sources {
         if fs::symlink_metadata(source).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            only_held_locks = false;
             reasons.push(format!(
                 "{} is a symbolic link; the migration moves the installation's own files, never \
                  what a link points at. Move what it points at to its place by hand",
@@ -111,17 +117,43 @@ pub fn check(
     if reasons.is_empty() {
         Ok(HeldLocks(held))
     } else {
-        Err(reasons.join("\n"))
+        Err(Refusal {
+            reason: reasons.join("\n"),
+            only_held_locks,
+        })
     }
 }
 
+/// Why `check` refused.
+#[derive(Debug)]
+pub struct Refusal {
+    /// Every reason, one per line.
+    pub reason: String,
+    /// `true` when every reason is a lock that another program holds. A
+    /// lock that cannot be opened or taken is not such a reason.
+    pub only_held_locks: bool,
+}
+
+/// Why a lock was not taken.
+enum LockError {
+    /// Another program holds it.
+    Held(String),
+    /// It cannot be opened or locked.
+    Other(String),
+}
+
 /// Takes `lock` without waiting; `None` when the file does not exist.
-fn take_lock(lock: &Lock) -> Result<Option<fs::File>, String> {
+fn take_lock(lock: &Lock) -> Result<Option<fs::File>, LockError> {
     let path = &lock.path;
     let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("cannot open {}: {error}", path.display())),
+        Err(error) => {
+            return Err(LockError::Other(format!(
+                "cannot open {}: {error}",
+                path.display()
+            )))
+        }
     };
     // SAFETY: flock on a descriptor this function owns.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -129,13 +161,16 @@ fn take_lock(lock: &Lock) -> Result<Option<fs::File>, String> {
     }
     let error = io::Error::last_os_error();
     if error.kind() == io::ErrorKind::WouldBlock {
-        return Err(format!(
+        return Err(LockError::Held(format!(
             "{} holds {}; stop it first",
             lock.holder,
             path.display()
-        ));
+        )));
     }
-    Err(format!("cannot lock {}: {error}", path.display()))
+    Err(LockError::Other(format!(
+        "cannot lock {}: {error}",
+        path.display()
+    )))
 }
 
 /// The fields of an old `workload.json` that tell whether it lives.
