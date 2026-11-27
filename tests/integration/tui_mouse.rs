@@ -417,3 +417,213 @@ mod list {
         assert!(!shown.contains("planning"), "{shown}");
     }
 }
+
+mod details {
+    use super::*;
+
+    use narsor::tui::task_app::detail::DetailRead;
+    use narsor::tui::task_app::tabs::conversation::{AttemptRead, Conversation};
+    use narsor::tui::task_app::DetailTab;
+    use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
+    use narsor_engine::controller_protocol::{ExecutionEventsResponse, ExecutionEventsSource};
+    use narsor_engine::engine::{ConversationState, PositionStatus};
+
+    use crate::task_app_support::{execution_events, position, timeline};
+
+    /// Running task `a`, selected, with the keys on the list and its details
+    /// on *Rozmowa*.
+    fn running_app() -> TaskApp {
+        let running = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "edit",
+        );
+        let mut app = app();
+        app.load(listing(vec![titled(running, "NAR-1")], "c"));
+        assert_eq!(app.detail().tab(), DetailTab::Conversation);
+        app
+    }
+
+    /// Puts the keys in the details and opens `tab` there.
+    fn open_tab(app: &mut TaskApp, tab: DetailTab) {
+        key(app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Details);
+        while app.detail().tab() != tab {
+            key(app, KeyCode::Char(']'));
+        }
+    }
+
+    /// Entries `from..=to` of the step `edit`: a header `AGENT · nn` and two
+    /// lines, `line nn` and `more nn`, `nn` two digits.
+    fn entries(from: u64, to: u64) -> AttemptRead {
+        AttemptRead {
+            entries: (from..=to)
+                .map(|n| {
+                    TranscriptEntry::new(
+                        TranscriptEntryId::from(format!("{n:02}")),
+                        vec![format!("line {n:02}"), format!("more {n:02}")],
+                        Vec::new(),
+                    )
+                    .with_header(format!("AGENT · {n:02}"))
+                })
+                .collect(),
+            next_entry: to,
+            closed: false,
+            truncated_tail: false,
+            complete: true,
+            no_record: false,
+            source: ExecutionEventsSource::Runner,
+            recorded_at: None,
+        }
+    }
+
+    fn read_entries(app: &mut TaskApp, from: u64, to: u64) {
+        app.on_detail_reads(
+            "a",
+            1,
+            vec![DetailRead::Attempt {
+                attempt_id: "act-edit".into(),
+                from: from - 1,
+                result: Ok(entries(from, to)),
+            }],
+        );
+    }
+
+    /// [`running_app`] whose step `edit` said 30 entries, more than its
+    /// window shows; *Rozmowa* follows the newest one.
+    fn talking_app() -> TaskApp {
+        let mut app = running_app();
+        let mut edit = position("edit", PositionStatus::InProgress);
+        edit.conversation = ConversationState::Recorded;
+        app.on_detail_reads(
+            "a",
+            1,
+            vec![DetailRead::Timeline(Ok(timeline(
+                "a",
+                vec![edit],
+                Some("edit #1"),
+            )))],
+        );
+        read_entries(&mut app, 1, 30);
+        app
+    }
+
+    fn conversation(app: &TaskApp) -> &Conversation {
+        app.detail().view("a").unwrap().conversation()
+    }
+
+    #[test]
+    fn a_notch_up_over_a_followed_conversation_scrolls_three_lines_and_stops_the_follow() {
+        let mut app = talking_app();
+        let buffer = draw(&mut app, 120, 30);
+        let bottom = conversation(&app).transcript().scroll_offset();
+        assert!(conversation(&app).follows());
+        let (column, y) = find(&buffer, "line 29");
+
+        wheel_up(&mut app, column, y);
+
+        let transcript = conversation(&app).transcript();
+        assert_eq!(transcript.scroll_offset(), bottom - 3);
+        assert!(!transcript.is_following_end());
+        assert!(!conversation(&app).follows());
+        assert_eq!(app.focus(), Focus::List, "the wheel leaves the focus");
+
+        read_entries(&mut app, 31, 32);
+        draw(&mut app, 120, 30);
+        assert_eq!(
+            conversation(&app).transcript().scroll_offset(),
+            bottom - 3,
+            "new entries do not move the view"
+        );
+    }
+
+    #[test]
+    fn a_notch_down_at_the_bottom_of_a_conversation_stays_where_page_down_stays() {
+        let mut app = talking_app();
+        let buffer = draw(&mut app, 120, 30);
+        let bottom = conversation(&app).transcript().scroll_offset();
+        let (column, y) = find(&buffer, "line 29");
+
+        wheel_down(&mut app, column, y);
+        assert_eq!(conversation(&app).transcript().scroll_offset(), bottom);
+
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::PageDown);
+        assert_eq!(conversation(&app).transcript().scroll_offset(), bottom);
+    }
+
+    #[test]
+    fn a_click_on_an_entry_of_the_conversation_selects_it_and_focuses_the_details() {
+        let mut app = talking_app();
+        let buffer = draw(&mut app, 120, 30);
+        // The cursor is on the newest entry, 30; 28 is drawn above it.
+        let (column, y) = find(&buffer, "line 28");
+
+        click(&mut app, column, y);
+
+        let transcript = conversation(&app).transcript();
+        assert_eq!(
+            transcript.selected_entry(),
+            Some(&TranscriptEntryId::from("act-edit/28"))
+        );
+        assert!(!conversation(&app).follows());
+        assert_eq!(app.focus(), Focus::Details);
+    }
+
+    #[test]
+    fn a_notch_over_info_scrolls_it_and_leaves_the_focus_on_the_list() {
+        let mut app = running_app();
+        open_tab(&mut app, DetailTab::Info);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus(), Focus::List);
+        // A low screen, so the sheet is taller than its window.
+        let buffer = draw(&mut app, 120, 20);
+        let (column, y) = find(&buffer, "Info");
+
+        wheel_down(&mut app, column, y + 3);
+
+        assert_eq!(app.detail().view("a").unwrap().info().top(), 3);
+        assert_eq!(app.focus(), Focus::List);
+    }
+
+    #[test]
+    fn a_notch_over_the_events_moves_the_cursor_three_events_and_stops_at_the_last() {
+        let mut app = running_app();
+        open_tab(&mut app, DetailTab::Events);
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Events {
+                after: 0,
+                result: Ok(ExecutionEventsResponse::Available {
+                    events: execution_events(8),
+                    has_more: false,
+                    source: ExecutionEventsSource::Runner,
+                }),
+            },
+        );
+        key(&mut app, KeyCode::Char('g'));
+        let cursor = |app: &TaskApp| app.detail().view("a").unwrap().events().cursor();
+        assert_eq!(cursor(&app), 0);
+        let buffer = draw(&mut app, 120, 30);
+        let (column, y) = find(&buffer, "state-2");
+
+        wheel_down(&mut app, column, y);
+        assert_eq!(cursor(&app), 3);
+
+        for _ in 0..3 {
+            draw(&mut app, 120, 30);
+            wheel_down(&mut app, column, y);
+        }
+        assert_eq!(cursor(&app), 7);
+
+        // Over the open detail of an event the notch scrolls the detail and
+        // leaves the event selected.
+        key(&mut app, KeyCode::Char(' '));
+        assert!(app.detail().view("a").unwrap().events().is_detail_open());
+        let buffer = draw(&mut app, 120, 30);
+        let (column, y) = find(&buffer, "szczegóły zdarzenia");
+        wheel_up(&mut app, column, y + 1);
+        assert_eq!(cursor(&app), 7);
+    }
+}

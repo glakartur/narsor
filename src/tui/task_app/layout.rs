@@ -260,7 +260,9 @@ fn render_view(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles
                 glyph,
                 axis_rows,
             };
-            history::render_details(frame, area, open, styles, look);
+            if let Some(content) = history::render_details(frame, area, open, styles, look) {
+                app.panels.record(Panel::Content, content);
+            }
         }
         View::Repositories(open) => repositories::render(frame, area, open, styles, focused),
         View::Queues(open) => {

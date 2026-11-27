@@ -776,3 +776,68 @@ fn following_in_raw_view_does_not_move_the_auto_expansion() {
 
     assert!(shown(&transcript, "a more 6"));
 }
+
+/// Six two-line utterances `u0`..`u5` in a five-row window: 17 lines with
+/// the gaps between entries, so the last offset is 12.
+fn six_short_utterances() -> TranscriptState {
+    let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+    transcript.set_viewport(5);
+    transcript.load(
+        (0..6)
+            .map(|n| utterance(&format!("u{n}"), 1, 0, 0))
+            .collect(),
+    );
+    transcript
+}
+
+#[test]
+fn scrolling_by_lines_ends_the_following_and_stops_where_the_page_keys_stop() {
+    let mut transcript = six_short_utterances();
+    assert_eq!(transcript.scroll_offset(), 12);
+    assert!(transcript.is_following_end());
+
+    transcript.scroll_by(-3);
+    assert_eq!(transcript.scroll_offset(), 9);
+    assert!(!transcript.is_following_end());
+    assert_eq!(
+        transcript.selected_entry(),
+        Some(&TranscriptEntryId::from("u3")),
+        "the cursor stays on an entry in view"
+    );
+
+    transcript.scroll_by(-100);
+    assert_eq!(transcript.scroll_offset(), 0);
+
+    let mut paged = transcript.clone();
+    for _ in 0..5 {
+        paged.page_down();
+    }
+    transcript.scroll_by(100);
+    assert_eq!(transcript.scroll_offset(), paged.scroll_offset());
+    transcript.scroll_by(3);
+    assert_eq!(transcript.scroll_offset(), 12, "the bottom holds");
+}
+
+#[test]
+fn a_visible_row_names_the_entry_drawn_on_it() {
+    let mut transcript = six_short_utterances();
+    transcript.scroll_by(-100);
+    transcript.scroll_by(1);
+    // From offset 1: the body of u0, the gap after it, then u1's header.
+    assert_eq!(
+        transcript.entry_at_row(0),
+        Some(TranscriptEntryId::from("u0"))
+    );
+    assert_eq!(
+        transcript.entry_at_row(2),
+        Some(TranscriptEntryId::from("u1"))
+    );
+    assert_eq!(transcript.entry_at_row(5), None, "below the window");
+
+    assert!(transcript.select_row(2));
+    assert_eq!(
+        transcript.selected_entry(),
+        Some(&TranscriptEntryId::from("u1"))
+    );
+    assert!(!transcript.select_row(5));
+}

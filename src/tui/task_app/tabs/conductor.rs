@@ -69,7 +69,7 @@ use super::super::detail::{fit_cells, short_age};
 use super::super::layout::first_row;
 use super::super::notify::Severity;
 use super::super::{DetailTab, Focus, Request, TaskApp};
-use super::conversation::{render_transcript, transcript_action};
+use super::conversation::{render_transcript, select_drawn, transcript_action};
 use super::READER_RETRY;
 
 /// Pages of the chat read in one go; a longer history is read on with `M`.
@@ -113,6 +113,9 @@ pub struct Conductor {
     read_at: Option<Instant>,
     transcript: TranscriptState,
     composer: Chooser,
+    /// Where the last frame drew the history, when it drew it: a click
+    /// finds the entry under it there.
+    window: Option<Rect>,
 }
 
 impl Conductor {
@@ -131,6 +134,7 @@ impl Conductor {
             read_at: None,
             transcript: TranscriptState::new(TranscriptId::from(format!("conductor:{task_id}"))),
             composer: new_composer(""),
+            window: None,
         }
     }
 
@@ -326,6 +330,17 @@ impl Conductor {
     /// What a key does to the reader of the history.
     pub fn on_action(&mut self, action: Action) {
         transcript_action(&mut self.transcript, action);
+    }
+
+    /// The wheel: the history `lines` lines along.
+    pub fn scroll_by(&mut self, lines: isize) {
+        self.transcript.scroll_by(lines);
+    }
+
+    /// A click at `column`, `row`: the entry of the history drawn there gets
+    /// the cursor, as the line keys give it.
+    pub fn click(&mut self, column: u16, row: u16) {
+        select_drawn(&mut self.transcript, self.window, column, row);
     }
 
     /// The decision the reader is on, when it is one that can be undone.
@@ -632,6 +647,7 @@ fn render_history(
     stale: bool,
     focused: bool,
 ) {
+    conductor.window = None;
     if area.height == 0 {
         return;
     }
@@ -664,6 +680,7 @@ fn render_history(
             area.height.saturating_sub(1),
         );
     }
+    conductor.window = Some(body);
     render_transcript(
         frame,
         body,

@@ -37,6 +37,8 @@ pub enum Panel {
     List,
     /// The details, or the view open in their place.
     Details,
+    /// What the open tab of the details shows, under their header and tabs.
+    Content,
     /// A window over the screen: the action menu, a list, a form.
     Overlay,
 }
@@ -134,14 +136,47 @@ impl TaskApp {
         match (gesture, panel) {
             (Gesture::WheelUp, Panel::List) => self.step_list(-1),
             (Gesture::WheelDown, Panel::List) => self.step_list(1),
+            (Gesture::WheelUp, Panel::Content) => self.wheel_details(-1, column, row),
+            (Gesture::WheelDown, Panel::Content) => self.wheel_details(1, column, row),
             (Gesture::Click, Panel::List) => {
                 self.click_focus(panel);
                 self.click_list(column, row);
+            }
+            (Gesture::Click, Panel::Content) => {
+                self.click_focus(panel);
+                self.click_details(column, row);
             }
             (Gesture::Click, _) => self.click_focus(panel),
             _ => {}
         }
         Request::None
+    }
+
+    /// A notch over the open tab of the details moves the text under the
+    /// pointer, `by` 1 down or -1 up; the focus stays where it is.
+    fn wheel_details(&mut self, by: isize, column: u16, row: u16) {
+        if let View::History(history) = &mut self.view {
+            history.on_detail_wheel(by, column, row);
+            return;
+        }
+        let Some(id) = self.list.selected_id().map(str::to_string) else {
+            return;
+        };
+        let tab = self.detail.tab;
+        self.detail.view_mut(&id).on_wheel(tab, by, column, row);
+    }
+
+    /// A click on the open tab of the selected task's details: in a
+    /// conversation it picks the entry drawn under the pointer.
+    fn click_details(&mut self, column: u16, row: u16) {
+        if !matches!(self.view, View::Tasks) {
+            return;
+        }
+        let Some(id) = self.list.selected_id().map(str::to_string) else {
+            return;
+        };
+        let tab = self.detail.tab;
+        self.detail.view_mut(&id).on_click(tab, column, row);
     }
 
     /// A notch over the list: the selection `by` items along, stopping at
@@ -204,8 +239,8 @@ impl TaskApp {
                 self.panel_focus = false;
                 self.back_to_axis();
             }
-            Panel::Details if history => self.focus = Focus::Details,
-            Panel::Details => {
+            Panel::Details | Panel::Content if history => self.focus = Focus::Details,
+            Panel::Details | Panel::Content => {
                 self.focus = Focus::Details;
                 self.panel_focus = false;
             }

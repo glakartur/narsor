@@ -71,6 +71,8 @@ pub struct Events {
     top: usize,
     detail_open: bool,
     detail_scroll: usize,
+    /// Where the last frame drew the detail of the event, when it drew it.
+    detail_window: Option<Rect>,
     raw: bool,
     height: usize,
 }
@@ -88,6 +90,7 @@ impl Default for Events {
             top: 0,
             detail_open: false,
             detail_scroll: 0,
+            detail_window: None,
             raw: false,
             height: 10,
         }
@@ -253,6 +256,19 @@ impl Events {
             self.detail_scroll = 0;
         }
     }
+
+    /// Whether the last frame drew the detail of the event at `column`,
+    /// `row`.
+    pub fn detail_at(&self, column: u16, row: u16) -> bool {
+        self.detail_window
+            .is_some_and(|area| area.contains(ratatui::layout::Position::new(column, row)))
+    }
+
+    /// The wheel over the detail of the event: `lines` lines along. The next
+    /// draw holds it in the detail, as it holds the page keys.
+    pub fn scroll_detail(&mut self, lines: isize) {
+        self.detail_scroll = self.detail_scroll.saturating_add_signed(lines);
+    }
 }
 
 /// One row of the log.
@@ -283,6 +299,7 @@ pub fn render(
     glyph: &str,
 ) {
     let grey = |role: Role| if stale { Role::Done } else { role };
+    events.detail_window = None;
     let mut notes: Vec<Line<'static>> = Vec::new();
     if events.is_starting() {
         notes.push(Line::styled(
@@ -363,6 +380,7 @@ pub fn render(
 
     if detail_rows > 0 {
         let detail = Rect::new(body.x, list.y + list.height, body.width, detail_rows);
+        events.detail_window = Some(detail);
         let lines = events
             .selected()
             .map(event_detail_lines)

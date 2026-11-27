@@ -185,6 +185,14 @@ impl History {
         }
     }
 
+    /// A notch of the wheel over the content of the selected entry's details.
+    pub(super) fn on_detail_wheel(&mut self, by: isize, column: u16, row: u16) {
+        let tab = self.tab;
+        if let Some(detail) = self.selected_detail_mut() {
+            detail.on_wheel(tab, by, column, row);
+        }
+    }
+
     /// What the details of the selected entry remember, created empty when
     /// there is nothing yet.
     fn selected_detail_mut(&mut self) -> Option<&mut TaskDetail> {
@@ -443,14 +451,15 @@ pub struct DetailsLook {
 }
 
 /// Draws the details of the selected entry into `area`: the header and the
-/// tabs of a task, with nothing to answer.
+/// tabs of a task, with nothing to answer. Returns where the tab's content
+/// went, when the tabs were drawn.
 pub fn render_details(
     frame: &mut Frame,
     area: Rect,
     history: &mut History,
     styles: &Styles,
     look: DetailsLook,
-) {
+) -> Option<Rect> {
     let DetailsLook {
         focused,
         stale,
@@ -473,7 +482,7 @@ pub fn render_details(
             )),
             inner,
         );
-        return;
+        return None;
     };
     let key = key_of(entry);
     let task = entry;
@@ -504,5 +513,5 @@ pub fn render_details(
         closed_run: true,
         axis_rows,
     };
-    render_view(frame, inner, view, styles, options, None);
+    render_view(frame, inner, view, styles, options, None)
 }
