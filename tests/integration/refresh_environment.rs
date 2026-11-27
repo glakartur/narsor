@@ -155,16 +155,16 @@ impl Fixture {
         self.service.control_plane().task(&task_id()).unwrap()
     }
 
-    /// Writes `runtime.yaml` with the seeded bundle and `task_image`.
+    /// Writes `runtime/runtime.yaml` with the seeded bundle and `task_image`.
     fn write_task_image(&self, task_image: &str) {
         fs::write(
-            self.state.join("runtime.yaml"),
+            self.state.join("runtime/runtime.yaml"),
             format!(
                 "bundle: ghcr.io/narsor/runtime@{}\ntask_image:\n{task_image}",
                 crate::environment_support::digest('b')
             ),
         )
-        .expect("write runtime.yaml");
+        .expect("write runtime/runtime.yaml");
     }
 
     /// The controller's desired command for the task, read as it polls.
@@ -559,5 +559,58 @@ async fn a_refreshed_and_resumed_task_resumes_on_its_storage_with_the_new_spec()
     );
     let moved = storage.marker().unwrap().expect("the marker");
     assert_eq!(moved, marker.for_launch(&new.digest));
+    fx.server.shutdown().await;
+}
+
+/// Moving an old runtime catalogue and its scripts into the runtime
+/// directory, without changing their text, changes no sealed environment.
+#[tokio::test]
+async fn moving_the_runtime_catalogue_into_its_directory_leaves_the_environment_unchanged() {
+    let fx = Fixture::new().await;
+    fs::remove_dir_all(fx.state.join("runtime")).unwrap();
+    fs::create_dir_all(fx.state.join("components")).unwrap();
+    fs::write(
+        fx.state.join("components/glab.sh"),
+        "apt-get install -y glab\n",
+    )
+    .unwrap();
+    fs::write(
+        fx.state.join("runtime.yaml"),
+        format!(
+            "bundle: ghcr.io/narsor/runtime@{}\ntask_image:\n  base: debian:trixie-slim\n  \
+             components:\n    - {{ name: glab, install: components/glab.sh }}\n",
+            crate::environment_support::digest('b')
+        ),
+    )
+    .unwrap();
+    let lease = fx.started_task().await;
+    fx.report(&lease, Observation::WorkloadLost { state_known: true });
+    let before = fx.record();
+    assert!(before.launch_spec.environment.task_image.is_some());
+
+    fs::create_dir_all(fx.state.join("runtime")).unwrap();
+    fs::rename(
+        fx.state.join("components"),
+        fx.state.join("runtime/components"),
+    )
+    .unwrap();
+    fs::rename(
+        fx.state.join("runtime.yaml"),
+        fx.state.join("runtime/runtime.yaml"),
+    )
+    .unwrap();
+    let refreshed = fx
+        .client
+        .control_refresh_environment(TASK, &RefreshEnvironmentRequest::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        refreshed.outcome,
+        EnvironmentRefreshResult::Unchanged {
+            identity: before.launch_spec.environment.identity.clone()
+        }
+    );
+    assert_eq!(fx.record().generation, before.generation);
     fx.server.shutdown().await;
 }

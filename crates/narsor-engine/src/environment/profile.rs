@@ -17,9 +17,11 @@
 //! additionally records a digest of the whole profile, so an edit that forgot
 //! to bump it still yields a different environment identity.
 //!
-//! The runtime catalogue, `{catalog}/runtime.yaml`, names the Narsor runtime
-//! bundle, the tool packages profiles may pick from, and the global task
-//! image (KTD8):
+//! The runtime catalogue, `{catalog}/runtime/runtime.yaml`, names the
+//! Narsor runtime bundle, the tool packages profiles may pick from, and the
+//! global task image (KTD8). A bare-string script is a path relative to the
+//! directory of `runtime.yaml`, so the scripts sit beside it in
+//! `{catalog}/runtime/components/`:
 //!
 //! ```yaml
 //! bundle: ghcr.io/narsor/runtime@sha256:…   # needed by backends that run images
@@ -30,7 +32,7 @@
 //!   secrets: [{ name: db-password, env: DATABASE_PASSWORD }] # every task
 //!   components:
 //!     - name: glab
-//!       install: components/glab.sh          # a path inside the catalogue,
+//!       install: components/glab.sh          # a path inside the runtime directory,
 //!       version: { inline: "glab --version" } # or the script text itself
 //!       secrets: [{ name: gitlab-token, env: GITLAB_TOKEN }]
 //!       home: [{ from: ~/.config/glab-cli, to: .config/glab-cli }]
@@ -413,17 +415,17 @@ impl TaskImageConfig {
     }
 
     /// The definition as a task seals it, with the text of every script
-    /// read from under `catalog_root`. A script outside the catalogue
-    /// directory (through a symbolic link, too) is refused. Call it on a
-    /// definition without [`Self::problems`].
-    pub fn seal(&self, catalog_root: &Path) -> Result<TaskImage, Vec<String>> {
+    /// read from under `script_dir`, the directory of the `runtime.yaml` in
+    /// use. A script outside that directory (through a symbolic link, too)
+    /// is refused. Call it on a definition without [`Self::problems`].
+    pub fn seal(&self, script_dir: &Path) -> Result<TaskImage, Vec<String>> {
         let mut problems = Vec::new();
         let mut components = Vec::new();
         for (index, component) in self.components.iter().enumerate() {
             let field = format!("task_image.components[{index}]");
             let mut load = |script_field: &str, script: &ScriptSource| {
                 script
-                    .text(catalog_root)
+                    .text(script_dir)
                     .map_err(|problem| problems.push(format!("{field}.{script_field}: {problem}")))
                     .ok()
             };
@@ -477,8 +479,8 @@ impl ScriptSource {
     fn problem(&self) -> Option<String> {
         match self {
             ScriptSource::Path(path) if !is_relative_inside(path) => Some(format!(
-                "script path '{path}' must be relative to the catalogue, without '.' or '..' \
-                 components"
+                "script path '{path}' must be relative to the directory of runtime.yaml, \
+                 without '.' or '..' components"
             )),
             ScriptSource::Inline { inline } if inline.trim().is_empty() => {
                 Some("the inline script is blank".to_string())
@@ -487,17 +489,18 @@ impl ScriptSource {
         }
     }
 
-    fn text(&self, catalog_root: &Path) -> Result<String, String> {
+    fn text(&self, script_dir: &Path) -> Result<String, String> {
         let path = match self {
             ScriptSource::Inline { inline } => return Ok(inline.clone()),
             ScriptSource::Path(path) => path,
         };
         let unreadable = |error: std::io::Error| format!("script '{path}' cannot be read: {error}");
-        let root = catalog_root.canonicalize().map_err(unreadable)?;
+        let root = script_dir.canonicalize().map_err(unreadable)?;
         let file = root.join(path).canonicalize().map_err(unreadable)?;
         if !file.starts_with(&root) {
             return Err(format!(
-                "script '{path}' lies outside the catalogue directory"
+                "script '{path}' lies outside the runtime directory '{}'",
+                script_dir.display()
             ));
         }
         std::fs::read_to_string(&file).map_err(unreadable)
