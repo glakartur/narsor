@@ -1,19 +1,19 @@
 #!/bin/sh
 # jira-new-issues, phase `check`: one task for every new Jira issue that a
-# JQL query selects. It serves a queue of mode `always` with `tasks` (see
+# JQL query selects. It serves a queue of mode `always` (see
 # queues/jira-intake.yaml). Read docs/user/observers.md first.
 #
 # The queue's condition (a JSON object, given to the script as it is):
 #   base_url     https:// address of the Jira server. Required.
 #   jql          the query, without ORDER BY. Required.
-#   fields       the data fields sent for each issue. Each one must be a
-#                field that the queue maps (`tasks.mapping`, input: field):
-#                the control plane refuses a field it does not map.
-#                Available: key, summary, issue_type, priority, status,
-#                labels, url, description. Default: ["key"].
-#   max_results  the most issues one run looks at, 1-100. Default: 10. Keep
-#                it at or below the queue's `tasks.task_limit_per_run`.
+#   workflow     the workflow of the tasks. Required. The script gives the
+#                issue key as the task's ticket and as the input
+#                `example_text` of the built-in `template`: change the
+#                `task create` line for the inputs of your workflow.
+#   max_results  the most issues one run looks at, 1-100. Default: 10.
 #   api_path     the search endpoint. Default: /rest/api/2/search.
+#   import_backlog  true: the first run creates tasks for what already
+#                matches. Default: false.
 #
 # Secrets: JIRA_TOKEN, a personal access token sent as a Bearer token. When
 # JIRA_USER is also set (declare `{name: jira-user, env: JIRA_USER}` in
@@ -21,16 +21,14 @@
 # authentication instead (Jira Cloud).
 #
 # Personal data: Jira issues can hold data of customers and other people.
-# The script sends to Narsor only the fields in `fields`, never the
-# reporter, the assignee, comments or attachments. Do not add a field that
-# holds personal data. `summary` and `description` are free text written by
-# people: send them only when the workflow needs them, and only when you
-# know what they hold.
+# The script sends to Narsor only the issue key, never the summary, the
+# reporter, the assignee, comments or attachments. The workflow reads the
+# issue itself when it needs more.
 #
 # State: {"last_id": N}, the highest Jira issue id the automation handled.
-#  * First run without `tasks.import_backlog`: the script only records the
+#  * First run without `import_backlog`: the script only records the
 #    newest matching issue as the starting point and creates no task.
-#  * First run with `tasks.import_backlog: true`, and every later run: one
+#  * First run with `import_backlog: true`, and every later run: one
 #    task for each matching issue with an id above last_id, oldest first, at
 #    most max_results per run; the next run continues from there.
 # Narsor does not stop a second task for the same issue: the state does.
@@ -39,7 +37,7 @@
 # state up to the last task it created and exits 0, so the next run
 # continues from there and repeats no task. When the run created no task,
 # it exits 1: Narsor records the error and counts it, and a refusal that
-# does not go away (an unmapped field, a limit, a policy) stops the
+# does not go away (an unknown workflow, a policy) stops the
 # automation (`error`, 5 failed runs in a row) instead of repeating the same
 # issue for ever. The run created nothing, so its failure gives no second
 # task. Only when the state of a successful run is not saved can an issue
@@ -74,9 +72,9 @@ base_url=$(read_input '.condition.base_url // "" | sub("/+$"; "")')
 jql=$(read_input '.condition.jql // ""')
 api_path=$(read_input '.condition.api_path // "/rest/api/2/search"')
 max_results=$(read_input '.condition.max_results // 10')
-fields=$(read_input '.condition.fields // ["key"] | tojson')
+workflow=$(read_input '.condition.workflow // ""')
 first_run=$(read_input '.first_run')
-import_backlog=$(read_input '.import_backlog')
+import_backlog=$(read_input '.condition.import_backlog // false')
 last_id=$(read_input '.state.last_id // 0')
 
 # The address the token is sent to: https, a plain host, no user name.
@@ -86,6 +84,8 @@ printf '%s' "$base_url" |
 printf '%s' "$api_path" | jq -R -e 'test("\\A/[A-Za-z0-9._~/-]*\\z")' >/dev/null ||
     fail "condition.api_path must be a path that starts with /"
 [ -n "$jql" ] || fail "the condition has no jql"
+printf '%s' "$workflow" | jq -R -e 'test("\\A[A-Za-z0-9_.-]+\\z")' >/dev/null ||
+    fail "condition.workflow must name a workflow"
 case $max_results in
 '' | *[!0-9]*) fail "condition.max_results must be a number from 1 to 100" ;;
 esac
@@ -94,12 +94,6 @@ esac
 case $last_id in
 '' | *[!0-9]*) fail "the state has a last_id that is not a number" ;;
 esac
-printf '%s' "$fields" | jq -e '
-    type == "array" and length > 0
-    and all(.[]; . as $field
-        | ["key", "summary", "issue_type", "priority", "status", "labels", "url", "description"]
-        | index([$field]) != null)' >/dev/null ||
-    fail "condition.fields must list some of: key, summary, issue_type, priority, status, labels, url, description"
 
 if [ "$first_run" = true ] && [ "$import_backlog" != true ]; then
     # The first run only records where to start (no task for the backlog).
@@ -135,7 +129,7 @@ search() {
         --max-time 60 --config - --get \
         --header 'Accept: application/json' \
         --data-urlencode "jql=$query" \
-        --data-urlencode "fields=summary,issuetype,priority,status,labels,description" \
+        --data-urlencode "fields=key" \
         --data-urlencode "maxResults=$limit" \
         "$base_url$api_path"
 }
@@ -154,32 +148,21 @@ if [ "$first_run" = true ] && [ "$import_backlog" != true ]; then
     exit 0
 fi
 
-# One line per issue, oldest first: {"id": …, "key": …, "data": {…}}, the
-# data holding only the fields of the condition.
+# One line per issue, oldest first: {"id": …, "key": …}.
 issues=$(printf '%s' "$response" | jq -c \
-    --argjson after "$last_id" --argjson limit "$limit" \
-    --argjson fields "$fields" --arg base "$base_url" '
+    --argjson after "$last_id" --argjson limit "$limit" '
     [.issues[] | .id |= tonumber | select(.id > $after)]
     | sort_by(.id) | .[:$limit] | .[]
-    | {id, key, data: ({
-        key: .key,
-        summary: .fields.summary,
-        issue_type: .fields.issuetype.name,
-        priority: .fields.priority.name,
-        status: .fields.status.name,
-        labels: .fields.labels,
-        url: ($base + "/browse/" + .key),
-        description: .fields.description
-      } | with_entries(select(.key as $name | $fields | index([$name]) != null)))}')
+    | {id, key}')
 
 newest=$last_id
 refused=
 while IFS= read -r issue; do
     [ -n "$issue" ] || continue
     key=$(printf '%s' "$issue" | jq -r '.key')
-    data=$(printf '%s' "$issue" | jq -c '.data')
     # stdout is the result document: the messages of narsor-cli go to stderr.
-    if ! narsor-cli task create --data "$data" </dev/null >&2; then
+    if ! narsor-cli task create "$workflow" --ticket "$key" --input "example_text=$key" \
+        </dev/null >&2; then
         refused=$key
         break
     fi

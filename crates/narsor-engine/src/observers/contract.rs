@@ -152,10 +152,6 @@ pub struct ScriptInput {
     /// No run of this pair has succeeded yet.
     #[serde(default)]
     pub first_run: bool,
-    /// On the first run, import what already matches instead of only
-    /// remembering where to start from.
-    #[serde(default)]
-    pub import_backlog: bool,
 }
 
 impl ScriptInput {

@@ -270,12 +270,7 @@ fn an_environment_refresh_event_decodes_and_an_older_client_reads_it_as_unrecogn
 }
 
 #[test]
-fn observer_effect_requests_refuse_fields_a_script_may_not_choose() {
-    let refused = serde_json::json!({
-        "data": {},
-        "workflow_id": "other",
-    });
-    assert!(serde_json::from_value::<super::ObserverCreateTaskRequest>(refused).is_err());
+fn an_effect_response_names_its_outcome_and_an_unknown_one_is_unrecognized() {
     let response = super::ObserverEffectResponse {
         outcome: super::ObserverEffectOutcome::Created,
         task_id: Some("task-1".into()),
@@ -1007,7 +1002,6 @@ fn queue_views_round_trip_and_old_fields_are_optional() {
         mode: Some("on_episodes".into()),
         interval_secs: None,
         cron: Some("*/5 * * * *".into()),
-        workflow_id: None,
         automations: vec![super::QueueAutomationView {
             automation: "gitlab-mr-label".into(),
             description: "label".into(),

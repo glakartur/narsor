@@ -14,16 +14,15 @@
 //! Like the environment catalogue, nothing is cached: every load reads the
 //! directories, so a change applies to the next run.
 //!
-//! The schedule, mode, task-creation and secret types are the observer
+//! The schedule, mode and secret types are the observer
 //! types, re-exported here so the catalogue speaks the same language as the
 //! scheduler.
 
 pub mod catalog;
 
-pub use crate::observers::{CreateTaskEffect, ObserverMode, ScheduleConfig, SecretRef};
+pub use crate::observers::{ObserverMode, ScheduleConfig, SecretRef};
 pub(crate) use catalog::problem_names_queue;
 pub use catalog::{
     pair_definition_digest, Automation, AutomationCatalog, AutomationCatalogError,
-    AutomationCatalogLoad, AutomationScript, CatalogProblem, HookPhase, Queue, QueueTasks,
-    AUTOMATION_FILE,
+    AutomationCatalogLoad, AutomationScript, CatalogProblem, HookPhase, Queue, AUTOMATION_FILE,
 };

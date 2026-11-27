@@ -102,7 +102,7 @@ pub fn time_text(at: DateTime<Utc>) -> String {
 /// when its queue file, `automation.yaml` or `check` script changes in the
 /// catalogue.
 fn stopped(view: &QueueAutomationView) -> bool {
-    matches!(view.state.as_str(), "needs_attention" | "error")
+    view.state == "error"
 }
 
 /// The run in progress or the last one, in words.
@@ -297,9 +297,6 @@ fn queue_title(view: &ObserverQueueView) -> String {
     }
     if view.interval_secs.is_some() || view.cron.is_some() {
         parts.push(schedule_text(view.interval_secs, view.cron.as_deref()));
-    }
-    if let Some(workflow) = view.workflow_id.as_deref() {
-        parts.push(format!("creates {}", one_line(workflow)));
     }
     parts.push(automations);
     parts.push(entries);

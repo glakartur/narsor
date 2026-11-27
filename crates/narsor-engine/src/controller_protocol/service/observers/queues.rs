@@ -127,9 +127,6 @@ impl ProtocolService {
             mode: found.map(|found| found.mode.to_string()),
             interval_secs,
             cron,
-            workflow_id: found
-                .and_then(|found| found.tasks.as_ref())
-                .map(|tasks| tasks.effect.workflow_id.clone()),
             automations: pairs
                 .iter()
                 .map(|pair| automation_view(pair, found, now))
@@ -229,7 +226,7 @@ fn schedule_fields(queue: Option<&Queue>) -> (Option<u64>, Option<String>) {
     }
 }
 
-/// The wire name of a `snake_case` enum value (`needs_attention`, say).
+/// The wire name of a `snake_case` enum value (`on_episodes`, say).
 fn wire_name<T: Serialize>(value: &T) -> String {
     serde_json::to_value(value)
         .ok()

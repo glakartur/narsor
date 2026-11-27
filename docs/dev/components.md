@@ -153,7 +153,7 @@ graph TD
 | `narsor-runner` | `narsor-server` | Poll, renew, snapshots, usage, materials | HTTP, `/runner/v1` |
 | `narsor-runner` | agent harness, scripts, git | Execute workflow actions | process (`engine/src/engine/actions/`) |
 | `narsor-observer-worker` | `narsor-server` | Claim due runs (the server holds the claim up to 25 s), report results | HTTP, `/observer/v1/worker` |
-| Automation script (`check` only) | `narsor-cli` → `narsor-server` | Create tasks (`task create --data`); answer the decision gate of its queue entry (`task decide`, `POST /observer/v1/runs/{run}/decide`) | process, then HTTP `/observer/v1/runs` |
+| Automation script (`check` only) | `narsor-cli` → `narsor-server` | Create tasks (`task create`, as the owner does); answer the decision gate of its queue entry (`task decide`, `POST /observer/v1/runs/{run}/decide`) | process, then HTTP `/observer/v1/runs` |
 
 Properties of the runtime:
 

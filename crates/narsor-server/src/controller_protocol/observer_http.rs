@@ -6,7 +6,7 @@
 //!
 //! | route | body | answer |
 //! | --- | --- | --- |
-//! | `POST /observer/v1/runs/{run}/tasks` | [`ObserverCreateTaskRequest`] | `201` created |
+//! | `POST /observer/v1/runs/{run}/tasks` | [`CreateTaskRequest`] (as the owner's) | `201` created |
 //! | `POST /observer/v1/runs/{run}/decide` | [`ObserverDecideRequest`] | `200` delivered |
 //!
 //! Each answers an [`ObserverEffectResponse`]. `decide` answers the gate of
@@ -63,9 +63,8 @@ use narsor_engine::controller_protocol::service::{
     ProtocolService, MAX_EFFECT_DATA_BYTES, MAX_STORED_LOG_BYTES,
 };
 use narsor_engine::controller_protocol::wire::{
-    ObserverClaimResponse, ObserverCreateTaskRequest, ObserverDecideRequest,
-    ObserverEffectResponse, ObserverQueueListResponse, ObserverQueueView, ObserverRunReport,
-    ObserverRunResultResponse,
+    CreateTaskRequest, ObserverClaimResponse, ObserverDecideRequest, ObserverEffectResponse,
+    ObserverQueueListResponse, ObserverQueueView, ObserverRunReport, ObserverRunResultResponse,
 };
 use narsor_engine::observers::{RunId, MAX_SCRIPT_OUTPUT_BYTES};
 use narsor_engine::orchestration::OwnerRef;
@@ -165,7 +164,7 @@ async fn post_task(
     body: Bytes,
 ) -> ProtocolResult<(StatusCode, Json<ObserverEffectResponse>)> {
     let run_id = token_run(&principal, &run)?;
-    let request: ObserverCreateTaskRequest = parse_json(&body, "effect request")?;
+    let request: CreateTaskRequest = parse_json(&body, "task create request")?;
     let response = blocking(&service, move |s| s.observer_create_task(&run_id, request)).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -365,10 +364,7 @@ mod tests {
         }
 
         fn automation_catalog(&self) -> AutomationCatalogLoad {
-            AutomationCatalog::new(&self.catalog).load(|workflow| {
-                self.workflow_definition(workflow)
-                    .map_err(|error| error.to_string())
-            })
+            AutomationCatalog::new(&self.catalog).load()
         }
 
         fn automation_script(
@@ -452,8 +448,8 @@ mod tests {
             std::fs::write(path, text).unwrap();
         }
 
-        /// The `always` queue `jira-intake` of the automation `jira-new`,
-        /// which creates `triage` tasks: due once the pass runs.
+        /// The `always` queue `jira-intake` of the automation `jira-new`:
+        /// due once the pass runs.
         fn jira_queue(&self) {
             self.write(
                 "automations/jira-new/automation.yaml",
@@ -462,8 +458,7 @@ mod tests {
             self.write("automations/jira-new/check.sh", "echo '{\"state\": {}}'\n");
             self.write(
                 "queues/jira-intake.yaml",
-                "automations: [jira-new]\nmode: always\nschedule: {interval_secs: 300}\n\
-                 tasks:\n  workflow_id: triage\n  mapping: {ticket: key}\n",
+                "automations: [jira-new]\nmode: always\nschedule: {interval_secs: 300}\n",
             );
         }
 
@@ -515,8 +510,9 @@ mod tests {
         format!("/observer/v1/runs/{}/tasks", run.run_id)
     }
 
+    /// What `narsor-cli task create triage --input ticket=ABC-1` sends.
     fn effect() -> Value {
-        json!({"data": {"key": "ABC-1"}})
+        json!({"launch": {"workflow_id": "triage", "workflow_version": 0, "inputs": {"ticket": "ABC-1"}}})
     }
 
     /// The worker key, as the server makes it when it starts the worker.
@@ -615,13 +611,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_create_request_naming_a_workflow_or_backend_is_a_coded_400() {
+    async fn a_create_request_with_an_unknown_field_is_a_coded_400() {
         let fx = Fixture::new();
         let run = fx.effect_run();
 
-        for field in ["workflow_id", "backend_id", "inputs"] {
+        for field in ["data", "mapping"] {
             let mut body = effect();
-            body[field] = json!("other");
+            body["launch"][field] = json!("other");
             let refused = fx
                 .send("POST", &tasks_uri(&run), run.token.expose(), body)
                 .await;
@@ -929,7 +925,7 @@ mod tests {
         assert_eq!(shown.status(), StatusCode::OK);
         let shown = json_body(shown).await;
         assert_eq!(shown["automations"][0]["scripts"], json!(["check"]));
-        assert_eq!(shown["workflow_id"], "triage");
+        assert!(shown.get("workflow_id").is_none(), "{shown}");
 
         // R22: the routes that managed stored observers are gone.
         for (method, uri) in [

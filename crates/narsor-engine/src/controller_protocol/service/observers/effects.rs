@@ -4,11 +4,11 @@
 //! ```text
 //! create task   a run whose phase is not `check`
 //!                                     → refused (not_a_check_run)
-//!               the queue has no `tasks` settings (now) → refused
 //!               no installation owner (unclaimed)       → refused
-//!               over limit            → refused; pair needs_attention
-//!               otherwise             → create_task (random id), owned by
-//!                                       the installation owner → created
+//!               otherwise             → create_task with the request as the
+//!                                       owner sends it, owned by the
+//!                                       installation owner, provenance of
+//!                                       the run → created
 //! decide        a run whose phase is not `check`
 //!                                     → refused (not_a_check_run)
 //!               run with no entry (always), or another task or episode
@@ -33,21 +33,17 @@
 //!
 //! Every effect runs under the pair's lock, so it is serialized with the
 //! other effects of the run and with the run's result: an effect never
-//! lands after the run ended. The queue's task settings are read from the
-//! catalogue at each effect (R2).
+//! lands after the run ended.
 
-use chrono::{DateTime, Utc};
-
-use crate::automations::{HookPhase, QueueTasks};
+use crate::automations::HookPhase;
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
+use crate::controller_protocol::service::tasks::launch_refusal;
 use crate::controller_protocol::service::ProtocolService;
 use crate::controller_protocol::wire::*;
 use crate::domain::TaskId;
 use crate::engine::actions::check_gate_answer;
 use crate::engine::HumanInputDelivery;
-use crate::observers::{
-    ActiveRun, AutomationLock, AutomationRecord, AutomationState, RunEntry, RunId,
-};
+use crate::observers::{ActiveRun, AutomationLock, AutomationRecord, RunEntry, RunId};
 use crate::orchestration::{
     observer_decide_key, InputRequest, OrchestrationError, TaskProvenance, TaskRecord,
 };
@@ -70,18 +66,18 @@ fn require_check_run(active: &ActiveRun, run_id: &RunId) -> ProtocolResult<()> {
     ))
 }
 
-/// Most bytes of a "create a task" effect's data, as JSON.
+/// Most bytes of an effect's data (an answer's variables), as JSON.
 pub const MAX_EFFECT_DATA_BYTES: usize = 64 * 1024;
 
 /// The run an effect belongs to, read under the pair's lock: the pair's
 /// record and its run in progress, a `check` run.
 struct EffectScope {
-    lock: AutomationLock,
+    /// Held while the effect runs: it never lands after the run ended.
+    _lock: AutomationLock,
     record: AutomationRecord,
     run_id: RunId,
     /// The queue entry the run checks, as the record held it.
     entry: Option<RunEntry>,
-    now: DateTime<Utc>,
 }
 
 impl EffectScope {
@@ -95,65 +91,37 @@ impl EffectScope {
             run_id: self.run_id.to_string(),
         }
     }
-
-    /// The run in progress; [`ProtocolService::effect_scope`] checked that
-    /// there is one.
-    fn active_run(&mut self) -> ProtocolResult<&mut ActiveRun> {
-        self.record
-            .run_in_progress_mut(self.run_id.sequence)
-            .ok_or(ProtocolError::Unauthorized)
-    }
 }
 
 impl ProtocolService {
-    /// Creates a task from the effect data for the run `run_id`
-    /// authenticated (R3, R6, R15, R19).
-    ///
-    /// The task belongs to the installation owner (A4), gets a random id
-    /// and runs what the queue file's `tasks` settings say now; the script
-    /// supplies only the data. Past the run's task limit the call is
-    /// refused with a conflict and an active pair goes to
-    /// `needs_attention`.
+    /// Creates a task for the run `run_id` authenticated (R6, R19): the
+    /// same request the owner sends (`narsor-cli task create`), checked the
+    /// same way; version `0` is the catalogue's. The task belongs to the installation owner (A4) and records
+    /// the queue, the automation and the run.
     pub fn observer_create_task(
         &self,
         run_id: &RunId,
-        request: ObserverCreateTaskRequest,
+        mut request: CreateTaskRequest,
     ) -> ProtocolResult<ObserverEffectResponse> {
-        // Read before the pair's lock: the catalogue is not the pair's.
-        let tasks = self
-            .automation_catalog()
-            .queues
-            .remove(&run_id.key.queue)
-            .and_then(|queue| queue.tasks);
-        let mut scope = self.effect_scope(run_id)?;
-        let tasks = tasks.ok_or_else(|| {
-            ProtocolError::bad_request(
-                "effect_not_allowed",
-                format!(
-                    "queue '{}' creates no tasks: its file has no `tasks` settings",
-                    run_id.key.queue
-                ),
-            )
-        })?;
-        check_size("effect data", &request.data, MAX_EFFECT_DATA_BYTES)?;
-        let task_request = tasks
-            .effect
-            .task_request(&request.data)
-            .map_err(invalid_effect)?;
-        self.within_task_limit(&mut scope, &tasks)?;
+        let scope = self.effect_scope(run_id)?;
+        // No version given: the catalogue's, as the owner's CLI asks the
+        // workflow list for it (a run token cannot list workflows).
+        if request.launch.workflow_version == 0 {
+            request.launch.workflow_version = self
+                .launch
+                .workflow_definition(&request.launch.workflow_id)
+                .map_err(launch_refusal)?
+                .version;
+        }
         let owner = (self.installation_owner)().ok_or_else(|| {
             ProtocolError::conflict(
                 "no_installation_owner",
                 "the installation has no owner yet; tasks of queues belong to the owner",
             )
         })?;
-        let summary = self.create_task_from(&owner, task_request, Some(scope.provenance()))?;
+        let summary = self.create_task_from(&owner, request, Some(scope.provenance()))?;
         let created = TaskId::parse(summary.task_id.to_string())
             .map_err(|error| ProtocolError::Internal(error.to_string()))?;
-        let active = scope.active_run()?;
-        active.tasks_created = active.tasks_created.saturating_add(1);
-        self.observers
-            .save(&scope.lock, &mut scope.record, scope.now)?;
         Ok(ObserverEffectResponse {
             outcome: ObserverEffectOutcome::Created,
             task_id: Some(created.to_string()),
@@ -302,37 +270,11 @@ impl ProtocolService {
         require_check_run(active, run_id)?;
         let entry = active.entry.clone();
         Ok(EffectScope {
-            lock,
+            _lock: lock,
             record,
             run_id: run_id.clone(),
             entry,
-            now,
         })
-    }
-
-    /// Refuses a new task past the run's limit (R15); an active pair then
-    /// stops (`needs_attention`) until its catalogue definition changes.
-    fn within_task_limit(&self, scope: &mut EffectScope, tasks: &QueueTasks) -> ProtocolResult<()> {
-        let limit = tasks.task_limit_per_run;
-        if scope.active_run()?.tasks_created < limit {
-            return Ok(());
-        }
-        if scope.record.state == AutomationState::Active {
-            let digest = scope.active_run()?.definition_digest.clone();
-            scope.record.state = AutomationState::NeedsAttention;
-            scope.record.stopped_definition_digest = Some(digest);
-            self.observers
-                .save(&scope.lock, &mut scope.record, scope.now)?;
-            tracing::info!(pair = %scope.record.key, limit, "automations: a run reached its task limit; stopped until its definition changes");
-        }
-        Err(ProtocolError::conflict(
-            "observer_task_limit",
-            format!(
-                "run {} reached the limit of {limit} new tasks per run; automation '{}' of queue \
-                 '{}' stops until its catalogue definition changes",
-                scope.run_id, scope.run_id.key.automation, scope.run_id.key.queue
-            ),
-        ))
     }
 }
 
@@ -347,16 +289,6 @@ fn decided_message(task: &TaskRecord, choice: &str, input_id: &str) -> String {
          unless another answer came first",
         task.task_id
     )
-}
-
-/// Effect data the script got wrong.
-fn invalid_effect(error: crate::observers::ObserverError) -> ProtocolError {
-    match error {
-        crate::observers::ObserverError::Invalid { .. } => {
-            ProtocolError::bad_request("invalid_effect_data", error.to_string())
-        }
-        other => other.into(),
-    }
 }
 
 /// Refuses data larger than `limit` bytes as JSON.

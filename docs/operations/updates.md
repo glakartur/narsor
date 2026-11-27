@@ -6,6 +6,31 @@ listed here need no special order. The update notes of the remote backends
 (automatic resume, the read-only runner) are in
 [Remote execution backends](remote-backends.md).
 
+## Update to scripts that create tasks as the CLI does
+
+This update removes `tasks` from the queue file. A `check` script creates a
+task with `narsor-cli task create` and the same arguments as from the
+console: the workflow, `--input`, `--repository`, `--branch`, `--ticket`,
+`--title`, or all of them as one JSON object with `--stdin`.
+
+### What changes
+
+| Area | Before | After |
+|---|---|---|
+| Queue file | `tasks`: workflow, workspaces, backend, profile, `mapping`, `task_limit_per_run`, `import_backlog` | No `tasks`. A queue file with it is a problem and does not run. |
+| `narsor-cli task create` in a script | Only `--data` with the mapped fields | The options of the console (`WORKFLOW`, `--input`, …), and `--stdin`. `--data` is removed. |
+| `narsor-cli task decide` | `--data JSON` or the options | `--stdin` (the same JSON) with the options over it. `--data` is removed. |
+| Task limit per run | `tasks.task_limit_per_run`; over it the pair stopped in `needs_attention` | None: the script decides how many tasks it creates. A stored `needs_attention` pair is `active` again. |
+| Script input | `import_backlog` | Removed: put it into `condition` when a script needs it. |
+
+### Before the update
+
+For each queue file with `tasks`: remove `tasks`, and change the
+`narsor-cli task create` line of its script to name the workflow and to
+give the inputs, repositories, ticket and title. Do this together with the
+update of the server: the old server refuses `task create` without
+`--data`, the new one refuses a queue file with `tasks`.
+
 ## Update to the runtime directory
 
 This update moves the runtime catalogue and the component scripts it names
@@ -631,8 +656,8 @@ cutover: Narsor does not migrate the observers stored in
 1. **Write the catalogue files.** For each observer that you keep, write an
    automation (`automation.yaml` with its description, params and secret
    names, and `check.sh`) and a queue file (its automations, mode,
-   schedule, condition and, for an observer that created tasks, `tasks`
-   with the workflow mapping). Change each script to contract version 3.
+   schedule and condition; a script names the workflow of its tasks in
+   `narsor-cli task create`). Change each script to contract version 3.
    Start from [`examples/catalog/`](../../examples/catalog/). The example
    review automations add and remove the review label themselves: remove
    the label steps from your workflows (as

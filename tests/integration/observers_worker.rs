@@ -120,7 +120,6 @@ impl Fixture {
             "jira-intake",
             "jira-new",
             "{interval_secs: 300}",
-            "",
         );
         self.service.observer_pass();
         AutomationKey::new("jira-intake", "jira-new").unwrap()

@@ -24,8 +24,6 @@ use narsor_engine::observers::{
     parse_script_output, ScriptChoice, ScriptEntry, ScriptOutput, ScriptVariable,
     SCRIPT_CONTRACT_VERSION,
 };
-use narsor_engine::workflow::load_from_str;
-use narsor_engine::workflows::builtin;
 use serde_json::{json, Value};
 
 /// The example catalogue of the repository.
@@ -35,13 +33,10 @@ fn example_catalog() -> PathBuf {
 
 /// A new installation copies `examples/catalog/` into its catalogue: every
 /// file loads, both queues are active, and the review automations have all
-/// three scripts. The Jira queue creates tasks of the built-in `template`.
+/// three scripts.
 #[test]
 fn the_example_catalog_loads_with_no_problems() {
-    let load = AutomationCatalog::new(example_catalog()).load(|id| {
-        let workflow = builtin(id).ok_or_else(|| format!("'{id}' is not built in"))?;
-        load_from_str(workflow.source).map_err(|error| error.to_string())
-    });
+    let load = AutomationCatalog::new(example_catalog()).load();
 
     assert_eq!(load.problems, Vec::new());
     assert_eq!(
@@ -56,8 +51,6 @@ fn the_example_catalog_loads_with_no_problems() {
             "{review}"
         );
     }
-    let intake = load.queues["jira-intake"].tasks.as_ref().expect("tasks");
-    assert_eq!(intake.effect.workflow_id, "template");
     assert!(!load.automations["jira-new-issues"].has(HookPhase::In));
 }
 
@@ -231,7 +224,6 @@ fn input(condition: Value, state: Value, entry: Value) -> Value {
         "condition": condition,
         "state": state,
         "first_run": state.is_null(),
-        "import_backlog": false,
     });
     if !entry.is_null() {
         input["entry"] = entry;
@@ -256,7 +248,7 @@ fn jira_issue(id: u64, key: &str) -> Value {
 }
 
 fn jira_condition() -> Value {
-    json!({"base_url": "https://jira.example.com", "jql": "project = ABC", "fields": ["key", "summary"]})
+    json!({"base_url": "https://jira.example.com", "jql": "project = ABC", "workflow": "template"})
 }
 
 #[test]
@@ -281,7 +273,7 @@ fn jira_first_run_records_the_newest_issue_and_creates_no_task() {
 
 #[test]
 #[ignore = "runs the example scripts with a real sh and jq"]
-fn jira_creates_one_task_per_new_issue_with_only_the_mapped_fields() {
+fn jira_creates_one_task_per_new_issue_with_only_its_key() {
     let sandbox = Sandbox::new();
     sandbox.answer(
         "search",
@@ -302,12 +294,16 @@ fn jira_creates_one_task_per_new_issue_with_only_the_mapped_fields() {
     assert_eq!(output.state, json!({"last_id": 102}));
     assert_eq!(run.calls.len(), 2, "{:?}", run.calls);
     for (call, key) in run.calls.iter().zip(["ABC-101", "ABC-102"]) {
-        assert_eq!(call[..3], ["task", "create", "--data"]);
-        let data: Value = serde_json::from_str(&call[3]).expect("the data is JSON");
-        assert_eq!(
-            data,
-            json!({"key": key, "summary": format!("Summary of {key}")})
-        );
+        let expected = [
+            "task".to_string(),
+            "create".into(),
+            "template".into(),
+            "--ticket".into(),
+            key.into(),
+            "--input".into(),
+            format!("example_text={key}"),
+        ];
+        assert_eq!(call[..], expected[..]);
     }
     assert!(
         !run.calls.concat().concat().contains("Kowalski"),

@@ -523,13 +523,7 @@ fn an_always_run_answers_no_gate() {
     // R27: an `always` run has no entry.
     let fx = Fixture::new();
     automation(&fx.root, "jira-new", CHECK_SCRIPT, &[]);
-    always_queue(
-        &fx.root,
-        "jira-intake",
-        "jira-new",
-        "{interval_secs: 300}",
-        "",
-    );
+    always_queue(&fx.root, "jira-intake", "jira-new", "{interval_secs: 300}");
     let task = fx.waiting_task("task-1", "input-1");
     let run = fx.claimed_run();
     assert!(run.input.entry.is_none());

@@ -398,7 +398,6 @@ fn queue_show_says_how_each_automation_processed_each_entry() {
         mode: Some("on_episodes".into()),
         interval_secs: None,
         cron: Some("*/5 * * * *".into()),
-        workflow_id: None,
         automations: vec![queue_automation("gitlab-mr-label"), stopped],
         entries: vec![review_entry(vec![
             QueueEntryAutomationView {
@@ -488,7 +487,6 @@ fn queue_text_from_the_server_carries_no_control_characters() {
         mode: Some(hostile.into()),
         interval_secs: None,
         cron: Some(hostile.into()),
-        workflow_id: Some(hostile.into()),
         automations: vec![automation],
         entries: vec![entry],
         problems: vec![CatalogProblemView {

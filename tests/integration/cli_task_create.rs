@@ -1,12 +1,12 @@
-//! The request `narsor task create` builds from its arguments, and what
-//! `task create --data` asks for in an observer's script
+//! The request `narsor task create` builds from its arguments and
+//! `--stdin`, and what it asks for in an observer's script
 //! (`NARSOR_OBSERVER_RUN`, passed in rather than set).
 
 use clap::Parser;
 use narsor::cli::observer_effect::{effect_call, EffectCall};
 use narsor::cli::remote::{create_request, TaskCommand};
 use narsor::cli::{Cli, Command};
-use narsor_protocol::controller::{CreateTaskRequest, ObserverCreateTaskRequest};
+use narsor_protocol::controller::CreateTaskRequest;
 use serde_json::json;
 
 fn parse(arguments: &[&str]) -> Result<Cli, clap::Error> {
@@ -16,10 +16,14 @@ fn parse(arguments: &[&str]) -> Result<Cli, clap::Error> {
 }
 
 fn request(arguments: &[&str]) -> CreateTaskRequest {
+    request_with_stdin(arguments, None)
+}
+
+fn request_with_stdin(arguments: &[&str], stdin: Option<&str>) -> CreateTaskRequest {
     let Command::Task { command } = parse(arguments).expect("arguments parse").command else {
         panic!("not a task command");
     };
-    create_request(&command)
+    create_request(&command, stdin)
         .expect("request builds")
         .expect("a catalogue workflow")
         .0
@@ -79,10 +83,63 @@ fn a_branch_without_a_workspace_name_is_a_usage_error_with_the_format() {
         panic!("not a task command");
     };
 
-    let error = create_request(&command).expect_err("a bare branch is refused");
+    let error = create_request(&command, None).expect_err("a bare branch is refused");
 
     assert!(error.message.contains("--branch"), "{}", error.message);
     assert!(error.message.contains("name=value"), "{}", error.message);
+}
+
+#[test]
+fn the_options_override_the_stdin_object_value_by_value() {
+    let stdin = r#"{
+        "workflow": "flow",
+        "inputs": {"description": "from stdin", "kept": 1},
+        "workspaces": {"code": {"repository": "acme", "branch": "main"}},
+        "ticket": "ABC-1",
+        "title": "from stdin"
+    }"#;
+
+    let request = request_with_stdin(
+        &[
+            "--stdin",
+            "--input",
+            "description=from the option",
+            "--branch",
+            "code=develop",
+            "--title",
+            "from the option",
+        ],
+        Some(stdin),
+    );
+
+    let launch = &request.launch;
+    assert_eq!(launch.workflow_id, "flow");
+    assert_eq!(
+        launch.inputs,
+        json!({"description": "from the option", "kept": 1})
+    );
+    assert_eq!(
+        launch.workspaces["code"].repository.as_deref(),
+        Some("acme")
+    );
+    assert_eq!(launch.workspaces["code"].branch.as_deref(), Some("develop"));
+    assert_eq!(launch.ticket.as_deref(), Some("ABC-1"));
+    assert_eq!(launch.title.as_deref(), Some("from the option"));
+}
+
+#[test]
+fn a_stdin_object_without_a_workflow_or_with_an_unknown_field_is_a_usage_error() {
+    for (stdin, expected) in [
+        (r#"{"inputs": {}}"#, "WORKFLOW"),
+        (r#"{"workflow": "flow", "data": {}}"#, "Invalid --stdin"),
+    ] {
+        let Command::Task { command } = parse(&["--stdin"]).unwrap().command else {
+            panic!("not a task command");
+        };
+        let error = create_request(&command, Some(stdin)).expect_err("refused");
+        assert_eq!(error.exit_code, 2, "{}", error.message);
+        assert!(error.message.contains(expected), "{}", error.message);
+    }
 }
 
 #[test]
@@ -119,72 +176,47 @@ fn task_command(arguments: &[&str]) -> TaskCommand {
     command
 }
 
-fn usage_error(arguments: &[&str], observer_run: Option<&str>) -> String {
-    let error = effect_call(&task_command(arguments), observer_run).expect_err("a usage error");
-    assert_eq!(error.exit_code, 2, "{}", error.message);
-    error.message
-}
-
-#[test]
-fn data_outside_an_observer_run_is_a_usage_error() {
-    let message = usage_error(&["create", "--data", "{}"], None);
-    assert!(message.contains("--data"), "{message}");
-    assert!(message.contains("NARSOR_OBSERVER_RUN"), "{message}");
-
-    // An empty variable is no run either.
-    usage_error(&["create", "--data", "{}"], Some(""));
-}
-
 #[test]
 fn outside_an_observer_run_task_create_goes_its_usual_way() {
     let command = task_command(&["create", "flow", "--input", "code=acme"]);
 
-    assert_eq!(effect_call(&command, None).unwrap(), None);
+    assert_eq!(effect_call(&command, None, None).unwrap(), None);
+    assert_eq!(effect_call(&command, Some(""), None).unwrap(), None);
 }
 
 #[test]
-fn in_an_observer_run_task_create_takes_only_the_data() {
-    let call = effect_call(
-        &task_command(&["create", "--data", r#"{"key": "ABC-1"}"#]),
+fn in_an_observer_run_task_create_sends_the_request_the_console_builds() {
+    let arguments = [
+        "create",
+        "flow",
+        "--input",
+        "description=x",
+        "--repository",
+        "code=acme",
+        "--ticket",
+        "ABC-1",
+    ];
+    let console = create_request(&task_command(&arguments), None)
+        .unwrap()
+        .unwrap()
+        .0;
+
+    let call = effect_call(&task_command(&arguments), Some(RUN), None).unwrap();
+
+    assert_eq!(call, Some(EffectCall::CreateTask(console)));
+}
+
+#[test]
+fn in_an_observer_run_a_definition_file_is_a_usage_error() {
+    let error = effect_call(
+        &task_command(&["create", "--file", "flow.yaml"]),
         Some(RUN),
+        None,
     )
-    .unwrap();
+    .expect_err("a local definition file");
 
-    assert_eq!(
-        call,
-        Some(EffectCall::CreateTask(ObserverCreateTaskRequest {
-            data: json!({"key": "ABC-1"}),
-        }))
-    );
-}
-
-#[test]
-fn in_an_observer_run_task_create_refuses_a_workflow_inputs_a_backend_and_repositories() {
-    for (arguments, refused) in [
-        (&["create", "flow", "--data", "{}"][..], "WORKFLOW"),
-        (&["create", "--data", "{}", "--input", "a=b"][..], "--input"),
-        (
-            &["create", "--data", "{}", "--backend", "k8s"][..],
-            "--backend",
-        ),
-        (
-            &["create", "--data", "{}", "--repository", "code=acme"][..],
-            "--repository",
-        ),
-    ] {
-        let message = usage_error(arguments, Some(RUN));
-        assert!(message.contains(refused), "{refused}: {message}");
-        assert!(message.contains("only --data"), "{message}");
-    }
-
-    let message = usage_error(&["create", "flow"], Some(RUN));
-    assert!(message.contains("WORKFLOW"), "{message}");
-}
-
-#[test]
-fn in_an_observer_run_task_create_needs_json_data() {
-    let message = usage_error(&["create", "--data", "{oops"], Some(RUN));
-    assert!(message.contains("--data"), "{message}");
+    assert_eq!(error.exit_code, 2);
+    assert!(error.message.contains("--file"), "{}", error.message);
 }
 
 #[test]

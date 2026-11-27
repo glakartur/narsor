@@ -70,7 +70,6 @@ fn active_run(sequence: u64) -> ActiveRun {
         claimed_at: now(),
         deadline: now() + Duration::seconds(360),
         token_digest: "sha256:abc".into(),
-        tasks_created: 2,
         entry: None,
         exit_generation: None,
     }
@@ -502,7 +501,6 @@ fn the_script_input_of_version_three_names_its_phase_queue_and_automation() {
         entry: None,
         exit: None,
         first_run: true,
-        import_backlog: false,
     };
 
     let value: serde_json::Value = serde_json::from_slice(&input.to_json_bytes()).unwrap();
