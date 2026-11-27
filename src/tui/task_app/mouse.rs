@@ -28,6 +28,7 @@
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
+use super::super::chooser::ListMouse;
 use super::tabs::progress::Spot;
 use super::{DetailTab, Focus, Request, StepFocus, TaskApp, View};
 
@@ -40,8 +41,11 @@ pub enum Panel {
     Details,
     /// What the open tab of the details shows, under their header and tabs.
     Content,
-    /// A window over the screen: the action menu, a list, a form.
+    /// A window over the screen: the action menu, a list, a form. The action
+    /// menu drawn in the details in place of the answer panel is one too.
     Overlay,
+    /// The answer panel under the open tab of the details.
+    Answer,
 }
 
 /// The panels of the last frame, in the order they were drawn.
@@ -100,6 +104,15 @@ impl Gesture {
             _ => None,
         }
     }
+
+    /// The same gesture over the list of a chooser.
+    fn on_list(self) -> ListMouse {
+        match self {
+            Self::WheelUp => ListMouse::Wheel(-1),
+            Self::WheelDown => ListMouse::Wheel(1),
+            Self::Click => ListMouse::Click,
+        }
+    }
 }
 
 /// What holds the screen while a mouse event comes.
@@ -119,8 +132,9 @@ impl TaskApp {
     }
 
     /// Folds a mouse event into the state, at the panel under the pointer.
-    /// Returns what needs the API: nothing, since a click selects and never
-    /// runs what it selected.
+    /// Returns what needs the API: at most the read a new highlight needs
+    /// (the branches of the workflow highlighted in the new-task form); a
+    /// click selects and never runs or sends what it selected.
     pub fn on_mouse(&mut self, event: MouseEvent) -> Request {
         let Some(gesture) = Gesture::of(event.kind) else {
             return Request::None;
@@ -147,8 +161,44 @@ impl TaskApp {
                 self.click_focus(panel);
                 self.click_details(column, row);
             }
-            (Gesture::Click, _) => self.click_focus(panel),
-            _ => {}
+            (_, Panel::Overlay) => self.on_overlay_mouse(gesture.on_list(), column, row),
+            (_, Panel::Answer) => self.answer_mouse(gesture, column, row),
+            (_, Panel::Details) => return self.view_mouse(gesture, column, row),
+        }
+        Request::None
+    }
+
+    /// A notch or a click on the answer panel moves or highlights the entry
+    /// of its list under the pointer; a click also gives the panel the keys,
+    /// as `Tab` in the details does. Nothing is sent.
+    fn answer_mouse(&mut self, gesture: Gesture, column: u16, row: u16) {
+        let Some(id) = self.list.selected_id().map(str::to_string) else {
+            return;
+        };
+        if gesture == Gesture::Click {
+            self.focus = Focus::Details;
+            self.focus_panel();
+        }
+        self.detail
+            .view_mut(&id)
+            .waiting
+            .on_mouse(gesture.on_list(), column, row);
+    }
+
+    /// A notch or a click on the view open in place of the details: its list
+    /// moves or highlights the entry under the pointer; a click also gives
+    /// the view the focus. Returns the read a new highlight needs, never a
+    /// send.
+    fn view_mouse(&mut self, gesture: Gesture, column: u16, row: u16) -> Request {
+        if gesture == Gesture::Click {
+            self.click_focus(Panel::Details);
+        }
+        let mouse = gesture.on_list();
+        match self.view {
+            View::NewTask(_) => return self.on_new_task_mouse(mouse, column, row),
+            View::Repositories(_) => self.on_repositories_mouse(mouse, column, row),
+            View::Queues(_) => self.on_queues_mouse(mouse, column, row),
+            View::Tasks | View::History(_) | View::Opening(_) => {}
         }
         Request::None
     }
@@ -288,7 +338,7 @@ impl TaskApp {
                 self.focus = Focus::Details;
                 self.panel_focus = false;
             }
-            Panel::Overlay => {}
+            Panel::Overlay | Panel::Answer => {}
         }
     }
 }

@@ -513,5 +513,5 @@ pub fn render_details(
         closed_run: true,
         axis_rows,
     };
-    render_view(frame, inner, view, styles, options, None)
+    render_view(frame, inner, view, styles, options, None).content
 }

@@ -1305,10 +1305,21 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         closed_run: false,
         axis_rows,
     };
-    let content = render_view(frame, inner, view, styles, options, panel.as_deref_mut());
+    let in_details = panel.is_some();
+    let drawn = render_view(frame, inner, view, styles, options, panel.as_deref_mut());
     app.restore_action_panel(panel);
-    if let Some(content) = content {
+    if let Some(content) = drawn.content {
         app.panels_mut().record(Panel::Content, content);
+    }
+    if let Some(place) = drawn.panel {
+        // The action panel drawn in the details is the window over the
+        // screen, only drawn in another place.
+        let drawn_as = if in_details {
+            Panel::Overlay
+        } else {
+            Panel::Answer
+        };
+        app.panels_mut().record(drawn_as, place);
     }
 }
 
@@ -1351,9 +1362,19 @@ pub(super) struct ViewOptions {
     pub(super) axis_rows: AxisRows,
 }
 
+/// Where [`render_view`] drew what the wheel and a click reach.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Drawn {
+    /// The tab's content, when the tabs were drawn.
+    pub(super) content: Option<Rect>,
+    /// The place under the tab: the answer panel, or the action panel in
+    /// its place, when one was drawn there.
+    pub(super) panel: Option<Rect>,
+}
+
 /// Draws `view` — the details of a task, or of an entry of the history —
-/// into `area`. Returns where the tab's content went, when the tabs were
-/// drawn: the wheel and a click reach the tab there.
+/// into `area`. Returns where the tab's content and the panel under it
+/// went.
 pub(super) fn render_view(
     frame: &mut Frame,
     area: Rect,
@@ -1361,7 +1382,7 @@ pub(super) fn render_view(
     styles: &Styles,
     options: ViewOptions,
     actions: Option<&mut ActionPanel>,
-) -> Option<Rect> {
+) -> Drawn {
     let ViewOptions {
         frame_focused,
         stale,
@@ -1458,7 +1479,7 @@ pub(super) fn render_view(
             )),
             message,
         );
-        return None;
+        return Drawn::default();
     }
     let tabs_content = Rect::new(
         parts.tabs.x.saturating_add(2),
@@ -1523,7 +1544,10 @@ pub(super) fn render_view(
             )),
             content,
         );
-        return Some(parts.content);
+        return Drawn {
+            content: Some(parts.content),
+            panel: None,
+        };
     }
 
     let unstarted = if closed_run && view.tab == DetailTab::Progress {
@@ -1653,7 +1677,10 @@ pub(super) fn render_view(
             view.task.as_of,
         );
     }
-    Some(parts.content)
+    Drawn {
+        content: Some(parts.content),
+        panel: parts.panel,
+    }
 }
 
 /// The tab titles, the active one in the focus role while the details have

@@ -41,7 +41,7 @@ use super::chat::{Chat, ChatEffect};
 use super::header::position_hint;
 use super::switcher::{FormKey, Switcher};
 use crate::tui::chooser::{
-    self, Chooser, ChooserAction, ChooserField, ChooserFocus, ChooserItem, Submission,
+    self, Chooser, ChooserAction, ChooserField, ChooserFocus, ChooserItem, ListMouse, Submission,
 };
 use crate::tui::failure_form::OperatorPanel;
 use crate::tui::input_form::{ContextLine, InputPanel, Tone};
@@ -1051,6 +1051,40 @@ impl WaitingPanel {
         used
     }
 
+    /// Folds a mouse event into the list of the form shown, as the last
+    /// frame drew it: a notch moves its highlight, a click highlights the
+    /// entry under the pointer and takes the keys out of the text box under
+    /// the list. Nothing is sent; the last send's verdict goes, as after a
+    /// key that moves the highlight. Returns whether the event reached the
+    /// list.
+    pub fn on_mouse(&mut self, mouse: ListMouse, column: u16, row: u16) -> bool {
+        match self.slot() {
+            Slot::Manual => self
+                .forms
+                .as_mut()
+                .and_then(|forms| forms.manual.as_mut())
+                .is_some_and(|chooser| chooser.on_mouse(mouse, column, row)),
+            Slot::Entry(index) => {
+                let Some(entry) = self.entries.get_mut(index) else {
+                    return false;
+                };
+                if !entry.chooser.on_mouse(mouse, column, row) {
+                    return false;
+                }
+                if mouse == ListMouse::Click {
+                    if let Some(composer) = entry.composer.as_mut() {
+                        composer.leave_fields();
+                    }
+                }
+                entry.sent = false;
+                entry.key = None;
+                entry.error = None;
+                true
+            }
+            Slot::Chat | Slot::Nothing => false,
+        }
+    }
+
     /// A key in the server's panel: `Esc` steps through the forms, the chat
     /// and the task's own actions take their keys; the entries take theirs
     /// in [`Self::on_key`]. `None` leaves the key to it.
@@ -1331,6 +1365,13 @@ impl WaitingPanel {
         focused: bool,
         as_of: chrono::DateTime<chrono::Utc>,
     ) {
+        // Only the list drawn below takes the mouse in this frame.
+        for entry in &mut self.entries {
+            entry.chooser.forget_drawn();
+        }
+        if let Some(manual) = self.forms.as_mut().and_then(|forms| forms.manual.as_mut()) {
+            manual.forget_drawn();
+        }
         if area.height == 0 || area.width == 0 {
             return;
         }

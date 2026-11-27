@@ -59,7 +59,9 @@ use narsor_protocol::controller::{
     TaskActionId, TaskActionKind, TaskActionOffer, TaskActionSend, TaskActionSurface, TaskState,
 };
 
-use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
+use super::super::chooser::{
+    self, Chooser, ChooserAction, ChooserField, ChooserItem, ListMouse, Submission,
+};
 use super::super::keymap::{self, Action, Context};
 use super::super::scroll::one_line;
 use super::super::stepped::{self, Stage, StepEntry, SteppedForm, SteppedOutcome};
@@ -1031,6 +1033,31 @@ impl TaskApp {
                 form.chooser.paste(pasted);
             }
             _ => {}
+        }
+    }
+
+    /// A notch or a click inside what sits over the screen: its list moves
+    /// or highlights the entry under the pointer. Nothing is chosen; the
+    /// `y` / `n` window has no list.
+    pub(super) fn on_overlay_mouse(&mut self, mouse: ListMouse, column: u16, row: u16) {
+        match &mut self.overlay {
+            Some(Overlay::Actions(panel)) => {
+                panel.sync_generation();
+                panel.form.on_choice_mouse(mouse, column, row);
+            }
+            Some(Overlay::Links(list)) => {
+                list.chooser.on_mouse(mouse, column, row);
+            }
+            Some(Overlay::Comment(form)) => {
+                form.chooser.on_mouse(mouse, column, row);
+            }
+            Some(Overlay::Harness(list)) => {
+                list.chooser_mut().on_mouse(mouse, column, row);
+            }
+            Some(Overlay::Limit(list)) => {
+                list.chooser_mut().on_mouse(mouse, column, row);
+            }
+            Some(Overlay::Confirm(_)) | None => {}
         }
     }
 

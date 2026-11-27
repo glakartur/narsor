@@ -49,7 +49,7 @@
 use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -64,7 +64,7 @@ use super::form::layout::{WindowRow, WrapWidth};
 use super::input_form::{cycle_option, pasted_text};
 use super::keymap::{digit_of, lookup, Action, Context};
 use super::scroll::{one_line, sanitize, wrap_visible, ScrollState};
-use super::selection::{bracketed_list_rows, render_bracketed_list, PREFIX_WIDTH};
+use super::selection::{bracketed_list_rows, render_bracketed_list, DrawnItems, PREFIX_WIDTH};
 use super::style::{Role, Styles};
 
 /// The narrowest area in which the description still sits beside the list.
@@ -633,6 +633,15 @@ pub enum ChooserFocus {
     Fields,
 }
 
+/// What the mouse did over the list of a chooser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListMouse {
+    /// A wheel notch: `-1` up the list, `1` down it.
+    Wheel(isize),
+    /// A left click.
+    Click,
+}
+
 /// What a chosen entry carries out of the chooser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Submission {
@@ -682,6 +691,10 @@ pub struct Chooser {
     growth: Cell<Option<Growth>>,
     /// The width the fields were last drawn in.
     area_width: Cell<usize>,
+    /// Where the last frame drew the list: its rows inside the pane, and
+    /// each entry's row. A list not drawn in the last frame has none.
+    list_area: Rect,
+    drawn: DrawnItems,
 }
 
 impl Chooser {
@@ -700,6 +713,8 @@ impl Chooser {
             confirms_submit: false,
             growth: Cell::new(None),
             area_width: Cell::new(0),
+            list_area: Rect::default(),
+            drawn: DrawnItems::default(),
         }
     }
 
@@ -1024,6 +1039,37 @@ impl Chooser {
             self.field = 0;
             self.description_scroll = ScrollState::new();
         }
+    }
+
+    /// Folds a mouse event at `column`, `row` into the list, as the last
+    /// frame drew it: a notch over the list moves the highlight one entry,
+    /// stopping at the first and the last, as `↓` / `↑` do; a click on an
+    /// entry highlights it. Neither chooses the entry. Returns whether the
+    /// event was over the list and so reached it.
+    pub fn on_mouse(&mut self, mouse: ListMouse, column: u16, row: u16) -> bool {
+        match mouse {
+            ListMouse::Wheel(by) => {
+                if self.items.is_empty() || !self.list_area.contains(Position::new(column, row)) {
+                    return false;
+                }
+                let last = self.items.len().saturating_sub(1);
+                self.select(self.selected.saturating_add_signed(by).min(last));
+                true
+            }
+            ListMouse::Click => match self.drawn.item_at(column, row) {
+                Some(index) => {
+                    self.select(index);
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// The list was not drawn in this frame: no mouse event reaches it.
+    pub fn forget_drawn(&mut self) {
+        self.list_area = Rect::default();
+        self.drawn = DrawnItems::default();
     }
 
     /// Folds one key into the chooser.
@@ -1651,6 +1697,7 @@ fn render_list(
     focused: bool,
     footer: bool,
 ) {
+    chooser.forget_drawn();
     let inner = if footer {
         if area.height == 0 {
             return;
@@ -1678,7 +1725,7 @@ fn render_list(
             .enumerate()
             .map(|(index, item)| vec![legacy_list_line(item, index, styles)])
             .collect();
-        render_bracketed_list(
+        chooser.drawn = render_bracketed_list(
             frame,
             inner,
             styles,
@@ -1687,6 +1734,7 @@ fn render_list(
             focused,
             &mut chooser.top,
         );
+        chooser.list_area = inner;
         return;
     }
     let selected = chooser.selected;
@@ -1706,6 +1754,10 @@ fn render_list(
         Paragraph::new(items).scroll((chooser.top.min(u16::MAX as usize) as u16, 0)),
         inner,
     );
+    // One row per entry, from the first in view.
+    let shown = chooser.items.len().saturating_sub(chooser.top);
+    chooser.drawn = DrawnItems::one_row_each(inner, chooser.top, shown);
+    chooser.list_area = inner;
 }
 
 /// The general chooser keeps the established bracket selection and trailing

@@ -17,6 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use crate::api::ClientError;
 use crate::controller_protocol::{ObserverQueueListResponse, ObserverQueueView};
 
+use super::super::chooser::ListMouse;
 use super::super::keymap::{self, Action, Context};
 use super::super::queues::Queues;
 use super::super::scroll::one_line;
@@ -40,6 +41,18 @@ impl TaskApp {
         match &mut self.view {
             View::Queues(queues) => Some(queues),
             _ => None,
+        }
+    }
+
+    /// A notch or a click on the list of the queues moves or highlights the
+    /// queue under the pointer; nothing is opened. An open queue does not
+    /// show the list, so the list takes nothing then.
+    pub(super) fn on_queues_mouse(&mut self, mouse: ListMouse, column: u16, row: u16) {
+        let Some(queues) = self.queues_mut() else {
+            return;
+        };
+        if queues.detail().is_none() && queues.opening().is_none() {
+            queues.chooser_mut().on_mouse(mouse, column, row);
         }
     }
 

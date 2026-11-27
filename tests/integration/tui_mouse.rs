@@ -854,3 +854,139 @@ mod progress {
         assert_eq!(app.focus(), Focus::List);
     }
 }
+
+mod choosers {
+    use super::*;
+    use crate::task_app_support::{catalogue, catalogue_workflow, registry, with_transitions};
+
+    /// A running task whose action menu offers `Pauza`, `Stop` and
+    /// `Przejście ręczne`, with the menu open.
+    fn menu_app() -> TaskApp {
+        let running = with_transitions(
+            with_controller(with_runner(
+                task("a", "local", "running", 1),
+                ExecutionStatus::Running,
+                "implement",
+            )),
+            "implement",
+            &[("Do review", "review", None), ("Wróć", "plan", None)],
+            Some(&["review", "plan"]),
+        );
+        let mut app = app();
+        app.load(listing(vec![titled(running, "NAR-1")], "c"));
+        key(&mut app, KeyCode::Char('.'));
+        app
+    }
+
+    fn menu_selected(app: &TaskApp) -> usize {
+        app.overlay()
+            .and_then(|overlay| overlay.chooser())
+            .expect("the menu is open on its choice")
+            .selected()
+    }
+
+    #[test]
+    fn a_click_on_the_third_action_of_the_menu_selects_it_without_running_it() {
+        let mut app = menu_app();
+        let buffer = draw(&mut app, 120, 30);
+        let (column, y) = find(&buffer, "Przejście ręczne");
+
+        assert_eq!(click(&mut app, column, y), Request::None);
+
+        // Still on the first level: the submenu behind the entry is not open.
+        assert_eq!(menu_selected(&app), 2);
+        let labels = app.overlay().and_then(|o| o.actions()).unwrap().labels();
+        assert_eq!(labels[0], "Pauza");
+    }
+
+    #[test]
+    fn the_wheel_inside_the_menu_moves_its_selection_and_outside_it_does_nothing() {
+        let mut app = menu_app();
+        let buffer = draw(&mut app, 120, 30);
+        let (column, y) = find(&buffer, "Stop");
+
+        wheel_down(&mut app, column, y);
+        assert_eq!(menu_selected(&app), 1);
+
+        // Over the details above the menu.
+        let (above, row) = find(&buffer, "brak kroków");
+        wheel_down(&mut app, above, row);
+        assert_eq!(menu_selected(&app), 1);
+
+        draw(&mut app, 120, 30);
+        wheel_down(&mut app, column, y);
+        wheel_down(&mut app, column, y);
+        assert_eq!(menu_selected(&app), 2, "the wheel stops at the last action");
+    }
+
+    #[test]
+    fn a_click_on_an_option_of_the_answer_panel_focuses_it_and_selects_without_sending() {
+        let mut form = serde_json::json!({
+            "execution_id": "exec-1",
+            "state_id": "review_scope",
+            "action_execution_id": "act-7",
+            "instruction": "Która wersja API?",
+            "fields": [{
+                "name": "entry_limit_decision",
+                "type": "select",
+                "options": ["continue", "reset_counter"],
+                "required": false
+            }],
+            "continuation": "entry_limit",
+            "episode": "ep-q",
+            "requested_at": "2026-10-09T11:54:00Z"
+        });
+        form["outputs"] = serde_json::json!([{ "label": "clean" }, { "label": "findings" }]);
+        form["entry_limit"] = serde_json::json!({ "entries": 5, "max_entries": 5 });
+        let waiting = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::InputNeeded,
+            "review_scope",
+        );
+        let mut app = app();
+        app.load(listing(
+            vec![titled(with_panel(with_pending(waiting, form)), "NAR-12")],
+            "c",
+        ));
+        key(&mut app, KeyCode::Char(' '));
+        key(&mut app, KeyCode::Enter);
+        let buffer = draw(&mut app, 120, 30);
+        let (column, y) = find(&buffer, "id:a");
+        click(&mut app, column, y);
+        assert_eq!(app.focus(), Focus::List);
+        let buffer = draw(&mut app, 120, 30);
+        let (column, y) = find(&buffer, "Wyzeruj licznik");
+
+        assert_eq!(click(&mut app, column, y), Request::None);
+
+        assert!(app.panel_focused());
+        let panel = app.detail().view("a").unwrap().waiting();
+        assert_eq!(panel.chooser().unwrap().selected(), 1);
+    }
+
+    #[test]
+    fn in_the_new_task_form_the_wheel_moves_the_workflow_and_the_list_behind_takes_no_click() {
+        let mut app = queue();
+        app.open_new_task(
+            catalogue(vec![
+                catalogue_workflow("alpha", "A", vec![]),
+                catalogue_workflow("beta", "B", vec![]),
+                catalogue_workflow("gamma", "C", vec![]),
+            ]),
+            registry(vec![]),
+        );
+        let buffer = draw(&mut app, 120, 30);
+        let (column, y) = find(&buffer, "beta");
+
+        wheel_down(&mut app, column, y);
+        assert_eq!(app.new_task_form().unwrap().chooser().selected(), 1);
+
+        let buffer = draw(&mut app, 120, 30);
+        let (column, y) = find(&buffer, "NAR-3");
+        let before = what_the_operator_sees(&app);
+        click(&mut app, column, y);
+        wheel_down(&mut app, column, y);
+        assert_eq!(what_the_operator_sees(&app), before);
+        assert_eq!(app.new_task_form().unwrap().chooser().selected(), 1);
+    }
+}

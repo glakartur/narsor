@@ -91,7 +91,9 @@ use crate::controller_protocol::{
 use narsor_protocol::controller::WorkflowInputType;
 use narsor_protocol::display::GENERATED_TITLE_MAX_CHARS;
 
-use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, FieldKind};
+use super::super::chooser::{
+    self, Chooser, ChooserAction, ChooserField, ChooserItem, FieldKind, ListMouse,
+};
 use super::super::input_form::{
     branch_field_name, repository_field_name, suggested_branch, workflow_input_fields,
     workflow_input_values, workspace_choices, workspace_fields,
@@ -952,6 +954,22 @@ impl TaskApp {
         request
     }
 
+    /// A notch or a click on the form's list of workflows: the highlight
+    /// moves to the entry, and what a key that moves it sets off follows —
+    /// the branches of its repositories are read. Nothing is sent.
+    pub(super) fn on_new_task_mouse(&mut self, mouse: ListMouse, column: u16, row: u16) -> Request {
+        let View::NewTask(form) = &mut self.view else {
+            return Request::None;
+        };
+        let slots_before = form.selected_branch_slots();
+        if !form.chooser.on_mouse(mouse, column, row) {
+            return Request::None;
+        }
+        let unasked = form.after_key(&slots_before);
+        self.sync_new_task_draft();
+        Self::reading(unasked)
+    }
+
     /// A paste while the form has the keys: into the field being typed in,
     /// kept as the draft, never sent.
     pub(super) fn on_new_task_paste(&mut self, pasted: &str) {
@@ -1399,6 +1417,8 @@ pub fn render_chooser(
     focused: bool,
 ) {
     if chooser.fields_focused() {
+        // The list folds into a strip that takes no click.
+        chooser.forget_drawn();
         layout::render(frame, area, chooser, styles, focused);
     } else {
         chooser::render(frame, area, chooser, styles, focused);
