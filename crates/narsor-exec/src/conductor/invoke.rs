@@ -69,7 +69,7 @@ use crate::engine::actions::harness::{
     AgentRequest, AgentRunEnding, ContextFiles, HarnessRegistry, RunObservers, CLAUDE_CODE, CODEX,
 };
 use crate::engine::actions::session::{ConversationSink, ReadingTap};
-use crate::engine::timeline_file::{ReadingSink, UsageReading};
+use crate::engine::timeline_file::{task_conductor_key, ReadingSink, UsageReading};
 use crate::persistence::{ExecutionStore, WorkPaths};
 
 /// The time limit of an invocation when no `agent_timeout` is configured.
@@ -211,7 +211,8 @@ impl HarnessInvoker {
 
     /// Returns the invoker writing the tokens and cost of its runs to
     /// `sink`, on the step the conductor decided in: the episode of the
-    /// invocation. A request without an episode has no step to count on.
+    /// invocation. A request without an episode (a chat reply, a title) has
+    /// no step to count on, so its use counts on the task.
     pub fn with_reading_sink(mut self, sink: Arc<dyn ReadingSink>) -> Self {
         self.readings = Some(sink);
         self
@@ -394,13 +395,19 @@ impl HarnessInvoker {
     }
 
     /// Where the use the harness reports goes: the timeline entry of the
-    /// invocation's episode.
+    /// invocation's episode, else the task, under a key of the invocation's
+    /// own so that the readings of two runs stay apart.
     fn reading_tap(&self, invocation: &Invocation, harness: &str) -> Option<ReadingTap> {
         let sink = self.readings.as_ref()?;
+        let key = invocation
+            .request
+            .episode
+            .clone()
+            .unwrap_or_else(|| task_conductor_key(&invocation.invocation_id));
         Some(ReadingTap::new(
             Arc::new(ConductorReadings(Arc::clone(sink))),
             invocation.execution_id.clone(),
-            invocation.request.episode.clone()?,
+            key,
             harness.to_string(),
         ))
     }

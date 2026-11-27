@@ -1331,7 +1331,7 @@ pub(super) fn render_view(
     let timeline = view.detail.progress.timeline();
     let usage = timeline
         .and_then(|response| response.timeline.as_ref())
-        .and_then(|timeline| task_usage_text::sum(&timeline.positions));
+        .and_then(task_usage_text::sum);
     let notice = notice(view.task, styles, stale, inner_width);
     let (mut lines, spots) = header(
         view.task,

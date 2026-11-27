@@ -7,12 +7,13 @@
 use std::collections::HashSet;
 
 use narsor_engine::domain::{Event, EventData, ExecutionStatus, RepromptedBy};
+use narsor_engine::engine::timeline_file::task_conductor_key;
 use narsor_engine::engine::{
     build_timeline, current_timeline, ConversationState, EventLink, PositionStatus, ReadingBasis,
     UsageReading,
 };
 use narsor_engine::persistence::ExecutionStore;
-use narsor_protocol::api::TokenCounts;
+use narsor_protocol::api::{SubagentStats, TokenCounts};
 use serde_json::json;
 
 const EXEC: &str = "exec-1";
@@ -893,6 +894,154 @@ fn a_timeline_file_without_conductor_fields_still_loads() {
         (usage.conductor_total, usage.conductor_cost_usd),
         (None, None)
     );
+}
+
+/// The conductor's use in a run that reported `spawned` subagents.
+fn conductor_use_with_subagents(cost: f64, spawned: u32) -> UsageReading {
+    let mut run = increment(100, 10, cost);
+    run.subagent_stats = Some(SubagentStats {
+        spawned,
+        tokens: 1_000,
+        ..SubagentStats::default()
+    });
+    UsageReading::of_conductor(run)
+}
+
+/// An agent step `plan` (attempt `a1`) and a gate `gate` the conductor
+/// decided in (attempt `d1`).
+fn agent_and_gate_log() -> Log {
+    let mut log = Log::new();
+    log.push(state_entered("plan"));
+    agent_run(&mut log, "a1", "plan", None, "hs-A");
+    log.push(state_entered("gate"));
+    log.push(action_started("d1", "gate", "decision"));
+    log
+}
+
+/// Covers AE1, AE3, AE5 and a reading of an episode that is no position.
+#[test]
+fn the_conductors_use_without_a_position_counts_on_the_task_and_on_no_position() {
+    let store = scratch("conductor-task-bucket");
+    let log = agent_and_gate_log();
+    let none = HashSet::new();
+    let record = narsor_engine::engine::timeline_file::record_reading;
+    record(&store, EXEC, "a1", increment(10, 4, 1.0)).unwrap();
+    record(&store, EXEC, "d1", conductor_use(300, 40, 0.1)).unwrap();
+    let before = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Running, &none);
+    assert_eq!(before.conductor_usage, None);
+
+    record(
+        &store,
+        EXEC,
+        &task_conductor_key("i1"),
+        conductor_use(50, 5, 0.05),
+    )
+    .unwrap();
+    record(&store, EXEC, "gate", conductor_use(20, 2, 0.02)).unwrap();
+    let after = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Running, &none);
+
+    let bucket = after.conductor_usage.expect("a task bucket");
+    assert_eq!(bucket.cost_usd, Some(0.07));
+    assert_eq!(bucket.total.map(|total| total.input), Some(70));
+    assert_eq!(after.positions, before.positions);
+}
+
+/// Covers AE2: a finished task still counts a chat reply, and a new read of
+/// the file gives it back.
+#[test]
+fn a_chat_reply_after_the_end_counts_and_stays_on_a_new_read() {
+    let store = scratch("conductor-after-end");
+    let mut log = agent_and_gate_log();
+    log.push(EventData::WorkflowCompleted { result: json!({}) });
+    let none = HashSet::new();
+    let read = |store: &ExecutionStore| {
+        current_timeline(store, EXEC, &log.events, ExecutionStatus::Completed, &none)
+    };
+    assert_eq!(read(&store).conductor_usage, None);
+
+    narsor_engine::engine::timeline_file::record_reading(
+        &store,
+        EXEC,
+        &task_conductor_key("i1"),
+        conductor_use(50, 5, 0.05),
+    )
+    .unwrap();
+
+    let counted = read(&store);
+    assert_eq!(counted.conductor_usage.unwrap().cost_usd, Some(0.05));
+    // Nothing is kept in memory: a new read, as after a restart, is the file's.
+    assert_eq!(read(&store), counted);
+}
+
+/// The subagents of the conductor's runs without a position add up in the
+/// task bucket and reach no position.
+#[test]
+fn the_subagents_of_the_conductors_task_runs_add_up_in_the_bucket() {
+    let store = scratch("conductor-task-subagents");
+    let log = agent_and_gate_log();
+    let none = HashSet::new();
+    let record = narsor_engine::engine::timeline_file::record_reading;
+    record(&store, EXEC, "a1", increment(10, 4, 1.0)).unwrap();
+    record(
+        &store,
+        EXEC,
+        &task_conductor_key("i1"),
+        conductor_use_with_subagents(0.05, 1),
+    )
+    .unwrap();
+    record(
+        &store,
+        EXEC,
+        &task_conductor_key("i2"),
+        conductor_use_with_subagents(0.05, 2),
+    )
+    .unwrap();
+
+    let timeline = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Running, &none);
+
+    let stats = timeline
+        .conductor_usage
+        .and_then(|bucket| bucket.subagent_stats);
+    assert_eq!(stats.map(|stats| stats.spawned), Some(3));
+    assert!(timeline.positions.iter().all(|position| position
+        .usage
+        .and_then(|usage| usage.subagent_stats)
+        .is_none()));
+}
+
+/// The subagents of the conductor's gate runs add up on their position and
+/// leave the agent's subagents of the position as they are.
+#[test]
+fn the_subagents_of_the_conductors_gate_runs_add_up_on_their_position() {
+    let store = scratch("conductor-gate-subagents");
+    let log = agent_and_gate_log();
+    let none = HashSet::new();
+    let record = narsor_engine::engine::timeline_file::record_reading;
+    record(&store, EXEC, "d1", conductor_use_with_subagents(0.1, 1)).unwrap();
+    record(&store, EXEC, "d1", conductor_use_with_subagents(0.1, 2)).unwrap();
+    record(
+        &store,
+        EXEC,
+        &task_conductor_key("i1"),
+        conductor_use_with_subagents(0.05, 2),
+    )
+    .unwrap();
+
+    let timeline = current_timeline(&store, EXEC, &log.events, ExecutionStatus::Running, &none);
+
+    let gate = timeline
+        .position("gate #1")
+        .and_then(|p| p.usage)
+        .expect("gate usage");
+    assert_eq!(
+        gate.conductor_subagent_stats.map(|stats| stats.spawned),
+        Some(3)
+    );
+    assert_eq!((gate.subagent_count, gate.subagent_stats), (None, None));
+    let bucket = timeline
+        .conductor_usage
+        .and_then(|bucket| bucket.subagent_stats);
+    assert_eq!(bucket.map(|stats| stats.spawned), Some(2));
 }
 
 #[test]
