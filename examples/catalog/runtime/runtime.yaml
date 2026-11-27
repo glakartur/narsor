@@ -1,4 +1,5 @@
-# The runtime catalogue: copy it to {catalog}/runtime.yaml.
+# The runtime catalogue: copy this directory, with components/, to
+# {catalog}/runtime/. Script paths are relative to this directory.
 #
 # `task_image` is the image the local controller builds for tasks in the
 # Docker work mode (controller.local.mode: docker). See

@@ -49,22 +49,22 @@ type DockerCheck<'a> = &'a dyn Fn() -> std::result::Result<String, String>;
 const CLAUDE_TOKEN_SECRET: &str = "claude-token";
 
 /// The example catalogue's task image (docs/user/local-docker.md).
-const EXAMPLE_RUNTIME: &str = include_str!("../../examples/catalog/runtime.yaml");
+const EXAMPLE_RUNTIME: &str = include_str!("../../examples/catalog/runtime/runtime.yaml");
 
 /// The scripts of the components `init` keeps from the example task image,
 /// by their path in the catalogue.
 const TASK_IMAGE_SCRIPTS: &[(&str, &str)] = &[
     (
         "components/base-tools.sh",
-        include_str!("../../examples/catalog/components/base-tools.sh"),
+        include_str!("../../examples/catalog/runtime/components/base-tools.sh"),
     ),
     (
         "components/claude-code/install.sh",
-        include_str!("../../examples/catalog/components/claude-code/install.sh"),
+        include_str!("../../examples/catalog/runtime/components/claude-code/install.sh"),
     ),
     (
         "components/claude-code/version.sh",
-        include_str!("../../examples/catalog/components/claude-code/version.sh"),
+        include_str!("../../examples/catalog/runtime/components/claude-code/version.sh"),
     ),
 ];
 
@@ -212,7 +212,7 @@ fn run_with(
     } else {
         write_new_atomic(&target, contents.as_bytes(), 0o600)?;
     }
-    let task_image_written = docker_catalog
+    let task_image = docker_catalog
         .as_deref()
         .map(write_task_image)
         .transpose()?;
@@ -231,8 +231,8 @@ fn run_with(
     if let Some(backend) = &workstation_backend {
         print_server_commands(backend, &target)?;
     }
-    if let (Some(catalog), Some(written)) = (&docker_catalog, task_image_written) {
-        print_docker_steps(catalog, written);
+    if let Some((runtime, written)) = &task_image {
+        print_docker_steps(runtime, *written);
     }
     Ok(())
 }
@@ -355,33 +355,61 @@ fn initial_runtime() -> String {
         .split_once(EXAMPLE_OPTIONAL_COMPONENTS)
         .map_or(EXAMPLE_RUNTIME, |(kept, _)| kept);
     kept.replacen(
-        "# The runtime catalogue: copy it to {catalog}/runtime.yaml.",
-        "# The runtime catalogue, written by `narsor-cli init` from the example catalogue.",
+        "# The runtime catalogue: copy this directory, with components/, to\n\
+         # {catalog}/runtime/. Script paths are relative to this directory.",
+        "# The runtime catalogue, written by `narsor-cli init` from the example catalogue.\n\
+         # Script paths are relative to this directory.",
         1,
     )
 }
 
-/// Writes the task image into `catalog` when it has no `runtime.yaml`;
-/// false when one exists. An existing file is never replaced.
-fn write_task_image(catalog: &Path) -> Result<bool> {
-    let runtime = catalog.join("runtime.yaml");
-    if path_exists(&runtime)? {
-        return Ok(false);
+/// The runtime directory of the catalogue. The client binaries do not
+/// link the store, so this repeats `CatalogPaths::runtime_dir` of
+/// `narsor-store` (a test keeps the two equal).
+fn runtime_dir(catalog: &Path) -> PathBuf {
+    catalog.join("runtime")
+}
+
+/// The runtime catalogue file `catalog` already has: in the runtime
+/// directory, or at the catalogue root where older catalogues keep it.
+fn existing_runtime_file(catalog: &Path) -> Result<Option<PathBuf>> {
+    let candidates = [
+        runtime_dir(catalog).join("runtime.yaml"),
+        runtime_dir(catalog).join("runtime.yml"),
+        catalog.join("runtime.yaml"),
+    ];
+    for file in candidates {
+        if path_exists(&file)? {
+            return Ok(Some(file));
+        }
     }
+    Ok(None)
+}
+
+/// Writes the task image into `catalog/runtime/` when the catalogue has
+/// no runtime catalogue in either place. Returns the runtime catalogue
+/// file and whether it was written now. An existing file is never
+/// replaced, and nothing is written beside an old one: two runtime
+/// catalogues stop every task.
+fn write_task_image(catalog: &Path) -> Result<(PathBuf, bool)> {
+    if let Some(existing) = existing_runtime_file(catalog)? {
+        return Ok((existing, false));
+    }
+    let runtime_dir = runtime_dir(catalog);
     for (path, script) in TASK_IMAGE_SCRIPTS {
-        let target = catalog.join(path);
+        let target = runtime_dir.join(path);
         if path_exists(&target)? {
             println!("Left unchanged: {}", target.display());
         } else {
             write_new_atomic(&target, script.as_bytes(), 0o644)?;
         }
     }
+    let runtime = runtime_dir.join("runtime.yaml");
     write_new_atomic(&runtime, initial_runtime().as_bytes(), 0o644)?;
-    Ok(true)
+    Ok((runtime, true))
 }
 
-fn print_docker_steps(catalog: &Path, runtime_written: bool) {
-    let runtime = catalog.join("runtime.yaml");
+fn print_docker_steps(runtime: &Path, runtime_written: bool) {
     if runtime_written {
         println!("Task image: {}", runtime.display());
     } else {
@@ -1993,9 +2021,11 @@ mod tests {
             assert!(all_on.contains("home: private"), "{case}: {all_on}");
 
             let catalog = install.catalog();
-            let runtime: narsor_engine::environment::RuntimeCatalog =
-                serde_yaml::from_str(&fs::read_to_string(catalog.join("runtime.yaml")).unwrap())
-                    .unwrap();
+            assert!(!catalog.join("runtime.yaml").exists(), "{case}");
+            let runtime: narsor_engine::environment::RuntimeCatalog = serde_yaml::from_str(
+                &fs::read_to_string(catalog.join("runtime/runtime.yaml")).unwrap(),
+            )
+            .unwrap();
             assert_eq!(runtime.problems(), Vec::<String>::new(), "{case}");
             let task_image = runtime.task_image.expect("task image written");
             let names: Vec<&str> = task_image
@@ -2005,38 +2035,58 @@ mod tests {
                 .collect();
             assert_eq!(names, ["base-tools", "claude-code"], "{case}");
             assert!(
-                task_image.seal(&catalog).is_ok(),
-                "{case}: the component scripts are in the catalogue"
+                task_image.seal(&catalog.join("runtime")).is_ok(),
+                "{case}: the component scripts are in the runtime directory"
             );
             assert!(initial_runtime().contains(&format!("name: {CLAUDE_TOKEN_SECRET}")));
+            assert!(initial_runtime().starts_with("# The runtime catalogue, written by"));
         }
     }
 
     #[test]
-    fn rerun_keeps_the_configuration_and_an_existing_task_image() {
-        let install = Installation::new("rerun");
-        fs::write(install.config(), "global:\n  root: /elsewhere\n").unwrap();
-        fs::create_dir_all(install.catalog()).unwrap();
-        let custom = b"task_image:\n  base: alpine:3\n  components: []\n";
-        fs::write(install.catalog().join("runtime.yaml"), custom).unwrap();
+    fn rerun_keeps_the_configuration_and_an_existing_task_image_in_either_place() {
+        let layout = narsor_engine::persistence::paths::CatalogPaths::new("/c");
+        assert_eq!(runtime_dir(Path::new("/c")), layout.runtime_dir());
+        assert_eq!(
+            [layout.runtime_file(), layout.legacy_runtime_file()],
+            [
+                runtime_dir(Path::new("/c")).join("runtime.yaml"),
+                Path::new("/c").join("runtime.yaml")
+            ]
+        );
+        for existing in ["runtime.yaml", "runtime/runtime.yaml"] {
+            let install = Installation::new("rerun");
+            fs::write(install.config(), "global:\n  root: /elsewhere\n").unwrap();
+            let file = install.catalog().join(existing);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            let custom = b"task_image:\n  base: alpine:3\n  components: []\n";
+            fs::write(&file, custom).unwrap();
 
-        install
-            .init(InitRole::Local, Some(LocalWorkMode::Docker), &docker_ready)
-            .unwrap();
+            install
+                .init(InitRole::Local, Some(LocalWorkMode::Docker), &docker_ready)
+                .unwrap();
 
-        assert_eq!(
-            fs::read(install.catalog().join("runtime.yaml")).unwrap(),
-            custom
-        );
-        assert!(!install.catalog().join("components").exists());
-        assert_eq!(
-            fs::read_to_string(install.config()).unwrap(),
-            "global:\n  root: /elsewhere\n"
-        );
-        assert_eq!(
-            install.written_mode(&install.root.join("config.yaml.new")),
-            Some(SettingValue::Text("docker".to_string()))
-        );
+            assert_eq!(fs::read(&file).unwrap(), custom, "{existing}");
+            let mut entries: Vec<_> = fs::read_dir(install.catalog())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            entries.sort();
+            let first = Path::new(existing).components().next().unwrap();
+            assert_eq!(
+                entries,
+                [first.as_os_str()],
+                "{existing}: nothing else written"
+            );
+            assert_eq!(
+                fs::read_to_string(install.config()).unwrap(),
+                "global:\n  root: /elsewhere\n"
+            );
+            assert_eq!(
+                install.written_mode(&install.root.join("config.yaml.new")),
+                Some(SettingValue::Text("docker".to_string()))
+            );
+        }
     }
 
     #[test]
@@ -2048,7 +2098,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(install.written_mode(&install.config()), None);
-        assert!(!install.catalog().join("runtime.yaml").exists());
+        assert!(!install.catalog().exists());
     }
 
     #[test]

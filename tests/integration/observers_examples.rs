@@ -61,7 +61,7 @@ fn the_example_catalog_loads_with_no_problems() {
     assert!(!load.automations["jira-new-issues"].has(HookPhase::In));
 }
 
-/// The example `runtime.yaml` defines a task image for the Docker work mode
+/// The example `runtime/runtime.yaml` defines a task image for the Docker work mode
 /// whose scripts are files of the catalogue: it has no problem and seals
 /// with every script's text, in the order the image installs them.
 #[test]
@@ -70,6 +70,7 @@ fn the_example_task_image_seals_with_its_scripts() {
         .runtime()
         .expect("runtime.yaml parses")
         .expect("runtime.yaml exists");
+    assert!(!located.legacy, "the example uses the runtime directory");
     let runtime = located.catalog;
     assert_eq!(runtime.problems(), Vec::<String>::new());
 
