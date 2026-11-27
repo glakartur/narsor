@@ -266,10 +266,11 @@ pub enum TaskCommand {
         #[arg(long = "task-id", value_name = "ID")]
         task_id: Option<String>,
         /// In an observer's script only (`NARSOR_OBSERVER_RUN` set): the
-        /// effect data, a JSON object of the fields the observer maps to
-        /// workflow inputs. Each call creates a new task. The observer's
-        /// record decides the workflow, repositories, backend and profile;
-        /// WORKFLOW and the other options are refused.
+        /// effect data, a JSON object of the fields the queue maps to
+        /// workflow inputs. Each call creates a new task. The script may
+        /// give WORKFLOW (one the queue allows; its default when omitted),
+        /// --repository and --branch; the queue decides the backend and
+        /// profile, and the other options are refused.
         #[arg(long, value_name = "JSON")]
         data: Option<String>,
     },

@@ -17,15 +17,22 @@ use serde_json::Value;
 
 /// `POST /observer/v1/runs/{run}/tasks`: create a task from the effect data.
 ///
-/// Only the data: the workflow, repositories, backend and
-/// profile come from the queue file, and only the fields its mapping
-/// names become workflow inputs. Any other field is refused.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// The script may name the workflow (one of the queue's) and the
+/// repositories of its workspaces. The backend and profile come from the
+/// queue file, and only the fields its mapping names become workflow
+/// inputs. Any other field is refused.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ObserverCreateTaskRequest {
     /// The effect data, a JSON object whose fields the mapping names.
     #[serde(default)]
     pub data: Value,
+    /// The workflow, one the queue allows; the queue's default when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    /// Repository choices by workspace name; they replace the queue's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspaces: BTreeMap<String, super::WorkspaceRequest>,
 }
 
 /// `POST /observer/v1/runs/{run}/decide`: answer the gate of the run's queue
@@ -491,7 +498,8 @@ pub struct ObserverQueueView {
     /// The cron expression (UTC), for a cron schedule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron: Option<String>,
-    /// The workflow an `always` queue creates tasks of.
+    /// The workflows an `always` queue creates tasks of, as text: their ids,
+    /// the default one marked `(default)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
     /// Its automations, in the queue file's order.

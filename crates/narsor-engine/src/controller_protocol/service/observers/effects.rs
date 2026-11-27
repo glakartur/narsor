@@ -138,7 +138,7 @@ impl ProtocolService {
         check_size("effect data", &request.data, MAX_EFFECT_DATA_BYTES)?;
         let task_request = tasks
             .effect
-            .task_request(&request.data)
+            .task_request(&request)
             .map_err(invalid_effect)?;
         self.within_task_limit(&mut scope, &tasks)?;
         let owner = (self.installation_owner)().ok_or_else(|| {

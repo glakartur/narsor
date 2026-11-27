@@ -643,6 +643,7 @@ fn a_pair_over_its_task_limit_runs_again_after_the_limit_is_raised() {
             &run.run_id,
             crate::controller_protocol::wire::ObserverCreateTaskRequest {
                 data: json!({"key": "ABC-2"}),
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -765,6 +766,7 @@ fn a_run_whose_phase_is_not_check_has_no_effect() {
         &run.run_id,
         crate::controller_protocol::wire::ObserverCreateTaskRequest {
             data: json!({"title": "From an entry script"}),
+            ..Default::default()
         },
     );
 

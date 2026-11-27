@@ -418,16 +418,19 @@ commands then go to the effect routes of the run. Only a `check` run may
 use them; the server refuses them from an `in` or `out` run:
 
 ```sh
-narsor-cli task create --data "$JSON"
+narsor-cli task create [WORKFLOW] [--repository WORKSPACE=ID]… [--branch WORKSPACE=BRANCH]… --data "$JSON"
 narsor-cli task decide TASK_ID --episode EPISODE --choice CHOICE [--reason TEXT] [--var NAME=VALUE]… [--var-file NAME=PATH]…
 narsor-cli task decide TASK_ID --episode EPISODE --data '{"choice": …, "reason": …, "variables": {…}}'
 ```
 
 - `task create --data JSON` creates a new task on each call. Narsor does not
   remove duplicates: the script records in its state what it already
-  reported. The `tasks` of the queue file decide the workflow, repositories,
-  backend and profile: in a script, `WORKFLOW`, `--input`, `--backend`,
-  `--repository` and the other options of `task create` are a usage error.
+  reported. `WORKFLOW` must be one that the queue allows (`tasks.workflow_id`
+  or `tasks.workflows`); without it the task runs `tasks.workflow_id`.
+  `--repository` and `--branch` replace the queue's choice for a workspace.
+  The queue decides the backend and profile: in a script, `--input`,
+  `--backend`, `--commit` and the other options of `task create` are a
+  usage error.
   The data is a JSON object of the fields the queue maps to workflow
   inputs (`tasks.mapping`); Narsor refuses a field that is not in the map.
 - `task decide TASK_ID --episode EPISODE` answers the gate of the queue

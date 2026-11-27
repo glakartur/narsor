@@ -129,7 +129,7 @@ impl ProtocolService {
             cron,
             workflow_id: found
                 .and_then(|found| found.tasks.as_ref())
-                .map(|tasks| tasks.effect.workflow_id.clone()),
+                .map(|tasks| workflows_shown(&tasks.effect)),
             automations: pairs
                 .iter()
                 .map(|pair| automation_view(pair, found, now))
@@ -367,4 +367,20 @@ fn entry_view(entry: &QueueEntry, pairs: &[PairState<'_>]) -> QueueEntryView {
             .collect(),
         gate_phase: None,
     }
+}
+
+/// The workflows an `always` queue creates tasks of, the default one marked.
+fn workflows_shown(effect: &crate::automations::CreateTaskEffect) -> String {
+    effect
+        .workflows
+        .keys()
+        .map(|id| {
+            if effect.default_workflow.as_deref() == Some(id.as_str()) {
+                format!("{id} (default)")
+            } else {
+                id.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }

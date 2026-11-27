@@ -57,7 +57,7 @@ fn the_example_catalog_loads_with_no_problems() {
         );
     }
     let intake = load.queues["jira-intake"].tasks.as_ref().expect("tasks");
-    assert_eq!(intake.effect.workflow_id, "template");
+    assert_eq!(intake.effect.default_workflow.as_deref(), Some("template"));
     assert!(!load.automations["jira-new-issues"].has(HookPhase::In));
 }
 

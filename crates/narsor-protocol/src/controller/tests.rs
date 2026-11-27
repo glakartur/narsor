@@ -273,7 +273,7 @@ fn an_environment_refresh_event_decodes_and_an_older_client_reads_it_as_unrecogn
 fn observer_effect_requests_refuse_fields_a_script_may_not_choose() {
     let refused = serde_json::json!({
         "data": {},
-        "workflow_id": "other",
+        "backend_id": "other",
     });
     assert!(serde_json::from_value::<super::ObserverCreateTaskRequest>(refused).is_err());
     let response = super::ObserverEffectResponse {

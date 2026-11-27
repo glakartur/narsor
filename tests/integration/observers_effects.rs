@@ -141,8 +141,13 @@ impl Fixture {
         run: &ClaimedObserverRun,
         data: Value,
     ) -> Result<ObserverEffectResponse, ProtocolError> {
-        self.service
-            .observer_create_task(&run.run_id, ObserverCreateTaskRequest { data })
+        self.service.observer_create_task(
+            &run.run_id,
+            ObserverCreateTaskRequest {
+                data,
+                ..Default::default()
+            },
+        )
     }
 
     fn finish(&self, run: &ClaimedObserverRun) {

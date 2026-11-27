@@ -64,7 +64,7 @@ fn always_queue_takes_the_catalogue_workflow_and_one_naming_an_unknown_workflow_
 
     let workflow = resolver.workflow_definition("wf").expect("seeded workflow");
     let tasks = load.queues["jira-intake"].tasks.as_ref().expect("tasks");
-    assert_eq!(tasks.effect.workflow_version, workflow.version);
+    assert_eq!(tasks.effect.workflows["wf"].version, workflow.version);
     assert!(!load.queues.contains_key("lost-intake"));
     assert_eq!(load.problems.len(), 1, "{:?}", load.problems);
     assert_eq!(load.problems[0].file, Path::new("queues/lost-intake.yaml"));

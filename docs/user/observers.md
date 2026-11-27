@@ -117,8 +117,9 @@ mode: always
 schedule: {cron: "*/10 * * * *"}
 condition: {base_url: "https://jira.example.com", jql: "project = ABC", fields: [key]}
 tasks:                             # mode always only: the scripts may create tasks
-  workflow_id: triage              # must be in the workflow catalogue
-  workflow_version: 2              # optional: the catalogue's version by default
+  workflow_id: triage              # the default workflow; must be in the workflow catalogue
+  workflow_version: 2              # optional: pins workflow_id; the catalogue's version by default
+  workflows: [bugfix, change]      # optional: more workflows the script may name
   workspaces: {code: {repository: api}}   # optional, as in a task create request
   backend_id: k8s                  # optional: the default backend by default
   profile: default                 # optional
@@ -435,15 +436,31 @@ from an `in` or `out` run (HTTP 400, `not_a_check_run`).
 ### Create a task
 
 ```sh
-narsor-cli task create --data "$JSON" </dev/null >&2
+narsor-cli task create [WORKFLOW] [--repository WORKSPACE=ID]… [--branch WORKSPACE=BRANCH]… \
+  --data "$JSON" </dev/null >&2
 ```
 
 - **A new task on each call.** Narsor does not check whether the object
   already has a task. The script decides that from its state (section 5).
-- **The queue decides the task.** The workflow, the repositories, the
-  backend and the profile come from `tasks` of the queue file, not from the
-  script. The data has only the fields that `tasks.mapping` maps to
-  workflow inputs. Narsor refuses a field that is not in the map.
+- **The workflow.** `WORKFLOW` is `tasks.workflow_id` or one of
+  `tasks.workflows`; Narsor refuses any other. Without `WORKFLOW` the task
+  runs `tasks.workflow_id`; a queue without it needs `WORKFLOW` in every
+  call. Each allowed workflow must be in the catalogue and declare every
+  input of `tasks.mapping`, or the queue file is a problem.
+- **The repositories.** The task gets the `tasks.workspaces` of the
+  workspaces that its workflow declares; the others are left out, so one
+  queue can serve workflows with different workspaces. `--repository` and
+  `--branch` choose a repository and a branch for a workspace and replace
+  the queue's choice for it. `--branch` is optional: without it the task
+  starts from the workspace's `base_branch`, then the repository's default
+  branch. Narsor checks them as for a task that a person
+  creates: the workspace must be one of the workflow's, the repository must
+  be registered.
+- **The queue decides the rest.** The backend and the profile come from
+  `tasks`. `--input`, `--backend`, `--commit` and the other options of
+  `task create` are a usage error. The data has only the fields that
+  `tasks.mapping` maps to workflow inputs. Narsor refuses a field that is
+  not in the map.
 - **Ticket and title.** The mapping keys `task.ticket` and `task.title`
   set the task's ticket and title (`{{ task.ticket }}`, `{{ task.title }}`
   in the workflow), not an input. For example, `task.ticket: key` gives the

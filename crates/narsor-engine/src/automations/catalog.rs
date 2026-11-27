@@ -15,7 +15,8 @@
 //!     schedule: {cron: "*/5 * * * *"}     # or {interval_secs: 300}
 //!     condition: {}                       # optional, handed to the scripts
 //!     tasks:                              # optional, `always` queues only
-//!       workflow_id: triage               # must be in the workflow catalogue
+//!       workflow_id: triage               # the default; must be in the workflow catalogue
+//!       workflows: [bugfix, change]       # optional: the script may name one of these
 //!       mapping: {summary: title, task.ticket: key}   # task.ticket/task.title: task fields
 //! ```
 //!
@@ -365,9 +366,12 @@ struct ScheduleFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TasksFile {
-    workflow_id: String,
+    #[serde(default)]
+    workflow_id: Option<String>,
     #[serde(default)]
     workflow_version: Option<u32>,
+    #[serde(default)]
+    workflows: Vec<String>,
     #[serde(default)]
     workspaces: BTreeMap<String, WorkspaceRequest>,
     #[serde(default)]
@@ -713,9 +717,9 @@ fn validate_condition(condition: Option<serde_json::Value>) -> Result<serde_json
     Ok(condition)
 }
 
-/// The task-creation settings, checked as `observer create` checked them:
-/// the workflow must be in the catalogue, its version is the catalogue's
-/// unless the file pins one, and every mapped input must be declared.
+/// The task-creation settings: `workflow_id` (the default) and each of
+/// `workflows` must be in the catalogue and declare every mapped input; the
+/// version is the catalogue's, unless the file pins one for `workflow_id`.
 fn validate_tasks(
     tasks: TasksFile,
     workflow: &impl Fn(&str) -> Result<WorkflowDefinition, String>,
@@ -725,20 +729,32 @@ fn validate_tasks(
             "'tasks.task_limit_per_run' must be between 1 and {MAX_TASK_LIMIT_PER_RUN}"
         ));
     }
-    let definition = workflow(&tasks.workflow_id)
-        .map_err(|reason| format!("workflow '{}' cannot be used: {reason}", tasks.workflow_id))?;
-    let effect = CreateTaskEffect {
-        workflow_version: tasks.workflow_version.unwrap_or(definition.version),
-        workflow_id: tasks.workflow_id,
+    if tasks.workflow_id.is_none() && tasks.workflows.is_empty() {
+        return Err("'tasks' needs 'workflow_id' or 'workflows'".into());
+    }
+    if tasks.workflow_id.is_none() && tasks.workflow_version.is_some() {
+        return Err("'tasks.workflow_version' pins the version of 'tasks.workflow_id'".into());
+    }
+    let mut effect = CreateTaskEffect {
+        default_workflow: tasks.workflow_id.clone(),
+        workflows: BTreeMap::new(),
         workspaces: tasks.workspaces,
         backend_id: tasks.backend_id,
         profile: tasks.profile,
         mapping: tasks.mapping,
     };
     effect.validate().map_err(|error| error.to_string())?;
-    effect
-        .validate_against(&definition)
-        .map_err(|error| error.to_string())?;
+    let allowed = tasks.workflow_id.iter().chain(&tasks.workflows);
+    for id in allowed {
+        let definition =
+            workflow(id).map_err(|reason| format!("workflow '{id}' cannot be used: {reason}"))?;
+        let pinned = tasks
+            .workflow_version
+            .filter(|_| tasks.workflow_id.as_deref() == Some(id.as_str()));
+        effect
+            .allow_workflow(&definition, pinned.unwrap_or(definition.version))
+            .map_err(|error| error.to_string())?;
+    }
     Ok(QueueTasks {
         effect,
         task_limit_per_run: tasks.task_limit_per_run,
@@ -854,7 +870,7 @@ mod tests {
 
     #[test]
     fn each_bad_file_is_one_problem_and_the_rest_loads() {
-        let cases: [BadFileCase; 6] = [
+        let cases: [BadFileCase; 8] = [
             (
                 "automation without check.sh",
                 |root| {
@@ -904,6 +920,28 @@ mod tests {
                 },
                 "queues/bad.yaml",
                 "workflow 'nope'",
+            ),
+            (
+                "always queue whose allowed workflow is not in the catalogue",
+                |root| {
+                    root.write(
+                        "queues/bad.yaml",
+                        "automations: [ok]\nmode: always\nschedule: {interval_secs: 300}\ntasks: {workflows: [nope]}\n",
+                    );
+                },
+                "queues/bad.yaml",
+                "workflow 'nope'",
+            ),
+            (
+                "always queue whose tasks name no workflow",
+                |root| {
+                    root.write(
+                        "queues/bad.yaml",
+                        "automations: [ok]\nmode: always\nschedule: {interval_secs: 300}\ntasks: {mapping: {a: b}}\n",
+                    );
+                },
+                "queues/bad.yaml",
+                "'workflow_id' or 'workflows'",
             ),
             (
                 "unknown field",

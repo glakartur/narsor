@@ -154,31 +154,54 @@ fn in_an_observer_run_task_create_takes_only_the_data() {
         call,
         Some(EffectCall::CreateTask(ObserverCreateTaskRequest {
             data: json!({"key": "ABC-1"}),
+            ..Default::default()
         }))
     );
 }
 
 #[test]
-fn in_an_observer_run_task_create_refuses_a_workflow_inputs_a_backend_and_repositories() {
+fn in_an_observer_run_task_create_may_name_the_workflow_and_repositories() {
+    let call = effect_call(
+        &task_command(&[
+            "create",
+            "bugfix",
+            "--repository",
+            "code=api",
+            "--branch",
+            "code=main",
+            "--data",
+            "{}",
+        ]),
+        Some(RUN),
+    )
+    .unwrap();
+
+    let Some(EffectCall::CreateTask(request)) = call else {
+        panic!("expected a create effect, got {call:?}");
+    };
+    assert_eq!(request.workflow_id.as_deref(), Some("bugfix"));
+    let code = &request.workspaces["code"];
+    assert_eq!(code.repository.as_deref(), Some("api"));
+    assert_eq!(code.branch.as_deref(), Some("main"));
+}
+
+#[test]
+fn in_an_observer_run_task_create_refuses_inputs_a_backend_and_commits() {
     for (arguments, refused) in [
-        (&["create", "flow", "--data", "{}"][..], "WORKFLOW"),
         (&["create", "--data", "{}", "--input", "a=b"][..], "--input"),
         (
             &["create", "--data", "{}", "--backend", "k8s"][..],
             "--backend",
         ),
         (
-            &["create", "--data", "{}", "--repository", "code=acme"][..],
-            "--repository",
+            &["create", "--data", "{}", "--commit", "code=abc"][..],
+            "--commit",
         ),
     ] {
         let message = usage_error(arguments, Some(RUN));
         assert!(message.contains(refused), "{refused}: {message}");
-        assert!(message.contains("only --data"), "{message}");
+        assert!(message.contains("takes only WORKFLOW"), "{message}");
     }
-
-    let message = usage_error(&["create", "flow"], Some(RUN));
-    assert!(message.contains("WORKFLOW"), "{message}");
 }
 
 #[test]

@@ -20,8 +20,8 @@ use crate::domain::{BackendId, TaskId, WorkflowDefinition};
 use chrono::{DateTime, Utc};
 pub use narsor_protocol::controller::ObserverMode;
 use narsor_protocol::controller::{
-    CreateTaskRequest, GateWatch, GateWatchChoice, GateWatchVariable, LaunchRequest, OwnerRef,
-    WorkspaceRequest,
+    CreateTaskRequest, GateWatch, GateWatchChoice, GateWatchVariable, LaunchRequest,
+    ObserverCreateTaskRequest, OwnerRef, WorkspaceRequest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -333,18 +333,23 @@ impl ScheduleConfig {
 
 /// The "create a task" effect: what every task an `always` queue creates runs.
 ///
-/// The script supplies only the effect data. The workflow,
-/// repositories, backend and profile come from here, and only the fields
-/// named by `mapping` become workflow inputs, so a script cannot choose
-/// another workflow or backend.
+/// The script supplies the effect data and may name the workflow (one the
+/// queue allows) and the repositories of its workspaces. The backend and
+/// profile come from here, and only the fields named by `mapping` become
+/// workflow inputs, so a script cannot choose another backend or smuggle in
+/// inputs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateTaskEffect {
-    /// Workflow to run.
-    pub workflow_id: String,
-    /// Workflow version the queue was validated against.
-    pub workflow_version: u32,
-    /// Repository choices for the workspaces of the workflow, by workspace
-    /// name, as in a task create request.
+    /// Workflow of a task whose script names none; when absent the script
+    /// must name one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_workflow: Option<String>,
+    /// The workflows the tasks may run, by id (see [`Self::allow_workflow`]).
+    #[serde(default)]
+    pub workflows: BTreeMap<String, AllowedWorkflow>,
+    /// Repository choices by workspace name, as in a task create request.
+    /// A task gets those of the workspaces its workflow declares; the
+    /// script's choice for a workspace replaces the queue's.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspaces: BTreeMap<String, WorkspaceRequest>,
     /// Backend the tasks are pinned to; the owner's default when absent.
@@ -370,15 +375,19 @@ fn is_task_field(mapping_key: &str) -> bool {
     mapping_key.starts_with(TASK_FIELD_PREFIX)
 }
 
+/// A workflow a queue's tasks may run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AllowedWorkflow {
+    /// The version the queue was checked against.
+    pub version: u32,
+    /// The workspaces the workflow declares.
+    #[serde(default)]
+    pub workspaces: BTreeSet<String>,
+}
+
 impl CreateTaskEffect {
-    /// Checks what can be checked without the workflow: names and backend.
+    /// Checks what can be checked without the workflows: names and backend.
     pub fn validate(&self) -> Result<()> {
-        if self.workflow_id.trim().is_empty() {
-            return Err(ObserverError::invalid(
-                "effect.workflow_id",
-                "the workflow must be named",
-            ));
-        }
         if let Some(backend) = &self.backend_id {
             BackendId::parse(backend.clone())
                 .map_err(|error| ObserverError::invalid("effect.backend_id", error.to_string()))?;
@@ -402,18 +411,29 @@ impl CreateTaskEffect {
         Ok(())
     }
 
-    /// The create request of the task the effect `data` yields (R3): this
-    /// effect's workflow, repositories, backend and profile, a random task
-    /// id, as inputs the data fields the mapping names, and as ticket and
-    /// title the fields mapped to [`TASK_TICKET_KEY`] and [`TASK_TITLE_KEY`].
+    /// The create request of the task the script asked for (R3): the
+    /// workflow it named (or the default one), the queue's repositories of
+    /// that workflow's workspaces with the script's choices over them, this
+    /// effect's backend and profile, a random task id, as inputs the data
+    /// fields the mapping names, and as ticket and title the fields mapped
+    /// to [`TASK_TICKET_KEY`] and [`TASK_TITLE_KEY`].
     ///
-    /// The data must be a JSON object (or absent) holding no field the
-    /// mapping does not name: the script cannot smuggle in inputs. A mapped
-    /// field missing from the data is left out of the inputs. A ticket or
-    /// title must be text; the task create checks its form.
-    pub fn task_request(&self, data: &serde_json::Value) -> Result<CreateTaskRequest> {
+    /// The workflow must be one the queue allows. The data must be a JSON
+    /// object (or absent) holding no field the mapping does not name: the
+    /// script cannot smuggle in inputs. A mapped field missing from the data
+    /// is left out of the inputs. A ticket or title must be text; the task
+    /// create checks its form, and the workspaces against the workflow.
+    pub fn task_request(&self, request: &ObserverCreateTaskRequest) -> Result<CreateTaskRequest> {
+        let (workflow_id, workflow) = self.chosen_workflow(request.workflow_id.as_deref())?;
+        let mut workspaces: BTreeMap<String, WorkspaceRequest> = self
+            .workspaces
+            .iter()
+            .filter(|(name, _)| workflow.workspaces.contains(*name))
+            .map(|(name, choice)| (name.clone(), choice.clone()))
+            .collect();
+        workspaces.extend(request.workspaces.clone());
         let empty = serde_json::Map::new();
-        let fields = match data {
+        let fields = match &request.data {
             serde_json::Value::Null => &empty,
             serde_json::Value::Object(fields) => fields,
             _ => {
@@ -454,10 +474,10 @@ impl CreateTaskEffect {
             task_id: None,
             backend_id: self.backend_id.clone(),
             launch: LaunchRequest {
-                workflow_id: self.workflow_id.clone(),
-                workflow_version: self.workflow_version,
+                workflow_id: workflow_id.to_string(),
+                workflow_version: workflow.version,
                 inputs: serde_json::Value::Object(inputs),
-                workspaces: self.workspaces.clone(),
+                workspaces,
                 profile: self.profile.clone(),
                 harness: None,
                 resources: None,
@@ -465,6 +485,34 @@ impl CreateTaskEffect {
                 title,
             },
         })
+    }
+
+    /// The workflow `named` by the script, or the default one, if the queue
+    /// allows it.
+    fn chosen_workflow<'a>(
+        &'a self,
+        named: Option<&'a str>,
+    ) -> Result<(&'a str, &'a AllowedWorkflow)> {
+        let Some(id) = named.or(self.default_workflow.as_deref()) else {
+            return Err(ObserverError::invalid(
+                "effect workflow",
+                "the queue has no default workflow: name one of its `tasks.workflows`",
+            ));
+        };
+        let workflow = self.workflows.get(id).ok_or_else(|| {
+            ObserverError::invalid(
+                "effect workflow",
+                format!(
+                    "workflow '{id}' is not allowed by the queue: use one of {}",
+                    self.workflows
+                        .keys()
+                        .map(|id| format!("'{id}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+        })?;
+        Ok((id, workflow))
     }
 
     /// The text of the data field mapped to the task field `task_key`, if
@@ -487,18 +535,25 @@ impl CreateTaskEffect {
         }
     }
 
-    /// Checks the effect against the workflow it names: same id and version,
-    /// and every mapped input declared by the workflow.
-    pub fn validate_against(&self, workflow: &WorkflowDefinition) -> Result<()> {
-        if workflow.id != self.workflow_id || workflow.version != self.workflow_version {
-            return Err(ObserverError::invalid(
-                "effect.workflow_id",
-                format!(
-                    "the effect names workflow '{}' version {}, but '{}' version {} was given",
-                    self.workflow_id, self.workflow_version, workflow.id, workflow.version
-                ),
-            ));
-        }
+    /// Lets the tasks run `workflow` at `version` once it declares every
+    /// mapped input.
+    pub fn allow_workflow(&mut self, workflow: &WorkflowDefinition, version: u32) -> Result<()> {
+        self.check_inputs_declared(workflow)?;
+        self.workflows.insert(
+            workflow.id.to_string(),
+            AllowedWorkflow {
+                version,
+                workspaces: workflow
+                    .repositories
+                    .iter()
+                    .map(|repository| repository.name.clone())
+                    .collect(),
+            },
+        );
+        Ok(())
+    }
+
+    fn check_inputs_declared(&self, workflow: &WorkflowDefinition) -> Result<()> {
         let declared: BTreeSet<&str> = workflow
             .inputs
             .iter()
@@ -517,7 +572,7 @@ impl CreateTaskEffect {
                 "effect.mapping",
                 format!(
                     "workflow '{}' has no input {}",
-                    self.workflow_id,
+                    workflow.id,
                     unknown
                         .iter()
                         .map(|input| format!("'{input}'"))
@@ -1131,10 +1186,17 @@ mod tests {
         assert_eq!(first.len(), 64);
     }
 
+    fn allowed(workspaces: &[&str]) -> AllowedWorkflow {
+        AllowedWorkflow {
+            version: 1,
+            workspaces: workspaces.iter().map(|name| name.to_string()).collect(),
+        }
+    }
+
     fn effect_mapping(mapping: &[(&str, &str)]) -> CreateTaskEffect {
         CreateTaskEffect {
-            workflow_id: "triage".into(),
-            workflow_version: 1,
+            default_workflow: Some("triage".into()),
+            workflows: BTreeMap::from([("triage".to_string(), allowed(&[]))]),
             workspaces: BTreeMap::new(),
             backend_id: None,
             profile: None,
@@ -1142,6 +1204,20 @@ mod tests {
                 .iter()
                 .map(|(key, field)| (key.to_string(), field.to_string()))
                 .collect(),
+        }
+    }
+
+    fn data_request(data: serde_json::Value) -> ObserverCreateTaskRequest {
+        ObserverCreateTaskRequest {
+            data,
+            ..Default::default()
+        }
+    }
+
+    fn repository(id: &str) -> WorkspaceRequest {
+        WorkspaceRequest {
+            repository: Some(id.into()),
+            ..Default::default()
         }
     }
 
@@ -1154,7 +1230,7 @@ mod tests {
         ]);
         let data = serde_json::json!({"key": "WRUW-7", "summary": "Fix login", "text": "body"});
 
-        let launch = effect.task_request(&data).unwrap().launch;
+        let launch = effect.task_request(&data_request(data)).unwrap().launch;
 
         assert_eq!(launch.ticket.as_deref(), Some("WRUW-7"));
         assert_eq!(launch.title.as_deref(), Some("Fix login"));
@@ -1165,7 +1241,55 @@ mod tests {
     fn a_task_field_mapping_refuses_unknown_fields_and_non_text_values() {
         assert!(effect_mapping(&[("task.owner", "key")]).validate().is_err());
         let effect = effect_mapping(&[(TASK_TICKET_KEY, "key")]);
-        assert!(effect.task_request(&serde_json::json!({"key": 7})).is_err());
+        let request = data_request(serde_json::json!({"key": 7}));
+        assert!(effect.task_request(&request).is_err());
+    }
+
+    #[test]
+    fn a_script_runs_an_allowed_workflow_with_the_queue_workspaces_it_declares() {
+        let mut effect = effect_mapping(&[]);
+        effect.default_workflow = None;
+        effect.workflows = BTreeMap::from([
+            ("bugfix".to_string(), allowed(&["code", "knowledge-base"])),
+            ("monorepo".to_string(), allowed(&["code"])),
+        ]);
+        effect.workspaces = BTreeMap::from([("knowledge-base".to_string(), repository("docs"))]);
+        let request = |workflow: &str| ObserverCreateTaskRequest {
+            workflow_id: Some(workflow.into()),
+            workspaces: BTreeMap::from([("code".to_string(), repository("api"))]),
+            ..Default::default()
+        };
+
+        let bugfix = effect.task_request(&request("bugfix")).unwrap().launch;
+        let monorepo = effect.task_request(&request("monorepo")).unwrap().launch;
+
+        assert_eq!(bugfix.workflow_id, "bugfix");
+        assert_eq!(
+            bugfix.workspaces,
+            BTreeMap::from([
+                ("code".to_string(), repository("api")),
+                ("knowledge-base".to_string(), repository("docs")),
+            ])
+        );
+        assert_eq!(
+            monorepo.workspaces,
+            BTreeMap::from([("code".to_string(), repository("api"))])
+        );
+    }
+
+    #[test]
+    fn a_script_may_not_run_a_workflow_the_queue_does_not_allow_or_none_without_a_default() {
+        let mut effect = effect_mapping(&[]);
+        let other = ObserverCreateTaskRequest {
+            workflow_id: Some("other".into()),
+            ..Default::default()
+        };
+        assert!(effect.task_request(&other).is_err());
+
+        effect.default_workflow = None;
+        assert!(effect
+            .task_request(&data_request(serde_json::Value::Null))
+            .is_err());
     }
 
     #[test]

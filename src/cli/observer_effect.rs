@@ -9,8 +9,8 @@
 //!
 //! ```text
 //!                          NARSOR_OBSERVER_RUN set          not set
-//! task create --data       effect route                     usage error
-//! task create WORKFLOW …   usage error (the record decides)  the owner's create
+//! task create [WORKFLOW] [--repository W=ID] [--branch W=B] --data
+//!                          effect route                     the owner's create
 //! task decide              effect route                     usage error
 //! ```
 //!
@@ -35,7 +35,7 @@ use serde_json::{Map, Value};
 
 use super::commands::{CliError, Result};
 use super::queue_text::effect_output;
-use super::remote::{failure, split_pair, TaskCommand};
+use super::remote::{failure, parse_workspaces, split_pair, TaskCommand};
 use crate::api::{ApiClient, ClientError, ServerTarget, TokenSource};
 use crate::controller_protocol::{
     ObserverCreateTaskRequest, ObserverDecideRequest, ObserverEffectResponse,
@@ -104,12 +104,9 @@ pub fn effect_call(
             Some(_),
         ) => {
             let chosen: Vec<&str> = [
-                (workflow.is_some(), "WORKFLOW"),
                 (file.is_some(), "--file"),
                 (workflow_version.is_some(), "--workflow-version"),
                 (!inputs.is_empty(), "--input"),
-                (!repositories.is_empty(), "--repository"),
-                (!branches.is_empty(), "--branch"),
                 (!commits.is_empty(), "--commit"),
                 (backend.is_some(), "--backend"),
                 (profile.is_some(), "--profile"),
@@ -121,14 +118,16 @@ pub fn effect_call(
             .collect();
             if !chosen.is_empty() {
                 return Err(CliError::usage(format!(
-                    "In an observer's script, task create takes only --data: the \
-                     observer's record decides the workflow, repositories, backend and profile \
-                     (refused: {})",
+                    "In an observer's script, task create takes only WORKFLOW, --repository, \
+                     --branch and --data: the queue decides the backend and profile, and \
+                     its mapping the inputs (refused: {})",
                     chosen.join(", ")
                 )));
             }
             Ok(Some(EffectCall::CreateTask(ObserverCreateTaskRequest {
                 data: parse_data(data.as_deref())?,
+                workflow_id: workflow.clone(),
+                workspaces: parse_workspaces(repositories, branches, &[])?,
             })))
         }
         _ => Ok(None),

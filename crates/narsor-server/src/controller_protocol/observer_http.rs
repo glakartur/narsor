@@ -615,11 +615,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_create_request_naming_a_workflow_or_backend_is_a_coded_400() {
+    async fn a_create_request_naming_a_backend_or_inputs_is_a_coded_400() {
         let fx = Fixture::new();
         let run = fx.effect_run();
 
-        for field in ["workflow_id", "backend_id", "inputs"] {
+        for field in ["backend_id", "inputs"] {
             let mut body = effect();
             body[field] = json!("other");
             let refused = fx
@@ -929,7 +929,7 @@ mod tests {
         assert_eq!(shown.status(), StatusCode::OK);
         let shown = json_body(shown).await;
         assert_eq!(shown["automations"][0]["scripts"], json!(["check"]));
-        assert_eq!(shown["workflow_id"], "triage");
+        assert_eq!(shown["workflow_id"], "triage (default)");
 
         // R22: the routes that managed stored observers are gone.
         for (method, uri) in [
