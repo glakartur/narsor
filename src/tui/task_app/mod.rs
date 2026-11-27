@@ -101,6 +101,7 @@ pub mod history;
 pub mod layout;
 pub mod limit;
 pub mod list;
+pub mod mouse;
 pub mod new_task;
 pub mod notify;
 pub mod panel;
@@ -561,6 +562,10 @@ pub struct TaskApp {
     problems: ProblemLog,
     /// Where `D` writes the problem log: the system's temporary directory.
     dump_dir: std::path::PathBuf,
+    /// Whether the operator wants the terminal to report the mouse: on at
+    /// start, `P` switches it. The loop tells the terminal.
+    mouse_captured: bool,
+    panels: mouse::Panels,
 }
 
 /// What a read of the list must tell after work was sent to a task without a
@@ -633,6 +638,8 @@ impl TaskApp {
             next_usage_at: Instant::now(),
             problems,
             dump_dir: std::env::temp_dir(),
+            mouse_captured: true,
+            panels: mouse::Panels::default(),
         }
     }
 
@@ -720,6 +727,10 @@ impl TaskApp {
     /// Whether the interface should be left.
     pub fn should_quit(&self) -> bool {
         self.quit
+    }
+
+    pub fn mouse_captured(&self) -> bool {
+        self.mouse_captured
     }
 
     /// Whether the `?` help is open.
@@ -928,6 +939,12 @@ impl TaskApp {
             self.start_dump();
             return Request::None;
         }
+        if keymap::lookup(Context::Global, &key) == Some(Action::ToggleMouse)
+            && !self.accepts_text()
+        {
+            self.toggle_mouse();
+            return Request::None;
+        }
         if matches!(self.view, View::Tasks) && self.focus == Focus::List && self.list.is_filtering()
         {
             self.on_filter_key(key);
@@ -1070,6 +1087,17 @@ impl TaskApp {
             }
         }
         Request::None
+    }
+
+    /// `P`: the mouse on or off. Off, a plain drag selects text again.
+    fn toggle_mouse(&mut self) {
+        self.mouse_captured = !self.mouse_captured;
+        let text = if self.mouse_captured {
+            "mysz włączona: kółko i kliknięcie działają (P wyłącza)"
+        } else {
+            "mysz wyłączona: przeciąganie zaznacza tekst (P włącza)"
+        };
+        self.notify(Severity::Success, text);
     }
 
     fn on_filter_key(&mut self, key: KeyEvent) {

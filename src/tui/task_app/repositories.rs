@@ -28,7 +28,9 @@ use ratatui::Frame;
 use crate::api::ClientError;
 use crate::controller_protocol::{CreateRepositoryRequest, RepositoryListResponse, RepositoryView};
 
-use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
+use super::super::chooser::{
+    self, Chooser, ChooserAction, ChooserField, ChooserItem, ListMouse, Submission,
+};
 use super::super::keymap::{self, Action, Context};
 use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
@@ -347,6 +349,17 @@ impl TaskApp {
         {
             self.sync_repository_draft();
         }
+    }
+
+    pub(super) fn on_repositories_mouse(&mut self, mouse: ListMouse, column: u16, row: u16) {
+        let View::Repositories(repositories) = &mut self.view else {
+            return;
+        };
+        let chooser = match repositories.adding.as_mut() {
+            Some(form) => form,
+            None => &mut repositories.chooser,
+        };
+        chooser.on_mouse(mouse, column, row);
     }
 
     fn on_repositories_list_key(&mut self, key: KeyEvent) -> Request {

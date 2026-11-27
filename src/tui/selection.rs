@@ -35,7 +35,7 @@
 //! Transcripts and *Zdarzenia* share only the left bar ([`bar_prefix`]),
 //! without rules (R15, R16).
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
@@ -114,7 +114,7 @@ pub fn render_bracketed_list(
     selected: Option<usize>,
     focused: bool,
     top: &mut usize,
-) {
+) -> DrawnItems {
     let list = List {
         items,
         selected,
@@ -127,7 +127,7 @@ pub fn render_bracketed_list(
         list,
         top,
         SelectionDecoration::Bracketed,
-    );
+    )
 }
 
 /// Draws `items` like [`render_bracketed_list`], with the same bar and rules
@@ -141,7 +141,7 @@ pub fn render_bracketed_list_plain(
     selected: Option<usize>,
     focused: bool,
     top: &mut usize,
-) {
+) -> DrawnItems {
     let list = List {
         items,
         selected,
@@ -154,7 +154,7 @@ pub fn render_bracketed_list_plain(
         list,
         top,
         SelectionDecoration::BracketedPlain,
-    );
+    )
 }
 
 /// Draws `items` one under another with only a left bar beside `selected`.
@@ -168,13 +168,55 @@ pub fn render_barred_list(
     selected: Option<usize>,
     focused: bool,
     top: &mut usize,
-) {
+) -> DrawnItems {
     let list = List {
         items,
         selected,
         focused,
     };
-    render_list(frame, area, styles, list, top, SelectionDecoration::Barred);
+    render_list(frame, area, styles, list, top, SelectionDecoration::Barred)
+}
+
+/// Where the items of a list were drawn: the screen rows each item took,
+/// without the rules around the selected one. What a click on a row reaches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DrawnItems {
+    items: Vec<(usize, Rect)>,
+}
+
+impl DrawnItems {
+    /// One row per item, from the top of `area`, for items `first..` that a
+    /// list drew without this module: `count` of them.
+    pub fn one_row_each(area: Rect, first: usize, count: usize) -> Self {
+        let mut drawn = Self::default();
+        let rows = count.min(usize::from(area.height));
+        for row in 0..rows {
+            drawn.push(first + row, area, row, 1);
+        }
+        drawn
+    }
+
+    /// The index of the item drawn at `column`, `row` of the screen; `None`
+    /// on a rule, below the last item or outside the list.
+    pub fn item_at(&self, column: u16, row: u16) -> Option<usize> {
+        let point = Position::new(column, row);
+        self.items
+            .iter()
+            .find(|(_, rows)| rows.contains(point))
+            .map(|&(index, _)| index)
+    }
+
+    fn push(&mut self, index: usize, area: Rect, first: usize, height: usize) {
+        if height == 0 {
+            return;
+        }
+        let y = area
+            .y
+            .saturating_add(u16::try_from(first).unwrap_or(u16::MAX));
+        let height = u16::try_from(height).unwrap_or(u16::MAX);
+        self.items
+            .push((index, Rect::new(area.x, y, area.width, height)));
+    }
 }
 
 /// What a list shows: its items, the selected one, and whether it has focus.
@@ -198,7 +240,7 @@ fn render_list(
     list: List<'_>,
     top: &mut usize,
     decoration: SelectionDecoration,
-) {
+) -> DrawnItems {
     let List {
         items,
         selected,
@@ -209,9 +251,10 @@ fn render_list(
     let heights: Vec<usize> = items.iter().map(Vec::len).collect();
     keep_in_view(top, selected, &heights, height, decoration);
     if area.width == 0 || area.height == 0 || items.is_empty() {
-        return;
+        return DrawnItems::default();
     }
     let marks = styles.selection_marks(focused);
+    let mut drawn = DrawnItems::default();
 
     if let Some(index) = selected {
         let rules = if decoration.has_rules() { 2 } else { 0 };
@@ -223,7 +266,8 @@ fn render_list(
                 };
                 draw_line(frame, area, row, styles, line, mark, decoration);
             }
-            return;
+            drawn.push(index, area, 0, height.min(heights[index]));
+            return drawn;
         }
     }
 
@@ -237,6 +281,7 @@ fn render_list(
             draw_rule(frame, area, row, marks.rule, marks.style);
             row += 1;
         }
+        let first = row;
         for line in item {
             if row >= height {
                 break;
@@ -248,11 +293,13 @@ fn render_list(
             draw_line(frame, area, row, styles, line, mark, decoration);
             row += 1;
         }
+        drawn.push(index, area, first, row - first);
         if is_selected && decoration.has_rules() && row < height {
             draw_rule(frame, area, row, marks.rule, marks.style);
             row += 1;
         }
     }
+    drawn
 }
 
 /// Moves `top` as little as it takes for the selected item and the rules

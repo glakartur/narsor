@@ -47,7 +47,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::chooser::{self, Chooser, ChooserAction, ChooserItem};
+use super::chooser::{self, Chooser, ChooserAction, ChooserItem, ListMouse};
 use super::keymap::{self, Action, Context};
 use super::scroll::{one_line, sanitize};
 use super::style::{Role, Styles};
@@ -357,6 +357,21 @@ impl SteppedForm {
             (Some(leaf), Stage::Fields) => leaf.fields.paste(pasted),
             _ => false,
         }
+    }
+
+    /// Folds a mouse event into the list of the choice step, as the last
+    /// frame drew it; past the choice the list is not drawn and nothing
+    /// happens. A move the operator made re-arms the choice, as an arrow
+    /// does. Never chooses. Returns whether the event reached the list.
+    pub fn on_choice_mouse(&mut self, mouse: ListMouse, column: u16, row: u16) -> bool {
+        if self.stage != Stage::Choice {
+            return false;
+        }
+        let reached = self.level_mut().chooser.on_mouse(mouse, column, row);
+        if reached {
+            self.disarmed = false;
+        }
+        reached
     }
 
     /// Chooses entry `index` of the level open now, as `Enter` on it does:

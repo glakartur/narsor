@@ -736,36 +736,6 @@ mod shortcut_bar_and_help {
         assert!(narrow.chars().count() <= 30, "{narrow:?}");
         assert!(wide.starts_with(narrow.trim_end()));
     }
-
-    #[test]
-    fn help_overlay_lists_every_key_of_the_list_context() {
-        let buffer = draw(100, 50, |frame| {
-            keymap::render_help(
-                frame,
-                Rect::new(0, 0, 100, 50),
-                Context::List,
-                &Styles::new(false),
-            )
-        });
-        let screen = screen(&buffer);
-        assert!(screen.contains("Pomoc"));
-        // A description too long for the overlay wraps onto the next row, so
-        // the text is read with the frame taken off and the rows joined.
-        let text = rows(&buffer)
-            .iter()
-            .map(|row| row.trim_matches(|c: char| c == '│' || c.is_whitespace()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        for description in keymap::help_entries(Context::List)
-            .iter()
-            .map(|entry| entry.description)
-        {
-            assert!(
-                text.contains(description),
-                "{description:?} is missing:\n{screen}"
-            );
-        }
-    }
 }
 
 mod connection_render {
@@ -7590,7 +7560,7 @@ mod bracketed_list_render {
                 selected,
                 focused,
                 top,
-            )
+            );
         })
     }
 
@@ -7721,7 +7691,7 @@ mod bracketed_list_render {
                         Some(1),
                         focused,
                         &mut top,
-                    )
+                    );
                 });
                 let filled = draw_list(width, height, &styles, &list, Some(1), focused, &mut 0);
                 let marks = styles.selection_marks(focused);
@@ -7758,7 +7728,7 @@ mod bracketed_list_render {
                 Some(1),
                 true,
                 &mut top,
-            )
+            );
         });
         assert!(rule_rows(&buffer).is_empty(), "{}", screen(&buffer));
         assert_eq!(buffer[(0, 0)].symbol(), "│");

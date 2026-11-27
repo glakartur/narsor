@@ -450,6 +450,21 @@ impl Attempts {
     }
 }
 
+/// A click at `column`, `row` on a reader the last frame drew into `window`:
+/// the entry drawn on that row gets the cursor, as the line keys give it.
+/// Returns whether an entry was drawn there; outside the window, or with no
+/// window drawn, nothing changes.
+pub fn select_drawn(
+    transcript: &mut TranscriptState,
+    window: Option<Rect>,
+    column: u16,
+    row: u16,
+) -> bool {
+    window
+        .filter(|area| area.contains(ratatui::layout::Position::new(column, row)))
+        .is_some_and(|area| transcript.select_row(usize::from(row - area.y)))
+}
+
 /// What a key does to a transcript reader — the same in every tab that has
 /// one: the entry cursor, expanding, the raw view.
 pub fn transcript_action(transcript: &mut TranscriptState, action: Action) {
@@ -504,6 +519,7 @@ pub struct Conversation {
     /// Some attempt was last read from the task's record: when the newest
     /// such record was written.
     record: Option<Option<DateTime<Utc>>>,
+    window: Option<Rect>,
 }
 
 impl Conversation {
@@ -520,6 +536,7 @@ impl Conversation {
             loading: false,
             failure: None,
             record: None,
+            window: None,
         }
     }
 
@@ -579,6 +596,25 @@ impl Conversation {
         if !self.transcript().is_following_end() {
             self.follow = false;
         }
+    }
+
+    /// The wheel: the selected step's reader `lines` lines along. Like a
+    /// page key, it ends the following.
+    pub fn scroll_by(&mut self, lines: isize) {
+        self.transcript_mut().scroll_by(lines);
+        self.follow = false;
+    }
+
+    /// A click at `column`, `row`: the entry drawn there gets the cursor, as
+    /// the line keys give it, and the following ends. Returns whether an
+    /// entry was drawn there.
+    pub fn click(&mut self, column: u16, row: u16) -> bool {
+        let window = self.window;
+        let picked = select_drawn(self.transcript_mut(), window, column, row);
+        if picked {
+            self.follow = false;
+        }
+        picked
     }
 
     /// Whether the conversation was put together at least once.
@@ -1450,6 +1486,7 @@ pub fn render(
         styles,
     );
     let body = render_notes(frame, area, notes);
+    conversation.window = None;
     if conversation.transcript().entries().is_empty() {
         let text = if conversation.is_loading() {
             format!("{glyph} wczytuję rozmowę kroku…")
@@ -1490,6 +1527,7 @@ pub fn render(
     } else {
         body
     };
+    conversation.window = Some(transcript_area);
     render_conversation(
         frame,
         ConversationWindow::new(transcript_area),

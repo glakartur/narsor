@@ -34,7 +34,7 @@ use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 use narsor_protocol::controller::TaskGateAutomationView;
 
 use super::super::super::scroll::one_line;
-use super::super::super::selection::{render_bracketed_list_plain, PREFIX_WIDTH};
+use super::super::super::selection::{render_bracketed_list_plain, DrawnItems, PREFIX_WIDTH};
 use super::super::detail::{cells as width_of, fit_cells, fit_step_name, position_icon, step_name};
 use super::super::layout::first_row;
 use super::super::StepFocus;
@@ -122,6 +122,7 @@ pub struct Progress {
     paused: bool,
     /// The first step in view on the axis, kept between frames.
     top: usize,
+    drawn: Drawn,
     /// The conversation of every entry into a step that was put together,
     /// by `(state, visit)`.
     step_views: BTreeMap<(String, u32), StepView>,
@@ -139,6 +140,7 @@ impl Default for Progress {
             follow: true,
             paused: false,
             top: 0,
+            drawn: Drawn::default(),
             step_views: BTreeMap::new(),
             built_for: None,
         }
@@ -386,6 +388,36 @@ impl Progress {
             .position(|position| position.label == label)
     }
 
+    pub fn spot_at(&self, column: u16, row: u16) -> Option<Spot> {
+        let point = ratatui::layout::Position::new(column, row);
+        if self.drawn.axis.is_some_and(|axis| axis.contains(point)) {
+            return Some(Spot::Axis(self.drawn.axis_rows.item_at(column, row)));
+        }
+        self.drawn
+            .step
+            .is_some_and(|step| step.contains(point))
+            .then_some(Spot::Step)
+    }
+
+    pub fn select(&mut self, index: usize) {
+        if index < self.positions().len() {
+            self.select_index(index);
+        }
+    }
+
+    pub fn scroll_step(&mut self, lines: isize) {
+        if let Some(view) = self.step_view_mut() {
+            view.transcript_mut().scroll_by(lines);
+        }
+    }
+
+    pub fn click_step_entry(&mut self, column: u16, row: u16) {
+        let window = self.drawn.transcript;
+        if let Some(view) = self.step_view_mut() {
+            conversation::select_drawn(view.transcript_mut(), window, column, row);
+        }
+    }
+
     fn select_index(&mut self, index: usize) {
         let label = self.positions()[index].label.clone();
         if self.selected.as_deref() != Some(label.as_str()) {
@@ -393,6 +425,20 @@ impl Progress {
             self.selected = Some(label);
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct Drawn {
+    axis: Option<Rect>,
+    axis_rows: DrawnItems,
+    step: Option<Rect>,
+    transcript: Option<Rect>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spot {
+    Axis(Option<usize>),
+    Step,
 }
 
 /// The glyph and the role of a step's status: the shape of the glyph says it
@@ -806,6 +852,7 @@ pub fn render(
 ) {
     let axis_focused = keys == Some(StepFocus::Axis);
     let conversation_focused = keys == Some(StepFocus::Conversation);
+    progress.drawn = Drawn::default();
     let mut top_rows = 0;
     if let Some(failure) = progress.failure() {
         frame.render_widget(
@@ -856,7 +903,8 @@ pub fn render(
 
     let items = layout.rows;
     let selected = progress.selected_index();
-    render_bracketed_list_plain(
+    progress.drawn.axis = Some(axis);
+    progress.drawn.axis_rows = render_bracketed_list_plain(
         frame,
         axis,
         styles,
@@ -868,6 +916,7 @@ pub fn render(
     if content.width < 8 {
         return;
     }
+    progress.drawn.step = Some(content);
     render_step(
         frame,
         content,
@@ -956,7 +1005,10 @@ fn render_step(
         position.action_execution_id.as_deref(),
     ) {
         (ConversationState::Recorded, Some(_)) => match progress.step_view_mut() {
-            Some(view) => render_step_view(frame, body, styles, view, stale, focused, glyph),
+            Some(view) => {
+                let window = render_step_view(frame, body, styles, view, stale, focused, glyph);
+                progress.drawn.transcript = window;
+            }
             None => message(frame, format!("{glyph} wczytuję rozmowę kroku…")),
         },
         (ConversationState::Recorded, None) | (ConversationState::NoRecord, _) => {
@@ -970,6 +1022,7 @@ fn render_step(
 
 /// The step's conversation: the badge of a record and a failed read on the
 /// fixed lines at the top, then the conversation in the window that is left.
+/// Returns that window when the conversation was drawn into it.
 fn render_step_view(
     frame: &mut Frame,
     area: Rect,
@@ -978,7 +1031,7 @@ fn render_step_view(
     stale: bool,
     focused: bool,
     glyph: &str,
-) {
+) -> Option<Rect> {
     let failure = view.failure.as_ref().map(|failure| failure.note(None));
     let notes = conversation::notes(view.record, failure, chrono::Utc::now(), area.width, styles);
     let body = conversation::render_notes(frame, area, notes);
@@ -986,19 +1039,19 @@ fn render_step_view(
         let text = if view.loading {
             format!("{glyph} wczytuję rozmowę kroku…")
         } else if view.failure.is_some() {
-            return;
+            return None;
         } else if view.no_record {
             "brak zapisanej rozmowy tego kroku".to_string()
         } else if view.record.is_some() {
             "brak zapisanej rozmowy".to_string()
         } else {
-            return;
+            return None;
         };
         frame.render_widget(
             Paragraph::new(Line::styled(text, styles.of(Role::Done))),
             body,
         );
-        return;
+        return None;
     }
     conversation::render_conversation(
         frame,
@@ -1008,6 +1061,7 @@ fn render_step_view(
         stale,
         focused,
     );
+    Some(body)
 }
 
 #[cfg(test)]

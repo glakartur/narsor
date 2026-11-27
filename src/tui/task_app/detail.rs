@@ -80,6 +80,7 @@ use super::super::style::{PanelEdge, Role, Styles};
 use super::actions::{self, ActionPanel};
 use super::background::{DetailJob, JobKey, Outcome};
 use super::list::{describe_loss, state_icon, title_of, StateIcon};
+use super::mouse::Panel;
 use super::notify::Severity;
 use super::panel::WaitingPanel;
 use super::problems::{self, Problem};
@@ -89,10 +90,14 @@ use super::tabs::conversation::{
 };
 use super::tabs::events::{self, Events};
 use super::tabs::info::{self, DriftOutcome, Info};
-use super::tabs::progress::{self, AxisRows, Progress, StepView};
+use super::tabs::progress::{self, AxisRows, Progress, Spot, StepView};
 use super::tabs::state::{self as state_tab, State};
 use super::workspace_rows::{self, Part, Piece};
 use super::{failure_reason, DetailTab, DetailView, StepFocus, TaskApp};
+
+/// How many lines one notch of the wheel moves a text window: a few, so the
+/// eye keeps its place.
+pub const WHEEL_LINES: usize = 3;
 
 /// Everything the details of one task remember.
 #[derive(Debug, Clone)]
@@ -220,6 +225,50 @@ impl TaskDetail {
             DetailTab::Info => self.info.on_action(action),
             DetailTab::Conductor => self.conductor.on_action(action),
             DetailTab::State => self.state.on_action(action),
+        }
+    }
+
+    /// A notch of the wheel over the content of `tab`, at `column`, `row`:
+    /// `by` is 1 down, -1 up. The text under the pointer moves
+    /// [`WHEEL_LINES`] lines, as far as its line keys take it; the
+    /// conversations move by lines rather than by entries, as their page
+    /// keys do, so a long entry does not jump past. On *Przebieg* a notch
+    /// over the axis moves the selection one step, as `j` and `k` move it,
+    /// and a notch over the step's conversation scrolls it without entering
+    /// it.
+    pub fn on_wheel(&mut self, tab: DetailTab, by: isize, column: u16, row: u16) {
+        let lines = by.saturating_mul(WHEEL_LINES as isize);
+        let line_key = if by > 0 { Action::Down } else { Action::Up };
+        match tab {
+            DetailTab::Conversation => self.conversation.scroll_by(lines),
+            DetailTab::Conductor => self.conductor.scroll_by(lines),
+            DetailTab::Events if self.events.detail_at(column, row) => {
+                self.events.scroll_detail(lines)
+            }
+            DetailTab::Events | DetailTab::State | DetailTab::Info => {
+                for _ in 0..WHEEL_LINES {
+                    self.on_action(tab, StepFocus::Axis, line_key);
+                }
+            }
+            DetailTab::Progress => match self.progress.spot_at(column, row) {
+                Some(Spot::Axis(_)) => self.progress.step(by),
+                Some(Spot::Step) => self.progress.scroll_step(lines),
+                None => {}
+            },
+        }
+    }
+
+    /// A click on the content of `tab` at `column`, `row`: in a conversation
+    /// the entry drawn there gets the cursor, as the line keys give it. A
+    /// click on *Przebieg* moves the level of the focus, so the application
+    /// takes it.
+    pub fn on_click(&mut self, tab: DetailTab, column: u16, row: u16) {
+        match tab {
+            DetailTab::Conversation => {
+                self.conversation.click(column, row);
+            }
+            DetailTab::Conductor => self.conductor.click(column, row),
+            DetailTab::Progress | DetailTab::Events | DetailTab::State | DetailTab::Info => {}
         }
     }
 
@@ -1256,8 +1305,22 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         closed_run: false,
         axis_rows,
     };
-    render_view(frame, inner, view, styles, options, panel.as_deref_mut());
+    let in_details = panel.is_some();
+    let drawn = render_view(frame, inner, view, styles, options, panel.as_deref_mut());
     app.restore_action_panel(panel);
+    if let Some(content) = drawn.content {
+        app.panels_mut().record(Panel::Content, content);
+    }
+    if let Some(place) = drawn.panel {
+        // The action panel drawn in the details is the window over the
+        // screen, only drawn in another place.
+        let drawn_as = if in_details {
+            Panel::Overlay
+        } else {
+            Panel::Answer
+        };
+        app.panels_mut().record(drawn_as, place);
+    }
 }
 
 /// Where the keys are, as the details draw it.
@@ -1299,8 +1362,15 @@ pub(super) struct ViewOptions {
     pub(super) axis_rows: AxisRows,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ViewAreas {
+    pub(super) content: Option<Rect>,
+    pub(super) panel: Option<Rect>,
+}
+
 /// Draws `view` — the details of a task, or of an entry of the history —
-/// into `area`.
+/// into `area`. Returns where the tab's content and the panel under it
+/// went.
 pub(super) fn render_view(
     frame: &mut Frame,
     area: Rect,
@@ -1308,7 +1378,7 @@ pub(super) fn render_view(
     styles: &Styles,
     options: ViewOptions,
     actions: Option<&mut ActionPanel>,
-) {
+) -> ViewAreas {
     let ViewOptions {
         frame_focused,
         stale,
@@ -1405,7 +1475,7 @@ pub(super) fn render_view(
             )),
             message,
         );
-        return;
+        return ViewAreas::default();
     }
     let tabs_content = Rect::new(
         parts.tabs.x.saturating_add(2),
@@ -1470,7 +1540,10 @@ pub(super) fn render_view(
             )),
             content,
         );
-        return;
+        return ViewAreas {
+            content: Some(parts.content),
+            panel: None,
+        };
     }
 
     let unstarted = if closed_run && view.tab == DetailTab::Progress {
@@ -1599,6 +1672,10 @@ pub(super) fn render_view(
             keys == KeysAt::Panel,
             view.task.as_of,
         );
+    }
+    ViewAreas {
+        content: Some(parts.content),
+        panel: parts.panel,
     }
 }
 

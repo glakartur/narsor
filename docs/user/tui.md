@@ -383,7 +383,7 @@ the current step or a draft.
 
 | Where | Keys |
 |---|---|
-| Everywhere | `?` help, `q` quit (press `q` again to confirm, `Esc` to stay), `D` write the problem log to a file (not while you type in a field) |
+| Everywhere | `?` help, `q` quit (press `q` again to confirm, `Esc` to stay), `D` write the problem log to a file (not while you type in a field), `P` mouse on / off (not while you type in a field) |
 | List | `j` / `k` (`↓` / `↑`), `g` / `G`, `/` filter, `Space` next waiting, `Enter` details, `Ctrl+.` (or `.`) action panel, `n` `z` `H` `R` `O` (queues), `Tab` details, `Ctrl+↑` `Ctrl+↓` `m`, `o` `c` `r`, `h` default harness, `L` task limit |
 | Details | `[` / `]` tabs, `Tab` content ↔ panel, `Ctrl+.` (or `.`) action panel, `h` default harness, `L` task limit (the history's details: `[` / `]`, `Tab`, `h`); then by where the keys are: |
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step, `v` one row or full rows per step |
@@ -395,6 +395,45 @@ the current step or a draft.
 | Menu | `j` / `k`, `1`–`9`, `Enter`, `Esc` and the shortcuts above |
 | Confirmation | `y` confirm, `n` / `Esc` take it back |
 | Forms | `↓` / `↑` fields, `←` / `→` options or cursor, `Tab` the neighbouring panel, `Enter` send, `Ctrl+J` new line, `Esc` back (from a new-task field to the list, then close; what was typed stays) |
+
+**Mouse.** The mouse adds a way in; every action still has its key. While the
+TUI runs, the terminal reports the mouse buttons and the wheel (not pointer
+moves or drags).
+
+- **Wheel.** It acts on the panel under the pointer and does not move the
+  focus. Over a list (the tasks, the history, the steps on *Przebieg*, the
+  action panel and the other windows with a list, the answer panel, the
+  new-task form, *Repozytoria*, the queues) one notch moves the selection by
+  one item and stops at the first and the last one. Over text (*Rozmowa*, a
+  step's conversation, *Zdarzenia* and its event detail, *Dyrygent*, *Stan*,
+  *Info*) one notch scrolls three lines, with the same limits as the keys of
+  that window; in a conversation it stops following the end, as
+  `PgUp` / `PgDn` do.
+- **Left click.** It gives the panel under the pointer the focus. On a list
+  item it also selects the item, as `j` / `k` would: a clicked task opens its
+  details. On *Przebieg* a click on a step puts the keys on the steps and
+  selects that step; a click on the selected step's side goes into its
+  conversation, as `Enter` does, and selects the entry under the pointer
+  (when the step has no conversation yet, the keys stay on the steps). In
+  *Rozmowa* and *Dyrygent* a click selects the entry under the pointer. A click
+  on the answer panel gives it the keys and highlights the option under the
+  pointer. A click never runs, chooses or sends anything: `Enter` does that.
+  A click on the header, the shortcut bar, a frame or empty space changes only
+  the focus, or nothing.
+- **Windows.** While a window (the action panel, a list, a confirmation) or a
+  form that has the keys is open, only what is inside it reacts. While you type
+  the list filter, move a task (`m`), or have the help or the quit
+  confirmation open, the mouse does nothing. On the "terminal too small"
+  screen the mouse does nothing.
+- **Selecting text.** While the TUI has the mouse, most terminals still
+  select text with `Shift`+drag (`Option`+drag or `Fn`+drag on macOS). `P`
+  switches the mouse off, so a plain drag selects text, and `P` again switches
+  it back on. While the mouse is off the bar shows `mysz wył. [P]`, and the
+  help says which state is on. `P` is text while you type in a field, so it
+  does not switch the mouse there. The mouse is on every time the TUI starts.
+- **tmux.** Inside `tmux` the mouse reaches the TUI only with
+  `set -g mouse on`. A terminal that does not report the mouse leaves the keys,
+  which do everything the mouse does.
 
 Colour means something: yellow what needs you, red what is wrong or cannot be
 undone, green what happens now, grey what is done or unavailable, cyan focus.

@@ -45,6 +45,7 @@ use super::super::style::{Role, Styles};
 use super::detail::fit_cells;
 use super::harness::HarnessHeader;
 use super::list::{Counters, Slots, TaskList};
+use super::mouse::Panel;
 use super::{actions, detail, history, new_task, repositories, usage};
 use super::{Focus, TaskApp, View};
 
@@ -155,6 +156,8 @@ pub fn render_at(
     now_utc: DateTime<Utc>,
 ) {
     let areas = areas(frame.area(), app.focus());
+    // The mouse reaches only what this frame draws.
+    app.panels_mut().clear();
     if areas.screen == Screen::TooSmall {
         render_too_small(frame, areas.outer, styles);
         if app.form_confirming() {
@@ -176,6 +179,7 @@ pub fn render_at(
 
     let list_focused = app.keys_on_list();
     if let Some(list_area) = areas.list {
+        app.panels_mut().record(Panel::List, list_area);
         if let View::History(open) = &mut app.view {
             history::render_list(frame, list_area, open, styles, list_focused, stale);
         } else {
@@ -191,20 +195,27 @@ pub fn render_at(
     }
     app.unplace_action_panel();
     if let Some(detail_area) = areas.detail {
+        app.panels_mut().record(Panel::Details, detail_area);
         render_view(frame, detail_area, app, styles, stale);
     }
     render_bar(frame, areas.bar, app, styles, now, now_utc);
     let body = overlay_area(areas.outer);
-    actions::render(frame, body, app, styles);
+    if let Some(place) = actions::render(frame, body, app, styles) {
+        app.panels_mut().record(Panel::Overlay, place);
+    }
     if app.form_confirming() {
         crate::tui::form::confirm::render(frame, body, styles);
     }
     if app.is_help_open() {
-        if app.active_agent_transcript_mode() == Some(crate::tui::transcript::DisplayMode::Raw) {
-            keymap::render_raw_conversation_help(frame, body, app.key_context(), styles);
+        let entries = if app.active_agent_transcript_mode()
+            == Some(crate::tui::transcript::DisplayMode::Raw)
+        {
+            keymap::raw_conversation_help_entries(app.key_context())
         } else {
-            keymap::render_help(frame, body, app.key_context(), styles);
-        }
+            keymap::help_entries(app.key_context())
+        };
+        let entries = keymap::with_mouse_state(entries, app.mouse_captured());
+        keymap::render_help_entries(frame, body, entries, styles);
     }
 }
 
@@ -249,7 +260,9 @@ fn render_view(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles
                 glyph,
                 axis_rows,
             };
-            history::render_details(frame, area, open, styles, look);
+            if let Some(content) = history::render_details(frame, area, open, styles, look) {
+                app.panels.record(Panel::Content, content);
+            }
         }
         View::Repositories(open) => repositories::render(frame, area, open, styles, focused),
         View::Queues(open) => {
@@ -513,10 +526,32 @@ pub fn render_bar(
     }
 }
 
+/// What the bar says while the mouse is not reported, before what else is on
+/// its right: the operator switched it off and `P` gives it back.
+const MOUSE_OFF_MARK: &str = "mysz wył. [P] ";
+
 /// The right of the bar in at most `room` columns: the notification, cut
 /// with `…` when longer (a held one, which may end in a path, from the
-/// directory side), or else the usage limits.
+/// directory side), or else the usage limits; after the mouse-off mark when
+/// the mouse is off.
 fn bar_right(
+    app: &TaskApp,
+    styles: &Styles,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+    room: usize,
+) -> Line<'static> {
+    if app.mouse_captured() {
+        return bar_news(app, styles, now, now_utc, room);
+    }
+    let mark = Span::styled(MOUSE_OFF_MARK, styles.of(Role::Attention));
+    let rest = room.saturating_sub(mark.width());
+    let mut line = bar_news(app, styles, now, now_utc, rest);
+    line.spans.insert(0, mark);
+    line
+}
+
+fn bar_news(
     app: &TaskApp,
     styles: &Styles,
     now: Instant,

@@ -4,7 +4,7 @@ use super::entry::{
     DisplayMode, TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptPresentation,
 };
 use super::grouping::ExpansionIdentity;
-use super::line::{fragments, raw_display, TranscriptLine};
+use super::line::{fragments, raw_display, wrap_visible_lines, TranscriptLine};
 use crate::tui::scroll::ScrollState;
 
 /// The marker of an entry that hides part of its text: it unfolds.
@@ -360,6 +360,42 @@ impl TranscriptState {
         self.scroll.page_up(self.total_lines());
         self.following_end = false;
         self.select_at_scroll();
+    }
+
+    /// Moves the view `lines` lines down (up when negative), as far as the
+    /// page keys go. Like them it stops following the end and keeps the
+    /// cursor on an entry in view; the cursor does not jump a whole entry, so
+    /// a long entry can be read a few lines at a time.
+    pub fn scroll_by(&mut self, lines: isize) {
+        let offset = self.scroll.offset().saturating_add_signed(lines);
+        self.scroll.set_offset(offset, self.total_lines());
+        self.following_end = false;
+        self.select_at_scroll();
+    }
+
+    /// The entry drawn on `row` of the window, counted from its top, as the
+    /// last draw wrapped it; the gap under an entry belongs to that entry.
+    /// `None` below the last line or the window.
+    pub fn entry_at_row(&self, row: usize) -> Option<TranscriptEntryId> {
+        let lines = self.logical_lines();
+        let visible = wrap_visible_lines(
+            &lines,
+            self.width,
+            self.scroll.offset(),
+            self.scroll.viewport(),
+        );
+        visible.into_iter().nth(row).map(|line| line.entry_id)
+    }
+
+    /// Puts the cursor on the entry drawn on `row` of the window, as the line
+    /// keys put it on an entry: the following ends. Returns whether an entry
+    /// is drawn there.
+    pub fn select_row(&mut self, row: usize) -> bool {
+        let Some(entry) = self.entry_at_row(row) else {
+            return false;
+        };
+        self.select(entry);
+        true
     }
 
     pub fn to_top(&mut self) {

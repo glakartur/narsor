@@ -38,7 +38,7 @@ use crate::api::ClientError;
 use crate::controller_protocol::{TaskListResponse, TaskSummary, TimelineResponse};
 
 use super::super::keymap::{self, Action, Context, Stack};
-use super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
+use super::super::selection::{render_bracketed_list, DrawnItems, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
 use super::background::{DetailJob, JobKey, OpeningKind, Outcome};
 use super::detail::{
@@ -85,6 +85,7 @@ pub struct History {
     /// The first row of the list in view, kept between frames so that a new
     /// read does not scroll the list.
     top: usize,
+    drawn: DrawnItems,
 }
 
 impl History {
@@ -96,6 +97,7 @@ impl History {
             tab: DetailTab::Progress,
             details: BTreeMap::new(),
             top: 0,
+            drawn: DrawnItems::default(),
         };
         history.set_entries(archived);
         history
@@ -150,13 +152,13 @@ impl History {
         self.details.get(&key)
     }
 
-    fn step(&mut self, by: isize) {
+    pub(super) fn step(&mut self, by: isize) {
         self.select(self.selected.saturating_add_signed(by));
     }
 
     /// Selects the entry at `index` (the last one past the end). An entry
     /// whose last read failed reads again once it is selected anew.
-    fn select(&mut self, index: usize) {
+    pub(super) fn select(&mut self, index: usize) {
         let index = index.min(self.entries.len().saturating_sub(1));
         if index == self.selected {
             return;
@@ -169,10 +171,21 @@ impl History {
         }
     }
 
+    pub(super) fn index_at(&self, column: u16, row: u16) -> Option<usize> {
+        self.drawn.item_at(column, row)
+    }
+
     fn on_detail_action(&mut self, action: Action) {
         let tab = self.tab;
         if let Some(detail) = self.selected_detail_mut() {
             detail.on_action(tab, StepFocus::Axis, action);
+        }
+    }
+
+    pub(super) fn on_detail_wheel(&mut self, by: isize, column: u16, row: u16) {
+        let tab = self.tab;
+        if let Some(detail) = self.selected_detail_mut() {
+            detail.on_wheel(tab, by, column, row);
         }
     }
 
@@ -399,7 +412,7 @@ pub fn render_list(
         .map(|row| history_row_text(row, width, styles, stale))
         .collect();
     let selected = (!rows.is_empty()).then_some(history.selected);
-    render_bracketed_list(
+    history.drawn = render_bracketed_list(
         frame,
         inner,
         styles,
@@ -434,14 +447,15 @@ pub struct DetailsLook {
 }
 
 /// Draws the details of the selected entry into `area`: the header and the
-/// tabs of a task, with nothing to answer.
+/// tabs of a task, with nothing to answer. Returns where the tab's content
+/// went, when the tabs were drawn.
 pub fn render_details(
     frame: &mut Frame,
     area: Rect,
     history: &mut History,
     styles: &Styles,
     look: DetailsLook,
-) {
+) -> Option<Rect> {
     let DetailsLook {
         focused,
         stale,
@@ -464,7 +478,7 @@ pub fn render_details(
             )),
             inner,
         );
-        return;
+        return None;
     };
     let key = key_of(entry);
     let task = entry;
@@ -495,5 +509,5 @@ pub fn render_details(
         closed_run: true,
         axis_rows,
     };
-    render_view(frame, inner, view, styles, options, None);
+    render_view(frame, inner, view, styles, options, None).content
 }

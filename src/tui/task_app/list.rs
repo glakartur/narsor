@@ -60,7 +60,7 @@ use narsor_protocol::controller::{
 use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, UNSPECIFIED_LOSS};
 
 use super::super::scroll::one_line;
-use super::super::selection::{render_barred_list, PREFIX_WIDTH};
+use super::super::selection::{render_barred_list, DrawnItems, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
 use super::detail::{cells, cursor_icon, fit_cells, short_task_id, step_name};
 
@@ -569,6 +569,8 @@ pub struct TaskList {
     /// The first row in view, kept between frames so that a refresh does not
     /// scroll the list.
     top: usize,
+    drawn: DrawnItems,
+    drawn_ids: Vec<String>,
     /// A mark in the title while the list is read again, with the rows kept.
     title_mark: Option<&'static str>,
 }
@@ -591,6 +593,8 @@ impl TaskList {
             filter_original: None,
             moving: None,
             top: 0,
+            drawn: DrawnItems::default(),
+            drawn_ids: Vec::new(),
             title_mark: None,
         }
     }
@@ -959,6 +963,11 @@ impl TaskList {
             .saturating_add_signed(by)
             .min(shown.len().saturating_sub(1));
         self.selected = shown.get(target).cloned();
+    }
+
+    pub(super) fn id_at(&self, column: u16, row: u16) -> Option<&str> {
+        let index = self.drawn.item_at(column, row)?;
+        self.drawn_ids.get(index).map(String::as_str)
     }
 
     /// Cursor to the first row.
@@ -1427,7 +1436,7 @@ impl TaskList {
         let selected = rows
             .iter()
             .position(|(id, _)| self.selected.as_deref() == Some(id.as_str()));
-        render_barred_list(
+        self.drawn = render_barred_list(
             frame,
             inner,
             styles,
@@ -1436,6 +1445,7 @@ impl TaskList {
             focused,
             &mut self.top,
         );
+        self.drawn_ids = rows.into_iter().map(|(id, _)| id).collect();
     }
 }
 
