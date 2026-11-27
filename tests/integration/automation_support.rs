@@ -49,19 +49,12 @@ pub fn on_episodes_queue(root: &Path, queue: &str, automations: &[&str], schedul
     );
 }
 
-/// The `always` queue `queue` served by `automation`, on `schedule`. With
-/// `tasks` (a YAML block of the `tasks:` settings, indented by two), its
-/// scripts may create tasks.
-pub fn always_queue(root: &Path, queue: &str, automation: &str, schedule: &str, tasks: &str) {
-    let tasks = if tasks.is_empty() {
-        String::new()
-    } else {
-        format!("tasks:\n{tasks}")
-    };
+/// The `always` queue `queue` served by `automation`, on `schedule`.
+pub fn always_queue(root: &Path, queue: &str, automation: &str, schedule: &str) {
     write(
         root,
         &format!("queues/{queue}.yaml"),
-        &format!("automations: [{automation}]\nmode: always\nschedule: {schedule}\n{tasks}"),
+        &format!("automations: [{automation}]\nmode: always\nschedule: {schedule}\n"),
     );
 }
 

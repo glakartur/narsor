@@ -118,9 +118,6 @@ pub fn queue_show_output(view: &ObserverQueueView, now: DateTime<Utc>) -> String
         "Schedule: {}",
         schedule_text(view.interval_secs, view.cron.as_deref())
     ));
-    if let Some(workflow) = &view.workflow_id {
-        line(format!("Creates tasks of: {}", clean(workflow)));
-    }
     for problem in &view.problems {
         line(format!("Problem: {}", problem_line(problem)));
     }
@@ -166,7 +163,7 @@ fn automation_lines(automation: &QueueAutomationView, now: DateTime<Utc>) -> Vec
     if !automation.description.is_empty() {
         lines.push(format!("    {}", clean(&automation.description)));
     }
-    if matches!(automation.state.as_str(), "needs_attention" | "error") {
+    if automation.state == "error" {
         lines.push(
             "    stopped: it runs again when its queue file, automation.yaml or check script changes".to_string(),
         );
@@ -278,7 +275,7 @@ fn short_entry(entry_id: &str) -> String {
     clean(entry_id).chars().take(12).collect()
 }
 
-/// What `task create --data` and `task decide` print for the script's log:
+/// What `task create` and `task decide` of a script print for its log:
 /// the server's line, cleaned.
 pub fn effect_output(response: &ObserverEffectResponse) -> String {
     format!("{}\n", clean(&response.message))

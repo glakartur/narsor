@@ -418,35 +418,44 @@ commands then go to the effect routes of the run. Only a `check` run may
 use them; the server refuses them from an `in` or `out` run:
 
 ```sh
-narsor-cli task create --data "$JSON"
+narsor-cli task create WORKFLOW [--input NAME=VALUE]… [--repository WORKSPACE=ID]… [--ticket KEY] …
+printf '%s' "$JSON" | narsor-cli task create --stdin [options]
 narsor-cli task decide TASK_ID --episode EPISODE --choice CHOICE [--reason TEXT] [--var NAME=VALUE]… [--var-file NAME=PATH]…
-narsor-cli task decide TASK_ID --episode EPISODE --data '{"choice": …, "reason": …, "variables": {…}}'
+printf '%s' "$JSON" | narsor-cli task decide TASK_ID --episode EPISODE --stdin [options]
 ```
 
-- `task create --data JSON` creates a new task on each call. Narsor does not
-  remove duplicates: the script records in its state what it already
-  reported. The `tasks` of the queue file decide the workflow, repositories,
-  backend and profile: in a script, `WORKFLOW`, `--input`, `--backend`,
-  `--repository` and the other options of `task create` are a usage error.
-  The data is a JSON object of the fields the queue maps to workflow
-  inputs (`tasks.mapping`); Narsor refuses a field that is not in the map.
+- `task create` takes the same arguments as from the console and sends the
+  same request: the script chooses the workflow, the inputs, the
+  repositories, the ticket and the title itself. The task belongs to the
+  installation owner and records the queue, the automation and the run.
+  Without `--workflow-version` the task runs the catalogue's version.
+  `--file` is a usage error in a script. Each call creates a new task.
+  Narsor does not remove duplicates: the script records in its state what
+  it already reported.
 - `task decide TASK_ID --episode EPISODE` answers the gate of the queue
   entry of this run, as a person answers it. `TASK_ID` and `EPISODE` are
   the `task_id` and the `episode` of the entry. Give `--choice` with
-  `--reason`, `--var` and `--var-file`, or give `--data` with the whole
-  answer, never both. Narsor checks the answer as it checks the answer of a
+  `--reason`, `--var` and `--var-file`. Narsor checks the answer as it checks the answer of a
   person. The first answer of an episode wins; a later one, and an answer
   for an episode that ended, is refused. When the queue has `out` scripts,
   the answer reaches the task when they ended. The task history shows the
   automation, its run and the reason.
 
-Without `NARSOR_OBSERVER_RUN`, `task create --data` and `task decide` are
-usage errors (exit code `2`). In a script:
+`--stdin` of both commands reads one JSON object, shaped as the options:
+`{"workflow", "workflow_version", "inputs", "workspaces": {NAME:
+{"repository", "branch", "commit"}}, "ticket", "title", "backend",
+"profile", "harness", "task_id"}` for `task create`, `{"choice", "reason",
+"variables"}` for `task decide`. The options given as well override it: a value
+replaces the object's; an input, a workspace choice or a variable replaces
+the object's of the same name.
+
+Without `NARSOR_OBSERVER_RUN`, `task decide` is a usage error (exit code
+`2`) and `task create` creates the task for you. In a script:
 
 | Answer | Prints | Exit code |
 |---|---|---|
 | created, answered | the server's line | `0` |
-| the run's task limit is reached, the data is refused, the answer is refused (the episode ended, another answer came first, an invalid choice or variables), the run is not a `check` run, the token is not valid | the reason, on stderr | `1` |
+| the task create is refused, the answer is refused (the episode ended, another answer came first, an invalid choice or variables), the run is not a `check` run, the token is not valid | the reason, on stderr | `1` |
 | incorrect usage | the reason, on stderr | `2` |
 
 Text that came from a script or a source (answer reasons, stderr) is

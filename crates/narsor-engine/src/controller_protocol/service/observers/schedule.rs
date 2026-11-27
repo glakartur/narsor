@@ -24,7 +24,7 @@
 //!                   in its episode, ended or is gone
 //!                 a tick while a run is active or a     → skipped, not queued:
 //!                 round goes on                           next_run_at = the next tick
-//!                 needs_attention or error, and the     → active again, due at once
+//!                 error, and the                        → active again, due at once
 //!                 queue file, automation.yaml or check
 //!                 script changed
 //!                 run past its deadline                 → lost: error file, token spent
@@ -167,7 +167,7 @@ pub struct ObserverPass {
     pub created: Vec<AutomationKey>,
     /// Pairs whose record was deleted: no longer in the catalogue.
     pub removed: Vec<AutomationKey>,
-    /// Stopped pairs (`needs_attention`, `error`) back on their schedule
+    /// Stopped pairs (`error`) back on their schedule
     /// because their catalogue definition changed.
     pub restarted: Vec<AutomationKey>,
     /// Runs that passed their deadline without a result.
@@ -850,7 +850,7 @@ impl ProtocolService {
         Ok(())
     }
 
-    /// Puts a stopped pair (`needs_attention`, `error`) back on its
+    /// Puts a stopped pair (`error`) back on its
     /// schedule, due at once, when its catalogue definition (the queue
     /// file, `automation.yaml`, the `check` script) is no longer the one it
     /// stopped with: the catalogue author changed it.
@@ -1105,11 +1105,6 @@ impl ProtocolService {
             entry: entry.map(script_entry),
             exit,
             first_run: !record.first_run_done,
-            import_backlog: phase == HookPhase::Check
-                && queue
-                    .tasks
-                    .as_ref()
-                    .is_some_and(|tasks| tasks.import_backlog),
         };
         let deadline = after(now, timeout_secs + RUN_DEADLINE_MARGIN_SECS);
         record.last_claim_at = Some(now);
@@ -1121,7 +1116,6 @@ impl ProtocolService {
             claimed_at: now,
             deadline,
             token_digest: token.digest(),
-            tasks_created: 0,
             entry: run_entry,
             exit_generation: None,
         };

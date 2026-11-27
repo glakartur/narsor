@@ -336,8 +336,8 @@ pub trait LaunchResolver: Send + Sync {
     }
 
     /// The catalogue's valid definition of workflow `workflow_id`, as a
-    /// task create request would run it: what an observer's "create a
-    /// task" effect is checked against. A resolver without a catalogue
+    /// task create request would run it: an automation's task create
+    /// without a version takes its version. A resolver without a catalogue
     /// knows no workflow.
     fn workflow_definition(&self, workflow_id: &str) -> Result<WorkflowDefinition, LaunchError> {
         Err(LaunchError::UnknownWorkflow {
@@ -347,9 +347,8 @@ pub trait LaunchResolver: Send + Sync {
     }
 
     /// The catalogue's automations and queues, read now (no cache), with a
-    /// problem for each file that cannot be used. An `always` queue that
-    /// creates tasks is checked against [`Self::workflow_definition`]. A
-    /// resolver without a catalogue has none.
+    /// problem for each file that cannot be used. A resolver without a
+    /// catalogue has none.
     fn automation_catalog(&self) -> AutomationCatalogLoad {
         AutomationCatalogLoad::default()
     }

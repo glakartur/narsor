@@ -5,7 +5,7 @@
 //! Queues and automations are catalogue files: the tests write them, and
 //! no command changes them (R21, R22). The queue commands run through
 //! [`operate`] on the [`QueueApi`] seam, implemented here on the service for
-//! one owner, as the owner routes call it. A script's `task create --data`
+//! one owner, as the owner routes call it. A script's `task create`
 //! and `task decide` are parsed by the real command line and sent through
 //! [`perform`] on the [`EffectApi`] seam, which authenticates the run token
 //! the way the run gate does. Where a worker is needed, it is the real
@@ -27,16 +27,16 @@ use narsor::cli::queue_text::effect_output;
 use narsor::cli::{Cli, Command};
 use narsor_engine::automations::HookPhase;
 use narsor_engine::controller_protocol::{ProtocolError, ProtocolService};
-use narsor_engine::observers::{AutomationKey, AutomationState, RunId};
+use narsor_engine::observers::{AutomationKey, RunId};
 use narsor_engine::orchestration::{Clock, ControlPlane, OwnerRef};
 use narsor_engine::persistence::ServerStatePaths;
 use narsor_observer_worker::worker::{
     ScriptEnd, ScriptExit, ScriptRunner, ScriptSpec, Worker, WorkerApi, WorkerOptions,
 };
 use narsor_protocol::controller::{
-    ObserverCreateTaskRequest, ObserverDecideRequest, ObserverEffectOutcome,
-    ObserverEffectResponse, ObserverQueueListResponse, ObserverQueueView, ObserverRunReport,
-    ObserverRunResultResponse, ObserverWorkerRun,
+    CreateTaskRequest, ObserverDecideRequest, ObserverEffectOutcome, ObserverEffectResponse,
+    ObserverQueueListResponse, ObserverQueueView, ObserverRunReport, ObserverRunResultResponse,
+    ObserverWorkerRun,
 };
 use serde_json::json;
 
@@ -112,14 +112,13 @@ impl Fixture {
         }
     }
 
-    /// The `always` queue `jira-intake` of the automation `jira-new`, which
-    /// creates `triage` tasks mapping `ticket` from `key`, at most `limit`
-    /// per run.
-    fn jira_queue(&self, limit: u32) {
+    /// The `always` queue `jira-intake` of the automation `jira-new`,
+    /// whose script creates `triage` tasks.
+    fn jira_queue(&self) {
         crate::automation_support::automation(
             &self.state,
             "jira-new",
-            "narsor-cli task create --data \"$JSON\"\n",
+            "narsor-cli task create triage --input \"ticket=$KEY\"\n",
             &[],
         );
         crate::automation_support::always_queue(
@@ -127,9 +126,6 @@ impl Fixture {
             "jira-intake",
             "jira-new",
             "{interval_secs: 300}",
-            &format!(
-                "  workflow_id: triage\n  mapping: {{ticket: key}}\n  task_limit_per_run: {limit}\n"
-            ),
         );
     }
 
@@ -275,7 +271,7 @@ impl EffectApi for TokenEffects {
     fn create_task<'a>(
         &'a self,
         run_id: &'a str,
-        request: &'a ObserverCreateTaskRequest,
+        request: &'a CreateTaskRequest,
     ) -> BoxFuture<'a, Result<ObserverEffectResponse, ClientError>> {
         ready(
             self.gate(run_id)
@@ -325,13 +321,24 @@ async fn script_cli(
     observer_run: Option<&str>,
     token: &str,
 ) -> Result<String, (i32, String)> {
+    script_cli_with_stdin(service, argv, None, observer_run, token).await
+}
+
+/// [`script_cli`] with `stdin` as what `--stdin` reads.
+async fn script_cli_with_stdin(
+    service: &Arc<ProtocolService>,
+    argv: &[String],
+    stdin: Option<&str>,
+    observer_run: Option<&str>,
+    token: &str,
+) -> Result<String, (i32, String)> {
     let mut full = vec!["narsor-cli".to_string()];
     full.extend(argv.iter().cloned());
     let cli = Cli::try_parse_from(full).map_err(|error| (2, error.to_string()))?;
     let Command::Task { command } = cli.command else {
         panic!("a script runs task commands");
     };
-    let call = effect_call(&command, observer_run)
+    let call = effect_call(&command, observer_run, stdin)
         .map_err(|error| (error.exit_code, error.message))?
         .expect("an effect command");
     let effects = TokenEffects {
@@ -365,12 +372,11 @@ impl ScriptRunner for CliScript {
 }
 
 fn create_line(key: &str) -> Vec<String> {
-    vec![
-        "task".into(),
-        "create".into(),
-        "--data".into(),
-        json!({"key": key}).to_string(),
-    ]
+    ["task", "create", "triage", "--input"]
+        .into_iter()
+        .map(String::from)
+        .chain([format!("ticket={key}")])
+        .collect()
 }
 
 fn lines_of(lines: &[Vec<String>]) -> Vec<Vec<&str>> {
@@ -389,7 +395,7 @@ async fn a_catalogue_queue_runs_with_no_cli_step_and_queue_show_reports_it() {
     // Success criterion of the origin: the catalogue files are enough; the
     // scheduled run's script creates the task.
     let fx = Fixture::new();
-    fx.jira_queue(10);
+    fx.jira_queue();
     let lines = [create_line("ABC-1")];
     let (worker, script) = fx.worker(
         &lines_of(&lines)
@@ -408,7 +414,6 @@ async fn a_catalogue_queue_runs_with_no_cli_step_and_queue_show_reports_it() {
     assert_eq!(fx.tasks(), 1);
     let shown = fx.cli(&["show", "jira-intake"]).await.unwrap();
     assert!(shown.contains("Mode: always"), "{shown}");
-    assert!(shown.contains("Creates tasks of: triage"), "{shown}");
     assert!(shown.contains("  jira-new (check): active"), "{shown}");
     assert!(shown.contains("last run succeeded"), "{shown}");
 }
@@ -506,40 +511,53 @@ fn the_text_of_an_untrusted_answer_has_no_control_characters() {
 
 /// The `jira-intake` queue with a run claimed; returns the run's id and
 /// token.
-async fn claimed_jira_run(fx: &Fixture, limit: u32) -> (String, String) {
-    fx.jira_queue(limit);
+async fn claimed_jira_run(fx: &Fixture) -> (String, String) {
+    fx.jira_queue();
     fx.service.observer_pass();
     let run = fx.service.claim_observer_run().unwrap().unwrap();
     (run.run_id.to_string(), run.token.expose().to_string())
 }
 
 #[tokio::test]
-async fn a_created_task_exits_0_and_a_run_over_its_limit_exits_1() {
+async fn a_script_creates_tasks_as_the_console_does_and_a_refusal_exits_1() {
     let fx = Fixture::new();
-    let (run, token) = claimed_jira_run(&fx, 1).await;
+    let (run, token) = claimed_jira_run(&fx).await;
+    let from_stdin: Vec<String> = ["task", "create", "--stdin", "--input", "ticket=ABC-2"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let unknown: Vec<String> = ["task", "create", "no-such-workflow"]
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     let created = script_cli(&fx.service, &create_line("ABC-1"), Some(&run), &token).await;
-    let over = script_cli(&fx.service, &create_line("ABC-1"), Some(&run), &token).await;
+    let merged = script_cli_with_stdin(
+        &fx.service,
+        &from_stdin,
+        Some(r#"{"workflow": "triage", "inputs": {"ticket": "ignored"}, "ticket": "ABC-2"}"#),
+        Some(&run),
+        &token,
+    )
+    .await;
+    let refused = script_cli(&fx.service, &unknown, Some(&run), &token).await;
 
     assert!(created.unwrap().starts_with("created task"));
-    let (code, message) = over.unwrap_err();
-    assert_eq!(code, 1);
-    assert!(message.contains("limit"), "{message}");
-    assert!(message.contains("observer_task_limit"), "{message}");
-    assert_eq!(fx.tasks(), 1);
-    let record = fx
-        .service
-        .observers()
-        .load(&AutomationKey::new("jira-intake", "jira-new").unwrap())
-        .unwrap()
-        .unwrap();
-    assert_eq!(record.state, AutomationState::NeedsAttention);
+    assert!(merged.unwrap().starts_with("created task"));
+    assert_eq!(refused.unwrap_err().0, 1);
+    let tasks = fx.service.control_plane().list_tasks().unwrap();
+    let from_stdin = tasks
+        .iter()
+        .find(|task| task.launch_spec.ticket.as_deref() == Some("ABC-2"))
+        .expect("the task of --stdin");
+    assert_eq!(from_stdin.launch_spec.inputs, json!({"ticket": "ABC-2"}));
+    assert_eq!(tasks.len(), 2);
 }
 
 #[tokio::test]
 async fn a_forged_token_or_the_path_of_another_run_is_refused() {
     let fx = Fixture::new();
-    let (run, token) = claimed_jira_run(&fx, 10).await;
+    let (run, token) = claimed_jira_run(&fx).await;
 
     let forged = script_cli(&fx.service, &create_line("ABC-1"), Some(&run), "nso.forged").await;
     let (code, message) = forged.unwrap_err();
@@ -646,7 +664,7 @@ async fn a_script_answers_its_gate_with_task_decide_and_a_refusal_exits_1() {
     .await;
     let second = script_cli(
         &fx.service,
-        &decide_line(&["--data", r#"{"choice": "check_feedback"}"#]),
+        &decide_line(&["--choice", "check_feedback"]),
         Some(&run),
         &token,
     )
@@ -675,22 +693,27 @@ async fn a_script_answers_its_gate_with_task_decide_and_a_refusal_exits_1() {
 }
 
 #[tokio::test]
-async fn task_decide_takes_the_answer_as_data() {
+async fn task_decide_takes_the_answer_on_stdin_with_the_options_over_it() {
     let fx = Fixture::new();
     let (run, token) = claimed_review_run(&fx).await;
 
-    let decided = script_cli(
+    let decided = script_cli_with_stdin(
         &fx.service,
-        &decide_line(&[
-            "--data",
-            r#"{"choice": "revise_plan", "reason": "label removed", "variables": {"note": "x"}}"#,
-        ]),
+        &decide_line(&["--stdin", "--var", "note=from the option"]),
+        Some(r#"{"choice": "revise_plan", "reason": "label removed", "variables": {"note": "x"}}"#),
         Some(&run),
         &token,
     )
     .await;
 
     assert!(decided.unwrap().contains("with revise_plan"));
+    let task = fx
+        .service
+        .control_plane()
+        .task(&narsor_engine::domain::TaskId::parse("task-1").unwrap())
+        .unwrap();
+    let delivery = task.inputs[0].delivery.as_ref().unwrap();
+    assert_eq!(delivery.values["note"], json!("from the option"));
 }
 
 #[tokio::test]
@@ -698,25 +721,23 @@ async fn task_decide_usage_errors_exit_2_and_send_nothing() {
     let fx = Fixture::new();
     let (run, token) = claimed_review_run(&fx).await;
 
-    let cases: Vec<(Vec<String>, Option<&str>, &str)> = vec![
+    let cases: Vec<(Vec<String>, Option<&str>, Option<&str>, &str)> = vec![
         (
             decide_line(&["--choice", "check_feedback"]),
             None,
+            None,
             "NARSOR_OBSERVER_RUN is not set",
         ),
+        (decide_line(&[]), None, Some(&run), "needs --choice"),
         (
-            decide_line(&["--choice", "check_feedback", "--data", "{}"]),
+            decide_line(&["--stdin"]),
+            Some(r#"{"choice": "x", "artifacts": {}}"#),
             Some(&run),
-            "not both",
-        ),
-        (decide_line(&[]), Some(&run), "needs --choice"),
-        (
-            decide_line(&["--data", r#"{"choice": "x", "artifacts": {}}"#]),
-            Some(&run),
-            "Invalid --data",
+            "Invalid --stdin",
         ),
         (
             decide_line(&["--choice", "revise_plan", "--var", "note"]),
+            None,
             Some(&run),
             "name=value",
         ),
@@ -727,14 +748,16 @@ async fn task_decide_usage_errors_exit_2_and_send_nothing() {
                 "--var-file",
                 "note=/no/such/file",
             ]),
+            None,
             Some(&run),
             "Cannot read --var-file",
         ),
     ];
-    for (line, observer_run, expected) in cases {
-        let (code, message) = script_cli(&fx.service, &line, observer_run, &token)
-            .await
-            .unwrap_err();
+    for (line, stdin, observer_run, expected) in cases {
+        let (code, message) =
+            script_cli_with_stdin(&fx.service, &line, stdin, observer_run, &token)
+                .await
+                .unwrap_err();
         assert_eq!(code, 2, "{line:?}: {message}");
         assert!(message.contains(expected), "{line:?}: {message}");
     }

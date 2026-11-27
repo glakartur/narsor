@@ -83,12 +83,11 @@ use narsor_protocol::controller::{
     ControllerView, ConversationPageQuery, CreateEnrollmentRequest, CreateRepositoryRequest,
     CreateTaskRequest, DefaultBackendView, EnrollmentResponse, ExecutionDetailsResponse,
     ExecutionEventsQuery, ExecutionEventsResponse, ExecutionStateResponse, HarnessUsageResponse,
-    ObserverClaimResponse, ObserverCreateTaskRequest, ObserverDecideRequest,
-    ObserverEffectResponse, ObserverRunReport, ObserverRunResultResponse, ObserverWorkerRun,
-    OwnerCommandRequest, RepositoryBranchesResponse, RepositoryListResponse, RepositoryView,
-    SetConcurrencyLimitRequest, SetDefaultBackendRequest, SubmitInputRequest,
-    SubmitOperatorCommandRequest, ValidateWorkflowRequest, ValidateWorkflowResponse,
-    WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
+    ObserverClaimResponse, ObserverDecideRequest, ObserverEffectResponse, ObserverRunReport,
+    ObserverRunResultResponse, ObserverWorkerRun, OwnerCommandRequest, RepositoryBranchesResponse,
+    RepositoryListResponse, RepositoryView, SetConcurrencyLimitRequest, SetDefaultBackendRequest,
+    SubmitInputRequest, SubmitOperatorCommandRequest, ValidateWorkflowRequest,
+    ValidateWorkflowResponse, WorkflowListResponse, WorkflowSourceRequest, WorkflowSourceResponse,
 };
 use narsor_protocol::controller::{ObserverQueueListResponse, ObserverQueueView};
 
@@ -1062,12 +1061,12 @@ impl ApiClient {
         self.get_json(&url).await
     }
 
-    /// Creates a task from effect data, for a client holding a run token
-    /// — `POST /observer/v1/runs/{run}/tasks`.
+    /// Creates a task as the owner's create does, for a client holding a
+    /// run token — `POST /observer/v1/runs/{run}/tasks`.
     pub async fn observer_create_task(
         &self,
         run_id: &str,
-        request: &ObserverCreateTaskRequest,
+        request: &CreateTaskRequest,
     ) -> Result<ObserverEffectResponse, ClientError> {
         let run_id = path_segment("run", run_id)?;
         let url = format!("{}/observer/v1/runs/{run_id}/tasks", self.base_url);

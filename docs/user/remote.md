@@ -16,6 +16,8 @@ narsor-cli usage [--json]                         # reported Claude/Copilot limi
 narsor-cli task create implement-feature --input ticket=NAR-1 [--backend k8s]
 narsor-cli task create implement-feature --input repo=acme-api --branch repo=develop   # start from another branch
 narsor-cli task create --file ./my-workflow.yaml --input name=value   # a workflow file of the local daemon, checked first
+narsor-cli task create implement-feature --ticket NAR-1 --title "Fix login"   # the task's ticket and title ({{ task.ticket }}, {{ task.title }})
+printf '%s' '{"workflow": "implement-feature", "inputs": {"ticket": "NAR-1"}}' | narsor-cli task create --stdin   # the parameters as JSON; options given as well override it
 narsor-cli task list [--archived] [--json]        # queue position (#n), `?`/`!` attention mark, backend, lifecycle, title; --archived: the history
 narsor-cli task move <task> --before|--after <other> | --top | --bottom   # reorder a queued task
 narsor-cli task show <task> [--json [--drift]]   # title and links, what it waits on, observations with their age, timeline, conversation; --drift: JSON also compares the environment with the catalogue

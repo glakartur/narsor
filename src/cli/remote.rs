@@ -216,7 +216,7 @@ pub enum TaskCommand {
         /// Workflow to run (its id in the control plane's catalogue).
         #[arg(
             value_name = "WORKFLOW",
-            required_unless_present_any = ["file", "data"],
+            required_unless_present_any = ["file", "stdin"],
             conflicts_with = "file"
         )]
         workflow: Option<String>,
@@ -232,7 +232,7 @@ pub enum TaskCommand {
             ]
         )]
         file: Option<PathBuf>,
-        /// Workflow version; read from the local catalogue when omitted.
+        /// Workflow version; the server catalogue's when omitted.
         #[arg(long = "workflow-version", value_name = "N")]
         workflow_version: Option<u32>,
         /// Workflow input, `name=value` (repeatable). A value that reads as
@@ -265,13 +265,21 @@ pub enum TaskCommand {
         /// safe and returns the same task.
         #[arg(long = "task-id", value_name = "ID")]
         task_id: Option<String>,
-        /// In an observer's script only (`NARSOR_OBSERVER_RUN` set): the
-        /// effect data, a JSON object of the fields the observer maps to
-        /// workflow inputs. Each call creates a new task. The observer's
-        /// record decides the workflow, repositories, backend and profile;
-        /// WORKFLOW and the other options are refused.
-        #[arg(long, value_name = "JSON")]
-        data: Option<String>,
+        /// The task's ticket (`{{ task.ticket }}` in the workflow).
+        #[arg(long, value_name = "TICKET")]
+        ticket: Option<String>,
+        /// The task's title (`{{ task.title }}`).
+        #[arg(long, value_name = "TITLE")]
+        title: Option<String>,
+        /// Read the parameters as one JSON object on stdin, shaped as the
+        /// options: `{"workflow", "workflow_version", "inputs": {NAME:
+        /// VALUE}, "workspaces": {NAME: {"repository", "branch",
+        /// "commit"}}, "ticket", "title", "backend", "profile", "harness",
+        /// "task_id"}`. WORKFLOW and the options given as well override it:
+        /// a value replaces the object's, an input or a workspace choice
+        /// replaces the object's of the same name.
+        #[arg(long, conflicts_with = "file")]
+        stdin: bool,
     },
     /// In an observer's script only (`NARSOR_OBSERVER_RUN` set): answers
     /// the gate of the queue entry the run was started for, as a person
@@ -298,10 +306,11 @@ pub enum TaskCommand {
         /// `name=path` (repeatable).
         #[arg(long = "var-file", value_name = "NAME=PATH")]
         var_files: Vec<String>,
-        /// The whole answer as JSON, `{"choice", "reason", "variables"}`,
-        /// instead of `--choice`, `--reason`, `--var` and `--var-file`.
-        #[arg(long, value_name = "JSON")]
-        data: Option<String>,
+        /// Read the answer as one JSON object on stdin, `{"choice",
+        /// "reason", "variables": {NAME: VALUE}}`. `--choice`, `--reason`,
+        /// `--var` and `--var-file` given as well override it.
+        #[arg(long)]
+        stdin: bool,
     },
     /// Lists your tasks with backend, runner state and queue state, the
     /// attention mark (`?` asks, `!` is wrong) and the title.
@@ -971,41 +980,137 @@ pub(super) fn print_conversation_entries(
 // task
 // ---------------------------------------------------------------------------
 
-/// `None` for any command but `create` with a workflow, not a definition file.
-pub fn create_request(command: &TaskCommand) -> Result<Option<(CreateTaskRequest, Option<u32>)>> {
-    Ok(match command {
-        TaskCommand::Create {
-            workflow: Some(workflow),
-            workflow_version,
-            inputs,
-            repositories,
-            branches,
-            commits,
-            backend,
-            profile,
-            harness,
-            task_id,
-            ..
-        } => Some((
-            CreateTaskRequest {
-                task_id: task_id.clone(),
-                backend_id: backend.clone(),
-                launch: LaunchRequest {
-                    workflow_id: workflow.clone(),
-                    workflow_version: workflow_version.unwrap_or_default(),
-                    inputs: Value::Object(parse_pairs("input", inputs)?),
-                    workspaces: parse_workspaces(repositories, branches, commits)?,
-                    profile: profile.clone(),
-                    harness: harness.clone(),
-                    resources: None,
-                    ticket: None,
-                    title: None,
-                },
+/// The parameters of `task create`: the JSON object of `--stdin`, with the
+/// options over it.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateParams {
+    #[serde(default)]
+    workflow: Option<String>,
+    #[serde(default)]
+    workflow_version: Option<u32>,
+    #[serde(default)]
+    inputs: Map<String, Value>,
+    #[serde(default)]
+    workspaces: BTreeMap<String, WorkspaceRequest>,
+    #[serde(default)]
+    ticket: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    harness: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+impl CreateParams {
+    /// The request, and the version the caller asked for: absent, it is
+    /// `0` in the request until the catalogue's version is known.
+    fn into_request(self) -> Result<(CreateTaskRequest, Option<u32>)> {
+        let workflow = self.workflow.ok_or_else(|| {
+            CliError::usage("task create needs WORKFLOW, or \"workflow\" in the --stdin object")
+        })?;
+        let request = CreateTaskRequest {
+            task_id: self.task_id,
+            backend_id: self.backend,
+            launch: LaunchRequest {
+                workflow_id: workflow,
+                workflow_version: self.workflow_version.unwrap_or_default(),
+                inputs: Value::Object(self.inputs),
+                workspaces: self.workspaces,
+                profile: self.profile,
+                harness: self.harness,
+                resources: None,
+                ticket: self.ticket,
+                title: self.title,
             },
-            *workflow_version,
-        )),
-        _ => None,
-    })
+        };
+        Ok((request, self.workflow_version))
+    }
+}
+
+/// `option` when given, else `base`.
+fn given_or<T: Clone>(option: &Option<T>, base: Option<T>) -> Option<T> {
+    option.clone().or(base)
+}
+
+/// The create request of `command`, with the version it asked for (see
+/// [`CreateParams::into_request`]). `stdin` is what `--stdin` read. `None`
+/// for any command but `create` of a catalogue workflow.
+pub fn create_request(
+    command: &TaskCommand,
+    stdin: Option<&str>,
+) -> Result<Option<(CreateTaskRequest, Option<u32>)>> {
+    let TaskCommand::Create {
+        workflow,
+        file: None,
+        workflow_version,
+        inputs,
+        repositories,
+        branches,
+        commits,
+        backend,
+        profile,
+        harness,
+        task_id,
+        ticket,
+        title,
+        stdin: from_stdin,
+    } = command
+    else {
+        return Ok(None);
+    };
+    let base = if *from_stdin {
+        serde_json::from_str::<CreateParams>(stdin.unwrap_or_default()).map_err(|error| {
+            CliError::usage(format!(
+                "Invalid --stdin — expected a JSON object of the task create parameters: {error}"
+            ))
+        })?
+    } else {
+        CreateParams::default()
+    };
+    let mut workspaces = base.workspaces;
+    for (name, choice) in parse_workspaces(repositories, branches, commits)? {
+        let merged = workspaces.entry(name).or_default();
+        merged.repository = choice.repository.or(merged.repository.take());
+        merged.branch = choice.branch.or(merged.branch.take());
+        merged.commit = choice.commit.or(merged.commit.take());
+    }
+    let mut merged_inputs = base.inputs;
+    merged_inputs.extend(parse_pairs("input", inputs)?);
+    let params = CreateParams {
+        workflow: given_or(workflow, base.workflow),
+        workflow_version: given_or(workflow_version, base.workflow_version),
+        inputs: merged_inputs,
+        workspaces,
+        ticket: given_or(ticket, base.ticket),
+        title: given_or(title, base.title),
+        backend: given_or(backend, base.backend),
+        profile: given_or(profile, base.profile),
+        harness: given_or(harness, base.harness),
+        task_id: given_or(task_id, base.task_id),
+    };
+    params.into_request().map(Some)
+}
+
+/// What `--stdin` of `task create` or `task decide` reads; `None` without
+/// it.
+fn read_stdin(command: &TaskCommand) -> Result<Option<String>> {
+    let wanted = matches!(
+        command,
+        TaskCommand::Create { stdin: true, .. } | TaskCommand::Decide { stdin: true, .. }
+    );
+    if !wanted {
+        return Ok(None);
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+        .map_err(|error| CliError::usage(format!("Cannot read --stdin: {error}")))?;
+    Ok(Some(text))
 }
 
 pub async fn task(
@@ -1015,8 +1120,11 @@ pub async fn task(
     state: &Path,
     flags: &Flags,
 ) -> Result<()> {
+    let stdin = read_stdin(&command)?;
     // An observer's script: the effect routes of its run, nothing else.
-    if let Some(call) = super::observer_effect::effect_call(&command, observer_run)? {
+    if let Some(call) =
+        super::observer_effect::effect_call(&command, observer_run, stdin.as_deref())?
+    {
         let run_id = observer_run.unwrap_or_default();
         let client = super::observer_effect::effect_client(target)?;
         print!(
@@ -1027,7 +1135,7 @@ pub async fn task(
     }
     // Parse everything local before connecting: a usage error never needs
     // the control plane.
-    let create = create_request(&command)?;
+    let create = create_request(&command, stdin.as_deref())?;
     let delivery = match &command {
         TaskCommand::Input {
             fields,

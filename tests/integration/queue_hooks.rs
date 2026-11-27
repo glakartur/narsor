@@ -570,13 +570,7 @@ fn an_entry_script_is_claimed_before_a_check_run_due_longer() {
     // U6: a gate waits on its entry scripts (R8).
     let fx = Fixture::new(&[(LABEL, &[HookPhase::In])]);
     automation(&fx.root, "jira-new", CHECK_SCRIPT, &[]);
-    always_queue(
-        &fx.root,
-        "jira-intake",
-        "jira-new",
-        "{interval_secs: 300}",
-        "",
-    );
+    always_queue(&fx.root, "jira-intake", "jira-new", "{interval_secs: 300}");
     fx.service.observer_pass();
     fx.advance(Duration::seconds(60));
     fx.waiting_task();

@@ -1139,10 +1139,7 @@ impl LaunchResolver for CatalogLaunchResolver {
     }
 
     fn automation_catalog(&self) -> AutomationCatalogLoad {
-        AutomationCatalog::new(&self.catalog_root).load(|workflow_id| {
-            self.catalogue_workflow(workflow_id)
-                .map_err(|error| error.to_string())
-        })
+        AutomationCatalog::new(&self.catalog_root).load()
     }
 
     fn automation_script(

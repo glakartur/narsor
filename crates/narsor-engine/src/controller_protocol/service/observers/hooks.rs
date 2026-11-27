@@ -246,7 +246,7 @@ impl ProtocolService {
     /// pair's lock; `None` when the pair has a hook run in progress, or the
     /// script could not be read (a failed attempt).
     ///
-    /// A pair stopped in `error` or `needs_attention` still runs its hooks,
+    /// A pair stopped in `error` still runs its hooks,
     /// on purpose: those states track the health of its `check` runs only,
     /// and holding hooks back would leave the gate stuck in `entering` or
     /// `exiting`.

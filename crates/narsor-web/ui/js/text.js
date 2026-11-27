@@ -356,7 +356,6 @@ export function modeText(mode) {
 
 const AUTOMATION_STATE = {
   active: { text: 'aktywna', role: 'live', stopped: false },
-  needs_attention: { text: 'czeka na Ciebie', role: 'attention', stopped: true },
   error: { text: 'błąd', role: 'problem', stopped: true },
 };
 

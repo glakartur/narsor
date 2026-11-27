@@ -305,12 +305,12 @@ control plane reads them at every load and keeps no copy; it schedules each
 - `schedule`: an interval in seconds or a five-field cron expression in UTC.
   Exactly one is set.
 - `condition`: a map handed to the scripts.
-- `tasks` (`always` only): the workflow, its version, workspaces, backend,
-  profile and input mapping of the tasks the scripts create, the task limit
-  of one run and `import_backlog`. The tasks belong to the installation owner.
+
+A `check` script of an `always` queue creates tasks with `narsor-cli task
+create`, as the owner does; the tasks belong to the installation owner.
 
 **Attributes of a pair (queue, automation)** (runtime state):
-- `state`: `active`, `needs_attention`, `error`. A stopped pair runs again
+- `state`: `active`, `error`. A stopped pair runs again
   when the queue file, `automation.yaml` or `check.sh` changes.
 - The script state of an `always` pair, the failure count and backoff, the
   run in progress, the last run and the newest errors.

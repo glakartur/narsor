@@ -1,6 +1,5 @@
-//! The effect commands of an observer's script: `narsor-cli task create
-//! --data JSON` (R3, PO1) and `narsor-cli task decide TASK --episode EP`
-//! (R12, R13).
+//! The effect commands of an observer's script: `narsor-cli task create`
+//! (R3, PO1) and `narsor-cli task decide TASK --episode EP` (R12, R13).
 //!
 //! The worker runs a script with `NARSOR_OBSERVER_RUN` (the run's id),
 //! `NARSOR_SERVER` and `NARSOR_TOKEN` (the run's token) set. With
@@ -9,14 +8,18 @@
 //!
 //! ```text
 //!                          NARSOR_OBSERVER_RUN set          not set
-//! task create --data       effect route                     usage error
-//! task create WORKFLOW …   usage error (the record decides)  the owner's create
+//! task create WORKFLOW …   effect route                     the owner's create
+//! task create --file …     usage error                      the owner's create
 //! task decide              effect route                     usage error
 //! ```
 //!
+//! `task create` takes the same options in both columns (and `--stdin`
+//! with them as one JSON object, the options over it) and sends the same request: in a script the
+//! server creates it for the installation owner and records the run.
+//!
 //! `task decide` takes `--choice CHOICE [--reason TEXT] [--var NAME=VALUE …]
-//! [--var-file NAME=PATH …]`, or `--data JSON` with `{choice, reason,
-//! variables}` (the answer of a script step), never both.
+//! [--var-file NAME=PATH …]` and `--stdin` with `{choice, reason,
+//! variables}` (the answer of a script step); the options override it.
 //!
 //! The server does not deduplicate tasks: every call creates one. The
 //! script keeps track in its state of what it already reported.
@@ -26,7 +29,7 @@
 //! | answer | prints | exit code |
 //! | --- | --- | --- |
 //! | created, delivered | the server's line | 0 |
-//! | task limit reached, refused data, refused answer (stale episode, another answer first, invalid choice or variables), token not valid | the reason, on stderr | 1 |
+//! | refused task create, refused answer (stale episode, another answer first, invalid choice or variables), token not valid | the reason, on stderr | 1 |
 //! | usage error | the reason, on stderr | 2 |
 
 use futures::future::BoxFuture;
@@ -35,10 +38,10 @@ use serde_json::{Map, Value};
 
 use super::commands::{CliError, Result};
 use super::queue_text::effect_output;
-use super::remote::{failure, split_pair, TaskCommand};
+use super::remote::{create_request, failure, split_pair, TaskCommand};
 use crate::api::{ApiClient, ClientError, ServerTarget, TokenSource};
 use crate::controller_protocol::{
-    ObserverCreateTaskRequest, ObserverDecideRequest, ObserverEffectResponse,
+    CreateTaskRequest, ObserverDecideRequest, ObserverEffectResponse,
 };
 
 /// The environment variable naming the observer run a script belongs to.
@@ -47,8 +50,8 @@ pub const OBSERVER_RUN_ENV: &str = "NARSOR_OBSERVER_RUN";
 /// An effect a script asked for.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EffectCall {
-    /// `task create --data JSON`.
-    CreateTask(ObserverCreateTaskRequest),
+    /// `task create …`, the request the owner's create sends.
+    CreateTask(CreateTaskRequest),
     /// `task decide TASK --episode EP …`.
     Decide(ObserverDecideRequest),
 }
@@ -56,18 +59,15 @@ pub enum EffectCall {
 /// What `command` asks for given the observer run of the environment
 /// (`NARSOR_OBSERVER_RUN`, `None` when unset or empty): an effect of that
 /// run, nothing of the kind (`Ok(None)`, the command goes its usual way),
-/// or a usage error (see the module documentation).
+/// or a usage error (see the module documentation). `stdin` is what
+/// `--stdin` read.
 pub fn effect_call(
     command: &TaskCommand,
     observer_run: Option<&str>,
+    stdin: Option<&str>,
 ) -> Result<Option<EffectCall>> {
     let observer_run = observer_run.filter(|run| !run.trim().is_empty());
     match (command, observer_run) {
-        (TaskCommand::Create { data, .. }, None) if data.is_some() => {
-            Err(CliError::usage(format!(
-                "--data is for the script of an observer run only: {OBSERVER_RUN_ENV} is not set"
-            )))
-        }
         (TaskCommand::Decide { .. }, None) => Err(CliError::usage(format!(
             "narsor-cli task decide is for the script of an observer run only: \
              {OBSERVER_RUN_ENV} is not set"
@@ -80,84 +80,38 @@ pub fn effect_call(
                 reason,
                 vars,
                 var_files,
-                data,
+                ..
             },
             Some(_),
         ) => Ok(Some(EffectCall::Decide(decide_request(
-            task_id, episode, choice, reason, vars, var_files, data,
+            task_id, episode, choice, reason, vars, var_files, stdin,
         )?))),
-        (
-            TaskCommand::Create {
-                workflow,
-                file,
-                workflow_version,
-                inputs,
-                repositories,
-                branches,
-                commits,
-                backend,
-                profile,
-                harness,
-                task_id,
-                data,
-            },
-            Some(_),
-        ) => {
-            let chosen: Vec<&str> = [
-                (workflow.is_some(), "WORKFLOW"),
-                (file.is_some(), "--file"),
-                (workflow_version.is_some(), "--workflow-version"),
-                (!inputs.is_empty(), "--input"),
-                (!repositories.is_empty(), "--repository"),
-                (!branches.is_empty(), "--branch"),
-                (!commits.is_empty(), "--commit"),
-                (backend.is_some(), "--backend"),
-                (profile.is_some(), "--profile"),
-                (harness.is_some(), "--harness"),
-                (task_id.is_some(), "--task-id"),
-            ]
-            .into_iter()
-            .filter_map(|(given, name)| given.then_some(name))
-            .collect();
-            if !chosen.is_empty() {
-                return Err(CliError::usage(format!(
-                    "In an observer's script, task create takes only --data: the \
-                     observer's record decides the workflow, repositories, backend and profile \
-                     (refused: {})",
-                    chosen.join(", ")
-                )));
-            }
-            Ok(Some(EffectCall::CreateTask(ObserverCreateTaskRequest {
-                data: parse_data(data.as_deref())?,
-            })))
+        (TaskCommand::Create { file: Some(_), .. }, Some(_)) => Err(CliError::usage(
+            "In an observer's script, task create runs a catalogue workflow: --file is a \
+             definition on a local daemon's disk",
+        )),
+        (TaskCommand::Create { .. }, Some(_)) => {
+            Ok(create_request(command, stdin)?.map(|(request, _)| EffectCall::CreateTask(request)))
         }
         _ => Ok(None),
     }
 }
 
-/// `--data`, which must be JSON; absent data is `null`.
-fn parse_data(raw: Option<&str>) -> Result<Value> {
-    match raw {
-        None => Ok(Value::Null),
-        Some(raw) => serde_json::from_str(raw)
-            .map_err(|error| CliError::usage(format!("Invalid --data — expected JSON: {error}"))),
-    }
-}
-
 /// The answer of a script step (`{choice, reason, variables}`), as `task
-/// decide --data` takes it. No artifacts in this version.
-#[derive(Debug, Deserialize)]
+/// decide --stdin` reads it. No artifacts in this version.
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DecideData {
-    choice: String,
+    #[serde(default)]
+    choice: Option<String>,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
     variables: Map<String, Value>,
 }
 
-/// The answer `task decide` sends: from `--data`, or from `--choice` and
-/// its options, never both.
+/// The answer `task decide` sends: the object of `--stdin` (what `stdin`
+/// holds), with `--choice`, `--reason`, `--var` and `--var-file` over it.
 fn decide_request(
     task_id: &str,
     episode: &str,
@@ -165,45 +119,22 @@ fn decide_request(
     reason: &Option<String>,
     vars: &[String],
     var_files: &[String],
-    data: &Option<String>,
+    stdin: Option<&str>,
 ) -> Result<ObserverDecideRequest> {
-    let request = |choice: String, reason: Option<String>, variables| ObserverDecideRequest {
-        task_id: task_id.to_string(),
-        episode: episode.to_string(),
-        choice,
-        reason,
-        variables,
-    };
-    if let Some(raw) = data {
-        let given: Vec<&str> = [
-            (choice.is_some(), "--choice"),
-            (reason.is_some(), "--reason"),
-            (!vars.is_empty(), "--var"),
-            (!var_files.is_empty(), "--var-file"),
-        ]
-        .into_iter()
-        .filter_map(|(given, name)| given.then_some(name))
-        .collect();
-        if !given.is_empty() {
-            return Err(CliError::usage(format!(
-                "task decide takes either --data or --choice with its options, not both \
-                 (refused: --data with {})",
-                given.join(", ")
-            )));
-        }
-        let data: DecideData = serde_json::from_str(raw).map_err(|error| {
+    let base = match stdin {
+        Some(raw) => serde_json::from_str::<DecideData>(raw).map_err(|error| {
             CliError::usage(format!(
-                "Invalid --data — expected JSON {{\"choice\", \"reason\", \"variables\"}}: {error}"
+                "Invalid --stdin — expected JSON {{\"choice\", \"reason\", \"variables\"}}: {error}"
             ))
-        })?;
-        return Ok(request(data.choice, data.reason, data.variables));
-    }
-    let Some(choice) = choice else {
+        })?,
+        None => DecideData::default(),
+    };
+    let Some(choice) = choice.clone().or(base.choice) else {
         return Err(CliError::usage(
-            "task decide needs --choice CHOICE, or --data JSON with the whole answer",
+            "task decide needs --choice CHOICE, or \"choice\" in the --stdin object",
         ));
     };
-    let mut variables = Map::new();
+    let mut variables = base.variables;
     for pair in vars {
         let (name, value) = split_pair("var", pair)?;
         variables.insert(name.to_string(), Value::String(value.to_string()));
@@ -215,7 +146,13 @@ fn decide_request(
         })?;
         variables.insert(name.to_string(), Value::String(text));
     }
-    Ok(request(choice.clone(), reason.clone(), variables))
+    Ok(ObserverDecideRequest {
+        task_id: task_id.to_string(),
+        episode: episode.to_string(),
+        choice,
+        reason: reason.clone().or(base.reason),
+        variables,
+    })
 }
 
 /// The effect routes of one run, as the script's commands use them: the
@@ -225,7 +162,7 @@ pub trait EffectApi: Send + Sync {
     fn create_task<'a>(
         &'a self,
         run_id: &'a str,
-        request: &'a ObserverCreateTaskRequest,
+        request: &'a CreateTaskRequest,
     ) -> BoxFuture<'a, std::result::Result<ObserverEffectResponse, ClientError>>;
 
     /// `POST /observer/v1/runs/{run}/decide`.
@@ -240,7 +177,7 @@ impl EffectApi for ApiClient {
     fn create_task<'a>(
         &'a self,
         run_id: &'a str,
-        request: &'a ObserverCreateTaskRequest,
+        request: &'a CreateTaskRequest,
     ) -> BoxFuture<'a, std::result::Result<ObserverEffectResponse, ClientError>> {
         Box::pin(self.observer_create_task(run_id, request))
     }

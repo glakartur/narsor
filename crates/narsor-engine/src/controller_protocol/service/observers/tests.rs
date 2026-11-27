@@ -108,10 +108,7 @@ impl crate::environment::LaunchResolver for NoLaunches {
     }
 
     fn automation_catalog(&self) -> AutomationCatalogLoad {
-        AutomationCatalog::new(&self.catalog).load(|workflow| {
-            self.workflow_definition(workflow)
-                .map_err(|error| error.to_string())
-        })
+        AutomationCatalog::new(&self.catalog).load()
     }
 
     fn automation_script(
@@ -191,22 +188,14 @@ impl Fixture {
         );
     }
 
-    /// Queue `queue` served by `automation`, every 300 s: an `on_episodes`
-    /// queue, or an `always` one that creates tasks of `triage`.
+    /// Queue `queue` served by `automation`, every 300 s.
     pub(super) fn queue(&self, queue: &str, automation: &str, mode: ObserverMode) {
         self.automation(automation);
-        let tasks = match mode {
-            ObserverMode::OnEpisodes => String::new(),
-            ObserverMode::Always => {
-                "tasks:\n  workflow_id: triage\n  mapping: {ticket: key}\n  task_limit_per_run: 1\n"
-                    .to_string()
-            }
-        };
         self.write(
             &format!("queues/{queue}.yaml"),
             &format!(
                 "automations: [{automation}]\nmode: {mode}\nschedule: {{interval_secs: {INTERVAL}}}\n\
-                 condition: {{project: ABC}}\n{tasks}"
+                 condition: {{project: ABC}}\n"
             ),
         );
     }
@@ -619,54 +608,6 @@ fn five_failures_stop_the_pair_until_its_catalogue_definition_changes() {
 }
 
 #[test]
-fn a_pair_over_its_task_limit_runs_again_after_the_limit_is_raised() {
-    // R15: `needs_attention` until the queue file changes.
-    let fx = Fixture::new();
-    fx.queue("jira-intake", "jira-new", ObserverMode::Always);
-    let pair = key("jira-intake", "jira-new");
-    fx.service.observer_pass();
-    let run = fx.claim().unwrap();
-    {
-        // This resolver launches nothing, so the one task the limit allows
-        // is counted by hand.
-        let lock = fx.service.observers().lock(&pair).unwrap();
-        let mut record = fx.record(&pair);
-        record.active_run.as_mut().unwrap().tasks_created = 1;
-        fx.service
-            .observers()
-            .save(&lock, &mut record, fx.now())
-            .unwrap();
-    }
-    let refused = fx
-        .service
-        .observer_create_task(
-            &run.run_id,
-            crate::controller_protocol::wire::ObserverCreateTaskRequest {
-                data: json!({"key": "ABC-2"}),
-            },
-        )
-        .unwrap_err();
-    assert!(matches!(
-        refused,
-        ProtocolError::Conflict {
-            code: "observer_task_limit",
-            ..
-        }
-    ));
-    fx.finish(&run, exited(0, r#"{"state": {}}"#));
-    assert_eq!(fx.record(&pair).state, AutomationState::NeedsAttention);
-    assert!(fx.service.observer_pass().restarted.is_empty());
-
-    let raised = std::fs::read_to_string(fx.catalog().join("queues/jira-intake.yaml"))
-        .unwrap()
-        .replace("task_limit_per_run: 1", "task_limit_per_run: 5");
-    fx.write("queues/jira-intake.yaml", &raised);
-
-    assert_eq!(fx.service.observer_pass().restarted, vec![pair.clone()]);
-    assert_eq!(fx.record(&pair).state, AutomationState::Active);
-}
-
-#[test]
 fn a_run_without_a_result_by_its_deadline_is_lost_without_counting_a_failure() {
     let fx = Fixture::new();
     fx.queue("jira-intake", "jira-new", ObserverMode::Always);
@@ -763,9 +704,8 @@ fn a_run_whose_phase_is_not_check_has_no_effect() {
     );
     let created = fx.service.observer_create_task(
         &run.run_id,
-        crate::controller_protocol::wire::ObserverCreateTaskRequest {
-            data: json!({"title": "From an entry script"}),
-        },
+        serde_json::from_value(json!({"launch": {"workflow_id": "triage", "workflow_version": 1}}))
+            .unwrap(),
     );
 
     for (effect, refused) in [("decide", decided), ("create task", created)] {

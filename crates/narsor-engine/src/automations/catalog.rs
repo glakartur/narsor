@@ -14,9 +14,6 @@
 //!     mode: on_episodes                   # or always
 //!     schedule: {cron: "*/5 * * * *"}     # or {interval_secs: 300}
 //!     condition: {}                       # optional, handed to the scripts
-//!     tasks:                              # optional, `always` queues only
-//!       workflow_id: triage               # must be in the workflow catalogue
-//!       mapping: {summary: title, task.ticket: key}   # task.ticket/task.title: task fields
 //! ```
 //!
 //! The directory or file name is the identifier, as in the environment
@@ -33,17 +30,14 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use narsor_protocol::controller::WorkspaceRequest;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::domain::observer_name::{name_like_problem, param_name_problem, queue_name_problem};
-use crate::domain::WorkflowDefinition;
 use crate::environment::catalog::EXTENSIONS;
 use crate::observers::store::script_digest;
 use crate::observers::{
-    CreateTaskEffect, ObserverMode, ScheduleConfig, SecretRef, DEFAULT_TASK_LIMIT_PER_RUN,
-    MAX_CONDITION_BYTES, MAX_SCRIPT_BYTES, MAX_SECRET_REFS, MAX_TASK_LIMIT_PER_RUN,
+    ObserverMode, ScheduleConfig, SecretRef, MAX_CONDITION_BYTES, MAX_SCRIPT_BYTES, MAX_SECRET_REFS,
 };
 use crate::persistence::CatalogPaths;
 
@@ -129,23 +123,9 @@ pub struct Queue {
     pub schedule: ScheduleConfig,
     /// Parameters handed to the scripts as they are (a JSON object).
     pub condition: serde_json::Value,
-    /// The tasks its scripts may create; only an `always` queue has them.
-    pub tasks: Option<QueueTasks>,
     /// `sha256:` digest of the queue file as it was read: a stopped pair
     /// runs again when it changes.
     pub definition_digest: String,
-}
-
-/// The task-creation settings of an `always` queue.
-#[derive(Debug, Clone, PartialEq)]
-pub struct QueueTasks {
-    /// What every created task runs, checked against the workflow
-    /// catalogue at load.
-    pub effect: CreateTaskEffect,
-    /// Most tasks one run may create.
-    pub task_limit_per_run: u32,
-    /// Whether the first run imports what already matches the condition.
-    pub import_backlog: bool,
 }
 
 /// The fingerprint of one (queue, automation) pair's definition: the queue
@@ -349,9 +329,14 @@ struct QueueFile {
     schedule: ScheduleFile,
     #[serde(default)]
     condition: Option<serde_json::Value>,
+    /// Removed: refused with a clear reason, see [`REMOVED_TASKS`].
     #[serde(default)]
-    tasks: Option<TasksFile>,
+    tasks: Option<serde_yaml::Value>,
 }
+
+/// Why a queue file with `tasks` is refused.
+const REMOVED_TASKS: &str = "'tasks' is removed: a script creates a task with \
+     `narsor-cli task create` and names the workflow, inputs and repositories itself";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -360,30 +345,6 @@ struct ScheduleFile {
     interval_secs: Option<u64>,
     #[serde(default)]
     cron: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TasksFile {
-    workflow_id: String,
-    #[serde(default)]
-    workflow_version: Option<u32>,
-    #[serde(default)]
-    workspaces: BTreeMap<String, WorkspaceRequest>,
-    #[serde(default)]
-    backend_id: Option<String>,
-    #[serde(default)]
-    profile: Option<String>,
-    #[serde(default)]
-    mapping: BTreeMap<String, String>,
-    #[serde(default = "default_task_limit_per_run")]
-    task_limit_per_run: u32,
-    #[serde(default)]
-    import_backlog: bool,
-}
-
-fn default_task_limit_per_run() -> u32 {
-    DEFAULT_TASK_LIMIT_PER_RUN
 }
 
 // ---------------------------------------------------------------------------
@@ -398,13 +359,8 @@ impl AutomationCatalog {
         }
     }
 
-    /// Reads every automation and queue now. `workflow` finds the valid
-    /// catalogue definition of a workflow id, or says why there is none; an
-    /// `always` queue that creates tasks is checked against it.
-    pub fn load(
-        &self,
-        workflow: impl Fn(&str) -> Result<WorkflowDefinition, String>,
-    ) -> AutomationCatalogLoad {
+    /// Reads every automation and queue now.
+    pub fn load(&self) -> AutomationCatalogLoad {
         let mut load = AutomationCatalogLoad::default();
         let mut invalid = BTreeSet::new();
         for (name, path) in self.list(&self.paths.automations_dir(), &mut load.problems) {
@@ -419,7 +375,7 @@ impl AutomationCatalog {
             }
         }
         for (name, path) in self.queue_files(&mut load.problems) {
-            match self.read_queue(&name, &path, &load.automations, &invalid, &workflow) {
+            match self.read_queue(&name, &path, &load.automations, &invalid) {
                 Ok(queue) => {
                     load.queues.insert(name, queue);
                 }
@@ -535,13 +491,15 @@ impl AutomationCatalog {
         file: &Path,
         automations: &BTreeMap<String, Automation>,
         invalid: &BTreeSet<String>,
-        workflow: &impl Fn(&str) -> Result<WorkflowDefinition, String>,
     ) -> Result<Queue, String> {
         if let Some(reason) = queue_name_problem(name) {
             return Err(format!("invalid queue name: {reason}"));
         }
         let text = std::fs::read_to_string(file).map_err(|error| error.to_string())?;
         let parsed: QueueFile = serde_yaml::from_str(&text).map_err(|error| error.to_string())?;
+        if parsed.tasks.is_some() {
+            return Err(REMOVED_TASKS.into());
+        }
         if parsed.automations.is_empty() {
             return Err("'automations' must name at least one automation".into());
         }
@@ -563,22 +521,12 @@ impl AutomationCatalog {
             ScheduleConfig::from_parts(parsed.schedule.interval_secs, parsed.schedule.cron)
                 .map_err(|error| error.to_string())?;
         let condition = validate_condition(parsed.condition)?;
-        let tasks = match (parsed.tasks, parsed.mode) {
-            (None, _) => None,
-            (Some(_), ObserverMode::OnEpisodes) => {
-                return Err(
-                    "'tasks' needs 'mode: always': an on_episodes queue creates no tasks".into(),
-                )
-            }
-            (Some(tasks), ObserverMode::Always) => Some(validate_tasks(tasks, workflow)?),
-        };
         Ok(Queue {
             name: name.to_string(),
             automations: parsed.automations,
             mode: parsed.mode,
             schedule,
             condition,
-            tasks,
             definition_digest: script_digest(text.as_bytes()),
         })
     }
@@ -713,39 +661,6 @@ fn validate_condition(condition: Option<serde_json::Value>) -> Result<serde_json
     Ok(condition)
 }
 
-/// The task-creation settings, checked as `observer create` checked them:
-/// the workflow must be in the catalogue, its version is the catalogue's
-/// unless the file pins one, and every mapped input must be declared.
-fn validate_tasks(
-    tasks: TasksFile,
-    workflow: &impl Fn(&str) -> Result<WorkflowDefinition, String>,
-) -> Result<QueueTasks, String> {
-    if tasks.task_limit_per_run == 0 || tasks.task_limit_per_run > MAX_TASK_LIMIT_PER_RUN {
-        return Err(format!(
-            "'tasks.task_limit_per_run' must be between 1 and {MAX_TASK_LIMIT_PER_RUN}"
-        ));
-    }
-    let definition = workflow(&tasks.workflow_id)
-        .map_err(|reason| format!("workflow '{}' cannot be used: {reason}", tasks.workflow_id))?;
-    let effect = CreateTaskEffect {
-        workflow_version: tasks.workflow_version.unwrap_or(definition.version),
-        workflow_id: tasks.workflow_id,
-        workspaces: tasks.workspaces,
-        backend_id: tasks.backend_id,
-        profile: tasks.profile,
-        mapping: tasks.mapping,
-    };
-    effect.validate().map_err(|error| error.to_string())?;
-    effect
-        .validate_against(&definition)
-        .map_err(|error| error.to_string())?;
-    Ok(QueueTasks {
-        effect,
-        task_limit_per_run: tasks.task_limit_per_run,
-        import_backlog: tasks.import_backlog,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,8 +708,7 @@ mod tests {
         }
 
         fn load(&self) -> AutomationCatalogLoad {
-            AutomationCatalog::new(&self.0)
-                .load(|id| Err(format!("workflow '{id}' is not in this test catalogue")))
+            AutomationCatalog::new(&self.0).load()
         }
     }
 
@@ -827,7 +741,6 @@ mod tests {
             queue.schedule.cron().map(|cron| cron.to_string()),
             Some("*/5 * * * *".into())
         );
-        assert!(queue.tasks.is_none());
         let automation = &load.automations["gitlab-mr-label"];
         assert!(HookPhase::ALL.iter().all(|phase| automation.has(*phase)));
         assert_eq!(automation.params, vec!["mr_url".to_string()]);
@@ -895,7 +808,7 @@ mod tests {
                 "carries a value",
             ),
             (
-                "always queue whose workflow is not in the catalogue",
+                "queue file with the removed 'tasks'",
                 |root| {
                     root.write(
                         "queues/bad.yaml",
@@ -903,7 +816,7 @@ mod tests {
                     );
                 },
                 "queues/bad.yaml",
-                "workflow 'nope'",
+                "'tasks' is removed",
             ),
             (
                 "unknown field",

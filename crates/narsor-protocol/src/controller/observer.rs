@@ -15,19 +15,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// `POST /observer/v1/runs/{run}/tasks`: create a task from the effect data.
-///
-/// Only the data: the workflow, repositories, backend and
-/// profile come from the queue file, and only the fields its mapping
-/// names become workflow inputs. Any other field is refused.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ObserverCreateTaskRequest {
-    /// The effect data, a JSON object whose fields the mapping names.
-    #[serde(default)]
-    pub data: Value,
-}
-
 /// `POST /observer/v1/runs/{run}/decide`: answer the gate of the run's queue
 /// entry, as a person answers it (R12, R13).
 ///
@@ -379,7 +366,7 @@ pub struct QueueAutomationView {
     /// The secret references handed to its scripts (never values).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<ObserverSecretRef>,
-    /// `active`, `needs_attention` (a run reached the task limit) or
+    /// `active` or
     /// `error` (too many failed runs). A stopped pair runs again when its
     /// queue file, `automation.yaml` or `check` script changes.
     pub state: String,
@@ -491,9 +478,6 @@ pub struct ObserverQueueView {
     /// The cron expression (UTC), for a cron schedule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron: Option<String>,
-    /// The workflow an `always` queue creates tasks of.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow_id: Option<String>,
     /// Its automations, in the queue file's order.
     #[serde(default)]
     pub automations: Vec<QueueAutomationView>,

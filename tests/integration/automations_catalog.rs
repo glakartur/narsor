@@ -38,15 +38,8 @@ impl Drop for TempRoot {
     }
 }
 
-fn always_queue(workflow: &str) -> String {
-    format!(
-        "automations: [jira-new-issues]\nmode: always\nschedule: {{interval_secs: 600}}\n\
-         tasks: {{workflow_id: {workflow}}}\n"
-    )
-}
-
 #[test]
-fn always_queue_takes_the_catalogue_workflow_and_one_naming_an_unknown_workflow_is_a_problem() {
+fn an_always_queue_loads_and_one_with_the_removed_tasks_is_a_problem() {
     let root = TempRoot::new();
     root.write(
         "automations/jira-new-issues/automation.yaml",
@@ -56,18 +49,21 @@ fn always_queue_takes_the_catalogue_workflow_and_one_naming_an_unknown_workflow_
         "automations/jira-new-issues/check.sh",
         "#!/bin/sh\nexit 0\n",
     );
-    root.write("queues/jira-intake.yaml", &always_queue("wf"));
-    root.write("queues/lost-intake.yaml", &always_queue("no-such-workflow"));
+    let queue = "automations: [jira-new-issues]\nmode: always\nschedule: {interval_secs: 600}\n";
+    root.write("queues/jira-intake.yaml", queue);
+    root.write(
+        "queues/old-intake.yaml",
+        &format!("{queue}tasks: {{workflow_id: wf}}\n"),
+    );
     let resolver = resolver(root.path());
 
     let load = resolver.automation_catalog();
 
-    let workflow = resolver.workflow_definition("wf").expect("seeded workflow");
-    let tasks = load.queues["jira-intake"].tasks.as_ref().expect("tasks");
-    assert_eq!(tasks.effect.workflow_version, workflow.version);
-    assert!(!load.queues.contains_key("lost-intake"));
+    assert!(load.queues.contains_key("jira-intake"));
+    assert!(!load.queues.contains_key("old-intake"));
     assert_eq!(load.problems.len(), 1, "{:?}", load.problems);
-    assert_eq!(load.problems[0].file, Path::new("queues/lost-intake.yaml"));
+    assert_eq!(load.problems[0].file, Path::new("queues/old-intake.yaml"));
+    assert!(load.problems[0].reason.contains("'tasks' is removed"));
     let script = resolver
         .automation_script("jira-new-issues", HookPhase::Check)
         .expect("check script");

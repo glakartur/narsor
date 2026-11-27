@@ -115,17 +115,7 @@ condition:                         # optional: any map, given to the scripts as 
 automations: [jira-new-issues]
 mode: always
 schedule: {cron: "*/10 * * * *"}
-condition: {base_url: "https://jira.example.com", jql: "project = ABC", fields: [key]}
-tasks:                             # mode always only: the scripts may create tasks
-  workflow_id: triage              # must be in the workflow catalogue
-  workflow_version: 2              # optional: the catalogue's version by default
-  workspaces: {code: {repository: api}}   # optional, as in a task create request
-  backend_id: k8s                  # optional: the default backend by default
-  profile: default                 # optional
-  mapping: {ticket: key}           # workflow input: field of the task data
-                                   # task.ticket / task.title: the task's ticket and title
-  task_limit_per_run: 10           # 1-1000, default 10
-  import_backlog: false            # the first run imports what already matches
+condition: {base_url: "https://jira.example.com", jql: "project = ABC", workflow: triage}
 ```
 
 | Field | Meaning |
@@ -134,7 +124,6 @@ tasks:                             # mode always only: the scripts may create ta
 | `mode` | Required. `on_episodes` or `always` (section 3). |
 | `schedule` | Required. Exactly one of `interval_secs` and `cron` (section 7). |
 | `condition` | A map, at most 64 KiB. Each script of the queue gets it as it is. When several automations serve one queue, they share it: give each one a key of its own (the example uses `gitlab` and `github`). |
-| `tasks` | Only for `mode: always`. What each task that a script creates runs. The tasks belong to the owner of the installation. |
 
 ### Problems
 
@@ -148,8 +137,8 @@ example:
 - a queue that names a missing or invalid automation (the queue does not
   run);
 - a schedule that breaks the rules of section 7;
-- `tasks` on an `on_episodes` queue, a workflow that is not in the
-  catalogue, or a `mapping` input that the workflow does not declare.
+- a queue file with `tasks` (removed: a script names what its task runs,
+  section 6).
 
 A gate that watches a queue which is not in the catalogue (or is a
 problem) waits for a person, as a gate without `watch` does.
@@ -325,8 +314,7 @@ One JSON document, contract version 3:
     ]
   },
   "exit": {"choice": "check_feedback", "author": "automation", "run_id": "…"},
-  "first_run": false,
-  "import_backlog": false
+  "first_run": false
 }
 ```
 
@@ -346,7 +334,6 @@ One JSON document, contract version 3:
 | `entry.variables` | The variables that an answer may give: name, type, description and, when the workflow restricts them, `options`. |
 | `exit` | Only for `out`: how the gate was left. `choice` is the choice (absent when the task ended at the gate). `author` is `person`, `automation` (with the `run_id` of the run that answered), `operator`, `task_end`, or `runner` when the runner left the gate with no exit that Narsor held. |
 | `first_run` | `true` until the first `check` run of the pair succeeds. |
-| `import_backlog` | The `tasks.import_backlog` of the queue file. |
 
 Version 2 had an `observer` object in place of `queue` and `automation`,
 and no `phase` and `exit`. A script of version 2 must be changed before it
@@ -420,9 +407,7 @@ cannot create a task or answer a gate.
 | A script file | 256 KiB |
 | stdout | 1 MiB |
 | stderr | 64 KiB (Narsor keeps the start) |
-| Data of one task (`--data`) | 64 KiB |
 | Params of one entry | 64 params, 16 KiB together |
-| Tasks of one run | `tasks.task_limit_per_run` (10 by default, 1000 at most) |
 
 ## 6. Effects
 
@@ -435,23 +420,27 @@ from an `in` or `out` run (HTTP 400, `not_a_check_run`).
 ### Create a task
 
 ```sh
-narsor-cli task create --data "$JSON" </dev/null >&2
+narsor-cli task create triage --ticket "$KEY" --input "description=Solve $KEY" \
+  --repository code=api </dev/null >&2
 ```
 
+or, with the parameters as one JSON object on stdin (the options given as
+well override it):
+
+```sh
+printf '%s' "$JSON" | narsor-cli task create --stdin >&2
+```
+
+- **The same command as from the console.** The script chooses the
+  workflow, the inputs, the repositories, the ticket, the title, the
+  backend and the profile, with the options of `narsor-cli task create`
+  ([CLI](cli.md#commands-for-an-automations-script)). Narsor checks the
+  request as for a task that a person creates. Without
+  `--workflow-version` the task runs the catalogue's version. `--file` is
+  refused.
 - **A new task on each call.** Narsor does not check whether the object
   already has a task. The script decides that from its state (section 5).
-- **The queue decides the task.** The workflow, the repositories, the
-  backend and the profile come from `tasks` of the queue file, not from the
-  script. The data has only the fields that `tasks.mapping` maps to
-  workflow inputs. Narsor refuses a field that is not in the map.
-- **Ticket and title.** The mapping keys `task.ticket` and `task.title`
-  set the task's ticket and title (`{{ task.ticket }}`, `{{ task.title }}`
-  in the workflow), not an input. For example, `task.ticket: key` gives the
-  Jira key as the ticket. The value must be text; Narsor checks its form as
-  for a task that a person creates. No other `task.` key is allowed.
-- **Task limit.** A run can create at most `tasks.task_limit_per_run`
-  tasks. Narsor refuses the next one, the command exits with `1`, and the
-  pair stops in the state `needs_attention` (section 8).
+  It also decides how many tasks one run creates.
 - **Owner and origin.** Each task from a queue belongs to the owner of the
   installation, and it records the queue, the automation and the run.
 
@@ -462,12 +451,12 @@ narsor-cli task decide "$TASK_ID" --episode "$EPISODE" \
   --choice check_feedback --reason "the label was removed" </dev/null >&2
 ```
 
-or, with the whole answer as JSON (the same object as the answer of a
-`script` step, without artifacts):
+or, with the answer as JSON on stdin (the same object as the answer of a
+`script` step, without artifacts; the options given as well override it):
 
 ```sh
-narsor-cli task decide "$TASK_ID" --episode "$EPISODE" \
-  --data '{"choice": "revise_plan", "reason": "…", "variables": {"note": "…"}}' </dev/null >&2
+printf '%s' '{"choice": "revise_plan", "reason": "…", "variables": {"note": "…"}}' |
+  narsor-cli task decide "$TASK_ID" --episode "$EPISODE" --stdin >&2
 ```
 
 | Option | Meaning |
@@ -476,7 +465,7 @@ narsor-cli task decide "$TASK_ID" --episode "$EPISODE" \
 | `--reason TEXT` | Why the script chose it. The task history shows it. |
 | `--var NAME=VALUE` | A variable of the gate, as text (repeatable). |
 | `--var-file NAME=PATH` | A variable of the gate whose value is the text of a file (repeatable). |
-| `--data JSON` | The whole answer, `{"choice", "reason", "variables"}`. Not together with the options above. |
+| `--stdin` | Read the answer, `{"choice", "reason", "variables"}`, on stdin. The options above override it. |
 
 - **Only from its entry.** `TASK_ID` and `EPISODE` must be the `task_id`
   and the `episode` of the entry of this run.
@@ -540,7 +529,6 @@ Each pair (queue, automation) has a state:
 | State | Meaning |
 |---|---|
 | `active` | Runs on the schedule of its queue. |
-| `needs_attention` | A run went over the task limit. The pair stopped. |
 | `error` | 5 `check` runs in a row failed. The pair stopped. |
 
 **A stopped pair starts again when its definition changes:** the queue
@@ -659,9 +647,10 @@ chmod +x fake/bin/narsor-cli
 echo '{"issues": [{"id": "101", "key": "ABC-101", "fields": {}}]}' > fake/search.json
 echo '{"contract_version": 3, "phase": "check",
        "queue": "jira-intake", "automation": "jira-new-issues",
-       "condition": {"base_url": "https://jira.example.com", "jql": "project = ABC"},
+       "condition": {"base_url": "https://jira.example.com", "jql": "project = ABC",
+                     "workflow": "template"},
        "state": {"last_id": 100},
-       "first_run": false, "import_backlog": false}' |
+       "first_run": false}' |
   PATH="$PWD/fake/bin:$PATH" FAKE_SOURCE_DIR="$PWD/fake" \
   sh examples/catalog/automations/jira-new-issues/check.sh
 ```
@@ -672,8 +661,9 @@ reads. Its input needs an `entry` (section 5), and an `out` input an
 
 Narsor has no dry run: the first run after a file goes into the catalogue
 uses the real source and has real effects. Test against the real source by
-hand first, with a token that can only read where you can, and set a low
-`task_limit_per_run` for the first runs.
+hand first, with a token that can only read where you can, and let the
+script create few tasks in its first runs (for example a low
+`max_results`).
 
 ## 13. Update from stored observers
 
@@ -684,6 +674,7 @@ script versions and approvals, and managed them with `narsor-cli observer
 longer reads those records, and the server logs one warning at start while
 the directory has them. Write each observer again as an automation and a
 queue in the catalogue (the condition, the schedule, the mode, the secret
-names and the workflow mapping move to the queue and automation files, and
-the script gets contract version 3). The order of the update is in
+names move to the queue and automation files, the script names the
+workflow of its tasks in `narsor-cli task create`, and the script gets
+contract version 3). The order of the update is in
 [Updates](../operations/updates.md#update-to-catalogue-automations-d78).
