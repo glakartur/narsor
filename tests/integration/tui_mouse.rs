@@ -627,3 +627,230 @@ mod details {
         assert_eq!(cursor(&app), 7);
     }
 }
+
+mod progress {
+    use super::*;
+
+    use narsor::tui::task_app::detail::DetailRead;
+    use narsor::tui::task_app::tabs::conversation::AttemptRead;
+    use narsor::tui::task_app::{DetailTab, StepFocus};
+    use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId, TranscriptState};
+    use narsor_engine::controller_protocol::ExecutionEventsSource;
+    use narsor_engine::engine::{ConversationState, PositionStatus};
+
+    use crate::task_app_support::{position, timeline};
+
+    /// The conversation of step `state`: entries `ids`, each a header
+    /// `AGENT · id` and a line `line id`.
+    fn read_step(app: &mut TaskApp, state: &str, ids: &[String]) {
+        let entries = ids
+            .iter()
+            .map(|id| {
+                TranscriptEntry::new(
+                    TranscriptEntryId::from(id.as_str()),
+                    vec![format!("line {id}")],
+                    Vec::new(),
+                )
+                .with_header(format!("AGENT · {id}"))
+            })
+            .collect();
+        let read = AttemptRead {
+            entries,
+            next_entry: ids.len() as u64,
+            closed: false,
+            truncated_tail: false,
+            complete: true,
+            no_record: false,
+            source: ExecutionEventsSource::Runner,
+            recorded_at: None,
+        };
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Attempt {
+                attempt_id: format!("act-{state}"),
+                from: 0,
+                result: Ok(read),
+            },
+        );
+    }
+
+    fn ids(count: usize) -> Vec<String> {
+        (1..=count).map(|n| format!("{n:02}")).collect()
+    }
+
+    /// Running task `a` on *Przebieg* with the keys on the list: `plan` and
+    /// `review_api` done, three entries each, `implement` running and
+    /// followed, its conversation not read yet.
+    fn przebieg_app() -> TaskApp {
+        let running = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "implement",
+        );
+        let mut app = app();
+        app.load(listing(vec![titled(running, "NAR-1")], "c"));
+        key(&mut app, KeyCode::Enter);
+        for _ in 0..DetailTab::ALL.len() {
+            if app.detail().tab() == DetailTab::Progress {
+                break;
+            }
+            key(&mut app, KeyCode::Char(']'));
+        }
+        assert_eq!(app.detail().tab(), DetailTab::Progress);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus(), Focus::List);
+        let positions = [
+            ("plan", PositionStatus::Succeeded),
+            ("review_api", PositionStatus::Succeeded),
+            ("implement", PositionStatus::InProgress),
+        ]
+        .into_iter()
+        .map(|(state, status)| {
+            let mut step = position(state, status);
+            step.conversation = ConversationState::Recorded;
+            step
+        })
+        .collect();
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline("a", positions, Some("implement #1")))),
+        );
+        read_step(&mut app, "plan", &ids(3));
+        read_step(&mut app, "review_api", &ids(3));
+        assert_eq!(selected_step(&app).as_deref(), Some("implement #1"));
+        app
+    }
+
+    fn selected_step(app: &TaskApp) -> Option<String> {
+        app.detail()
+            .view("a")?
+            .progress()
+            .selected_label()
+            .map(str::to_string)
+    }
+
+    fn step_transcript(app: &TaskApp) -> &TranscriptState {
+        app.detail()
+            .view("a")
+            .unwrap()
+            .step_conversation()
+            .unwrap()
+            .transcript()
+    }
+
+    fn selected_entry(app: &TaskApp) -> Option<String> {
+        step_transcript(app)
+            .selected_entry()
+            .map(|id| id.as_str().rsplit('/').next().unwrap().to_string())
+    }
+
+    fn paused(app: &TaskApp) -> bool {
+        app.detail().view("a").unwrap().progress().is_paused()
+    }
+
+    /// Clicks the first cell of `text` on a freshly drawn frame.
+    fn click_on(app: &mut TaskApp, text: &str) {
+        let (column, y) = find(&draw(app, 120, 30), text);
+        click(app, column, y);
+    }
+
+    #[test]
+    fn a_click_on_a_step_focuses_the_axis_and_selects_that_step() {
+        let mut app = przebieg_app();
+
+        click_on(&mut app, "review_api");
+
+        assert_eq!(app.focus(), Focus::Details);
+        assert_eq!(app.step_focus(), StepFocus::Axis);
+        assert_eq!(selected_step(&app).as_deref(), Some("review_api #1"));
+
+        // From the step's conversation a click on another step goes back to
+        // the axis too.
+        click_on(&mut app, "line 02");
+        assert_eq!(app.step_focus(), StepFocus::Conversation);
+        click_on(&mut app, "plan");
+        assert_eq!(app.step_focus(), StepFocus::Axis);
+        assert!(!paused(&app));
+        assert_eq!(selected_step(&app).as_deref(), Some("plan #1"));
+    }
+
+    #[test]
+    fn a_click_in_the_steps_conversation_enters_it_and_selects_the_entry() {
+        let mut app = przebieg_app();
+        click_on(&mut app, "review_api");
+
+        click_on(&mut app, "line 02");
+
+        assert_eq!(app.focus(), Focus::Details);
+        assert_eq!(app.step_focus(), StepFocus::Conversation);
+        assert!(paused(&app), "the axis holds the step");
+        assert_eq!(selected_step(&app).as_deref(), Some("review_api #1"));
+        assert_eq!(selected_entry(&app).as_deref(), Some("02"));
+    }
+
+    #[test]
+    fn a_click_where_the_step_has_no_conversation_yet_only_focuses_the_axis() {
+        let mut app = przebieg_app();
+
+        click_on(&mut app, "rozmowę kroku");
+
+        assert_eq!(app.focus(), Focus::Details);
+        assert_eq!(app.step_focus(), StepFocus::Axis);
+        assert!(!paused(&app));
+        assert_eq!(selected_step(&app).as_deref(), Some("implement #1"));
+    }
+
+    #[test]
+    fn the_wheel_over_the_axis_steps_it_and_leaves_the_focus_on_the_list() {
+        let mut app = przebieg_app();
+        let (column, y) = find(&draw(&mut app, 120, 30), "plan");
+
+        wheel_down(&mut app, column, y);
+        assert_eq!(
+            selected_step(&app).as_deref(),
+            Some("implement #1"),
+            "the last step stays selected"
+        );
+
+        draw(&mut app, 120, 30);
+        wheel_up(&mut app, column, y);
+        assert_eq!(selected_step(&app).as_deref(), Some("review_api #1"));
+        assert_eq!(app.focus(), Focus::List);
+    }
+
+    #[test]
+    fn a_notch_over_the_axis_from_the_steps_conversation_goes_back_to_the_axis_and_steps() {
+        let mut app = przebieg_app();
+        click_on(&mut app, "review_api");
+        click_on(&mut app, "line 02");
+        assert_eq!(app.step_focus(), StepFocus::Conversation);
+        let (column, y) = find(&draw(&mut app, 120, 30), "plan");
+
+        wheel_down(&mut app, column, y);
+
+        assert_eq!(app.step_focus(), StepFocus::Axis);
+        assert!(!paused(&app));
+        assert_eq!(selected_step(&app).as_deref(), Some("implement #1"));
+        assert_eq!(app.focus(), Focus::Details);
+    }
+
+    #[test]
+    fn a_notch_over_the_steps_conversation_scrolls_three_lines_without_entering_it() {
+        let mut app = przebieg_app();
+        read_step(&mut app, "review_api", &ids(30));
+        click_on(&mut app, "review_api");
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus(), Focus::List);
+        let buffer = draw(&mut app, 120, 30);
+        let bottom = step_transcript(&app).scroll_offset();
+        let (column, y) = find(&buffer, "line 29");
+
+        wheel_up(&mut app, column, y);
+
+        assert_eq!(step_transcript(&app).scroll_offset(), bottom - 3);
+        assert_eq!(app.step_focus(), StepFocus::Axis);
+        assert_eq!(app.focus(), Focus::List);
+    }
+}

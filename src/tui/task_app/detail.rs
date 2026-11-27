@@ -90,7 +90,7 @@ use super::tabs::conversation::{
 };
 use super::tabs::events::{self, Events};
 use super::tabs::info::{self, DriftOutcome, Info};
-use super::tabs::progress::{self, AxisRows, Progress, StepView};
+use super::tabs::progress::{self, AxisRows, Progress, Spot, StepView};
 use super::tabs::state::{self as state_tab, State};
 use super::workspace_rows::{self, Part, Piece};
 use super::{failure_reason, DetailTab, DetailView, StepFocus, TaskApp};
@@ -232,7 +232,10 @@ impl TaskDetail {
     /// `by` is 1 down, -1 up. The text under the pointer moves
     /// [`WHEEL_LINES`] lines, as far as its line keys take it; the
     /// conversations move by lines rather than by entries, as their page
-    /// keys do, so a long entry does not jump past.
+    /// keys do, so a long entry does not jump past. On *Przebieg* a notch
+    /// over the axis moves the selection one step, as `j` and `k` move it,
+    /// and a notch over the step's conversation scrolls it without entering
+    /// it.
     pub fn on_wheel(&mut self, tab: DetailTab, by: isize, column: u16, row: u16) {
         let lines = by.saturating_mul(WHEEL_LINES as isize);
         let line_key = if by > 0 { Action::Down } else { Action::Up };
@@ -247,12 +250,18 @@ impl TaskDetail {
                     self.on_action(tab, StepFocus::Axis, line_key);
                 }
             }
-            DetailTab::Progress => {}
+            DetailTab::Progress => match self.progress.spot_at(column, row) {
+                Some(Spot::Axis(_)) => self.progress.step(by),
+                Some(Spot::Step) => self.progress.scroll_step(lines),
+                None => {}
+            },
         }
     }
 
     /// A click on the content of `tab` at `column`, `row`: in a conversation
-    /// the entry drawn there gets the cursor, as the line keys give it.
+    /// the entry drawn there gets the cursor, as the line keys give it. A
+    /// click on *Przebieg* moves the level of the focus, so the application
+    /// takes it.
     pub fn on_click(&mut self, tab: DetailTab, column: u16, row: u16) {
         match tab {
             DetailTab::Conversation => {

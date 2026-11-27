@@ -28,7 +28,8 @@
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
-use super::{Focus, Request, TaskApp, View};
+use super::tabs::progress::Spot;
+use super::{DetailTab, Focus, Request, StepFocus, TaskApp, View};
 
 /// A panel a click or a notch can reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,11 +164,23 @@ impl TaskApp {
             return;
         };
         let tab = self.detail.tab;
+        // The keys on a step's conversation read the selected step; a notch
+        // that moves the selection first takes them back to the axis, as
+        // `Esc` does, so they never read a step they did not enter.
+        let over_axis = tab == DetailTab::Progress
+            && matches!(
+                self.detail.view_mut(&id).progress.spot_at(column, row),
+                Some(Spot::Axis(_))
+            );
+        if over_axis {
+            self.back_to_axis();
+        }
         self.detail.view_mut(&id).on_wheel(tab, by, column, row);
     }
 
     /// A click on the open tab of the selected task's details: in a
-    /// conversation it picks the entry drawn under the pointer.
+    /// conversation it picks the entry drawn under the pointer; on
+    /// *Przebieg* it picks the level of the focus.
     fn click_details(&mut self, column: u16, row: u16) {
         if !matches!(self.view, View::Tasks) {
             return;
@@ -176,7 +189,38 @@ impl TaskApp {
             return;
         };
         let tab = self.detail.tab;
-        self.detail.view_mut(&id).on_click(tab, column, row);
+        if tab == DetailTab::Progress {
+            self.click_progress(&id, column, row);
+        } else {
+            self.detail.view_mut(&id).on_click(tab, column, row);
+        }
+    }
+
+    /// A click on *Przebieg* of task `id`. On the axis: the keys go to the
+    /// axis and the step under the pointer is selected, as `Esc` and then
+    /// `j` / `k` would. On the selected step: the keys go into its
+    /// conversation, as `Enter` takes them, and the entry under the pointer
+    /// gets the cursor; a step with no conversation yet keeps them on the
+    /// axis.
+    fn click_progress(&mut self, id: &str, column: u16, row: u16) {
+        match self.detail.view_mut(id).progress.spot_at(column, row) {
+            Some(Spot::Axis(index)) => {
+                self.back_to_axis();
+                if let Some(index) = index {
+                    self.detail.view_mut(id).progress.select(index);
+                }
+            }
+            Some(Spot::Step) => {
+                self.enter_step();
+                if self.step_focus() == StepFocus::Conversation {
+                    self.detail
+                        .view_mut(id)
+                        .progress
+                        .click_step_entry(column, row);
+                }
+            }
+            None => {}
+        }
     }
 
     /// A notch over the list: the selection `by` items along, stopping at
