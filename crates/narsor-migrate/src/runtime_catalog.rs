@@ -1,21 +1,28 @@
-//! `narsor-migrate runtime-catalog`: moves an old runtime catalogue into
-//! the runtime directory of the catalogue.
+//! `narsor-migrate runtime-catalog`: plans the move of an old runtime
+//! catalogue into the runtime directory of the catalogue. It changes
+//! nothing; `dist/install.sh` does the move with `mv -n`.
 //!
 //! ```text
 //! {catalog}/runtime.yaml  ->  {catalog}/runtime/runtime.yaml
 //! {catalog}/components/   ->  {catalog}/runtime/components/
 //! ```
 //!
-//! The move only renames: it never copies, deletes or overwrites a file, so
-//! it needs no backup. It refuses before any change while a program of the
-//! installation runs, and when the runtime directory already holds what
-//! would move (both layouts at once). Script paths in `runtime.yaml` resolve
-//! relative to its directory, so the usual `components/...` entries stay
-//! valid; a bare-string script outside `components/` is reported after the
-//! move, because it is not found until the operator moves it too.
+//! The command resolves the catalogue as `narsor-server` does (bash cannot),
+//! refuses while a program of the installation runs, refuses when the runtime
+//! directory already holds what would move (both layouts at once), and reads
+//! `runtime.yaml` for the script warning. A bare-string script outside
+//! `components/` is reported as a warning, because it is not found after the
+//! move until the operator moves it too.
 //!
-//! A rerun after a crash between the two renames finds the old file, no old
-//! `components/` and the new `runtime/components/`, and finishes the move.
+//! Output, one line each, fields separated by a tab:
+//!
+//! ```text
+//! move<TAB>{from}<TAB>{to}     in the order to run them: scripts first
+//! warning<TAB>{text}           about a script outside components/
+//! ```
+//!
+//! A rerun after a crash between the two moves finds the old file, no old
+//! `components/` and the new `runtime/components/`, and plans the file only.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -46,15 +53,15 @@ impl RuntimeCatalogMove {
     }
 }
 
-/// What a run did.
+/// What a run found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// No runtime catalogue at the old place.
     NothingToMove,
-    /// A dry run: the plan was printed, nothing changed.
-    DryRun,
-    /// The move is done. `warnings` name the scripts not found after it.
-    Moved {
+    /// The moves to make, in order, and the scripts not found after them.
+    Plan {
+        /// From and to of each move.
+        moves: Vec<(PathBuf, PathBuf)>,
         /// One line per script path outside `components/`.
         warnings: Vec<String>,
     },
@@ -63,12 +70,11 @@ pub enum Outcome {
 /// Why a run stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
-    /// A program of the installation runs; nothing changed.
+    /// A program of the installation runs.
     Running(String),
-    /// The runtime directory already holds what would move; nothing
-    /// changed.
+    /// The runtime directory already holds what would move.
     Collision(String),
-    /// A rename failed. A rerun finishes what was started.
+    /// The check could not run.
     Failed(String),
 }
 
@@ -86,31 +92,19 @@ impl Failure {
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Failure::Running(reason) => {
-                write!(f, "refused, nothing was changed:\n{reason}")
-            }
-            Failure::Collision(reason) => {
-                write!(f, "refused, nothing was changed: {reason}")
-            }
-            Failure::Failed(reason) => write!(
-                f,
-                "the move stopped: {reason}\nCorrect the cause and run narsor-migrate \
-                 runtime-catalog again: it finishes what was started."
-            ),
+            Failure::Running(reason) => write!(f, "refused, nothing to do now:\n{reason}"),
+            Failure::Collision(reason) => write!(f, "refused: {reason}"),
+            Failure::Failed(reason) => write!(f, "{reason}"),
         }
     }
 }
 
-/// One rename: from, to.
-type Rename = (PathBuf, PathBuf);
+/// One move: from, to.
+type Move = (PathBuf, PathBuf);
 
-/// Moves the old runtime catalogue of `target` (see the module
-/// documentation). `out` gets the plan, what moved and the warnings.
-pub fn run(
-    target: &RuntimeCatalogMove,
-    dry_run: bool,
-    out: &mut dyn Write,
-) -> Result<Outcome, Failure> {
+/// Plans the move of the old runtime catalogue of `target` (see the module
+/// documentation). `out` gets the plan lines. Nothing changes on disk.
+pub fn run(target: &RuntimeCatalogMove, out: &mut dyn Write) -> Result<Outcome, Failure> {
     let failed = |error: io::Error| Failure::Failed(error.to_string());
     let catalog = &target.catalog;
     let old_file = catalog.legacy_runtime_file();
@@ -123,69 +117,37 @@ pub fn run(
         .map_err(failed)?;
         return Ok(Outcome::NothingToMove);
     }
-    let renames = plan(catalog)?;
+    let moves = plan(catalog)?;
 
-    // Held until the renames are done, so no program starts meanwhile.
     let checks = refusal::Checks {
         locks: target.locks.clone(),
         ..refusal::Checks::default()
     };
-    let _locks = refusal::check(&checks, &NoContainers, true).map_err(|refusal| {
-        if refusal.only_held_locks {
-            Failure::Running(refusal.reason)
-        } else {
-            Failure::Failed(refusal.reason)
-        }
-    })?;
-    let runtime_dir = catalog.runtime_dir();
-    let warnings = outside_components(&old_file, &runtime_dir);
+    // The locks are released at once: the installer moves later and checks
+    // each target again right before its move.
+    drop(
+        refusal::check(&checks, &NoContainers, true).map_err(|refusal| {
+            if refusal.only_held_locks {
+                Failure::Running(refusal.reason)
+            } else {
+                Failure::Failed(refusal.reason)
+            }
+        })?,
+    );
+    let warnings = outside_components(&old_file, &catalog.runtime_dir());
 
-    for (from, to) in &renames {
-        let verb = if dry_run { "Would move" } else { "Moving" };
-        writeln!(out, "{verb} {} -> {}", from.display(), to.display()).map_err(failed)?;
+    for (from, to) in &moves {
+        writeln!(out, "move\t{}\t{}", from.display(), to.display()).map_err(failed)?;
     }
-    if dry_run {
-        for warning in &warnings {
-            writeln!(out, "warning (after the move): {warning}").map_err(failed)?;
-        }
-        return Ok(Outcome::DryRun);
-    }
-
-    std::fs::create_dir_all(&runtime_dir).map_err(|error| {
-        Failure::Failed(format!("cannot create {}: {error}", runtime_dir.display()))
-    })?;
-    for (from, to) in &renames {
-        // A rename replaces an existing target on Linux: check right before.
-        if exists(to) {
-            return Err(Failure::Collision(format!(
-                "{} appeared during the move; {} was not moved",
-                to.display(),
-                from.display()
-            )));
-        }
-        std::fs::rename(from, to).map_err(|error| {
-            Failure::Failed(format!(
-                "cannot move {} to {}: {error}",
-                from.display(),
-                to.display()
-            ))
-        })?;
-    }
-    writeln!(
-        out,
-        "Moved the runtime catalogue to {}.",
-        catalog.runtime_file().display()
-    )
-    .map_err(failed)?;
     for warning in &warnings {
-        writeln!(out, "warning: {warning}").map_err(failed)?;
+        writeln!(out, "warning\t{warning}").map_err(failed)?;
     }
-    Ok(Outcome::Moved { warnings })
+    Ok(Outcome::Plan { moves, warnings })
 }
 
-/// The renames for a catalogue with an old runtime file, scripts first, or
+/// The moves for a catalogue with an old runtime file, scripts first, or
 /// the collision that stops the move.
-fn plan(catalog: &CatalogPaths) -> Result<Vec<Rename>, Failure> {
+fn plan(catalog: &CatalogPaths) -> Result<Vec<Move>, Failure> {
     let new_file = catalog.runtime_file();
     for existing in [new_file.clone(), new_file.with_extension("yml")] {
         if exists(&existing) {
@@ -201,7 +163,7 @@ fn plan(catalog: &CatalogPaths) -> Result<Vec<Rename>, Failure> {
     }
     let old_components = catalog.legacy_components_dir();
     let new_components = catalog.runtime_components_dir();
-    let mut renames = Vec::new();
+    let mut moves = Vec::new();
     if exists(&old_components) {
         if exists(&new_components) {
             return Err(Failure::Collision(format!(
@@ -213,10 +175,10 @@ fn plan(catalog: &CatalogPaths) -> Result<Vec<Rename>, Failure> {
                 old_components.display()
             )));
         }
-        renames.push((old_components, new_components));
+        moves.push((old_components, new_components));
     }
-    renames.push((catalog.legacy_runtime_file(), new_file));
-    Ok(renames)
+    moves.push((catalog.legacy_runtime_file(), new_file));
+    Ok(moves)
 }
 
 /// One line per bare-string `install` or `version` script under

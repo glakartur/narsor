@@ -186,13 +186,14 @@ installer prints the plan and the command. Until the data is migrated, the new
 `narsor-server` refuses to start and names the same command. A migration that
 stops makes a non-interactive installation fail.
 
-Next, for the same roles, the installer runs `narsor-migrate runtime-catalog`.
-This step moves an old runtime catalogue (`{catalog}/runtime.yaml` and
-`{catalog}/components/`) into `{catalog}/runtime/`. It only renames files,
-so it makes no backup and asks no question. When Narsor still runs, an
+Next, for the same roles, the installer moves an old runtime catalogue
+(`{catalog}/runtime.yaml` and `{catalog}/components/`) into
+`{catalog}/runtime/`. It does the move with bash (`mv -n`, which never
+overwrites), after `narsor-migrate runtime-catalog` has found the catalogue
+and checked it. The step makes no backup and asks no question. When Narsor still runs, an
 interactive installer offers once more to stop it. Otherwise the installer
-skips the move, prints the command in a highlighted line, and continues. The
-old place keeps working until the move. When both layouts exist, or a rename
+skips the move, prints in a highlighted line what to do, and continues. The
+old place keeps working until the move. When both layouts exist, or a move
 fails, the installer prints the step. A non-interactive installation then
 fails; an interactive one continues (see
 [Updates](updates.md#update-to-the-runtime-directory)).

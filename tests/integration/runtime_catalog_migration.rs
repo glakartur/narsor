@@ -1,6 +1,7 @@
 //! `narsor-migrate runtime-catalog`: the move of an old runtime catalogue
 //! (`{catalog}/runtime.yaml`, `{catalog}/components/`) into
-//! `{catalog}/runtime/`, on temp catalogues.
+//! `{catalog}/runtime/`, on temp catalogues: the plan of `narsor-migrate` and
+//! the move of `dist/install.sh`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -71,9 +72,9 @@ impl TempDir {
         ))
     }
 
-    fn run(&self, dry_run: bool) -> (Result<Outcome, Failure>, String) {
+    fn run(&self) -> (Result<Outcome, Failure>, String) {
         let mut out = Vec::new();
-        let result = runtime_catalog::run(&self.target(), dry_run, &mut out);
+        let result = runtime_catalog::run(&self.target(), &mut out);
         (result, String::from_utf8(out).unwrap())
     }
 }
@@ -92,6 +93,32 @@ fn files(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         .iter()
         .map(|(path, text)| (path.to_string(), text.to_string()))
         .collect()
+}
+
+/// Runs the plan the way `dist/install.sh` does: `move_catalog_path` of the
+/// installer, taken from the script, for each planned move. `Err` holds the
+/// message of the first move that failed.
+fn apply_with_installer(moves: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    let script =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("dist/install.sh")).unwrap();
+    let start = script
+        .find("move_catalog_path() {")
+        .expect("installer function");
+    let function = &script[start..start + script[start..].find("\n}\n").unwrap() + 3];
+    for (from, to) in moves {
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("{function}\nmove_catalog_path \"$1\" \"$2\""))
+            .arg("bash")
+            .arg(from)
+            .arg(to)
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            return Err(String::from_utf8(output.stderr).unwrap());
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -117,7 +144,7 @@ fn an_old_layout_moves_into_the_runtime_directory_with_the_same_bytes() {
             vec![("runtime/runtime.yaml", inline)],
         ),
         (
-            "rerun after a crash between the renames",
+            "rerun after a crash between the moves",
             vec![
                 ("runtime.yaml", SCRIPT_RUNTIME),
                 ("runtime/components/glab/install.sh", "echo glab\n"),
@@ -134,38 +161,44 @@ fn an_old_layout_moves_into_the_runtime_directory_with_the_same_bytes() {
             dir.write(path, text);
         }
 
-        let (result, out) = dir.run(false);
-
+        let (result, out) = dir.run();
+        let Ok(Outcome::Plan { moves, warnings }) = result else {
+            panic!("{name}: {result:?}\n{out}");
+        };
+        assert!(warnings.is_empty(), "{name}: {warnings:?}");
         assert_eq!(
-            result,
-            Ok(Outcome::Moved { warnings: vec![] }),
-            "{name}: {out}"
+            dir.tree(),
+            files(&before),
+            "{name}: planning changes nothing"
         );
+        apply_with_installer(&moves).unwrap_or_else(|error| panic!("{name}: {error}"));
+
         assert_eq!(dir.tree(), files(&after), "{name}");
         assert!(!dir.catalog().join("components").exists(), "{name}");
     }
 }
 
 #[test]
-fn a_script_outside_components_moves_with_a_warning_that_names_it() {
+fn a_script_outside_components_is_planned_with_a_warning_that_names_it() {
     let dir = TempDir::new();
     let runtime = "task_image:\n  base: debian:trixie-slim\n  components:\n    \
                    - { name: x, install: tools/x.sh, version: components/x/version.sh }\n";
     dir.write("runtime.yaml", runtime);
     dir.write("tools/x.sh", "echo x\n");
 
-    let (result, out) = dir.run(false);
+    let (result, out) = dir.run();
 
-    let Ok(Outcome::Moved { warnings }) = result else {
-        panic!("the layout moves: {result:?}\n{out}");
+    let Ok(Outcome::Plan { moves, warnings }) = result else {
+        panic!("the layout is planned: {result:?}\n{out}");
     };
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(
         warnings[0].contains("task_image.components[0].install")
             && warnings[0].contains("tools/x.sh")
-            && out.contains(&warnings[0]),
+            && out.contains(&format!("warning\t{}", warnings[0])),
         "{out}"
     );
+    apply_with_installer(&moves).unwrap();
     assert_eq!(
         dir.tree(),
         files(&[
@@ -176,23 +209,31 @@ fn a_script_outside_components_moves_with_a_warning_that_names_it() {
 }
 
 #[test]
-fn nothing_changes_on_a_collision_a_running_program_or_a_dry_run() {
+fn nothing_changes_on_a_collision_or_a_running_program() {
     let old_layout = [
         ("runtime.yaml", SCRIPT_RUNTIME),
         ("components/glab/install.sh", "echo glab\n"),
     ];
     type Arrange = Box<dyn Fn(&TempDir) -> Option<fs::File>>;
-    // (name, extra arrangement, dry run, expected exit or None for Ok, text in the output)
-    let cases: Vec<(&str, Arrange, bool, Option<i32>, &str)> = vec![
+    // (name, extra arrangement, expected exit, text in the message)
+    let cases: Vec<(&str, Arrange, i32, &str)> = vec![
         (
             "both runtime files",
             Box::new(|dir: &TempDir| {
                 dir.write("runtime/runtime.yaml", "task_image:\n  base: alpine:3\n");
                 None
             }),
-            false,
-            Some(EXIT_REFUSED),
+            EXIT_REFUSED,
             "runtime/runtime.yaml",
+        ),
+        (
+            "an old file and a runtime.yml",
+            Box::new(|dir: &TempDir| {
+                dir.write("runtime/runtime.yml", "task_image:\n  base: alpine:3\n");
+                None
+            }),
+            EXIT_REFUSED,
+            "runtime/runtime.yml",
         ),
         (
             "both components directories",
@@ -200,8 +241,7 @@ fn nothing_changes_on_a_collision_a_running_program_or_a_dry_run() {
                 dir.write("runtime/components/other.sh", "echo other\n");
                 None
             }),
-            false,
-            Some(EXIT_REFUSED),
+            EXIT_REFUSED,
             "runtime/components",
         ),
         (
@@ -215,8 +255,7 @@ fn nothing_changes_on_a_collision_a_running_program_or_a_dry_run() {
                 assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
                 Some(file)
             }),
-            false,
-            Some(EXIT_RUNNING),
+            EXIT_RUNNING,
             "daemon.instance.lock",
         ),
         (
@@ -226,33 +265,11 @@ fn nothing_changes_on_a_collision_a_running_program_or_a_dry_run() {
                 fs::create_dir_all(dir.0.join("state/narsor-server/daemon.instance.lock")).unwrap();
                 None
             }),
-            false,
-            Some(EXIT_FAILED),
+            EXIT_FAILED,
             "cannot open",
         ),
-        (
-            "dry run",
-            Box::new(|_: &TempDir| None),
-            true,
-            None,
-            "Would move",
-        ),
-        (
-            "dry run with a script outside components",
-            Box::new(|dir: &TempDir| {
-                dir.write(
-                    "runtime.yaml",
-                    "task_image:\n  base: debian:trixie-slim\n  components:\n    \
-                     - { name: x, install: tools/x.sh }\n",
-                );
-                None
-            }),
-            true,
-            None,
-            "warning (after the move): task_image.components[0].install",
-        ),
     ];
-    for (name, arrange, dry_run, exit, text) in cases {
+    for (name, arrange, exit, text) in cases {
         let dir = TempDir::new();
         for (path, content) in old_layout {
             dir.write(path, content);
@@ -260,19 +277,41 @@ fn nothing_changes_on_a_collision_a_running_program_or_a_dry_run() {
         let _held = arrange(&dir);
         let before = dir.tree();
 
-        let (result, out) = dir.run(dry_run);
+        let (result, out) = dir.run();
 
-        match (exit, &result) {
-            (None, Ok(Outcome::DryRun)) => assert!(out.contains(text), "{name}: {out}"),
-            (Some(code), Err(failure)) => {
-                assert_eq!(failure.exit_code(), code, "{name}: {failure}");
-                let message = failure.to_string();
-                assert!(message.contains(text), "{name}: {message}");
-            }
-            _ => panic!("{name}: {result:?}\n{out}"),
-        }
+        let Err(failure) = &result else {
+            panic!("{name}: {result:?}\n{out}");
+        };
+        assert_eq!(failure.exit_code(), exit, "{name}: {failure}");
+        assert!(failure.to_string().contains(text), "{name}: {failure}");
+        assert!(!out.contains("move\t"), "{name}: no plan line: {out}");
         assert_eq!(dir.tree(), before, "{name}: nothing changed");
     }
+}
+
+#[test]
+fn the_installer_move_keeps_both_files_when_a_target_appears_after_the_plan() {
+    let dir = TempDir::new();
+    dir.write("runtime.yaml", SCRIPT_RUNTIME);
+    dir.write("components/glab/install.sh", "echo glab\n");
+    let (result, out) = dir.run();
+    let Ok(Outcome::Plan { moves, .. }) = result else {
+        panic!("{result:?}\n{out}");
+    };
+    // Someone writes the new file between the plan and the move.
+    dir.write("runtime/runtime.yml", "task_image:\n  base: alpine:3\n");
+
+    let error = apply_with_installer(&moves).expect_err("the file move must refuse");
+
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(
+        dir.tree(),
+        files(&[
+            ("runtime.yaml", SCRIPT_RUNTIME),
+            ("runtime/components/glab/install.sh", "echo glab\n"),
+            ("runtime/runtime.yml", "task_image:\n  base: alpine:3\n"),
+        ])
+    );
 }
 
 #[test]
@@ -280,9 +319,13 @@ fn a_catalogue_without_an_old_runtime_file_has_nothing_to_move() {
     let dir = TempDir::new();
     dir.write("runtime/runtime.yaml", SCRIPT_RUNTIME);
 
-    let (result, _) = dir.run(false);
+    let (result, out) = dir.run();
 
     assert_eq!(result, Ok(Outcome::NothingToMove));
+    assert!(
+        out.starts_with("No runtime catalogue at the old place"),
+        "{out}"
+    );
     assert_eq!(
         dir.tree(),
         files(&[("runtime/runtime.yaml", SCRIPT_RUNTIME)])

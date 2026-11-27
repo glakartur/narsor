@@ -60,12 +60,13 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Move an old runtime catalogue ({catalog}/runtime.yaml and
-    /// {catalog}/components/) into {catalog}/runtime/. Renames only; no
-    /// backup and no question. Exit status: 0 moved or nothing to move; 1
-    /// a rename failed (run again to finish); 2 usage or configuration
-    /// error; 3 the runtime directory already holds what would move; 5 a
-    /// program of the installation runs.
+    /// Plan the move of an old runtime catalogue ({catalog}/runtime.yaml and
+    /// {catalog}/components/) into {catalog}/runtime/. Changes nothing: it
+    /// prints one `move` line per move (`dist/install.sh` runs them with
+    /// `mv -n`) and a `warning` line per script outside components/. Exit
+    /// status: 0 planned or nothing to move; 1 the check could not run; 2
+    /// usage or configuration error; 3 the runtime directory already holds
+    /// what would move; 5 a program of the installation runs.
     RuntimeCatalog,
     /// Move the files of a controller started by hand
     /// (`narsor-controller local`) on another machine.
@@ -108,7 +109,7 @@ fn main() {
             eprintln!("narsor-migrate: {message}");
             std::process::exit(EXIT_USAGE);
         });
-        match runtime_catalog::run(&target, args.dry_run, &mut std::io::stdout()) {
+        match runtime_catalog::run(&target, &mut std::io::stdout()) {
             Ok(_) => std::process::exit(EXIT_OK),
             Err(failure) => {
                 eprintln!("narsor-migrate: {failure}");

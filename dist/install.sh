@@ -30,12 +30,13 @@
 # they keep running, the migration is skipped and the command is printed.
 # Interactive: narsor-migrate shows its plan and asks. --non-interactive: it
 # migrates (with --yes) only with --migrate; otherwise it prints the command.
-# Then it runs `narsor-migrate runtime-catalog`, which moves an old runtime
-# catalogue ({catalog}/runtime.yaml and {catalog}/components/) into
-# {catalog}/runtime/ by renaming, without a backup or a question. While Narsor
-# still runs, it offers once more (interactive) to stop it; otherwise the move
-# is skipped with the command to run, and the old place keeps working. When
-# both layouts exist or a rename fails, it prints the step, then fails with
+# Then it moves an old runtime catalogue ({catalog}/runtime.yaml and
+# {catalog}/components/) into {catalog}/runtime/ with a no-clobber `mv -n`,
+# without a backup or a question. `narsor-migrate runtime-catalog` only plans
+# the move (it finds the catalogue and checks for a collision). While Narsor
+# still runs, the installer offers once more (interactive) to stop it;
+# otherwise the move is skipped, and the old place keeps working. When both
+# layouts exist or a move fails, it prints the step, then fails with
 # --non-interactive and continues otherwise.
 set -euo pipefail
 
@@ -354,29 +355,56 @@ run_migration() {
     fi
 }
 
+# Moves one planned path of an old runtime catalogue with a no-clobber mv.
+# $1 is the source, $2 the target. It checks again, right before the move,
+# that nothing exists at the target (for runtime.yaml, also runtime.yml),
+# and afterwards that the source is gone: mv -n does not fail when it skips.
+move_catalog_path() {
+    local from="$1" to="$2" other=
+    [[ "${to##*/}" == runtime.yaml ]] && other="${to%.yaml}.yml"
+    if [[ -e "$to" || -L "$to" || (-n "$other" && (-e "$other" || -L "$other")) ]]; then
+        printf 'narsor installer: %s already exists; %s was not moved.\n' "$to" "$from" >&2
+        return 1
+    fi
+    mkdir -p -- "${to%/*}" || return 1
+    mv -n -T -- "$from" "$to" || return 1
+    if [[ -e "$from" || -L "$from" ]]; then
+        printf 'narsor installer: %s was not moved: %s exists.\n' "$from" "$to" >&2
+        return 1
+    fi
+}
+
 # Moves an old runtime catalogue ({catalog}/runtime.yaml and components/) into
-# {catalog}/runtime/ with narsor-migrate runtime-catalog. It only renames, so
-# there is no backup and no question; it needs Narsor stopped. Only for the
-# roles whose configuration names the catalogue the server reads.
+# {catalog}/runtime/. narsor-migrate runtime-catalog only plans (it resolves
+# the catalogue, checks for a running program and a collision, and reads the
+# scripts); the installer moves with mv -n, so there is no backup and no
+# question. It needs Narsor stopped. Only for the roles whose configuration
+# names the catalogue the server reads.
 move_runtime_catalog() {
-    local migrate="$bin_dir/narsor-migrate" status=0 command arg answer line output
-    local -a scope lines=() pids=()
+    local migrate="$bin_dir/narsor-migrate" status=0 answer line output errors kind from to
+    local -a scope lines=() pids=() warnings=()
+    local rerun="stop every Narsor process, then run this installer again (or move the files by hand, see docs/operations/updates.md)"
     case "$role" in local|server) ;; *) return 0 ;; esac
     [[ -x "$migrate" ]] || return 0
     step "Runtime catalogue"
     mapfile -t scope < <(migrate_scope_args)
-    command="$(shell_quote "$migrate")"
-    for arg in ${scope[@]+"${scope[@]}"}; do
-        command+=" $(shell_quote "$arg")"
-    done
-    command+=" runtime-catalog"
-    # Probe first: with nothing to move, neither a question nor a warning.
-    output="$("$migrate" ${scope[@]+"${scope[@]}"} runtime-catalog --dry-run 2>&1)" || status=$?
+    errors="$(mktemp)"
+    plan_runtime_catalog() {
+        status=0
+        output="$("$migrate" ${scope[@]+"${scope[@]}"} runtime-catalog 2>"$errors")" || status=$?
+    }
+    plan_runtime_catalog
     if ((status == 0)) && [[ "$output" == "No runtime catalogue at the old place"* ]]; then
+        rm -f "$errors"
         printf 'No old runtime catalogue to move.\n'
         return 0
     fi
-    status=0
+    if ((status == 2)); then
+        cat "$errors" >&2
+        rm -f "$errors"
+        warn_loudly "narsor-migrate cannot read the configuration, so an old runtime catalogue was not moved; correct it, then $rerun"
+        return 0
+    fi
     if ((narsor_running && interactive)); then
         answer="$(ask 'Narsor still runs. Stop it now to move an old runtime catalogue? Running tasks are interrupted. [y/N]: ')"
         case "${answer,,}" in
@@ -390,27 +418,42 @@ move_runtime_catalog() {
                     printf 'Stopped %d process(es).\n' "${#pids[@]}"
                 fi
                 narsor_running=0
+                plan_runtime_catalog
                 ;;
         esac
     fi
-    if ((narsor_running)); then
-        warn_loudly "An old runtime catalogue was NOT moved to {catalog}/runtime/: Narsor is still running. Tasks keep using the old place until it moves. Stop every Narsor process, then run: $command"
+    if ((narsor_running || status == 5)); then
+        rm -f "$errors"
+        warn_loudly "An old runtime catalogue was NOT moved to {catalog}/runtime/: Narsor is still running. Tasks keep using the old place until it moves. Stop Narsor, then run this installer again (or move the files by hand, see docs/operations/updates.md)."
         return 0
     fi
-    "$migrate" ${scope[@]+"${scope[@]}"} runtime-catalog || status=$?
-    case "$status" in
-        0) ;;
-        5)
-            warn_loudly "An old runtime catalogue was NOT moved to {catalog}/runtime/: a Narsor program still runs. Tasks keep using the old place until it moves. Stop every Narsor process, then run: $command"
-            ;;
-        2)
-            warn_loudly "narsor-migrate cannot read the configuration, so an old runtime catalogue was not moved; correct it, then run: $command"
-            ;;
-        *)
-            warn_loudly "The runtime catalogue was NOT moved (exit status $status). See the message above, correct it, then run: $command"
-            ((interactive)) || fail "the runtime catalogue move did not complete"
-            ;;
-    esac
+    if ((status != 0)); then
+        cat "$errors" >&2
+        rm -f "$errors"
+        warn_loudly "The runtime catalogue was NOT moved (exit status $status). Read the message above and correct the cause; the old place keeps working until then."
+        ((interactive)) || fail "the runtime catalogue move did not complete"
+        return 0
+    fi
+    rm -f "$errors"
+    status=0
+    while IFS=$'\t' read -r kind from to; do
+        case "$kind" in
+            move)
+                printf 'Moving %s -> %s\n' "$from" "$to"
+                move_catalog_path "$from" "$to" || { status=1; break; }
+                ;;
+            warning) warnings+=("$from") ;;
+        esac
+    done <<<"$output"
+    if ((status)); then
+        warn_loudly "The runtime catalogue move stopped. Nothing was deleted or overwritten; correct the cause, then run this installer again to finish it."
+        ((interactive)) || fail "the runtime catalogue move did not complete"
+        return 0
+    fi
+    printf 'Moved the old runtime catalogue to {catalog}/runtime/.\n'
+    for line in ${warnings[@]+"${warnings[@]}"}; do
+        warn_loudly "$line"
+    done
 }
 
 install_binaries() {

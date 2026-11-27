@@ -48,44 +48,55 @@ A later release removes the old place. Its update notes will say so.
 
 ### The installer moves the files
 
-For the `local` and `server` roles, the installer runs
-`narsor-migrate runtime-catalog` after the data migration. The step
-reads the same configuration as `narsor-server` (`--config-file` or
-`--config`, else the one the server finds). It only renames:
-`components/` first, then `runtime.yaml`. It never copies, deletes or
-overwrites a file, so it makes no backup and asks no question. A rerun
-after a crash between the two renames finishes the move.
+For the `local` and `server` roles, the installer moves the files after the
+data migration. First it runs `narsor-migrate runtime-catalog`, which only
+plans: it reads the same configuration as `narsor-server` (`--config-file`
+or `--config`, else the one the server finds), checks for a running
+program and for a collision, and prints the moves. Then bash does each move
+with `mv -n`: `components/` first, then `runtime.yaml`. Right before each
+move, the installer checks again that nothing exists at the target (for
+`runtime.yaml`, also `runtime.yml`), and afterwards that the source is gone.
+It never copies, deletes or overwrites a file, so it makes no backup and
+asks no question. A rerun after a crash between the two moves finishes the
+move.
 
 - **Narsor still runs.** An interactive installer offers once more to stop
   it. When you decline, or with `--non-interactive`, the installer skips
-  the move, prints the command in a highlighted line, and continues. The
-  same happens when a program that the installer did not see holds a lock
-  of the installation.
+  the move, prints in a highlighted line what to do, and continues. Stop
+  Narsor, then run the installer again. The same happens when a program
+  that the installer did not see holds a lock of the installation.
 - **Both layouts exist** (`runtime/runtime.yaml` is already there, or both
-  `components/` and `runtime/components/` exist), **or a rename fails** (for
-  example, the catalogue is read-only). The installer prints both paths or
-  the manual step and changes nothing. A non-interactive installation then
+  `components/` and `runtime/components/` exist), **or a move fails** (for
+  example, the catalogue is read-only, or a file appears at the target
+  after the check). The installer prints both paths or the failed move.
+  It overwrites nothing. A non-interactive installation then
   fails; an interactive one continues.
 
 ### Scripts outside `components/`
 
 A bare-string script outside `components/` (for example
-`install: tools/x.sh`) moves with the rest. The command prints a warning that
-names the entry. After the move, that script is looked up in
+`install: tools/x.sh`) moves with the rest. The installer prints a warning
+that names the entry, after the move. After the move, that script is looked up in
 `{catalog}/runtime/`, where it is not. A Docker-mode task does not start
 until you move the script into `{catalog}/runtime/` (here
 `{catalog}/runtime/tools/x.sh`) or make it inline (`{ inline: "…" }`).
 
 ### Run it by hand
 
+Run the installer again after you stop Narsor. Or move the files
+yourself with a no-clobber `mv`. Stop Narsor first:
+
 ```console
-$ narsor-migrate runtime-catalog --dry-run   # print what would move
-$ narsor-migrate runtime-catalog             # stop Narsor first
+$ narsor-migrate runtime-catalog              # print the plan; changes nothing
+$ mkdir -p {catalog}/runtime
+$ mv -nT {catalog}/components {catalog}/runtime/components   # when it exists
+$ mv -nT {catalog}/runtime.yaml {catalog}/runtime/runtime.yaml
 ```
 
+`mv -n` does not fail when it skips a file, so check that the old path is gone.
 Pass `--config FILE` or `--root DIRECTORY` before `runtime-catalog` when the
-server uses them. Exit status: 0 moved, or nothing to move; 1 a rename
-failed (run it again to finish); 2 usage or configuration error; 3 the
+server uses them. Exit status of `runtime-catalog`: 0 planned, or nothing to
+move; 1 the check could not run; 2 usage or configuration error; 3 the
 runtime directory already holds what would move; 5 a Narsor program still
 runs.
 

@@ -23,7 +23,7 @@ execution: code
 
 ## Product Contract
 
-Product Contract preservation: restructured, no scope change. Q1 and Q2 answers moved from the questions list into Key Decisions. A8 updated with the research finding. The 2026-11-26 review items were resolved into KTD6, KTD7 and Q3 to Q4. Q5 is new and comes from R14. R1 to R14 and AE1 to AE5 unchanged; AE6 added (covers R13). The answers to Q3 to Q5 changed R13 and AE6. The second review pass corrected the AE6 failure reason: the moved path is not found; it is not an R4 containment error.
+Product Contract preservation: restructured, no scope change. Q1 and Q2 answers moved from the questions list into Key Decisions. A8 updated with the research finding. The 2026-11-26 review items were resolved into KTD6, KTD7 and Q3 to Q4. Q5 is new and comes from R14. R1 to R14 and AE1 to AE5 unchanged; AE6 added (covers R13). The answers to Q3 to Q5 changed R13 and AE6. The second review pass corrected the AE6 failure reason: the moved path is not found; it is not an R4 containment error. Review Q8 (2026-11-27): the move runs in `dist/install.sh` with `mv -n`; `narsor-migrate runtime-catalog` only plans it (KTD6, KTD7, U5, U6). No product behavior changed; Q3 (c) and Q4 hold.
 
 ### Summary
 
@@ -90,7 +90,7 @@ The current script-path rule is also tied to the catalogue root (`crates/narsor-
 - No change to the `runtime.yaml` schema (`bundle`, `tools`, `task_image`) or to how the controller builds images.
 - No change to other catalogue kinds (`backends/`, `profiles/`, `workflows/`, `automations/`, `queues/`).
 - Considered and not built: moving a lone `{catalog}/components/` when `runtime.yaml` is already in `runtime/`. Only an operator who moved half the layout by hand reaches this state, and the seal error names the missing script. Evidence that operators do this would change the call.
-- Considered and not built: a backup before the catalogue move. The move only renames, never deletes or overwrites (KTD7), so the old files stay intact. A move that copied or rewrote files would change the call.
+- Considered and not built: a backup before the catalogue move. The move only moves with a no-clobber `mv -n`, never deletes or overwrites (KTD7), so the old files stay intact. A move that copied or rewrote files would change the call.
 
 #### Deferred to Follow-Up Work
 
@@ -152,13 +152,13 @@ The current script-path rule is also tied to the catalogue root (`crates/narsor-
 - KTD3. **Location rules** (the table in High-Level Technical Design is the full rule set). The new location is looked up as `runtime.yaml` then `runtime.yml` (the `EXTENSIONS` order of `read_entry`); the old location is `runtime.yaml` only, as today. A file in both locations is a new `CatalogError` variant that names both paths (R6). It reaches task creation and refresh as `LaunchError` through the existing `From<CatalogError>` conversion.
 - KTD4. **The old-location warning is logged once per process.** The catalogue is read on every task creation and refresh, so a warning per read would flood the log. Use a process-wide once-guard in `catalog.rs`; the warning names both paths and the move to make (R5).
 - KTD5. **Writes follow the read.** `save_runtime` writes the old file when only the old file exists, else the new file (creating `runtime/`), and refuses with the KTD3 error when both exist (R7).
-- KTD6. **The move is a `narsor-migrate` subcommand that `dist/install.sh` runs.** `narsor-migrate` already resolves the configuration as `narsor-server` does, is installed for the local and server roles, and is what the installer runs at that point. The move needs `server.catalog` from the configuration cascade and reads `runtime.yaml` for the Q3 warning; neither fits in bash. It is a separate subcommand (working name `runtime-catalog`), not part of the default run, because the default run stops early once the per-binary marker exists. Rejected: bash with `narsor-cli config show --format json`, which needs `jq` and still cannot read `runtime.yaml`; a `narsor-cli` command, which the Scope Boundaries defer.
-- KTD7. **Move procedure.** Rename only, never copy, delete or overwrite.
+- KTD6. **`dist/install.sh` does the move with bash; a `narsor-migrate` subcommand only plans it.** Review Q8: the author wants the move in the installer, not in Rust (`std::fs::rename`). Bash cannot resolve `server.catalog` from the configuration cascade or read `runtime.yaml` for the Q3 warning, and `narsor-migrate` already does the first and is installed for the local and server roles. So the subcommand `runtime-catalog` is read-only: it resolves the catalogue, checks for a running program and a collision, and prints `move` and `warning` lines. The installer runs each `move` line with `mv -n`. It is a separate subcommand, not part of the default run, because the default run stops early once the per-binary marker exists. Rejected: bash with `narsor-cli config show --format json`, which needs `jq` and still cannot read `runtime.yaml`; a `narsor-cli` command, which the Scope Boundaries defer.
+- KTD7. **Move procedure.** Move only, never copy, delete or overwrite. Steps 1 to 3 are the plan (Rust); step 4 is the installer (bash).
   1. Nothing to do when `{catalog}/runtime.yaml` does not exist.
   2. Collision (Q4): `runtime/runtime.yaml` or `runtime/runtime.yml` exists, or `runtime/components` exists while `{catalog}/components` also exists. Report both paths and change nothing.
   3. Q3 (c): no refusal. Parse the old file as YAML (best effort); report every bare-string `install` and `version` under `task_image.components` that does not start with `components/` as a warning after the move. An unreadable file is moved as is.
-  4. Create `runtime/`, rename `components/` to `runtime/components/` when it exists, then rename `runtime.yaml` to `runtime/runtime.yaml`.
-  Check each target for absence right before its rename, because a file rename on Linux replaces the target. A rerun after a crash between the two renames finds the old file, no old `components/` and an existing `runtime/components/`. Step 2 does not count that as a collision, so step 4 finishes the move.
+  4. The installer creates `runtime/`, then moves `components/` to `runtime/components/` when it exists, then `runtime.yaml` to `runtime/runtime.yaml`, each with `mv -n -T`.
+  Right before each move the installer checks that the target is absent (for `runtime.yaml`, also `runtime/runtime.yml`), because a plain `mv` replaces a file at the target. After the move it checks that the source is gone, because `mv -n` exits 0 when it skips. A failed check is a collision. A rerun after a crash between the two moves finds the old file, no old `components/` and an existing `runtime/components/`. Step 2 does not count that as a collision, so step 4 finishes the move.
 - KTD8. **The work-mode default is read by `narsor-cli init`.** `install.sh` passes the question to `narsor-cli init`, so the default (R14) lives in `select_local_mode`. It reads `controller.local.mode` from the environment, else from the existing configuration file `init` would keep. `prompt::select` gets a starting index so the existing mode is preselected. With Q5 (a), the existing mode is also the non-interactive default. The same behavior applies to a direct `narsor-cli init` run, which asks the same question.
 - KTD9. **R10 is a documentation change.** The ConfigMap init script that the docs name (`deploy/kind/server.yaml`) is not in the repository, so there is no code to change. The table row changes, and `docs/operations/updates.md` tells operators with their own copy of the script to map the `runtime.yaml` key to `runtime/runtime.yaml`. Their script must also remove `{catalog}/runtime.yaml` before the copy, as it already empties `automations/` and `queues/`. On a catalogue that persists between Pod starts, the old file would otherwise stay, and the R6 both-files error would stop every task. Until they change the mapping, R5 keeps their catalogue working.
 
@@ -190,9 +190,9 @@ flowchart TB
   D -->|yes| E{"collision in runtime/?"}
   E -->|yes| W2["Report both paths, change nothing, EXIT_REFUSED"]
   E -->|no| G["Rename components/ then runtime.yaml into runtime/"]
-  G -->|rename fails, e.g. read-only| W4["Report the manual step, EXIT_FAILED"]
+  G -->|move fails or a target appeared| W4["Report the failed move; nothing is overwritten"]
   G --> Q3["Warn about bare script paths outside components/, Q3 option c"]
-  Q3 --> DONE["Moved, EXIT_OK"]
+  Q3 --> DONE["Moved"]
   W2 --> H{"interactive?"}
   W4 --> H
   H -->|no| FAIL["Installer fails after printing the step"]
@@ -307,35 +307,35 @@ U1 → U2 → U3 → U4, and U5 → U6 after U1; U7 last. U4 and U5 do not depen
 
 ### U5. `narsor-migrate` moves an old runtime layout
 
-- **Goal:** A subcommand that moves `{catalog}/runtime.yaml` and `{catalog}/components/` into `{catalog}/runtime/` under the rules of KTD7.
+- **Goal:** A read-only subcommand that plans the move of `{catalog}/runtime.yaml` and `{catalog}/components/` into `{catalog}/runtime/` under the rules of KTD7 (steps 1 to 3). The installer does the move (U6).
 - **Requirements:** R13; AE6.
 - **Dependencies:** U1 (uses `CatalogPaths` for both locations).
 - **Files:**
-  - `crates/narsor-migrate/src/main.rs` (subcommand, `--dry-run`, `--config`, `--root`)
+  - `crates/narsor-migrate/src/main.rs` (subcommand, `--config`, `--root`)
   - `crates/narsor-migrate/src/runtime_catalog.rs` (new: plan and move)
   - `crates/narsor-migrate/src/lib.rs` (module export)
   - `crates/narsor-migrate/Cargo.toml` (`serde_yaml` from the workspace, for the Q3 warning)
-  - Tests: `tests/integration/runtime_catalog_migration.rs` (new, registered in `tests/integration/main.rs`). It catches the real filesystem renames on temp catalogues; it misses `install.sh` wiring, which U6 checks by smoke.
+  - Tests: `tests/integration/runtime_catalog_migration.rs` (new, registered in `tests/integration/main.rs`). It plans on temp catalogues and runs the installer function `move_catalog_path` (taken from `dist/install.sh`) on the plan; it misses the rest of the `install.sh` wiring, which U6 checks by smoke.
 - **Approach:**
   1. Resolve the configuration as the default run does and take `server.catalog`.
   2. Apply KTD7 steps 1 to 4. Print what moved, or why nothing moved, with the paths.
-  3. Refuse before any change while a Narsor instance lock is held, with `EXIT_RUNNING` (see Assumptions). Take the lock list the default run builds for this configuration and call `refusal::check` with a `Checks` that holds only those locks, so every reason it returns means "a program runs" (`check` joins all reasons into one string, so mixing in other checks would hide which kind failed). Keep the locks held until the renames finish. A hand-run move under a running old server hides the task image until restart.
-  4. `--dry-run` prints the plan and changes nothing. No confirmation prompt: the move only renames.
-  5. Exit codes: `EXIT_OK` (moved, with or without the Q3 warning, or nothing to move), `EXIT_RUNNING` (a lock is held), `EXIT_REFUSED` (collision), `EXIT_FAILED` (a rename failed), and `EXIT_USAGE` (bad configuration).
+  3. Refuse before any change while a Narsor instance lock is held, with `EXIT_RUNNING` (see Assumptions). Take the lock list the default run builds for this configuration and call `refusal::check` with a `Checks` that holds only those locks, so every reason it returns means "a program runs" (`check` joins all reasons into one string, so mixing in other checks would hide which kind failed). Release the locks on return: the installer moves later. A move under a running old server hides the task image until restart, so the installer stops Narsor first.
+  4. Print one `move<TAB>from<TAB>to` line per move (scripts first) and one `warning<TAB>text` line per Q3 warning. Change nothing. No `--dry-run`, because the command is always a dry run.
+  5. Exit codes: `EXIT_OK` (planned, with or without the Q3 warning, or nothing to move), `EXIT_RUNNING` (a lock is held), `EXIT_REFUSED` (collision), `EXIT_FAILED` (the check could not run), and `EXIT_USAGE` (bad configuration).
 - **Patterns to follow:** `Target::plan` / `run` split and `Failure::exit_code` in `lib.rs`; fixtures in `tests/integration/layout_migration.rs`.
 - **Test scenarios:**
-  - Old layout with `components/glab/install.sh`: after the run, `runtime/runtime.yaml` and `runtime/components/glab/install.sh` hold the same bytes, and nothing is left at the root.
+  - Old layout with `components/glab/install.sh`: the plan has two moves; after the installer function ran them, `runtime/runtime.yaml` and `runtime/components/glab/install.sh` hold the same bytes, and nothing is left at the root. Planning alone changes nothing.
   - Old `runtime.yaml` with inline scripts only and no `components/`: only the file moves.
-  - Covers AE6. Old `runtime.yaml` names `tools/x.sh`: the layout moves, the output warns about the entry, and the exit is `EXIT_OK`.
-  - Collision: old `runtime.yaml` and an existing `runtime/runtime.yaml`: nothing changes, the output names both paths, and the exit is `EXIT_REFUSED`.
-  - Rerun after a crash: old `runtime.yaml`, no old `components/`, existing `runtime/components/`: the file moves and the layout is complete.
+  - Covers AE6. Old `runtime.yaml` names `tools/x.sh`: the layout is planned, the output warns about the entry, and the exit is `EXIT_OK`.
+  - Collision: old `runtime.yaml` and an existing `runtime/runtime.yaml` or `runtime/runtime.yml`, or both `components/` directories: nothing changes, the message names both paths, and the exit is `EXIT_REFUSED`.
+  - Rerun after a crash: old `runtime.yaml`, no old `components/`, existing `runtime/components/`: only the file is planned and the layout is complete after it.
   - A held instance lock on an old layout: nothing changes and the exit is `EXIT_RUNNING`.
-  - `--dry-run` on an old layout: the plan is printed and the tree is unchanged.
+  - Covers Q8. A file appears at `runtime/runtime.yml` after the plan: the installer function refuses the file move, and both files stay intact.
 - **Verification:** the new integration tests pass; the default `narsor-migrate` run and `layout_migration` tests are unchanged.
 
 ### U6. The installer runs the catalogue move
 
-- **Goal:** `dist/install.sh` runs the U5 subcommand on install and update for the local and server roles.
+- **Goal:** `dist/install.sh` runs the U5 plan and moves the files with `mv -n` on install and update for the local and server roles (Q8).
 - **Requirements:** R13.
 - **Dependencies:** U5.
 - **Files:**
@@ -343,14 +343,14 @@ U1 → U2 → U3 → U4, and U5 → U6 after U1; U7 last. U4 and U5 do not depen
 - **Approach:**
   1. Run only for the `local` and `server` roles, when `narsor-migrate` is installed, after `run_migration`.
   2. Pass the same `--config` the data migration gets (`migrate_scope_args`).
-  3. Running Narsor (Q4 (a) with a retry). `handle_running_processes` already ran before the binaries were installed. When it left `narsor_running` set and the run is interactive, ask once more whether to stop Narsor for the catalogue move. On yes, stop it with `running_narsor_processes` and `stop_processes`, clear `narsor_running`, and run the move. When the operator declines, or in non-interactive mode, skip the move, print `warn_loudly` with the exact command to run, and continue. Handle `EXIT_RUNNING` from the subcommand (a process the installer did not see holds a lock) the same way, without a second offer.
-  4. On `EXIT_USAGE`, print the output and `warn_loudly` with the command to run after the configuration is fixed, then continue, as `run_migration` does.
-  5. On `EXIT_REFUSED` (collision) or `EXIT_FAILED` (for example a read-only catalogue), print the step with `warn_loudly`, then fail in non-interactive mode and continue in interactive mode (Q4 (a)).
-  6. On `EXIT_OK`, print the subcommand's output, including any Q3 warning.
-- **Execution note:** mostly shell wiring with no shell tests in the repository; prove it with a smoke run of the installer on a temp catalogue rather than new test infrastructure.
+  3. Running Narsor (Q4 (a) with a retry). `handle_running_processes` already ran before the binaries were installed. When it left `narsor_running` set and the run is interactive, ask once more whether to stop Narsor for the catalogue move. On yes, stop it with `running_narsor_processes` and `stop_processes`, clear `narsor_running`, and plan again. When the operator declines, or in non-interactive mode, skip the move, print `warn_loudly` that says to stop Narsor and run the installer again, and continue. Handle `EXIT_RUNNING` from the plan (a process the installer did not see holds a lock) the same way, without a second offer.
+  4. On `EXIT_USAGE`, print the output and `warn_loudly` that says to fix the configuration and run the installer again, then continue, as `run_migration` does.
+  5. On `EXIT_REFUSED` (collision), another plan failure, or a failed move (a target appeared, a read-only catalogue), print the step with `warn_loudly`, then fail in non-interactive mode and continue in interactive mode (Q4 (a)).
+  6. On `EXIT_OK`, run each `move` line with `move_catalog_path`: `mkdir -p` the target directory, check again that the target (and `runtime.yml` for the file) is absent, `mv -n -T`, then check that the source is gone (Q8). After the moves, print each `warning` line with `warn_loudly` (Q3 (c)).
+- **Execution note:** shell wiring. `move_catalog_path` is covered by the U5 integration tests, which run the function from `dist/install.sh`; the rest is proved by a smoke run of the installer on a temp catalogue.
 - **Patterns to follow:** `run_migration`, `handle_running_processes` and `stop_processes` in `dist/install.sh`.
-- **Test expectation:** none -- shell wiring with no test harness for `install.sh`; behavior is covered by U5 tests plus the smoke check under Verification.
-- **Verification:** `bash -n dist/install.sh` passes, and `shellcheck` passes when it is available. A local smoke run of the new step on a temp old-layout catalogue moves it. With a running-process stub, the step prints the command and changes nothing.
+- **Test expectation:** `move_catalog_path` is tested through U5; the rest of the wiring has no test harness for `install.sh` and is checked by the smoke run under Verification.
+- **Verification:** `bash -n dist/install.sh` passes, and `shellcheck` passes when it is available. A local smoke run of the new step on a temp old-layout catalogue moves it. With a running-process stub, the step prints that Narsor must stop and changes nothing.
 
 ### U7. Documentation and module docs
 
