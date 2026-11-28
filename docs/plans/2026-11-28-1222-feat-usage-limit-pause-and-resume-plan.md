@@ -35,7 +35,7 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 ### Key Decisions
 
 - **A usage-limit stop is a separate outcome, not a failure.** It does not use an attempt of the retry policy and it does not go through the conductor's failure diagnosis. Governs R4, R5, R10.
-- **Continue the existing harness session; never start a new one because of a usage limit.** This is the core of the request: the work done before the stop must not be lost. Governs R7, R8.
+- **Continue the existing harness session; never start a new one because of a usage limit.** This is the core of the request: the work done before the stop must not be lost. Governs R5, R8, R9.
 - **The reset time from the harness is preferred; periodic retry is the fallback.** The request names this order. Governs R6.
 - **Detection is per harness and based on recorded real output.** Claude Code is required in v1. A harness without detection keeps today's behaviour. Governs R1, R2, R3.
 
@@ -43,7 +43,7 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 
 **Detection**
 
-- R1. The repo contains at least one real Claude Code stream-json recording (fixture) of a run that stops on an exhausted subscription limit, with a README note that describes the lines that signal it. The recording contains no customer data or secrets.
+- R1. The repo contains at least one real Claude Code stream-json recording (fixture) of a run that stops on an exhausted subscription limit, with a README note that describes the lines that signal it. The fixture set also contains a recording of `--resume <id>` on that session after the window resets, which shows that the conversation before the stop is kept (see Dependencies / Assumptions). The recordings contain no customer data or secrets.
 - R2. The Claude Code parser classifies a run as "usage limit reached" only from signals seen in R1 recordings (for example a `rate_limit_event` with status `rejected`, an error marker on the `result` or `assistant` line, or the limit message text). An ordinary error, an API error or a `max_turns` stop is not classified as a usage limit.
 - R3. When the classification is "usage limit reached", the run carries the harness session id and, when the harness reports it, the reset time of the exhausted window.
 
@@ -91,7 +91,7 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 
 - The usage data flow from the earlier work (`docs/brainstorms/2026-10-31-limity-abonamentu-harnessow-requirements.md`) stays as is; this work can read it but does not change its display scope.
 - Claude Code accepts `--resume <id>` on a session that stopped on the usage limit, and the conversation before the stop is kept. R1 recordings must confirm this.
-- Session continuation reuses D85 (`docs/dev/architecture.md`): the harness session id is kept in `timeline.json` as soon as the harness reports it, the step failure record keeps the session of the failed attempt, and `resumable_agent_session` finds it. Today only an owner comment uses this path; this work makes the usage-limit wait use it without a comment.
+- Session continuation reuses D85 (`docs/dev/architecture.md`): the harness session id is kept in `timeline.json` as soon as the harness reports it, and `resumable_agent_session` finds it. D85 also lets the step failure record keep the session of a failed attempt, but a usage-limit stop is not a failed attempt (R4), so the wait must not depend on a failure record: the session id comes from the attempt's entry in `timeline.json`. Today only an owner comment uses this path; this work makes the usage-limit wait use it without a comment.
 - No document in `docs/` (brainstorms, plans, follow-ups, residual review findings, solutions, sources) records what Claude Code sends when the limit is exhausted, and no recording exists. The earlier usage-limit work excluded "alarms and blocking of new tasks at high usage" from its scope, so this work is new.
 
 ### Założenia do potwierdzenia
@@ -100,7 +100,7 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 - A2. The fallback retry interval is 15 minutes, and the safety margin after a reported reset is 1 minute. Both are settings with these defaults.
 - A3. The wait has no maximum length; a 7-day window can make a task wait for days. The operator can cancel it (R12).
 - A4. Only the step that hit the limit waits. Other steps that hit the limit wait on their own; Narsor does not block steps that did not hit it (decided in Q1).
-- A5. The waiting state uses the existing `Paused` task state with a reason, not a new task state, so that clients need small changes only (decided in Q2).
+- A5. The waiting state uses the existing `Paused` task state with a reason, not a new task state (decided in Q2). Today `Paused` is derived only from the runner state, means the owner's decision (D62), and has no reason field in the task summary. So this choice needs a reason field and a change to the task-state derivation. The planner must also decide how a wait of days interacts with the slot-release policy (D62) and with the timed resume that R8 requires; `auto_resume.rs` today resumes only interrupted tasks.
 - A6. The continuation prompt is a short fixed text that tells the agent to continue the interrupted work; it is not the step's original prompt.
 - A7. The R1 recording is made by the developer on a real account at a moment when the limit is exhausted, then cleaned of personal data; a synthetic line is not enough for R1.
 - A8. A usage-limit stop in a conductor chat or other non-step conversation is out of scope for v1 and keeps today's behaviour.
@@ -140,3 +140,15 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 - `docs/solutions/design-patterns/show-only-what-harness-reports-count-without-tokens-record-fixture-2026-11-13.md` — the convention to record a real fixture before the parser relies on a harness field (applies to R1).
 - `tests/fixtures/claude-code/README.md` — existing recordings; none shows an exhausted limit.
 - `docs/brainstorms/2026-10-31-limity-abonamentu-harnessow-requirements.md` — earlier usage-display work and its scope boundaries.
+
+## Deferred / Open Questions
+
+These entries are review items left for the author. They do not block implementation.
+
+### From 2026-11-28 review
+
+- **Text-only reset time parsing may resume a step far too late** — Założenia do potwierdzenia, A1 (P3, scope-guardian, confidence 75)
+
+  If the limit message carries only a time of day, guessing its date and timezone can be wrong. A wrong guess makes the step resume hours or days late, because A3 sets no maximum wait. The fixed 15-minute retry in R6 already covers a missing reset time at a small cost.
+
+  Change: Use only the machine-readable `resetsAt` as the reset time in v1. Move text-only reset parsing to Scope Boundaries as deferred. Bring it back only if the R1 recording shows that `resetsAt` is missing when the limit is exhausted.
