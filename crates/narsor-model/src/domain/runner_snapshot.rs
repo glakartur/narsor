@@ -118,6 +118,11 @@ pub struct RunnerSnapshot {
 }
 
 impl RunnerSnapshot {
+    /// Whether the snapshot reports an execution and no problem.
+    pub fn speaks_of_execution(&self) -> bool {
+        self.execution_cursor.execution_id.is_some() && self.problem.is_none()
+    }
+
     /// The wire form a runner reports (`POST /runner/v1/snapshots`).
     pub fn to_request(&self) -> Result<RunnerSnapshotRequest, serde_json::Error> {
         let snapshot = self;

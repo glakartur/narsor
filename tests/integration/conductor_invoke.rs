@@ -1630,8 +1630,6 @@ fn the_autopilot_modes_change_the_task_and_not_the_answer_contract() {
     assert_eq!(prompt_in(None), prompt_in(Some(Autopilot::On)));
 }
 
-/// A conductor chat does not wait for an exhausted usage limit: a run that
-/// stops on it fails as any harness failure does.
 #[tokio::test]
 async fn a_chat_reply_stopped_on_the_usage_limit_fails_as_a_harness_failure() {
     let fixture = Fixture::new();

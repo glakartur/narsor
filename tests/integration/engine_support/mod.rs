@@ -667,8 +667,6 @@ pub enum AgentTurn {
     Ask(&'static str),
     /// A permission request for one Bash command.
     Permission,
-    /// The harness stopped on an exhausted usage limit, in the session
-    /// `agent-session`, reporting no reset time.
     UsageLimit,
 }
 

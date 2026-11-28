@@ -402,7 +402,7 @@ impl Engine {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             usage_continuation: record
-                .get("usage_continuation")
+                .get(USAGE_CONTINUATION_KEY)
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             note: None,

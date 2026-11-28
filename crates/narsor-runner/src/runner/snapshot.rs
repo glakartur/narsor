@@ -532,10 +532,6 @@ mod tests {
         }
     }
 
-    /// The snapshot reports the wait for the usage limit from the parked
-    /// execution's own record, so any runner on the storage reports it; not
-    /// once the continuation has cleared the record, and not for an
-    /// execution that is no longer paused.
     #[test]
     fn the_snapshot_reports_the_usage_limit_wait_of_a_parked_execution() {
         use chrono::TimeZone;
@@ -613,7 +609,6 @@ mod tests {
             let request: RunnerSnapshotRequest =
                 serde_json::from_value(body.clone()).expect("a request");
             assert_eq!(request.usage_wait, expected, "{name}");
-            // A body of a runner that does not report the wait reads as no wait.
             body.as_object_mut()
                 .expect("an object")
                 .remove("usage_wait");

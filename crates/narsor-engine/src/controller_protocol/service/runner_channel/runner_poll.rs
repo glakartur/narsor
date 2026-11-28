@@ -138,9 +138,6 @@ impl ProtocolService {
         Ok(outcome)
     }
 
-    /// Plans the resume of a task whose snapshot just reported a wait for
-    /// the harness's usage limit, with the backend's periods as configured
-    /// now; the task as written, or `None` when nothing was planned.
     fn schedule_usage_wait(&self, task: &TaskRecord) -> Option<TaskRecord> {
         let reported = task
             .runner

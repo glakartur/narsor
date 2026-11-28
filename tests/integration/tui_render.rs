@@ -4667,9 +4667,6 @@ mod task_app_detail_render {
         }
     }
 
-    /// A task that waits for the usage limit keeps the paused icon; its row
-    /// shows when it resumes, and its details name the harness too. A reason
-    /// this version does not know shows a plain pause.
     #[test]
     fn a_task_waiting_for_the_usage_limit_shows_why_in_the_row_and_the_details() {
         use crate::task_app_support::{at, usage_limit, usage_waiting};

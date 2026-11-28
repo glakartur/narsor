@@ -17,10 +17,8 @@ use crate::orchestration::{
     usage_resume_key, CommandActor, CommandRequest, OrchestrationError, OwnerCommand, TaskRecord,
 };
 
-/// What one pass of the usage-limit resume did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageResumePass {
-    /// Tasks resumed by this pass (a replayed receipt is not counted).
     pub resumed: Vec<TaskId>,
 }
 
@@ -65,7 +63,6 @@ impl ProtocolService {
         pass
     }
 
-    /// Resumes one task whose wait is due; true when this call did.
     fn usage_resume(&self, task: &TaskRecord) -> bool {
         let backend_id = &task.assignment.backend_id;
         let request = CommandRequest::new(OwnerCommand::Resume, usage_resume_key(task.generation))
@@ -82,7 +79,6 @@ impl ProtocolService {
                 self.notify(&task.task_id);
                 true
             }
-            // The owner (or another pass) acted first; nothing to do.
             Err(
                 error @ (OrchestrationError::StaleGeneration { .. }
                 | OrchestrationError::IllegalCommand { .. }),

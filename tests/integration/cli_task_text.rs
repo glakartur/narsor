@@ -733,7 +733,6 @@ fn the_task_text_shows_the_state_and_whether_a_slot_is_held() {
     assert!(list_line(&asking).contains("awaiting input · no slot"));
 }
 
-/// The local wall-clock time `at` reads as on this machine, as the texts show it.
 fn local_clock(at: chrono::DateTime<Utc>) -> String {
     at.with_timezone(&chrono::Local).format("%H:%M").to_string()
 }

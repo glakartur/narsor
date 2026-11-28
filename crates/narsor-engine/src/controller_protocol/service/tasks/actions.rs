@@ -17,7 +17,7 @@ use narsor_protocol::api::{
     PendingHumanInputView, PermissionDecisionDto, PermissionDecisionKindDto,
 };
 use narsor_protocol::controller::{
-    placeholder, AttentionKind, Freshness, OperatorCommand, RunnerState, StepKind,
+    placeholder, AttentionKind, Freshness, OperatorCommand, PauseReason, RunnerState, StepKind,
     SubmitCommentRequest, SubmitCommentResponse, SubmitInputRequest, TaskActionField,
     TaskActionFieldKind, TaskActionId, TaskActionKind, TaskActionOffer, TaskActionOption,
     TaskActionSend, TaskActionSurface, TaskState, TaskSummary, TransitionOffer,
@@ -91,7 +91,8 @@ fn describe(task: &TaskSummary, id: TaskActionId) -> TaskActionOffer {
         TaskActionId::Pause => leaf(
             "Pauza",
             "Czeka, aż trwająca praca skończy krok. Potem zadanie staje w bezpiecznym punkcie i \
-             oddaje zasoby obliczeniowe. Storage zostaje."
+             oddaje zasoby obliczeniowe. Storage zostaje. Przy zadaniu czekającym na limit \
+             użycia anuluje planowane wznowienie."
                 .to_string(),
             TaskActionSend::owner(OwnerCommand::Pause),
         ),
@@ -319,6 +320,13 @@ pub(super) fn unavailable_reason(task: &TaskSummary, id: TaskActionId) -> Option
         | TaskActionId::AllowPermission
         | TaskActionId::DenyPermission => decision_reason(task, id),
         TaskActionId::Pause => match task.runner_state {
+            // The owner cancels a planned usage resume with a pause, as the
+            // control plane accepts it.
+            RunnerState::Stopped
+                if matches!(task.pause_reason, Some(PauseReason::UsageLimit { .. })) =>
+            {
+                None
+            }
             RunnerState::Stopped => {
                 Some(not_running(task).unwrap_or_else(|| state_phrase(task).to_string()))
             }
@@ -1460,6 +1468,17 @@ mod tests {
 
         let question = waiting_on("resume_agent");
         assert!(offered(&question, TaskActionId::Restart).is_none());
+    }
+
+    #[test]
+    fn pause_cancels_a_planned_usage_resume_of_a_stopped_task() {
+        let mut task = summary("stopped", "paused", true);
+        assert!(reason(&task, TaskActionId::Pause).is_some());
+        task.pause_reason = Some(PauseReason::UsageLimit {
+            harness: "claude".to_string(),
+            resumes_at: chrono::Utc::now(),
+        });
+        assert_eq!(reason(&task, TaskActionId::Pause), None);
     }
 
     #[test]

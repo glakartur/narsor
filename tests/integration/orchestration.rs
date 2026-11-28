@@ -6368,10 +6368,6 @@ fn a_queued_or_interrupted_task_is_refreshed_in_place_and_old_policy_commands_go
     }
 }
 
-// ---------------------------------------------------------------------------
-// The wait for a harness's usage limit
-// ---------------------------------------------------------------------------
-
 mod usage_wait {
     use super::*;
     use narsor_engine::controller_protocol::{OwnerCommandRequest, ProtocolError, ProtocolService};
@@ -6389,8 +6385,6 @@ mod usage_wait {
         fx.clock.advance(to - now);
     }
 
-    /// The central as the daemon runs it, on the fixture's state and clock;
-    /// a new one reads everything from disk.
     fn central(fx: &Fixture, slots: Option<u32>) -> ProtocolService {
         ProtocolService::new(
             fx.reopen(),
@@ -6399,8 +6393,6 @@ mod usage_wait {
         .with_max_concurrent_tasks(slots)
     }
 
-    /// The task's runner reports its execution parked on the usage limit of
-    /// `claude-code` (`wait`), or no wait, through the central.
     fn runner_reports_wait(
         fx: &Fixture,
         central: &ProtocolService,
@@ -6433,8 +6425,6 @@ mod usage_wait {
             .task
     }
 
-    /// A running task whose runner reported a wait for a reset at 15:00
-    /// and that the central then stopped to free its slot.
     fn stopped_waiting(fx: &Fixture, central: &ProtocolService, id: &str, lease: &BackendLease) {
         fx.running(id, lease);
         runner_reports_wait(fx, central, id, Some(Some(at(15, 0, 0))));
@@ -6487,7 +6477,6 @@ mod usage_wait {
                     resume_at,
                 })
             );
-            // No grace: the pass at the very same instant frees the slot.
             assert_eq!(
                 central.slot_release_pass().released,
                 vec![task("task-1")],
@@ -6526,7 +6515,6 @@ mod usage_wait {
         stopped_waiting(&fx, &central(&fx, None), "task-1", &lease);
         let generation = fx.control.task(&task("task-1")).unwrap().generation;
 
-        // The central restarts at 14:00: everything is read from disk again.
         set_clock(&fx, at(14, 0, 0));
         let restarted = central(&fx, None);
         set_clock(&fx, at(15, 0, 59));
@@ -6602,9 +6590,6 @@ mod usage_wait {
 
     #[test]
     fn the_owner_decides_over_the_planned_resume() {
-        // An owner's pause before the policy stopped the task removes the
-        // wait, and a later snapshot that still reports it does not bring
-        // it back.
         let fx = Fixture::new();
         let central_a = central(&fx, None);
         let lease = long_lease(&fx, "controller-a");
@@ -6617,8 +6602,6 @@ mod usage_wait {
         fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
             .expect("safe point");
 
-        // An owner's pause of a task the policy already stopped removes the
-        // wait as well.
         stopped_waiting(&fx, &central_a, "task-2", &lease);
         let paused = fx.command("task-2", OwnerCommand::Pause, "pause-2");
         assert_eq!(paused.usage_wait, None);
@@ -6634,7 +6617,6 @@ mod usage_wait {
             );
         }
 
-        // An owner's resume during the wait resumes at once.
         let fx = Fixture::new();
         let central_b = central(&fx, None);
         let lease = long_lease(&fx, "controller-a");
@@ -6655,7 +6637,6 @@ mod usage_wait {
         assert_eq!(resumed.task.runner_state, RunnerState::Provisioning);
         assert_eq!(fx.control.task(&task("task-1")).unwrap().usage_wait, None);
 
-        // The policy's key is not the owner's to use.
         let forged = central_b
             .command(
                 &owner,

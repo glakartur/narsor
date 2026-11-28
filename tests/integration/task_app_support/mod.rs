@@ -838,8 +838,6 @@ pub fn stub_definition(form: &serde_json::Value) -> narsor_protocol::panel::Pane
     serde_json::from_value(record["def"].clone()).expect("a recorded definition")
 }
 
-/// A stopped task the control plane paused with `reason`, the JSON of its
-/// `pause_reason` as the server sends it (an unknown kind included).
 pub fn usage_waiting(id: &str, rank: u32, reason: serde_json::Value) -> TaskSummary {
     let mut value = serde_json::to_value(task(id, "local", "stopped", rank)).expect("a summary");
     value["pause_reason"] = reason;
@@ -848,7 +846,6 @@ pub fn usage_waiting(id: &str, rank: u32, reason: serde_json::Value) -> TaskSumm
     offered(task)
 }
 
-/// The JSON of a pause for the usage limit of `harness` until `resumes_at`.
 pub fn usage_limit(harness: &str, resumes_at: DateTime<Utc>) -> serde_json::Value {
     serde_json::json!({
         "kind": "usage_limit",

@@ -77,7 +77,6 @@ pub struct RunnerSnapshotRequest {
 /// exhausted, and that continues in the same session once the limit resets.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UsageLimitWait {
-    /// The harness whose usage limit stopped the step.
     pub harness: String,
     /// When the exhausted usage window resets, when the harness said.
     #[serde(default, skip_serializing_if = "Option::is_none")]

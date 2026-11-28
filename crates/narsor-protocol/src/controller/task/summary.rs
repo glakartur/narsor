@@ -187,7 +187,6 @@ pub enum PauseReason {
     /// The harness's usage limit is used up: the control plane resumes the
     /// task by itself at `resumes_at`.
     UsageLimit {
-        /// The harness whose usage limit is used up.
         harness: String,
         /// When the control plane plans to resume the task: after the
         /// limit resets, or at the next try when the reset time is not

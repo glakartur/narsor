@@ -5339,11 +5339,6 @@ async fn adapters_map_scope_dirs_to_what_they_can_enforce() {
     assert!(!opencode.args(1).iter().any(|arg| arg == "--add-dir"));
 }
 
-// ---------------------------------------------------------------------------
-// A stop on an exhausted usage limit
-// ---------------------------------------------------------------------------
-
-/// One agent step under a policy of three attempts.
 const USAGE_LIMIT_WORKFLOW: &str = r#"
 name: usage-limit
 version: 1
@@ -5370,7 +5365,6 @@ terminal_states:
 /// The session id of `usage_limit_stop.ndjson`.
 const STOPPED_SESSION: &str = "00000000-0000-4000-8000-000000000301";
 
-/// A Claude Code run that stops on an exhausted usage limit.
 fn usage_limit_stream() -> String {
     fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -5383,9 +5377,6 @@ fn count_of(types: &[String], wanted: &str) -> usize {
     types.iter().filter(|kind| kind.as_str() == wanted).count()
 }
 
-/// A stop on the usage limit parks the execution with a usage-wait record
-/// for the attempt and its session: no failed attempt, no failed session,
-/// no retry, and no step failure.
 #[tokio::test]
 async fn a_usage_limit_stop_parks_the_step_without_a_failed_attempt() {
     let fixture = EngineFixture::new();
@@ -5430,10 +5421,6 @@ async fn a_usage_limit_stop_parks_the_step_without_a_failed_attempt() {
     );
 }
 
-/// A step that goes on in a saved session and stops on the usage limit
-/// waits like any other: the stop is not a refused session, so the
-/// operator is not asked for a new one, and an owner's message that would
-/// restart a refused session starts none.
 #[tokio::test]
 async fn a_resumed_session_that_stops_on_the_usage_limit_waits_and_starts_no_new_session() {
     for restart_if_refused in [false, true] {

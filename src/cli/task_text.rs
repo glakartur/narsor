@@ -486,7 +486,6 @@ pub fn pause_reason_label(task: &TaskSummary) -> Option<String> {
     }
 }
 
-/// `at` as `HH:MM` on the clock of this machine.
 fn local_clock(at: DateTime<Utc>) -> String {
     at.with_timezone(&chrono::Local).format("%H:%M").to_string()
 }

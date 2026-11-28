@@ -2,6 +2,8 @@
 
 use super::*;
 
+pub(crate) const USAGE_CONTINUATION_KEY: &str = "usage_continuation";
+
 /// The one-shot instruction delivered by an operator to an agent step.
 /// `harness` and `session` are optional for records written before
 /// continuation metadata was persisted.
@@ -156,10 +158,27 @@ impl Engine {
 /// limit in `execution`, without saving it: the fixed continuation prompt,
 /// for the session the attempt stopped in.
 pub(crate) fn put_usage_continuation(execution: &mut WorkflowExecution, wait: &UsageWait) {
+    // An owner comment left while the task waited sits under the same key:
+    // keep it, after the fixed prompt, so the session still gets it.
+    let comment = engine_metadata_mut(execution)
+        .get(METADATA_AGENT_INPUT_KEY)
+        .and_then(Value::as_object)
+        .filter(|record| {
+            record.get("state_id").and_then(Value::as_str) == Some(wait.state_id.as_str())
+                && !record.contains_key(USAGE_CONTINUATION_KEY)
+        })
+        .and_then(|record| record.get("answer").and_then(Value::as_str))
+        .map(ToString::to_string);
+    let prompt = match comment {
+        Some(comment) if !comment.trim().is_empty() => {
+            format!("{USAGE_LIMIT_CONTINUATION_PROMPT}\n\n{comment}")
+        }
+        _ => USAGE_LIMIT_CONTINUATION_PROMPT.to_string(),
+    };
     put_agent_input(
         execution,
         &wait.state_id,
-        USAGE_LIMIT_CONTINUATION_PROMPT,
+        &prompt,
         Some(&wait.harness),
         Some(&wait.harness_session_id),
         Vec::new(),
@@ -170,6 +189,6 @@ pub(crate) fn put_usage_continuation(execution: &mut WorkflowExecution, wait: &U
         .get_mut(METADATA_AGENT_INPUT_KEY)
         .and_then(Value::as_object_mut)
     {
-        record.insert("usage_continuation".to_string(), Value::Bool(true));
+        record.insert(USAGE_CONTINUATION_KEY.to_string(), Value::Bool(true));
     }
 }

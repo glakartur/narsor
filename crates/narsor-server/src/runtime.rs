@@ -422,7 +422,6 @@ pub fn run_periodic_pass(control: &ProtocolService) -> AutoResumePass {
     // limit allows, e.g. after the operator edited the backend file.
     control.limit_stop_pass();
     let resumed = control.auto_resume_pass();
-    // Resumes tasks whose wait for the usage limit of their harness ran out.
     control.usage_resume_pass();
     // Stops tasks whose deadline came; the slot itself goes on once the
     // runner reached its safe point, and that report re-runs admission.

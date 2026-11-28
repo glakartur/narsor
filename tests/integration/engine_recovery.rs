@@ -2199,12 +2199,6 @@ async fn a_refused_session_restarts_the_step_with_the_message_as_its_note() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The wait for an exhausted usage limit
-// ---------------------------------------------------------------------------
-
-/// `agent_failure` (two attempts) whose first attempt stopped on the usage
-/// limit: parked, with its usage-wait record.
 async fn parked_on_the_usage_limit(harness: &Harness) -> (WorkflowExecution, UsageWait) {
     let agent = Arc::new(ScriptedAgentExecutor::new(vec![AgentTurn::UsageLimit]));
     let parked = harness
@@ -2220,7 +2214,6 @@ async fn parked_on_the_usage_limit(harness: &Harness) -> (WorkflowExecution, Usa
     (parked, wait)
 }
 
-/// Resumes the parked `execution_id` on an agent that plays `turns`.
 async fn resumed_after_the_wait(
     harness: &Harness,
     execution_id: &str,
@@ -2240,8 +2233,6 @@ fn count(types: &[String], wanted: &str) -> usize {
     types.iter().filter(|kind| kind.as_str() == wanted).count()
 }
 
-/// A crash while the execution waits for the usage limit changes nothing:
-/// it parked itself, so reconciliation leaves it `Paused` with its record.
 #[tokio::test]
 async fn reconciliation_leaves_an_execution_parked_on_the_usage_limit_paused() {
     let harness = Harness::new();
@@ -2255,9 +2246,6 @@ async fn reconciliation_leaves_an_execution_parked_on_the_usage_limit_paused() {
     assert_eq!(usage_wait(&stored).expect("readable"), Some(wait));
 }
 
-/// When the wait ends, the same attempt goes on in the same session with
-/// the continuation prompt: one attempt in the history, none failed, and
-/// no record left once the step is done.
 #[tokio::test]
 async fn after_the_wait_the_same_attempt_continues_its_session() {
     let harness = Harness::new();
@@ -2285,8 +2273,6 @@ async fn after_the_wait_the_same_attempt_continues_its_session() {
     assert_eq!(usage_wait(&finished).expect("readable"), None);
 }
 
-/// A continuation that stops on the limit again waits again, as the same
-/// attempt; nothing failed.
 #[tokio::test]
 async fn a_continuation_that_stops_on_the_limit_again_waits_again_as_the_same_attempt() {
     let harness = Harness::new();
@@ -2304,10 +2290,6 @@ async fn a_continuation_that_stops_on_the_limit_again_waits_again_as_the_same_at
     }
 }
 
-/// A continuation that fails for another reason — a refused session
-/// included — is an ordinary failed attempt: no question to the operator,
-/// the retry policy starts the next attempt in a new session, and when
-/// that one fails too the execution fails.
 #[tokio::test]
 async fn a_continuation_that_fails_otherwise_goes_through_the_retry_policy() {
     for (case, first) in [
@@ -2349,4 +2331,32 @@ async fn a_continuation_that_fails_otherwise_goes_through_the_retry_policy() {
         );
         assert_eq!(count(&types, "action_failed"), 1, "{case}: {types:?}");
     }
+}
+
+#[tokio::test]
+async fn an_owner_comment_left_during_the_usage_wait_reaches_the_continued_session() {
+    let harness = Harness::new();
+    let (parked, _wait) = parked_on_the_usage_limit(&harness).await;
+    harness
+        .engine()
+        .leave_resume_message(&parked.id, "c-usage", "use the v2 API")
+        .expect("leave the comment");
+
+    let (agent, finished) = resumed_after_the_wait(
+        &harness,
+        &parked.id,
+        vec![AgentTurn::label("implemented", "done")],
+    )
+    .await;
+
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+    let calls = agent.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].resume_session.as_deref(), Some("agent-session"));
+    assert!(calls[0].prompt.contains(USAGE_LIMIT_CONTINUATION_PROMPT));
+    assert!(
+        calls[0].prompt.contains("use the v2 API"),
+        "{}",
+        calls[0].prompt
+    );
 }

@@ -156,13 +156,9 @@ pub enum EventData {
     /// execution is parked and the same attempt goes on in the same harness
     /// session once the limit resets ([`EventData::ActionResumedAfterUsageLimit`]).
     ActionWaitingForUsageLimit {
-        /// The attempt that waits.
         action_execution_id: String,
-        /// The state whose action waits.
         state_id: String,
-        /// The harness that stopped.
         harness: String,
-        /// The harness's own session id, which the attempt continues.
         harness_session_id: String,
         /// When the exhausted window resets, when the harness said.
         #[serde(default)]
@@ -172,9 +168,7 @@ pub enum EventData {
     /// harness session and under the same `action_execution_id`. Not a new
     /// attempt and not a retry.
     ActionResumedAfterUsageLimit {
-        /// The attempt that goes on.
         action_execution_id: String,
-        /// The state whose action goes on.
         state_id: String,
     },
     /// A new attempt asks the agent of a rejected attempt for its output label

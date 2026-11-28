@@ -1628,11 +1628,6 @@ fn run_of_lines_fed<S: AsRef<str>>(
     parser.finish(0, "")
 }
 
-// ---------------------------------------------------------------------------
-// A stop on an exhausted subscription limit
-// ---------------------------------------------------------------------------
-
-/// The `result` line that ends a run stopped on the usage limit.
 fn usage_limit_result() -> String {
     recording("usage_limit_stop.ndjson")
         .into_iter()

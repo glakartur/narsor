@@ -154,8 +154,7 @@ impl ControlPlane {
             // and the episode must outlive the problem (R17). Any other
             // runner with an execution says where it waits, or that it
             // waits at no watched gate.
-            let speaks_of_execution =
-                snapshot.execution_cursor.execution_id.is_some() && snapshot.problem.is_none();
+            let speaks_of_execution = snapshot.speaks_of_execution();
             let gate_change = if speaks_of_execution {
                 follow_watched_gate(record, &snapshot, now, entry_scripts)
             } else {

@@ -1115,9 +1115,6 @@ fn the_session_an_attempt_reported_while_it_ran_is_on_its_position() {
     assert_eq!(reported_sessions(&store, EXEC).get("a1"), Some(&session));
 }
 
-/// An attempt whose harness stopped on the usage limit waits, in progress
-/// and not failed; once it goes on in its session it is the same entry and
-/// no longer waits.
 #[test]
 fn an_attempt_waiting_for_the_usage_limit_is_in_progress_not_failed() {
     let mut log = Log::new();

@@ -55,7 +55,7 @@ use crate::controller_protocol::{
 use crate::domain::BackendId;
 use narsor_protocol::controller::{
     AttentionItem, AttentionKind, MoveTaskTarget, OperatorCommand, OperatorCommandStatus,
-    QueueReason, ResumeExhaustion, RunnerState, TaskEvent, TaskEventKind, TaskState,
+    PauseReason, QueueReason, ResumeExhaustion, RunnerState, TaskEvent, TaskEventKind, TaskState,
 };
 use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, UNSPECIFIED_LOSS};
 
@@ -326,8 +326,9 @@ fn activity_since(task: &TaskSummary) -> Option<DateTime<Utc>> {
         TaskState::Queued => task.queue.as_ref().map(|queue| queue.since),
         TaskState::HumanNeeded => task.attention.iter().map(|item| item.since).min(),
         TaskState::Finished | TaskState::Error | TaskState::Archived => None,
-        // The time the task resumes at (`label_of`) takes the age's place.
-        TaskState::Paused if pause_reason_label(task).is_some() => None,
+        TaskState::Paused if matches!(task.pause_reason, Some(PauseReason::UsageLimit { .. })) => {
+            None
+        }
         _ => task.state_since,
     }
 }

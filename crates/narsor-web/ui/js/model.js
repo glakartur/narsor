@@ -300,11 +300,6 @@ export function slots(tasks, selected) {
   return { used: own.filter((task) => task.holds_slot).length, limit: null };
 }
 
-/**
- * Why the control plane paused the task, in words, with the resume time in
- * the local time of the browser (`src/cli/task_text.rs`, `pause_reason_text`);
- * `null` for a pause by the owner and for a reason this version does not know.
- */
 export function pauseReasonText(task) {
   const reason = task.state === 'paused' ? task.pause_reason : null;
   if (reason?.kind !== 'usage_limit') return null;

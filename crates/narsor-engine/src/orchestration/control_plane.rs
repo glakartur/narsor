@@ -381,13 +381,14 @@ impl ControlPlane {
                 },
             };
 
+            let owner_pause =
+                request.command == OwnerCommand::Pause && request.actor == CommandActor::Owner;
             let effect = match command_effect(record.runner_state, request.command) {
                 // The owner's pause of a task stopped to wait for its usage
                 // limit: the task stays stopped, and the planned resume is
                 // removed below.
                 CommandEffect::Illegal
-                    if request.command == OwnerCommand::Pause
-                        && request.actor == CommandActor::Owner
+                    if owner_pause
                         && record.runner_state == RunnerState::Stopped
                         && record.usage_wait.is_some() =>
                 {
@@ -424,12 +425,10 @@ impl ControlPlane {
                     // keeps the slot until the wait would end; any other
                     // command (a resume, an archive, `ReleaseSlot`) ends a
                     // hold. Read before the state changes.
-                    let slot_hold = (request.command == OwnerCommand::Pause
-                        && request.actor == CommandActor::Owner
-                        && record.slot_release_pending())
-                    .then_some(record.slot_release_due_at)
-                    .flatten()
-                    .filter(|due_at| *due_at > now);
+                    let slot_hold = (owner_pause && record.slot_release_pending())
+                        .then_some(record.slot_release_due_at)
+                        .flatten()
+                        .filter(|due_at| *due_at > now);
                     record.generation += 1;
                     record.runner_state = next;
                     // The accepted safe point belongs to the pause it was
@@ -444,10 +443,7 @@ impl ControlPlane {
                     // A resume, by the owner or at the planned time, ends the
                     // wait for the usage limit, and the owner's pause removes
                     // the planned resume: the owner decides from then on.
-                    if request.command == OwnerCommand::Resume
-                        || (request.command == OwnerCommand::Pause
-                            && request.actor == CommandActor::Owner)
-                    {
+                    if request.command == OwnerCommand::Resume || owner_pause {
                         record.usage_wait = None;
                     }
                     // Nothing else may read the storage the task's own
@@ -671,9 +667,7 @@ impl ControlPlane {
                 .runner
                 .as_ref()
                 .map(|runner| &runner.snapshot)
-                .filter(|snapshot| {
-                    snapshot.execution_cursor.execution_id.is_some() && snapshot.problem.is_none()
-                })
+                .filter(|snapshot| snapshot.speaks_of_execution())
                 .and_then(|snapshot| snapshot.usage_wait.clone());
             let Some(reported) = reported else {
                 return Ok(Mutation::Unchanged(false));
@@ -695,7 +689,6 @@ impl ControlPlane {
                 resets_at: reported.resets_at,
                 resume_at,
             });
-            // The grace is for a transient state; the wait is due at once.
             refresh_slot_release_due(record, now, Duration::zero());
             Ok(Mutation::Changed(
                 TaskEventKind::UsageWaitScheduled {
