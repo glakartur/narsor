@@ -13,12 +13,18 @@ execution: code
 ## Goal Capsule
 
 - **Objective:** When an agent step stops because the harness subscription has no tokens left, the task waits until the next usage window and then continues the same agent conversation, without a failed attempt in the history and without operator action.
-- **Product authority:** The request of the project owner (this brainstorm). Claude Code is the required harness for v1. Other harnesses are context only.
-- **Open blockers:** A real Claude Code recording of an exhausted limit does not exist in the repo yet (R1); detection rules depend on it.
+- **Means:** The harness run reports a usage-limit stop as its own outcome (KTD1, KTD2). The engine parks the execution as `Paused` with a durable usage-wait record (KTD3). The control plane frees the slot, shows `Paused` with a reason, and resumes the task at the planned time from a persisted deadline (KTD5, KTD6). The new runner continues the same session as the same attempt (KTD4).
+- **Product authority:** The Product Contract below (R1–R12, AE1–AE4, decisions Q1–Q3). Claude Code is the required harness for v1. Other harnesses are context only.
+- **Execution profile:** One pull request. Units U1–U8 in dependency order.
+- **Merge gate:** The PR does not merge until the real recordings of R1 exist (U1, Q5). Units U3–U8 can be built and tested before that against a provisional fixture that U1 replaces.
+- **Stop conditions:** Stop and report if the R1 recording shows that Claude Code refuses `--resume` on a session that stopped on the usage limit, or loses the conversation before the stop. Then R9 cannot hold as written. Also stop if the recording shows no signal that tells a usage-limit stop apart from other errors (R2).
+- **Who finishes:** The implementer builds U2–U8. The developer with a real Claude Code account supplies the U1 recordings.
 
 ---
 
 ## Product Contract
+
+Product Contract preservation: Product Contract unchanged. "Outstanding Questions → Deferred to Planning" is resolved in place (KTD1, KTD3, KTD5). The review item about text-only reset parsing (A1) is now question Q4 below. New questions Q4 and Q5 are in "Pytania otwarte dla użytkownika".
 
 ### Summary
 
@@ -114,17 +120,26 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 - Q3 — **Decided: (a).** (Requirements → Waiting, A3) Is there a maximum wait after which the task goes to the operator instead?
   - Options: (a, recommended) No maximum; the step waits until the reset and the operator can cancel it. (b) A maximum (for example 24 hours), then `HumanNeeded`.
 
+### Pytania otwarte dla użytkownika
+
+- Q4. (Założenia do potwierdzenia, A1; Requirements → Waiting, R6) If the limit message carries only a time of day and no machine-readable `resetsAt`, what does the step use as its reset time?
+  - Options: (a, recommended) Use only the machine-readable `resetsAt` in v1. A text-only reset time is not parsed, and the step uses the fixed retry interval of R6. Text parsing is deferred and comes back only if the R1 recording shows `resetsAt` missing when the limit is exhausted. (b) Parse the text as A1 says (the next such time in the stated timezone). A wrong guess can delay the resume by hours or days, because A3 sets no maximum wait.
+  - The plan builds option (a) (KTD2). Option (b) adds one parser function and its tests to U2.
+- Q5. (Requirements → Detection, R1, A7) Who records the R1 fixtures, and does the pull request wait for them?
+  - Options: (a, recommended) The developer records both runs (the limit stop, then `--resume` after the reset) on a real account and masks personal data. The PR does not merge before the recordings are in the repo. Until then, U2 tests run against a provisional fixture that is marked as not recorded. (b) Merge with detection switched off, and switch it on in a follow-up PR with the recordings. All other units stay unused until then.
+  - The plan builds option (a) (Goal Capsule, merge gate).
+
 ### Outstanding Questions
 
 **Resolve Before Planning**
 
 - None. Q1–Q3 are answered above.
 
-**Deferred to Planning**
+**Deferred to Planning** (resolved in the Planning Contract)
 
-- The exact detection signals for Claude Code, after the R1 recording exists.
-- Where the wait lives (runner timer vs. engine scheduling, for example next to `auto_resume.rs`) so that R8 holds.
-- How the waiting attempt is stored so the history shows one attempt (R4).
+- The exact detection signals for Claude Code: read from the R1 recording in U1 and U2 (KTD1, Deferred to Implementation).
+- Where the wait lives: in the control-plane task record, with a periodic resume pass next to `auto_resume_pass` (KTD5).
+- How the waiting attempt is stored: the execution is `Paused` with a usage-wait record that keeps the attempt's `action_execution_id` (KTD3).
 
 ### Sources / Research
 
@@ -141,14 +156,271 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 - `tests/fixtures/claude-code/README.md` — existing recordings; none shows an exhausted limit.
 - `docs/brainstorms/2026-10-31-limity-abonamentu-harnessow-requirements.md` — earlier usage-display work and its scope boundaries.
 
-## Deferred / Open Questions
+---
 
-These entries are review items left for the author. They do not block implementation.
+## Planning Contract
 
-### From 2026-11-28 review
+### Key Technical Decisions
 
-- **Text-only reset time parsing may resume a step far too late** — Założenia do potwierdzenia, A1 (P3, scope-guardian, confidence 75)
+- KTD1. **The harness run carries a usage-limit stop as data, not as free text.** `HarnessRun` gets an optional usage-limit stop with the harness session id and the reset time when known. The Claude Code parser keeps the last `rate_limit_event` limits it saw (today `take_usage` hands them to the relay and forgets them) and, in `finish`, sets the stop only when a failed run also shows the signals of the R1 recording. The other adapters leave the field empty, so they keep today's behaviour. Reason: `HarnessRun.failure` is free text and `ActionError.error_type` is a string code. A typed field is the only place the session layer can branch on without parsing messages. Governs R2, R3.
+- KTD2. **The reset time is the `resetsAt` of the rejected window; text is not parsed in v1.** When more than one window is rejected, the latest `resetsAt` wins, because the run cannot continue before all rejected windows reset. When no rejected window has `resetsAt`, the stop has no reset time and R6's retry interval applies. This is option (a) of Q4; option (b) adds a text parser in U2 and changes nothing else. Governs R6.
+- KTD3. **A usage-limit stop suspends the action; it is not an error.** The session layer returns a new `SuspendedAction` variant for a usage-limit stop and does not emit `AgentSessionFailed`. This check comes before `harness_error`, so a resumed run never becomes `resume_session_rejected` (R5). The step runner maps it to a new `AttemptOutcome` variant. That variant parks the execution: status `Paused`, a `WorkflowPaused` event with reason `usage_limit`, and a usage-wait record in `metadata.engine`. The record holds the state id, the `action_execution_id`, the attempt number, the harness, the harness session id and the reset time. No `ActionAttemptFailed`, `ActionFailed` or step-memory failure is written. A new event marks the attempt as waiting for the usage limit, so the timeline shows the attempt as waiting, not failed. Reason: `Paused` is already "parked durably" for crash reconciliation (`engine/recovery.rs` examines only `Running`) and for the runner's `go_on`, so R8 needs no new execution status. `WaitingForEvent` was rejected: it means a `wait` step and maps to the `Running` task state. Governs R4, R5, R8.
+- KTD4. **Continuation reuses the agent-input path with a usage-wait origin.** When the engine resumes a `Paused` execution that holds a usage-wait record, it restarts the same action with the same `action_execution_id` and attempt number (`AttemptsFrom`), emits a resume event instead of `ActionStarted`, and writes agent input for the stored harness and session with the fixed continuation prompt of A6. The input is marked as a usage continuation. For such an input, `attempt.rs` does not take the `RESUME_SESSION_REJECTED` branch (operator question or `restart_if_refused`). A failure that is not a usage limit goes the ordinary `AttemptFailure` way into the retry policy, then `Failed` (R11). A new usage-limit stop parks again with the same attempt (R10). Reason: `prepare_harness_attempt` already continues a session from `METADATA_AGENT_INPUT_KEY`, and D85 already resumes sessions from stored ids. Governs R9, R10, R11.
+- KTD5. **The wait lives in the control-plane task record and ends through a policy resume.** The runner reports the parked wait in its snapshot (a new optional field with the harness and the reset time). The central stores a `usage_wait` field on `TaskRecord` with `#[serde(default)]`, with the reset time and the computed `resume_at`: reset time plus the safety margin, or the report time plus the retry interval when no reset time is known (R6, A2). A new `usage_resume_pass` runs on the 5-second tick next to `auto_resume_pass`. When `resume_at` has passed and the runner is `Stopped` or `Interrupted`, it sends a `Resume` with `CommandActor::Policy`, the reserved key prefix `usage-resume:<generation>` and `expected_generation`. The command goes through the scheduler's capacity-aware path (`orchestration/scheduler.rs`, the one that decides `queue_resume` under the schedule lock), not through `ControlPlane::auto_resume`, which skips the capacity check because an interrupted task still holds its slot. With a full backend the task goes to `Queued` and keeps its position (D84). `policy_may_act` in `ControlPlane::command_routed` today lets a policy `Resume` act only when `auto_resume_due` holds; it must also accept a task whose usage wait is due. The central stores a reported wait only while the runner state is `Running` or `PauseRequested` and no owner `Pause` or `Stop` cleared a wait in the same generation (KTD7), so a late snapshot cannot restore a wait the owner removed. Reason: the task record is the only state that survives a server restart (JSON per task), and the D58/D62 passes already use this pattern (`ResumeState.next_attempt_at`, `slot_release_due_at`). An in-runner timer (in-memory `tokio::sleep`, like the retry backoff) would hold a slot and a pod for days and would die with the runner. Governs R6, R8.
+- KTD6. **A waiting task frees its slot at once and shows `Paused` with a reason.** The usage wait counts as a release class with no grace: `slot_release_pass` sends the existing policy pause, the runner stops at the safe point, and the task becomes `Stopped`. `derive_task_state` returns `Paused` for a task with a usage wait unless the execution is terminal or needs input. `TaskSummary` gets an optional `pause_reason` with a `UsageLimit { harness, resumes_at }` variant and `#[serde(other)] Unrecognized`. Clients render it and derive nothing (D62). Reason: A5 asks for `Paused` with a reason (Q2), and a wait of up to 7 days must not block the backend's slots. On resume, D84 keeps the task's queue position. This changes D62's sentence "`Paused` in `TaskState` means solely the owner's decision"; the new architecture decision records it (U8). Governs R7.
+- KTD7. **Owner controls during the wait.** Cancel and archive work as today. An owner `Resume` resumes at once and clears the planned time (R12). An owner `Pause` or `Stop` on a waiting task removes the planned resume, so the task stays `Paused` as an owner pause with no reason. `auto_resume_pass` skips a task that has a usage wait, so a lost runner during the wait is resumed only by `usage_resume_pass` at `resume_at`. Governs R12, R8.
+- KTD8. **The retry interval and the safety margin are backend settings.** `BackendLimits` gets `usage_wait_retry_secs` (default 900) and `usage_wait_margin_secs` (default 60), read fresh at every decision, with the range of the existing slot settings. Reason: A2 asks for settings, and `BackendLimits` is where the central already keeps the slot-policy times. Governs R6.
 
-  If the limit message carries only a time of day, guessing its date and timezone can be wrong. A wrong guess makes the step resume hours or days late, because A3 sets no maximum wait. The fixed 15-minute retry in R6 already covers a missing reset time at a small cost.
+### High-Level Technical Design
 
-  Change: Use only the machine-readable `resetsAt` as the reset time in v1. Move text-only reset parsing to Scope Boundaries as deferred. Bring it back only if the R1 recording shows that `resetsAt` is missing when the limit is exhausted.
+```mermaid
+sequenceDiagram
+  participant H as Claude Code
+  participant E as Engine (runner)
+  participant R as Runner
+  participant C as Central
+  H->>E: run ends, usage-limit stop + session id + resetsAt (KTD1, KTD2)
+  E->>E: Suspended usage limit, execution Paused, usage-wait record (KTD3)
+  R->>C: snapshot: Paused, usage_wait {harness, resets_at}
+  C->>C: TaskRecord.usage_wait, resume_at, UsageWaitScheduled (KTD5)
+  C->>R: policy pause, slot released (KTD6)
+  R-->>C: safe point, runner Stopped, task Paused with reason
+  Note over C: 5 s tick, usage_resume_pass, resume_at passed
+  C->>R: policy Resume usage-resume:gen, new runner
+  R->>E: go_on, resume Paused execution
+  E->>H: --resume same session, continuation prompt, same attempt (KTD4)
+  alt usage limit again
+    H->>E: usage-limit stop, park again (R10)
+  else other failure
+    E->>E: retry policy, then Failed (R11)
+  end
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Running
+  Running --> WaitingUsage: usage-limit stop (execution Paused)
+  WaitingUsage --> Stopped: policy pause, slot freed
+  Stopped --> Resuming: resume_at passed or owner Resume
+  Resuming --> Running: same session continues
+  Resuming --> WaitingUsage: usage limit again
+  Running --> Failed: other failure after retries
+  Stopped --> OwnerPaused: owner Pause or Stop clears the wait
+  Stopped --> Cancelled: owner Cancel
+```
+
+### Assumptions
+
+- The control plane receives the snapshot with the usage wait before the runner exits. If the runner is lost first, the task becomes `Interrupted` and the next runner's `go_on` reports the wait again from the execution record, because the record is on task storage.
+- An owner `Resume` reaches the runner with an owner actor; a usage resume reaches it with the `usage-resume:` key. The engine continues the session in both cases. The runner does not need to tell them apart.
+- `resumable_agent_session` (D85) already returns the in-flight session of a parked attempt. The usage-wait record stores the session id anyway, so the continuation does not depend on `timeline.json` being present.
+- A conductor chat (A8) uses the same session layer. The conductor path turns the new suspended outcome back into today's harness error, so its behaviour does not change.
+
+### Sequencing
+
+U1 first only for the recording; U2 can start on the provisional fixture. U3 needs U2. U4 needs U3. U5 needs U3. U6 needs U5. U7 needs U6. U8 last.
+
+### Risks
+
+| Risk | Mitigation |
+|---|---|
+| The R1 recording shows no reliable usage-limit signal, or `--resume` loses the conversation. | Goal Capsule stop condition. U1 runs before U2 is finished. |
+| A new runner sends the snapshot field to an older central, which ignores it: the task shows `Running` with a parked execution and is never resumed. | Update order of D62: central first, then runners and clients. U8 adds it to `docs/operations/updates.md`. |
+| A rejected-status `rate_limit_event` appears in a run that ends normally or ends on another error. | KTD1 requires a failed run plus the recorded signals. AE1 test and a test for a rejected event in a successful run. |
+| Many tasks on one subscription all resume at the same reset time and some stop again. | Accepted. Q1 chose per-step waits. Each repeated stop re-parks without a failure (R10). |
+
+### System-Wide Impact
+
+- **Persisted data:** `TaskRecord.usage_wait` and the execution's usage-wait metadata are optional with `#[serde(default)]`. Old records read as "no wait". No record version change is needed (`docs/solutions/conventions/removing-a-field-from-serde-wire-and-persisted-types-2026-11-18.md`).
+- **Wire:** `RunnerSnapshotRequest`, `TaskSummary.pause_reason` and a new `TaskEventKind::UsageWaitScheduled` are additive. New enum variants end in `#[serde(other)] Unrecognized` (D58 pattern).
+- **Slots:** a waiting task holds no slot. The `usage-resume:` key prefix is reserved like `slot-release:` and `auto-resume:`.
+- **Clients:** CLI, TUI and web render the reason. They derive nothing.
+
+---
+
+## Implementation Units
+
+### U1. Record the usage-limit fixtures
+
+- **Goal:** Real Claude Code recordings of a run that stops on an exhausted subscription limit, and of `--resume` on that session after the reset.
+- **Requirements:** R1, A7, Q5.
+- **Dependencies:** none. Needs a person with a real account at a moment when the limit is exhausted.
+- **Files:**
+  - `tests/fixtures/claude-code/usage_limit_stop.ndjson` (new)
+  - `tests/fixtures/claude-code/usage_limit_resume.ndjson` (new)
+  - `tests/fixtures/claude-code/README.md` (scenario rows, the lines that signal the stop, CLI version, masking note)
+- **Approach:**
+  1. Record with the common flags of the README, as a schema run, so the shape matches Narsor's calls.
+  2. After the window resets, record `--resume <id>` on the same session with a short continuation prompt.
+  3. Mask user paths and identifiers as in `subagents.ndjson`. Keep no customer data or secrets.
+  4. Until the recordings exist, U2 uses a provisional fixture named and documented as not recorded; U1 replaces it before merge.
+- **Patterns to follow:** `docs/solutions/design-patterns/show-only-what-harness-reports-count-without-tokens-record-fixture-2026-11-13.md`.
+- **Test expectation:** none -- fixtures only; U2 tests read them.
+- **Verification:** both files are in the repo, the README names the signal lines, and the resume recording shows the earlier conversation is kept.
+
+### U2. Classify a usage-limit stop in the Claude Code parser
+
+- **Goal:** `HarnessRun` reports a usage-limit stop with the session id and the reset time (KTD1, KTD2).
+- **Requirements:** R2, R3, AE1.
+- **Dependencies:** U1 (provisional fixture allowed before merge).
+- **Files:**
+  - `crates/narsor-exec/src/engine/actions/harness/mod.rs` (the new `HarnessRun` field and its type)
+  - `crates/narsor-exec/src/engine/actions/harness/claude_code.rs` (keep the last limits, set the stop in `finish`)
+  - `crates/narsor-exec/src/engine/actions/harness/claude_code/usage.rs` (reset time of the rejected windows)
+  - the other adapters under `crates/narsor-exec/src/engine/actions/harness/` (field left empty)
+  - Tests: `tests/integration/claude_code_classification.rs`
+- **Approach:** Keep the limits after `take_usage` hands them to the relay; the relay still gets each event once. In `finish`, set the stop only when `failure` would be set and the R1 signals are present. The test seam is the parser over fixture lines: it catches classification errors, but not how the session layer uses the result (U3).
+- **Patterns to follow:** existing rate-limit tests in `claude_code_classification.rs` (`recorded_rate_limit_event`, `usage_of`).
+- **Test scenarios:**
+  - The `usage_limit_stop` recording gives a usage-limit stop with the session id of its `system/init` line and the `resetsAt` of the rejected window.
+  - Covers AE1. A run that ends with `terminal_reason: api_error` and `API Error: 400` gives an ordinary failure and no usage-limit stop.
+  - The `max_turns` recording gives no usage-limit stop.
+  - A rejected event without `resetsAt`, followed by the recorded stop signal, gives a stop with no reset time.
+  - A run with a rejected event that ends with a successful `result` gives no failure and no stop.
+- **Verification:** the parser tests pass on the recorded fixture, and the usage relay still receives each `rate_limit_event`.
+
+### U3. Park the execution on a usage-limit stop
+
+- **Goal:** A usage-limit stop suspends the action and parks the execution as `Paused` with a usage-wait record, without a failed attempt (KTD3).
+- **Requirements:** R4, R5, R8, AE3, A8.
+- **Dependencies:** U2.
+- **Files:**
+  - `crates/narsor-exec/src/engine/actions/mod.rs` (new `SuspendedAction` variant)
+  - `crates/narsor-exec/src/engine/actions/session.rs` and `actions/session/process.rs` (check the stop before `harness_error`, no `AgentSessionFailed`)
+  - `crates/narsor-exec/src/engine/runner/step/outcome.rs`, `step/attempt.rs`, `step/action.rs` (new `AttemptOutcome` variant, park)
+  - `crates/narsor-exec/src/engine/runner/metadata/` (new usage-wait module next to `pending_step.rs`)
+  - `crates/narsor-model/src/` event data (new waiting event) and `crates/narsor-exec/src/engine/timeline.rs` (waiting position)
+  - the conductor's use of the session layer (map back to today's error, A8)
+  - Tests: `tests/integration/actions_agent.rs`, `tests/integration/engine_recovery.rs`, `tests/integration/timeline.rs`, `tests/integration/engine_support/mod.rs` (a new `AgentTurn` that stops on the usage limit)
+- **Approach:**
+  1. In the session layer, a run with a usage-limit stop ends as the new suspended outcome before the failure branch.
+  2. The step runner writes the usage-wait record and calls `pause_execution` with reason `usage_limit`.
+  3. The retry loop does not count the attempt and creates no new `action_execution_id`.
+- **Patterns to follow:** `SuspendedAction::AwaitingAgentInput` and `suspend_for_agent_input`; `AttemptOutcome::SessionRefused` for an outcome outside the retry count.
+- **Test scenarios:**
+  - A step with `max_attempts: 3` whose agent stops on the usage limit ends with execution `Paused`, one `ActionStarted`, no `ActionAttemptFailed` and no `ActionFailed`, and a usage-wait record with that attempt's id and session.
+  - Covers AE3. A step resumed with `resume_session` that stops on the usage limit parks the same way: no operator request for a new session, and `restart_if_refused` starts no new session.
+  - The timeline shows the attempt as waiting, not failed.
+  - Crash reconciliation after the park leaves the execution `Paused`, not `Unknown`.
+  - A conductor chat run that stops on the usage limit gives today's harness error.
+- **Verification:** no usage-limit test path writes a failure event or a step-memory failure.
+
+### U4. Continue the same session after the wait
+
+- **Goal:** Resuming a parked execution continues the stored session as the same attempt (KTD4).
+- **Requirements:** R9, R10, R11, A6, AE2.
+- **Dependencies:** U3.
+- **Files:**
+  - `crates/narsor-exec/src/engine/runner/lifecycle/resume.rs` (detect the usage-wait record)
+  - `crates/narsor-exec/src/engine/runner/step/action.rs` (`run_attempts` from the stored attempt)
+  - `crates/narsor-exec/src/engine/runner/step/harness_attempt.rs` and `human_input/agent_input.rs` (usage-continuation input)
+  - `crates/narsor-exec/src/engine/runner/step/attempt.rs` (skip the refused-session branch for this input)
+  - Tests: `tests/integration/actions_agent.rs`, `tests/integration/engine_recovery.rs`
+- **Approach:** On resume, take the usage-wait record, write the agent input with the stored harness, session and the A6 prompt, and run the action from the stored `AttemptsFrom`. Remove the record when the attempt runs, so a second resume does not repeat it.
+- **Patterns to follow:** `prepare_recover` with `resumable_agent_session` (D85); `take_agent_input`.
+- **Test scenarios:**
+  - Covers AE2. After a park, a resume runs the agent with the same session id (`resumed_sessions()`) and the continuation prompt. The step completes, the history has one attempt, and no attempt is failed.
+  - Covers F2. A continuation that stops on the usage limit again parks again with the same `action_execution_id`.
+  - A continuation that fails with another error uses the retry policy: with `max_attempts: 2`, the next attempt starts a new session, and after it fails the execution is `Failed`.
+  - A continuation whose resume is refused does not ask the operator for a new session; it goes into the retry policy.
+- **Verification:** the scenario tests pass, and no usage-wait record is left after a completed step.
+
+### U5. Report the wait from the runner
+
+- **Goal:** The runner's snapshot tells the central that the execution waits for the usage limit, also after a runner restart.
+- **Requirements:** R7, R8.
+- **Dependencies:** U3.
+- **Files:**
+  - `crates/narsor-protocol/src/controller/runner/snapshot.rs` (optional `usage_wait` field with harness and reset time)
+  - `crates/narsor-runner/src/runner/snapshot.rs` (fill it from the execution record)
+  - `crates/narsor-runner/src/runner/mod.rs` (`go_on` keeps the record for the engine resume)
+  - Tests: `tests/integration/orchestration.rs` or the runner's existing snapshot tests
+- **Approach:** The field is derived from the execution record, not from memory, so a new runner reports the same wait.
+- **Test scenarios:**
+  - A snapshot of a parked execution carries the harness and the reset time.
+  - A snapshot after the continuation has started carries no wait.
+  - A snapshot body without the field still decodes.
+- **Verification:** the snapshot tests pass.
+
+### U6. Store the wait, free the slot, and resume on time
+
+- **Goal:** The central keeps the wait in the task record, frees the slot, and resumes the task at `resume_at` (KTD5, KTD6, KTD7, KTD8).
+- **Requirements:** R6, R7, R8, R12, AE4, A2, A3, A4.
+- **Dependencies:** U5.
+- **Files:**
+  - `crates/narsor-engine/src/orchestration/model.rs` (`TaskRecord.usage_wait`, `derive_task_state`, `SlotReleaseClass`, `auto_resume_due`)
+  - `crates/narsor-engine/src/controller_protocol/service/` snapshot handling (store and clear the wait, `UsageWaitScheduled` event)
+  - `crates/narsor-engine/src/controller_protocol/service/scheduling/usage_resume.rs` (new pass) and `scheduling/slot_release.rs`
+  - `crates/narsor-engine/src/orchestration/control_plane.rs` (`policy_may_act` accepts a due usage wait, reserved `usage-resume:` prefix, owner Pause or Stop clears the wait) and `crates/narsor-engine/src/orchestration/scheduler.rs` (the pass resumes through the capacity-aware command path)
+  - `crates/narsor-server/src/runtime.rs` (`run_periodic_pass` calls the new pass)
+  - `crates/narsor-engine/src/environment/backend.rs` (KTD8 settings)
+  - `crates/narsor-protocol/src/controller/task/events.rs` (`UsageWaitScheduled`)
+  - Tests: `tests/integration/orchestration.rs`, `tests/integration/backend_contract.rs`
+- **Approach:** Compute `resume_at` when the snapshot first reports the wait, under the storing rule of KTD5. A later snapshot without the wait clears it. The pass checks the backend controller is online, as `auto_resume_pass` does, resumes through the scheduler path of KTD5, and treats `StaleGeneration` and `IllegalCommand` as "someone was first".
+- **Patterns to follow:** `scheduling/auto_resume.rs`, `slot_release_due_at`, `docs/solutions/architecture-patterns/auto-resume-policy-for-lost-workloads-2026-10-11.md`.
+- **Test scenarios:**
+  - A snapshot with a reset at 15:00 gives `resume_at` 15:01 and an immediate slot release; the task state is `Paused`.
+  - A snapshot without a reset time gives `resume_at` 15 minutes after the report.
+  - Covers AE4. A task waiting for 15:00 whose central restarts at 14:00 (reload the record from disk) gets a policy resume with the `usage-resume:` key at the first pass after 15:01, not before.
+  - A runner lost during the wait is not resumed by `auto_resume_pass`; it is resumed at `resume_at`.
+  - With the backend at its limit at `resume_at`, the policy resume puts the task in `Queued` at its own position, not in `Provisioning`.
+  - A snapshot that still reports the wait after an owner `Pause` cleared it does not restore the planned resume.
+  - An owner `Resume` during the wait resumes at once; an owner `Pause` clears the wait, and the pass does not resume the task.
+  - An owner key with the `usage-resume:` prefix is refused as a reserved key.
+- **Verification:** the scenario tests pass; a waiting task never holds a slot after its release.
+
+### U7. Show the reason to the operator
+
+- **Goal:** CLI, TUI and web show "usage limit — resumes at HH:MM" for a waiting task (KTD6).
+- **Requirements:** R7.
+- **Dependencies:** U6.
+- **Files:**
+  - `crates/narsor-protocol/src/controller/task/summary.rs` (`pause_reason`)
+  - `crates/narsor-engine/src/controller_protocol/service/tasks/summary.rs` (fill it)
+  - `src/cli/task_text.rs` (`state_hint`)
+  - `src/tui/task_app/list.rs`, `src/tui/task_app/detail.rs`, `src/tui/task_app/tabs/info.rs`
+  - `crates/narsor-web/ui/js/model.js`, `crates/narsor-web/ui/js/ui/tabs/info.js`
+  - Tests: `tests/integration/cli_task_text.rs`, `tests/integration/tui_render.rs`
+- **Approach:** Show the harness and the local time of `resume_at`. Without a known reset time, show the planned retry time. The TUI keeps the `Paused` icon.
+- **Test scenarios:**
+  - The CLI text of a waiting task names the usage limit, the harness and the resume time.
+  - The TUI list and detail show the same reason.
+  - A summary with an unknown `pause_reason` variant renders as a plain `Paused`.
+- **Verification:** the render tests pass; the web view shows the reason in the info tab.
+
+### U8. Documentation
+
+- **Goal:** Record the decision and the operator notes.
+- **Requirements:** R1, R7, R8.
+- **Dependencies:** U1–U7.
+- **Files:**
+  - `docs/dev/architecture.md` (new decision D88: usage-limit wait, its change to D62's `Paused` meaning, the reserved key, update order)
+  - `docs/operations/updates.md` (update order: central first)
+  - `docs/user/` page on task states (the new reason)
+  - `tests/fixtures/claude-code/README.md` (done in U1)
+- **Test expectation:** none -- documentation only; `tests/integration/docs_links.rs` checks the links.
+- **Verification:** the decision text names KTD5–KTD7, and the docs link test passes.
+
+---
+
+## Verification Contract
+
+| Gate | Command or check | Applies to |
+|---|---|---|
+| Build | `cargo build --workspace --bins` | all units |
+| Tests | `cargo test --workspace` (CI runs it with `--locked`) | all units |
+| Parser on the real recording | `claude_code_classification` tests read `usage_limit_stop.ndjson` recorded by U1, not the provisional fixture | U1, U2, merge gate |
+| Manual check | With an exhausted real limit, run one agent step: the task shows `Paused` with the reason, frees the slot, and after the reset the same session continues | before merge, when a limit is available |
+
+No `#[ignore]`d test is needed: the fake agent in `engine_support` covers the engine flow.
+
+---
+
+## Definition of Done
+
+- R1–R12 and AE1–AE4 each have a passing test or the U1 recording that shows them.
+- The provisional fixture is gone, and the README describes the real recordings.
+- `cargo test --workspace` passes.
+- Q4 and Q5 have an answer; if Q4 is (b), U2 has the text parser and its tests.
+- No dead code from abandoned approaches is left in the diff.
+- Per unit: the unit's Verification line holds.
