@@ -14,7 +14,7 @@ execution: code
 
 - **Objective:** When an agent step stops because the harness subscription has no tokens left, the task waits until the next usage window and then continues the same agent conversation, without a failed attempt in the history and without operator action.
 - **Product authority:** The request of the project owner (this brainstorm). Claude Code is the required harness for v1. Other harnesses are context only.
-- **Open blockers:** The questions in "Pytania otwarte dla użytkownika" change visible behaviour. A real Claude Code recording of an exhausted limit does not exist in the repo yet (R1); detection rules depend on it.
+- **Open blockers:** A real Claude Code recording of an exhausted limit does not exist in the repo yet (R1); detection rules depend on it.
 
 ---
 
@@ -99,26 +99,26 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 - A1. Claude Code gives a reset time in the stream (`rate_limit_event.resetsAt` with status `rejected`, or the "resets …" text in the limit message). If only the text exists, a time without a date and with a local timezone is interpreted as the next such time in that timezone.
 - A2. The fallback retry interval is 15 minutes, and the safety margin after a reported reset is 1 minute. Both are settings with these defaults.
 - A3. The wait has no maximum length; a 7-day window can make a task wait for days. The operator can cancel it (R12).
-- A4. Only the step that hit the limit waits. Other steps that hit the limit wait on their own; Narsor does not block steps that did not hit it (see the questions).
-- A5. The waiting state uses the existing `Paused` task state with a reason, not a new task state, so that clients need small changes only (see the questions).
+- A4. Only the step that hit the limit waits. Other steps that hit the limit wait on their own; Narsor does not block steps that did not hit it (decided in Q1).
+- A5. The waiting state uses the existing `Paused` task state with a reason, not a new task state, so that clients need small changes only (decided in Q2).
 - A6. The continuation prompt is a short fixed text that tells the agent to continue the interrupted work; it is not the step's original prompt.
 - A7. The R1 recording is made by the developer on a real account at a moment when the limit is exhausted, then cleaned of personal data; a synthetic line is not enough for R1.
 - A8. A usage-limit stop in a conductor chat or other non-step conversation is out of scope for v1 and keeps today's behaviour.
 
-### Pytania otwarte dla użytkownika
+### Decisions (answered by the project owner on the PR)
 
-- Q1. (Requirements → Waiting, A4) When one step hits the limit, what happens to other steps and tasks on the same harness subscription?
+- Q1 — **Decided: (a).** (Requirements → Waiting, A4) When one step hits the limit, what happens to other steps and tasks on the same harness subscription?
   - Options: (a, recommended) Only the step that hit the limit waits; the others continue and wait on their own when they hit it. (b) All new agent steps on that harness wait until the reset, so they do not start and stop at once.
-- Q2. (Requirements → Waiting, R7, A5) How should a waiting task look to the operator?
+- Q2 — **Decided: (a).** (Requirements → Waiting, R7, A5) How should a waiting task look to the operator?
   - Options: (a, recommended) The existing `Paused` state with a reason "usage limit — resumes at HH:MM". (b) A new task state, for example `WaitingForUsage`, in the TUI, CLI and web. (c) The `Running` state with a note.
-- Q3. (Requirements → Waiting, A3) Is there a maximum wait after which the task goes to the operator instead?
+- Q3 — **Decided: (a).** (Requirements → Waiting, A3) Is there a maximum wait after which the task goes to the operator instead?
   - Options: (a, recommended) No maximum; the step waits until the reset and the operator can cancel it. (b) A maximum (for example 24 hours), then `HumanNeeded`.
 
 ### Outstanding Questions
 
 **Resolve Before Planning**
 
-- Q1–Q3 above.
+- None. Q1–Q3 are answered above.
 
 **Deferred to Planning**
 
