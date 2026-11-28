@@ -43,6 +43,7 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 - **A usage-limit stop is a separate outcome, not a failure.** It does not use an attempt of the retry policy and it does not go through the conductor's failure diagnosis. Governs R4, R5, R10.
 - **Continue the existing harness session; never start a new one because of a usage limit.** This is the core of the request: the work done before the stop must not be lost. Governs R5, R8, R9.
 - **The reset time from the harness is preferred; periodic retry is the fallback.** The request names this order. Governs R6.
+- **The interrupted session is the only source of the stop.** A usage-limit stop is detected only from what the harness returned in that run (stream, `result` line, message). The monitored usage state (`harness_usage.rs`, `narsor usage`) never decides that a step stopped. It may only help to compute the next retry time, and the reset time from the run itself has priority over it. Governs R2, R3, R6.
 - **Detection is per harness and based on recorded real output.** Claude Code is required in v1. A harness without detection keeps today's behaviour. Governs R1, R2, R3.
 
 ### Requirements
