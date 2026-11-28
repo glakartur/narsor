@@ -26,8 +26,8 @@ use narsor_protocol::controller::PendingInputRefView;
 use narsor_protocol::controller::{
     AttentionItem, AttentionKind, ConversationAttemptSummary, EnvironmentDiff, EnvironmentDrift,
     EnvironmentRefreshResult, GateAutomationPhase, GateHookView, InputStatus, NamedChanges,
-    OperatorCommand, OwnerCommand, QueueReason, RunnerState, SlotReleaseReason, TaskActionId,
-    TaskEvent, TaskEventKind, TaskState,
+    OperatorCommand, OwnerCommand, PauseReason, QueueReason, RunnerState, SlotReleaseReason,
+    TaskActionId, TaskEvent, TaskEventKind, TaskState,
 };
 use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, WorkspaceHeader};
 
@@ -457,10 +457,52 @@ fn is_live(task: &TaskSummary) -> bool {
         && matches!(task.state, TaskState::Running | TaskState::Paused)
 }
 
+/// Why the control plane paused the task, in words: `usage limit of claude-code
+/// — resumes at 14:30`, in the local time of this machine. `None` for a pause
+/// by the owner and for a reason this version does not know, which read as a
+/// plain pause.
+pub fn pause_reason_text(task: &TaskSummary) -> Option<String> {
+    match task.pause_reason.as_ref()? {
+        PauseReason::UsageLimit {
+            harness,
+            resumes_at,
+        } => Some(format!(
+            "usage limit of {} — resumes at {}",
+            without_unsafe_chars(harness),
+            local_clock(*resumes_at)
+        )),
+        PauseReason::Unrecognized => None,
+    }
+}
+
+/// [`pause_reason_text`] short enough for a row of the narrow task list:
+/// `usage limit · 14:30`.
+pub fn pause_reason_label(task: &TaskSummary) -> Option<String> {
+    match task.pause_reason.as_ref()? {
+        PauseReason::UsageLimit { resumes_at, .. } => {
+            Some(format!("usage limit · {}", local_clock(*resumes_at)))
+        }
+        PauseReason::Unrecognized => None,
+    }
+}
+
+/// `at` as `HH:MM` on the clock of this machine.
+fn local_clock(at: DateTime<Utc>) -> String {
+    at.with_timezone(&chrono::Local).format("%H:%M").to_string()
+}
+
 /// What the owner can do about the task now, in words.
 pub fn state_hint(task: &TaskSummary) -> Option<ToneLine> {
     if let Some(hint) = gate_hint(task) {
         return Some(hint);
+    }
+    if task.state == TaskState::Paused {
+        if let Some(reason) = pause_reason_text(task) {
+            return Some(ToneLine::new(
+                format!("{reason}; the task resumes by itself"),
+                Tone::Normal,
+            ));
+        }
     }
     let hint = match task.state {
         TaskState::Queued => {

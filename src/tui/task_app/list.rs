@@ -48,7 +48,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
-use crate::cli::task_text::activity_age;
+use crate::cli::task_text::{activity_age, pause_reason_label};
 use crate::controller_protocol::{
     Freshness, InputView, OperatorCommandView, QueueView, TaskSummary,
 };
@@ -326,6 +326,8 @@ fn activity_since(task: &TaskSummary) -> Option<DateTime<Utc>> {
         TaskState::Queued => task.queue.as_ref().map(|queue| queue.since),
         TaskState::HumanNeeded => task.attention.iter().map(|item| item.since).min(),
         TaskState::Finished | TaskState::Error | TaskState::Archived => None,
+        // The time the task resumes at (`label_of`) takes the age's place.
+        TaskState::Paused if pause_reason_label(task).is_some() => None,
         _ => task.state_since,
     }
 }
@@ -343,13 +345,17 @@ fn controller_offline(task: &TaskSummary) -> bool {
 }
 
 /// The label of a row (its third line, before the time): the step of a
-/// running task, the place of a queued one, and nothing else — the icon says
-/// the state. `queue_position` is the 1-based place among the queued tasks of
-/// the backend, in list order.
+/// running task, the place of a queued one, when a task the control plane
+/// paused resumes, and nothing else — the icon says the state.
+/// `queue_position` is the 1-based place among the queued tasks of the
+/// backend, in list order.
 pub fn label_of(task: &TaskSummary, queue_position: Option<usize>) -> String {
     match task.state {
         TaskState::Queued => queue_position.map_or_else(String::new, |place| format!("#{place}")),
         TaskState::Running => current_step(task).unwrap_or_default(),
+        TaskState::Paused => {
+            pause_reason_label(task).map_or_else(String::new, |label| one_line(&label))
+        }
         _ => String::new(),
     }
 }

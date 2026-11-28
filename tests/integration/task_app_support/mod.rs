@@ -17,7 +17,7 @@ use narsor_engine::orchestration::{
     derive_task_state, AttentionItem, AttentionKind, ExecutionCursor, QueueReason,
     ResumeExhaustion, ResumeState, RunnerState, TaskEvent, TaskEventKind, TaskState, WorkloadLoss,
 };
-use narsor_protocol::controller::{PanelForm, PanelFormKind, PanelOffer};
+use narsor_protocol::controller::{PanelForm, PanelFormKind, PanelOffer, PauseReason};
 
 pub fn at() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 9, 12, 0, 0).unwrap()
@@ -103,7 +103,7 @@ pub fn served_state(task: &TaskSummary) -> TaskState {
         task.runner.as_ref().map(|runner| runner.execution_status),
         &task.resume,
         false,
-        false,
+        matches!(task.pause_reason, Some(PauseReason::UsageLimit { .. })),
     )
 }
 
@@ -836,4 +836,23 @@ pub fn stub_definition(form: &serde_json::Value) -> narsor_protocol::panel::Pane
             )
         });
     serde_json::from_value(record["def"].clone()).expect("a recorded definition")
+}
+
+/// A stopped task the control plane paused with `reason`, the JSON of its
+/// `pause_reason` as the server sends it (an unknown kind included).
+pub fn usage_waiting(id: &str, rank: u32, reason: serde_json::Value) -> TaskSummary {
+    let mut value = serde_json::to_value(task(id, "local", "stopped", rank)).expect("a summary");
+    value["pause_reason"] = reason;
+    let mut task: TaskSummary = serde_json::from_value(value).expect("a paused summary");
+    task.state = served_state(&task);
+    offered(task)
+}
+
+/// The JSON of a pause for the usage limit of `harness` until `resumes_at`.
+pub fn usage_limit(harness: &str, resumes_at: DateTime<Utc>) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "usage_limit",
+        "harness": harness,
+        "resumes_at": resumes_at,
+    })
 }

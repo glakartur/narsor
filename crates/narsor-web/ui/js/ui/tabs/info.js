@@ -5,7 +5,7 @@
 // generation shows the comparison already read. A failed read is not kept.
 
 import { html } from '../../lib.js';
-import { secondsBetween, shortAge } from '../../model.js';
+import { pauseReasonText, secondsBetween, shortAge } from '../../model.js';
 import { driftRow } from '../../text.js';
 import { useRead } from '../read.js';
 
@@ -77,6 +77,7 @@ export function Info({ api, task }) {
     <${Sheet} title="Workflow" rows=${[
       ['workflow', `${task.workflow_id} v${task.workflow_version}`],
       ['stan', STATE_NAME[task.state] ?? task.state],
+      ['pause reason', pauseReasonText(task)],
       ['slot', slotText(task)],
       ['pozycja', task.state === 'queued' ? String(task.rank + 1) : null],
       ['kolejka', task.queue ? queueText(task.queue) : null],

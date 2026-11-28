@@ -6376,7 +6376,7 @@ mod usage_wait {
     use super::*;
     use narsor_engine::controller_protocol::{OwnerCommandRequest, ProtocolError, ProtocolService};
     use narsor_engine::orchestration::{SlotReleaseReason, TaskState, TaskUsageWait};
-    use narsor_protocol::controller::UsageLimitWait;
+    use narsor_protocol::controller::{PauseReason, UsageLimitWait};
 
     fn at(hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 3, hour, minute, second)
@@ -6504,6 +6504,14 @@ mod usage_wait {
             assert_eq!(stopped.runner_state, RunnerState::Stopped, "{case}");
             assert!(!stopped.holds_capacity(), "{case}");
             assert_eq!(stopped.task_state(), TaskState::Paused, "{case}");
+            assert_eq!(
+                central.summarize(&stopped).unwrap().pause_reason,
+                Some(PauseReason::UsageLimit {
+                    harness: "claude-code".to_string(),
+                    resumes_at: resume_at,
+                }),
+                "{case}"
+            );
             assert_eq!(
                 stopped.usage_wait.map(|wait| wait.resume_at),
                 Some(resume_at)

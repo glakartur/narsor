@@ -4667,6 +4667,55 @@ mod task_app_detail_render {
         }
     }
 
+    /// A task that waits for the usage limit keeps the paused icon; its row
+    /// shows when it resumes, and its details name the harness too. A reason
+    /// this version does not know shows a plain pause.
+    #[test]
+    fn a_task_waiting_for_the_usage_limit_shows_why_in_the_row_and_the_details() {
+        use crate::task_app_support::{at, usage_limit, usage_waiting};
+        let resumes_at = at() + chrono::Duration::minutes(195);
+        let clock = resumes_at
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        let cases = [
+            (
+                usage_limit("claude-code", resumes_at),
+                Some((
+                    format!("usage limit · {clock}"),
+                    format!("usage limit of claude-code — resumes at {clock}"),
+                )),
+            ),
+            (serde_json::json!({ "kind": "credit_exhausted" }), None),
+        ];
+        for (reason, shown) in cases {
+            let mut app = app();
+            let waiting = with_controller(usage_waiting("a", 1, reason));
+            app.load(listing(vec![titled(waiting, "NAR-1")], "c"));
+            let buffer = render(&mut app, &Styles::new(false));
+            let text = screen(&buffer);
+            assert!(text.contains("‖ paused"), "{text}");
+            let list: Vec<String> = rows(&buffer)
+                .iter()
+                .map(|row| row.chars().take(28).collect())
+                .collect();
+            match &shown {
+                Some((row, notice)) => {
+                    assert!(
+                        list.iter().any(|line| line.contains(row.as_str())),
+                        "{text}"
+                    );
+                    assert!(text.contains(notice.as_str()), "{text}");
+                }
+                None => assert!(!text.contains("usage limit"), "{text}"),
+            }
+            app.detail_mut()
+                .set_tab(narsor::tui::task_app::DetailTab::Info);
+            let info = screen(&render(&mut app, &Styles::new(false)));
+            assert_eq!(info.contains("pause reason"), shown.is_some(), "{info}");
+        }
+    }
+
     /// The details of an interrupted task say what it waits for; the row
     /// is marked only when its owner has to act, and stays where it was.
     #[test]
