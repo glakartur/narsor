@@ -247,6 +247,7 @@ pub fn snapshot(
         default_harness_unavailable: None,
         workspaces: Vec::new(),
         generated_title: None,
+        usage_wait: None,
         observed_at: Utc::now(),
     }
 }

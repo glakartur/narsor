@@ -266,6 +266,7 @@ fn safe_point_snapshot(sequence: u64) -> RunnerSnapshot {
         default_harness_unavailable: None,
         workspaces: Vec::new(),
         generated_title: None,
+        usage_wait: None,
         observed_at: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap(),
     }
 }

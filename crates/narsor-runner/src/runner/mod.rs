@@ -839,6 +839,7 @@ async fn report_problem(
         default_harness_unavailable: None,
         workspaces: Vec::new(),
         generated_title: None,
+        usage_wait: None,
         observed_at,
     };
     send_until(link, timing, &snapshot).await;

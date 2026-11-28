@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use narsor_protocol::api::Timeline;
 use narsor_protocol::controller::{
     AttentionItem, ConversationAvailability, ExecutionCursor, GateWatch, HarnessUnavailable,
-    PendingInputRefView, RunnerProblem, RunnerSnapshotRequest,
+    PendingInputRefView, RunnerProblem, RunnerSnapshotRequest, UsageLimitWait,
 };
 use serde::{Deserialize, Serialize};
 
@@ -108,6 +108,11 @@ pub struct RunnerSnapshot {
     /// the last report that has one wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_title: Option<String>,
+    /// What the parked execution waits for when it waits for the harness's
+    /// usage limit to reset. Read from the execution's own record, so a
+    /// restarted runner reports the same wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_wait: Option<UsageLimitWait>,
     /// When the runner took this snapshot.
     pub observed_at: DateTime<Utc>,
 }
@@ -144,6 +149,7 @@ impl RunnerSnapshot {
             default_harness_unavailable: snapshot.default_harness_unavailable.clone(),
             workspaces: snapshot.workspaces.clone(),
             generated_title: snapshot.generated_title.clone(),
+            usage_wait: snapshot.usage_wait.clone(),
             observed_at: snapshot.observed_at,
         })
     }
@@ -177,6 +183,7 @@ impl RunnerSnapshot {
             default_harness_unavailable: request.default_harness_unavailable,
             workspaces: request.workspaces,
             generated_title: request.generated_title,
+            usage_wait: request.usage_wait,
             observed_at: request.observed_at,
         })
     }
