@@ -55,6 +55,7 @@ albo `awaiting_input`).
 | `schema_mismatch.ndjson` | `--json-schema <schemat> --permission-mode acceptEdits` | prompt żąda labela spoza `enum`; CLI odrzuca wywołanie `StructuredOutput` i model poprawia odpowiedź |
 | `subagent_denial.ndjson` | *(ręcznie napisane, nie nagranie)* | główny agent, dwóch subagentów (jeden w tle, jeden na pierwszym planie, ten drugi z zagnieżdżonym), `parent_tool_use_id` na liniach subagentów, odmowa `Bash` w subagencie, dwie linie `result` z tą samą odmową w `permission_denials`, odpowiedź końcowa w ostatniej. Treść zmyślona. |
 | `subagents.ndjson` | `--permission-mode default` | nagranie z 2026-11-13: dwóch subagentów (jeden na pierwszym planie, jeden w tle: `tool_use_result` ze `status: async_launched`), dwie linie `result` (druga po powiadomieniu o końcu zadania w tle). Ścieżki użytkownika zamaskowane (`/home/user`, `/tmp/project`), reszta bez skracania. |
+| `usage_limit_stop.ndjson` | *(built from public reports, not recorded)* | a run that stops on an exhausted subscription limit: `system/init`, a `rate_limit_event` with `status: rejected`, an `assistant` line with `error: rate_limit`, a `result` with `is_error: true` and `api_error: usage_limit_reached`. See "Usage-limit stop" below. |
 
 ## Odpowiedzi na pytania odłożone do implementacji
 
@@ -147,3 +148,27 @@ Zapis tylko dla przyszłych prac. Kod tych pól nie czyta poza `subagent_stats`.
   tylko ostatnia tura (pole `iterations` ma jeden wpis). Wniosek: opis grupy `✨` („liczby zawierają
   subagentów”) nie jest potwierdzony dla Claude Code. Opis się nie zmienia (decyzja Q5), to
   tylko zapis faktu z jednego nagrania; trzeba go potwierdzić na większej próbie.
+
+## Usage-limit stop (`usage_limit_stop.ndjson`)
+
+This file is **not a recording**. Nobody recorded a run from a real account that hit its
+subscription limit. The lines are built from the shape that users reported publicly for
+Claude Code 2.1.303/2.1.304 (issue anthropics/claude-code#103820; the reporters shortened the
+lines) and for 2.1.309 (issue anthropics/claude-code#104690). The `claude_code_version` in
+`system/init` is the reported version. If a real run shows a different shape, correct this file
+and the parser signals in a follow-up change.
+
+The lines that signal the stop:
+
+- `rate_limit_event` with `rate_limit_info.status: rejected`, a subscription window in
+  `rateLimitType` (`five_hour` or `seven_day`) and `isUsingOverage: false`. `resetsAt` (seconds
+  since the Unix epoch) is the reset time. A `rejected` status with `isUsingOverage: true` is not
+  a stop: extra usage covers the run.
+- `result` with `is_error: true` and `api_error: usage_limit_reached`.
+
+The `assistant` line with `error: rate_limit` and the text `You've hit your weekly limit · resets
+11am (UTC)` is in the file for the shape only. The parser does not read the reset time from the
+text. `terminal_reason: api_error` is not a signal: an ordinary API error has the same value.
+
+Masking: the session id and every `uuid` are test UUIDs (`00000000-0000-4000-8000-0000000003NN`),
+the working directory is `/workspace/project`. The file contains no customer data or secrets.
