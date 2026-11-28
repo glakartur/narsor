@@ -93,3 +93,43 @@ fn status(text: &str) -> Option<UsageStatus> {
         _ => None,
     }
 }
+
+/// The `rate_limit_info` of a line that says the subscription is exhausted:
+/// `Some` with the latest `resetsAt` of its rejected windows (`None` inside
+/// when none has one), or `None` when no subscription window is rejected.
+///
+/// A window is rejected when the line's `status` is `rejected` and it is the
+/// line's `rateLimitType`, or when its own entry in `unifiedWindows` has
+/// `status: rejected`. A line with `isUsingOverage: true` is never a stop:
+/// extra usage covers the run.
+pub(super) fn exhausted(line: &Map<String, Value>) -> Option<Option<DateTime<Utc>>> {
+    let info = line.get("rate_limit_info")?.as_object()?;
+    if info.get("isUsingOverage").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let rejected = |fields: &Map<String, Value>| {
+        fields.get("status").and_then(Value::as_str) == Some("rejected")
+    };
+    let limit_type = info.get("rateLimitType").and_then(Value::as_str);
+    let windows = info.get("unifiedWindows").and_then(Value::as_object);
+
+    let mut found = false;
+    let mut resets_at = None;
+    for (name, _) in WINDOWS {
+        let fields = if Some(name) == limit_type && rejected(info) {
+            Some(info)
+        } else {
+            windows
+                .and_then(|windows| windows.get(name))
+                .and_then(Value::as_object)
+                .filter(|fields| rejected(fields))
+        };
+        let Some(fields) = fields else {
+            continue;
+        };
+        found = true;
+        let reset = fields.get("resetsAt").and_then(unix_seconds);
+        resets_at = resets_at.max(reset);
+    }
+    found.then_some(resets_at)
+}

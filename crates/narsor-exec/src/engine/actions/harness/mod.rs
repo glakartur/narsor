@@ -87,6 +87,19 @@ pub struct HarnessRun {
     /// Structured permission denials emitted by Claude Code in the final
     /// `result` record. Other harnesses leave this empty.
     pub permission_denials: Vec<PermissionDenial>,
+
+    /// The run stopped because the subscription usage limit of the harness
+    /// is exhausted. Set only together with [`Self::failure`], and only by an
+    /// adapter that can tell such a stop from other failures; the others
+    /// leave it `None`. The session to continue is [`Self::session_id`].
+    pub usage_limit_stop: Option<UsageLimitStop>,
+}
+
+/// A run that stopped on an exhausted subscription usage limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageLimitStop {
+    /// When the exhausted window resets, when the harness reported it.
+    pub resets_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A Claude Code permission denial correlated to the attempted tool call.

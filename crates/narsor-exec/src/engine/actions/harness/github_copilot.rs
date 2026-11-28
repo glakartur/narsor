@@ -604,6 +604,7 @@ impl HarnessStreamParser for GitHubCopilotStreamParser {
             failure,
             structured_output: None,
             permission_denials: Vec::new(),
+            usage_limit_stop: None,
         }
     }
 }
