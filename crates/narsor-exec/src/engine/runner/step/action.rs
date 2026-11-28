@@ -273,7 +273,7 @@ impl Engine {
     /// stopped on an exhausted usage limit: the record and `Paused` in one
     /// save, then the attempt marked as waiting. Nothing failed: the attempt
     /// goes on in its session when the execution is resumed.
-    fn park_for_usage_limit(
+    pub(crate) fn park_for_usage_limit(
         &self,
         execution: &mut WorkflowExecution,
         state: &State,

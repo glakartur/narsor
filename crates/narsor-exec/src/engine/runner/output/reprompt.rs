@@ -35,6 +35,15 @@ pub(crate) enum RepromptEnd {
     Unlabelled(UnlabelledAnswer),
     /// It asked a question instead; the attempt stays open until answered.
     Asked(HumanInputRequest),
+    /// The harness stopped on an exhausted usage limit: the attempt is to
+    /// wait for the reset and go on in its session, not to be failed. Only
+    /// the engine's own reprompt ends so; the conductor's keeps it a failure.
+    AwaitingUsageLimit {
+        /// The reprompt attempt that stopped.
+        action_execution_id: String,
+        /// The stop, with the session to continue.
+        stopped: UsageLimitStopped,
+    },
     /// The execution failed, and that is already persisted.
     Stopped,
 }
@@ -145,6 +154,27 @@ impl Engine {
                 result,
             },
             RepromptEnd::Stopped => ActionUpshot::Stopped,
+            RepromptEnd::AwaitingUsageLimit {
+                action_execution_id,
+                stopped,
+            } => {
+                // The same attempt, parked: the continuation goes on in the
+                // session, and an answer still without a label is rejected
+                // and asked for again as usual.
+                self.park_for_usage_limit(
+                    execution,
+                    state,
+                    UsageWait {
+                        state_id: state.id.clone(),
+                        action_execution_id,
+                        attempt: rejection.attempt.unwrap_or(1),
+                        harness: stopped.harness,
+                        harness_session_id: stopped.harness_session_id,
+                        resets_at: stopped.resets_at,
+                    },
+                )?;
+                ActionUpshot::Stopped
+            }
             RepromptEnd::Asked(request) => {
                 let flow = self.route_agent_question(execution, state, request).await?;
                 ActionUpshot::settled(flow)
@@ -301,9 +331,16 @@ impl Engine {
                     &request.instruction,
                 ))
             }
-            // A reprompt does not wait for a usage limit: its stop is the
-            // harness failure it always was.
+            // The engine's reprompt waits for the limit like any attempt; the
+            // conductor's rescue has no attempt to continue, so for it the
+            // stop stays the harness failure it was.
             Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingUsageLimit(stopped))) => {
+                if matches!(by, RepromptedBy::Engine) {
+                    return Ok(RepromptEnd::AwaitingUsageLimit {
+                        action_execution_id,
+                        stopped,
+                    });
+                }
                 RepromptFailure::Failed(stopped.error.message)
             }
             Err(error) => match OutputRejection::from_error(state, &action_execution_id, &error) {

@@ -299,7 +299,11 @@ impl Engine {
                                 result,
                             );
                         }
-                        RepromptEnd::Stopped => return Ok(Flow::Stop),
+                        // The conductor's reprompt never ends waiting for a
+                        // usage limit (see `reprompt_attempt`).
+                        RepromptEnd::Stopped | RepromptEnd::AwaitingUsageLimit { .. } => {
+                            return Ok(Flow::Stop)
+                        }
                         RepromptEnd::Asked(request) => {
                             return self.route_agent_question(execution, state, request).await;
                         }

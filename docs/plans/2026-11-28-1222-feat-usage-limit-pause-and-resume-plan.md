@@ -24,7 +24,7 @@ execution: code
 
 ## Product Contract
 
-Product Contract preservation: Product Contract unchanged. "Outstanding Questions → Deferred to Planning" is resolved in place (KTD1, KTD3, KTD5). The review item about text-only reset parsing (A1) became question Q4. Q4 and Q5 are decided and kept in "Pytania otwarte dla użytkownika" as a record. R1 and the Key Decision on detection follow Q5 (no real recording).
+Product Contract preservation: Product Contract unchanged. "Outstanding Questions → Deferred to Planning" is resolved in place (KTD1, KTD3, KTD5). The review item about text-only reset parsing (A1) became question Q4. Q4 and Q5 are decided and kept in "Open Questions for the User" as a record. R1 and the Key Decision on detection follow Q5 (no real recording).
 
 ### Summary
 
@@ -101,7 +101,7 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 - Session continuation reuses D85 (`docs/dev/architecture.md`): the harness session id is kept in `timeline.json` as soon as the harness reports it, and `resumable_agent_session` finds it. D85 also lets the step failure record keep the session of a failed attempt, but a usage-limit stop is not a failed attempt (R4), so the wait must not depend on a failure record: the session id comes from the attempt's entry in `timeline.json`. Today only an owner comment uses this path; this work makes the usage-limit wait use it without a comment.
 - No document in `docs/` (brainstorms, plans, follow-ups, residual review findings, solutions, sources) records what Claude Code sends when the limit is exhausted, and no recording exists. The earlier usage-limit work excluded "alarms and blocking of new tasks at high usage" from its scope, so this work is new.
 
-### Założenia do potwierdzenia
+### Assumptions to Confirm
 
 - A1. Claude Code gives a reset time in the stream (`rate_limit_event.resetsAt` with status `rejected`, or the "resets …" text in the limit message). If only the text exists, a time without a date and with a local timezone is interpreted as the next such time in that timezone.
 - A2. The fallback retry interval is 15 minutes, and the safety margin after a reported reset is 1 minute. Both are settings with these defaults.
@@ -121,9 +121,9 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 - Q3 — **Decided: (a).** (Requirements → Waiting, A3) Is there a maximum wait after which the task goes to the operator instead?
   - Options: (a, recommended) No maximum; the step waits until the reset and the operator can cancel it. (b) A maximum (for example 24 hours), then `HumanNeeded`.
 
-### Pytania otwarte dla użytkownika
+### Open Questions for the User
 
-- Q4 — **Decided: (a).** (Założenia do potwierdzenia, A1; Requirements → Waiting, R6) The step uses only the machine-readable `resetsAt` of the interrupted run. A text-only reset time is not parsed. When `resetsAt` is missing, the fixed retry interval of R6 applies (KTD2).
+- Q4 — **Decided: (a).** (Assumptions to Confirm, A1; Requirements → Waiting, R6) The step uses only the machine-readable `resetsAt` of the interrupted run. A text-only reset time is not parsed. When `resetsAt` is missing, the fixed retry interval of R6 applies (KTD2).
 - Q5 — **Decided: no developer recording.** (Requirements → Detection, R1, A7) The developer does not record logs. The fixture is built from the signals found in public reports (External research) and is marked as not recorded. The PR does not wait for recordings.
 - No question is open. Q4 and Q5 stay here as a record of the decisions.
 
