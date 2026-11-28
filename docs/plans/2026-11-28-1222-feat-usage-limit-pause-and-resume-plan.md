@@ -16,9 +16,9 @@ execution: code
 - **Means:** The harness run reports a usage-limit stop as its own outcome (KTD1, KTD2). The engine parks the execution as `Paused` with a durable usage-wait record (KTD3). The control plane frees the slot, shows `Paused` with a reason, and resumes the task at the planned time from a persisted deadline (KTD5, KTD6). The new runner continues the same session as the same attempt (KTD4).
 - **Product authority:** The Product Contract below (R1–R12, AE1–AE4, decisions Q1–Q3). Claude Code is the required harness for v1. Other harnesses are context only.
 - **Execution profile:** One pull request. Units U1–U8 in dependency order.
-- **Merge gate:** The PR does not merge until the real recordings of R1 exist (U1, Q5). Units U3–U8 can be built and tested before that against a provisional fixture that U1 replaces.
-- **Stop conditions:** Stop and report if the R1 recording shows that Claude Code refuses `--resume` on a session that stopped on the usage limit, or loses the conversation before the stop. Then R9 cannot hold as written. Also stop if the recording shows no signal that tells a usage-limit stop apart from other errors (R2).
-- **Who finishes:** The implementer builds U2–U8. The developer with a real Claude Code account supplies the U1 recordings.
+- **Merge gate:** No recording gate. Nobody records logs from a real account (Q5, decided). The fixture is built from the stream-json shape found in public reports (External research) and is marked as not recorded. CI and the manual check are the only gates.
+- **Stop conditions:** Stop and report if the public reports and the official docs give no signal that tells a usage-limit stop apart from other errors (R2).
+- **Who finishes:** The implementer builds U1–U8. No developer recording is needed.
 
 ---
 
@@ -50,8 +50,8 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 
 **Detection**
 
-- R1. The repo contains at least one real Claude Code stream-json recording (fixture) of a run that stops on an exhausted subscription limit, with a README note that describes the lines that signal it. The fixture set also contains a recording of `--resume <id>` on that session after the window resets, which shows that the conversation before the stop is kept (see Dependencies / Assumptions). The recordings contain no customer data or secrets.
-- R2. The Claude Code parser classifies a run as "usage limit reached" only from signals seen in R1 recordings (for example a `rate_limit_event` with status `rejected`, an error marker on the `result` or `assistant` line, or the limit message text). An ordinary error, an API error or a `max_turns` stop is not classified as a usage limit.
+- R1. The repo contains a Claude Code stream-json fixture of a run that stops on an exhausted subscription limit, built from the line shape reported publicly (External research). The README marks it as not recorded from a real run and names the lines that signal the stop. The fixture contains no customer data or secrets.
+- R2. The Claude Code parser classifies a run as "usage limit reached" only from the signals of the R1 fixture (for example a `rate_limit_event` with status `rejected`, an error marker on the `result` or `assistant` line). An ordinary error, an API error or a `max_turns` stop is not classified as a usage limit.
 - R3. When the classification is "usage limit reached", the run carries the harness session id and, when the harness reports it, the reset time of the exhausted window.
 
 **Waiting**
@@ -97,7 +97,7 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 ### Dependencies / Assumptions
 
 - The usage data flow from the earlier work (`docs/brainstorms/2026-10-31-limity-abonamentu-harnessow-requirements.md`) stays as is; this work can read it but does not change its display scope.
-- Claude Code accepts `--resume <id>` on a session that stopped on the usage limit, and the conversation before the stop is kept. R1 recordings must confirm this.
+- Claude Code accepts `--resume <id>` on a session that stopped on the usage limit, and the conversation before the stop is kept. This is not confirmed (one old public report says the context was lost). The manual check confirms it.
 - Session continuation reuses D85 (`docs/dev/architecture.md`): the harness session id is kept in `timeline.json` as soon as the harness reports it, and `resumable_agent_session` finds it. D85 also lets the step failure record keep the session of a failed attempt, but a usage-limit stop is not a failed attempt (R4), so the wait must not depend on a failure record: the session id comes from the attempt's entry in `timeline.json`. Today only an owner comment uses this path; this work makes the usage-limit wait use it without a comment.
 - No document in `docs/` (brainstorms, plans, follow-ups, residual review findings, solutions, sources) records what Claude Code sends when the limit is exhausted, and no recording exists. The earlier usage-limit work excluded "alarms and blocking of new tasks at high usage" from its scope, so this work is new.
 
@@ -109,7 +109,7 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 - A4. Only the step that hit the limit waits. Other steps that hit the limit wait on their own; Narsor does not block steps that did not hit it (decided in Q1).
 - A5. The waiting state uses the existing `Paused` task state with a reason, not a new task state (decided in Q2). Today `Paused` is derived only from the runner state, means the owner's decision (D62), and has no reason field in the task summary. So this choice needs a reason field and a change to the task-state derivation. The planner must also decide how a wait of days interacts with the slot-release policy (D62) and with the timed resume that R8 requires; `auto_resume.rs` today resumes only interrupted tasks.
 - A6. The continuation prompt is a short fixed text that tells the agent to continue the interrupted work; it is not the step's original prompt.
-- A7. The R1 recording is made by the developer on a real account at a moment when the limit is exhausted, then cleaned of personal data; a synthetic line is not enough for R1.
+- A7. No real recording is made (Q5). The fixture is built from public reports. If a real run later differs, the fixture and the parser signals are corrected in a follow-up change.
 - A8. A usage-limit stop in a conductor chat or other non-step conversation is out of scope for v1 and keeps today's behaviour.
 
 ### Decisions (answered by the project owner on the PR)
@@ -123,14 +123,8 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 
 ### Pytania otwarte dla użytkownika
 
-- Q4. (Założenia do potwierdzenia, A1; Requirements → Waiting, R6) If the limit message carries only a time of day and no machine-readable `resetsAt`, what does the step use as its reset time?
-  - Options: (a, recommended) Use only the machine-readable `resetsAt` in v1. A text-only reset time is not parsed, and the step uses the fixed retry interval of R6. Text parsing is deferred and comes back only if the R1 recording shows `resetsAt` missing when the limit is exhausted. (b) Parse the text as A1 says (the next such time in the stated timezone). A wrong guess can delay the resume by hours or days, because A3 sets no maximum wait.
-  - The plan builds option (a) (KTD2). Option (b) adds one parser function and its tests to U2.
-  - Web research (External research) supports option (a): in the reported usage-limit stop, the `rate_limit_event` with `status: rejected` carries `resetsAt`, and the text "resets 11am (UTC)" only repeats it.
-- Q5 — **Decided: (a).** (Requirements → Detection, R1, A7) Who records the R1 fixtures, and does the pull request wait for them?
-  - Options: (a, recommended) The developer records both runs (the limit stop, then `--resume` after the reset) on a real account and masks personal data. The PR does not merge before the recordings are in the repo. Until then, U2 tests run against a provisional fixture that is marked as not recorded. (b) Merge with detection switched off, and switch it on in a follow-up PR with the recordings. All other units stay unused until then.
-  - The plan builds option (a) (Goal Capsule, merge gate).
-  - Web research (2026-11-28, see "External research" in the Planning Contract): public bug reports show the probable shape of a usage-limit stop in `stream-json`. These are reports from other users, not recordings from this repo and not official documentation, so they do not satisfy R1 or A7. They let U2 start now: the provisional fixture is built from this shape and is marked as not recorded. The reports also show that the `--resume` behaviour after a reset is not confirmed (one old report says the context is lost), so the second recording of R1 is still necessary. Research does not change the recommended option.
+- Q4 — **Decided: (a).** (Założenia do potwierdzenia, A1; Requirements → Waiting, R6) The step uses only the machine-readable `resetsAt` of the interrupted run. A text-only reset time is not parsed. When `resetsAt` is missing, the fixed retry interval of R6 applies (KTD2).
+- Q5 — **Decided: no developer recording.** (Requirements → Detection, R1, A7) The developer does not record logs. The fixture is built from the signals found in public reports (External research) and is marked as not recorded. The PR does not wait for recordings.
 
 ### Outstanding Questions
 
@@ -140,7 +134,7 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 
 **Deferred to Planning** (resolved in the Planning Contract)
 
-- The exact detection signals for Claude Code: read from the R1 recording in U1 and U2 (KTD1, Deferred to Implementation).
+- The exact detection signals for Claude Code: taken from the public reports in U1 (KTD1); corrected later if a real run differs.
 - Where the wait lives: in the control-plane task record, with a periodic resume pass next to `auto_resume_pass` (KTD5).
 - How the waiting attempt is stored: the execution is `Paused` with a usage-wait record that keeps the attempt's `action_execution_id` (KTD3).
 
@@ -165,7 +159,7 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 
 ### Key Technical Decisions
 
-- KTD1. **The harness run carries a usage-limit stop as data, not as free text.** `HarnessRun` gets an optional usage-limit stop with the harness session id and the reset time when known. The Claude Code parser keeps the last `rate_limit_event` limits it saw (today `take_usage` hands them to the relay and forgets them) and, in `finish`, sets the stop only when a failed run also shows the signals of the R1 recording. The expected signals, from public reports (External research), are: a `rate_limit_event` with `status: rejected`, a subscription window in `rateLimitType` (`five_hour`, `seven_day`) and `isUsingOverage: false`, and a `result` with `is_error: true` and `api_error: usage_limit_reached`. A `rejected` status with `isUsingOverage: true` is not an exhausted limit, because extra usage covers the run. `terminal_reason: api_error` alone is not a signal, because AE1 has the same value. The R1 recording confirms or replaces this list. The other adapters leave the field empty, so they keep today's behaviour. Reason: `HarnessRun.failure` is free text and `ActionError.error_type` is a string code. A typed field is the only place the session layer can branch on without parsing messages. Governs R2, R3.
+- KTD1. **The harness run carries a usage-limit stop as data, not as free text.** `HarnessRun` gets an optional usage-limit stop with the harness session id and the reset time when known. The Claude Code parser keeps the last `rate_limit_event` limits it saw (today `take_usage` hands them to the relay and forgets them) and, in `finish`, sets the stop only when a failed run also shows the signals of the R1 recording. The expected signals, from public reports (External research), are: a `rate_limit_event` with `status: rejected`, a subscription window in `rateLimitType` (`five_hour`, `seven_day`) and `isUsingOverage: false`, and a `result` with `is_error: true` and `api_error: usage_limit_reached`. A `rejected` status with `isUsingOverage: true` is not an exhausted limit, because extra usage covers the run. `terminal_reason: api_error` alone is not a signal, because AE1 has the same value. A real run may later correct this list. The other adapters leave the field empty, so they keep today's behaviour. Reason: `HarnessRun.failure` is free text and `ActionError.error_type` is a string code. A typed field is the only place the session layer can branch on without parsing messages. Governs R2, R3.
 - KTD2. **The reset time is the `resetsAt` of the rejected window; text is not parsed in v1.** When more than one window is rejected, the latest `resetsAt` wins, because the run cannot continue before all rejected windows reset. When no rejected window has `resetsAt`, the stop has no reset time and R6's retry interval applies. This is option (a) of Q4; option (b) adds a text parser in U2 and changes nothing else. Governs R6.
 - KTD3. **A usage-limit stop suspends the action; it is not an error.** The session layer returns a new `SuspendedAction` variant for a usage-limit stop and does not emit `AgentSessionFailed`. This check comes before `harness_error`, so a resumed run never becomes `resume_session_rejected` (R5). The step runner maps it to a new `AttemptOutcome` variant. That variant parks the execution: status `Paused`, a `WorkflowPaused` event with reason `usage_limit`, and a usage-wait record in `metadata.engine`. The record holds the state id, the `action_execution_id`, the attempt number, the harness, the harness session id and the reset time. No `ActionAttemptFailed`, `ActionFailed` or step-memory failure is written. A new event marks the attempt as waiting for the usage limit, so the timeline shows the attempt as waiting, not failed. Reason: `Paused` is already "parked durably" for crash reconciliation (`engine/recovery.rs` examines only `Running`) and for the runner's `go_on`, so R8 needs no new execution status. `WaitingForEvent` was rejected: it means a `wait` step and maps to the `Running` task state. Governs R4, R5, R8.
 - KTD4. **Continuation reuses the agent-input path with a usage-wait origin.** When the engine resumes a `Paused` execution that holds a usage-wait record, it restarts the same action with the same `action_execution_id` and attempt number (`AttemptsFrom`), emits a resume event instead of `ActionStarted`, and writes agent input for the stored harness and session with the fixed continuation prompt of A6. The input is marked as a usage continuation. For such an input, `attempt.rs` does not take the `RESUME_SESSION_REJECTED` branch (operator question or `restart_if_refused`). A failure that is not a usage limit goes the ordinary `AttemptFailure` way into the retry policy, then `Failed` (R11). A new usage-limit stop parks again with the same attempt (R10). Reason: `prepare_harness_attempt` already continues a session from `METADATA_AGENT_INPUT_KEY`, and D85 already resumes sessions from stored ids. Governs R9, R10, R11.
@@ -221,17 +215,17 @@ stateDiagram-v2
 
 ### Sequencing
 
-U1 first only for the recording; U2 can start on the provisional fixture. U3 needs U2. U4 needs U3. U5 needs U3. U6 needs U5. U7 needs U6. U8 last.
+U1 first. U3 needs U2. U4 needs U3. U5 needs U3. U6 needs U5. U7 needs U6. U8 last.
 
 ### Risks
 
 | Risk | Mitigation |
 |---|---|
-| The R1 recording shows no reliable usage-limit signal, or `--resume` loses the conversation. | Goal Capsule stop condition. U1 runs before U2 is finished. |
+| Real `--resume` after a limit stop may lose the conversation or be refused (one old public report), and the real signals may differ from the reports. | Accepted for v1. A refused resume is not a usage limit, so it takes the ordinary failure path of KTD4 (retry policy, then `Failed`). The manual check confirms it when a limit is available. |
 | A new runner sends the snapshot field to an older central, which ignores it: the task shows `Running` with a parked execution and is never resumed. | Update order of D62: central first, then runners and clients. U8 adds it to `docs/operations/updates.md`. |
 | A rejected-status `rate_limit_event` appears in a run that ends normally or ends on another error. | KTD1 requires a failed run plus the recorded signals. AE1 test and a test for a rejected event in a successful run. |
 | A `rejected` status appears while extra usage covers the run (`isUsingOverage: true`). | KTD1 excludes it. U2 test. |
-| Claude Code sometimes exits with code 1 on a weekly limit and writes no `rate_limit_event` and no `result` to stdout (reported for 2.1.303, issue anthropics/claude-code#103820, open). | Such a run is an ordinary failure, which is today's behaviour. Accepted for v1. If the R1 recording shows this case, record it in the README and in Deferred to Implementation. |
+| Claude Code sometimes exits with code 1 on a weekly limit and writes no `rate_limit_event` and no `result` to stdout (reported for 2.1.303, issue anthropics/claude-code#103820, open). | Such a run is an ordinary failure, which is today's behaviour. Accepted for v1. If a real run shows this case, record it in the README and in Deferred to Implementation. |
 | Many tasks on one subscription all resume at the same reset time and some stop again. | Accepted. Q1 chose per-step waits. Each repeated stop re-parks without a failure (R10). |
 
 ### External research
@@ -245,9 +239,9 @@ Web search on 2026-11-28 for Q5. All sources are user reports or third-party not
   - The same issue reports a failure case with none of these lines on stdout (see Risks).
 - anthropics/claude-code#104690 (open; 2.1.309): a session limit shows `rateLimitType: five_hour` and `isUsingOverage: false`. `overageDisabledReason` also appears on `allowed` events, so it is not a signal. The reporter's runner waits until `resetsAt` and then continues with `--resume`.
 - Untether stream-json cheatsheet (2.1.283/2.1.289): `resetsAt` is in epoch seconds. `rejected` with `isUsingOverage: true` is not a throttle. `api_error` is an internal field and can change without notice.
-- A Claude Code issue mirrored on claudeissues.com (#3138; the original was not opened) says that `--resume` lost the conversation after a usage limit in an older version. So R9 is not confirmed until the second R1 recording exists.
+- A Claude Code issue mirrored on claudeissues.com (#3138; the original was not opened) says that `--resume` lost the conversation after a usage limit in an older version. So R9 is not confirmed; the manual check covers it.
 
-Consequence for the plan: KTD1 lists the expected signals, U1 builds the provisional fixture from them, and the merge gate stays.
+Consequence for the plan: KTD1 lists the expected signals, and U1 builds the fixture from them. There is no recording gate (Q5).
 
 ### System-Wide Impact
 
@@ -260,29 +254,26 @@ Consequence for the plan: KTD1 lists the expected signals, U1 builds the provisi
 
 ## Implementation Units
 
-### U1. Record the usage-limit fixtures
+### U1. Build the usage-limit fixture from public reports
 
-- **Goal:** Real Claude Code recordings of a run that stops on an exhausted subscription limit, and of `--resume` on that session after the reset.
+- **Goal:** A fixture of a Claude Code run that stops on an exhausted subscription limit, built from the shape in External research. It is not recorded from a real run.
 - **Requirements:** R1, A7, Q5.
-- **Dependencies:** none. Needs a person with a real account at a moment when the limit is exhausted.
+- **Dependencies:** none.
 - **Files:**
   - `tests/fixtures/claude-code/usage_limit_stop.ndjson` (new)
-  - `tests/fixtures/claude-code/usage_limit_resume.ndjson` (new)
   - `tests/fixtures/claude-code/README.md` (scenario rows, the lines that signal the stop, CLI version, masking note)
 - **Approach:**
-  1. Record with the common flags of the README, as a schema run, so the shape matches Narsor's calls.
-  2. After the window resets, record `--resume <id>` on the same session with a short continuation prompt.
-  3. Mask user paths and identifiers as in `subagents.ndjson`. Keep no customer data or secrets.
-  4. Until the recordings exist, U2 uses a provisional fixture named and documented as not recorded; U1 replaces it before merge. Build it from the line shape in External research (`rate_limit_event` rejected, `assistant` with `error: rate_limit`, `result` with `api_error: usage_limit_reached`).
+  1. Write the lines (`rate_limit_event` rejected, `assistant` with `error: rate_limit`, `result` with `api_error: usage_limit_reached`) and a `system/init` line with a session id, in the shape of the other fixtures.
+  2. In the README, mark the fixture as built from public reports and not recorded, and name the signal lines.
 - **Patterns to follow:** `docs/solutions/design-patterns/show-only-what-harness-reports-count-without-tokens-record-fixture-2026-11-13.md`.
 - **Test expectation:** none -- fixtures only; U2 tests read them.
-- **Verification:** both files are in the repo, the README names the signal lines, and the resume recording shows the earlier conversation is kept.
+- **Verification:** the file is in the repo and the README says it is not recorded.
 
 ### U2. Classify a usage-limit stop in the Claude Code parser
 
 - **Goal:** `HarnessRun` reports a usage-limit stop with the session id and the reset time (KTD1, KTD2).
 - **Requirements:** R2, R3, AE1.
-- **Dependencies:** U1 (provisional fixture allowed before merge).
+- **Dependencies:** U1.
 - **Files:**
   - `crates/narsor-exec/src/engine/actions/harness/mod.rs` (the new `HarnessRun` field and its type)
   - `crates/narsor-exec/src/engine/actions/harness/claude_code.rs` (keep the last limits, set the stop in `finish`)
@@ -292,9 +283,9 @@ Consequence for the plan: KTD1 lists the expected signals, U1 builds the provisi
 - **Approach:** Keep the limits after `take_usage` hands them to the relay; the relay still gets each event once. In `finish`, set the stop only when `failure` would be set and the R1 signals are present. The test seam is the parser over fixture lines: it catches classification errors, but not how the session layer uses the result (U3).
 - **Patterns to follow:** existing rate-limit tests in `claude_code_classification.rs` (`recorded_rate_limit_event`, `usage_of`).
 - **Test scenarios:**
-  - The `usage_limit_stop` recording gives a usage-limit stop with the session id of its `system/init` line and the `resetsAt` of the rejected window.
+  - The `usage_limit_stop` fixture gives a usage-limit stop with the session id of its `system/init` line and the `resetsAt` of the rejected window.
   - Covers AE1. A run that ends with `terminal_reason: api_error` and `API Error: 400` gives an ordinary failure and no usage-limit stop.
-  - The `max_turns` recording gives no usage-limit stop.
+  - The `max_turns` fixture gives no usage-limit stop.
   - A rejected event without `resetsAt`, followed by the recorded stop signal, gives a stop with no reset time.
   - A run with a rejected event that ends with a successful `result` gives no failure and no stop.
   - A failed run with a rejected event and `isUsingOverage: true` gives an ordinary failure and no stop.
@@ -430,7 +421,7 @@ Consequence for the plan: KTD1 lists the expected signals, U1 builds the provisi
 |---|---|---|
 | Build | `cargo build --workspace --bins` | all units |
 | Tests | `cargo test --workspace` (CI runs it with `--locked`) | all units |
-| Parser on the real recording | `claude_code_classification` tests read `usage_limit_stop.ndjson` recorded by U1, not the provisional fixture | U1, U2, merge gate |
+| Parser on the fixture | `claude_code_classification` tests read `usage_limit_stop.ndjson` (built from public reports, not recorded) | U1, U2 |
 | Manual check | With an exhausted real limit, run one agent step: the task shows `Paused` with the reason, frees the slot, and after the reset the same session continues | before merge, when a limit is available |
 
 No `#[ignore]`d test is needed: the fake agent in `engine_support` covers the engine flow.
@@ -439,9 +430,9 @@ No `#[ignore]`d test is needed: the fake agent in `engine_support` covers the en
 
 ## Definition of Done
 
-- R1–R12 and AE1–AE4 each have a passing test or the U1 recording that shows them.
-- The provisional fixture is gone, and the README describes the real recordings.
+- R1–R12 and AE1–AE4 each have a passing test.
+- The README states that the fixture is built from public reports and is not recorded.
 - `cargo test --workspace` passes.
-- Q4 and Q5 have an answer; if Q4 is (b), U2 has the text parser and its tests.
+- Q4 and Q5 are decided; U2 has no text parser.
 - No dead code from abandoned approaches is left in the diff.
 - Per unit: the unit's Verification line holds.
