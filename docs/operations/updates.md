@@ -6,6 +6,37 @@ listed here need no special order. The update notes of the remote backends
 (automatic resume, the read-only runner) are in
 [Remote execution backends](remote-backends.md).
 
+## Update to the usage-limit wait
+
+This update lets a task wait for an exhausted harness usage limit and go on
+in the same agent session after the reset (D88). Before, the stop was a
+failed attempt: the retry policy started new sessions that failed at once,
+and the task ended in `Error`.
+
+### What changes
+
+| Area | Before | After |
+|---|---|---|
+| A `claude-code` run that stops on the usage limit | A failed attempt; retries in new sessions, then `Failed`. | The execution is `Paused`; no failed attempt. The same session goes on after the reset. |
+| Task state | `Error` after the retries. | `Paused` with the reason "usage limit of <harness> — resumes at HH:MM"; the slot is free. |
+| Runner snapshot | — | A new optional field `usage_wait` (harness, reset time). |
+| Task record | — | A new optional field `usage_wait` with `resume_at`. Old records read as "no wait". |
+| Task history | — | `UsageWaitScheduled`, `UsageWaitResumed`; slot release with the reason `usage_limit`. |
+| Reserved idempotency keys | `slot-release:`, `auto-resume:` | Also `usage-resume:`. An owner command with this prefix is refused. |
+| Backend `limits` | — | `usage_wait_retry_secs` (default 900) and `usage_wait_margin_secs` (default 60). |
+
+### Update order
+
+Update the server first, then the runners, then the clients. A new runner
+that sends `usage_wait` to an older server is ignored by it: the task shows
+`Running` with a parked execution and nobody resumes it. An older client
+shows a waiting task as a plain `Paused`.
+
+### Rollback
+
+An older server ignores the new fields of the task record. A task that waits
+at the rollback stays `Stopped`; resume it by hand.
+
 ## Update to scripts that create tasks as the CLI does
 
 This update removes `tasks` from the queue file. A `check` script creates a

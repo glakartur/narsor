@@ -231,6 +231,8 @@ limits:
   slot_release_grace_secs: 300           # wait before a task in a transient state frees its slot
   slot_release_read_extension_secs: 180  # what a read of the task's details adds to that wait
   slot_reader_idle_secs: 120             # idle time after which the read-only runner of a stopped task is removed
+  usage_wait_retry_secs: 900            # a task stopped on a harness usage limit without a reset time tries again after this
+  usage_wait_margin_secs: 60             # what is added to a reported reset time before the task resumes
 harnesses: [claude-code, codex]   # optional allow list
 secret_delivery: platform         # none | platform
 secrets:
@@ -776,10 +778,29 @@ applies without a restart.
   record, so a restart of the daemon neither loses nor shortens it. The
   history shows `SlotReleaseScheduled` and `SlotReleased` (`terminal` or
   `grace_elapsed`).
+* **A wait for a harness usage limit (D88).** When an agent step stops
+  because the harness subscription has no tokens left (v1: `claude-code`),
+  the step is not failed. The runner parks the execution and reports the
+  wait; the control plane frees the slot at once (`SlotReleased` with the
+  reason `usage_limit`), shows the task as `Paused` with the reason "usage
+  limit of <harness> — resumes at HH:MM", and plans the resume: the reported
+  reset time plus `usage_wait_margin_secs`, or the report time plus
+  `usage_wait_retry_secs` when the harness gave no reset time
+  (`UsageWaitScheduled`). At that time it resumes the task as a policy
+  command (idempotency key `usage-resume:<generation>`, `UsageWaitResumed`);
+  on a full backend the task waits in the queue at its own position. The
+  step goes on in the same agent session. If it stops on the limit again,
+  it waits again. The plan is kept in the task's record, so a restart of the
+  daemon does not lose it. Automatic resume after a lost runner skips a
+  waiting task. `narsor-cli task resume` resumes at once; `narsor-cli task
+  pause` removes the planned resume, and the task then waits for its owner.
+  The two settings are read again at every decision; each must be a whole
+  number from 1 to 86400.
 * **What the owner sees.** The control plane computes one `state` for each
   task: `Queued`, `Running`, `HumanNeeded`, `Paused`, `Finished`, `Error` or
   `Archived`. A task stopped to free its slot keeps the state of its work
-  (for example `Finished`); `Paused` means only the owner's own pause. The
+  (for example `Finished`); `Paused` means the owner's own pause or a wait
+  for a harness usage limit (D88), and `pause_reason` tells them apart. The
   runner and its resources are a separate field, `runner_state` (older
   versions called it `lifecycle`, and `Stopped` was `Paused`; both old names
   are still read).
