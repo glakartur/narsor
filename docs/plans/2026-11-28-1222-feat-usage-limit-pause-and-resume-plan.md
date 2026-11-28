@@ -91,6 +91,8 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 
 - The usage data flow from the earlier work (`docs/brainstorms/2026-10-31-limity-abonamentu-harnessow-requirements.md`) stays as is; this work can read it but does not change its display scope.
 - Claude Code accepts `--resume <id>` on a session that stopped on the usage limit, and the conversation before the stop is kept. R1 recordings must confirm this.
+- Session continuation reuses D85 (`docs/dev/architecture.md`): the harness session id is kept in `timeline.json` as soon as the harness reports it, the step failure record keeps the session of the failed attempt, and `resumable_agent_session` finds it. Today only an owner comment uses this path; this work makes the usage-limit wait use it without a comment.
+- No document in `docs/` (brainstorms, plans, follow-ups, residual review findings, solutions, sources) records what Claude Code sends when the limit is exhausted, and no recording exists. The earlier usage-limit work excluded "alarms and blocking of new tasks at high usage" from its scope, so this work is new.
 
 ### Założenia do potwierdzenia
 
@@ -132,5 +134,9 @@ The repo already parses `rate_limit_event` lines into usage limits (window, util
 - `crates/narsor-exec/src/engine/runner/step/action.rs`, `crates/narsor-exec/src/engine/runner/step/attempt.rs`, `crates/narsor-exec/src/engine/retry.rs` — retry loop, new session per attempt, refused-resume handling.
 - `crates/narsor-engine/src/controller_protocol/service/scheduling/harness_usage.rs`, `auto_resume.rs` — in-memory usage state; auto-resume of lost workloads.
 - `crates/narsor-engine/src/orchestration/model.rs` — execution status to task state mapping.
+- `docs/dev/architecture.md` D70 (harness subscription limits: in-memory state, expiry on access) and D85 (continue the agent session after a lost workload or a failed step).
+- `docs/plans/2026-11-22-2125-feat-continue-agent-session-after-loss-or-error-plan.md` — how the session id is kept and found again (`resumable_agent_session`).
+- `docs/plans/2026-10-31-001-feat-limity-abonamentu-harnessow-plan.md` — mapping of `rate_limit_info` and the `Rejected` status.
+- `docs/solutions/design-patterns/show-only-what-harness-reports-count-without-tokens-record-fixture-2026-11-13.md` — the convention to record a real fixture before the parser relies on a harness field (applies to R1).
 - `tests/fixtures/claude-code/README.md` — existing recordings; none shows an exhausted limit.
 - `docs/brainstorms/2026-10-31-limity-abonamentu-harnessow-requirements.md` — earlier usage-display work and its scope boundaries.
