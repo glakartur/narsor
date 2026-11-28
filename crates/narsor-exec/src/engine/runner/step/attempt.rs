@@ -184,10 +184,17 @@ impl Engine {
                 Ok(AttemptOutcome::AwaitingAgentInput(request))
             }
 
+            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingUsageLimit(stopped))) => {
+                Ok(AttemptOutcome::UsageLimitReached(stopped))
+            }
+
+            // The continuation after a usage limit is the same attempt going
+            // on: a refused session is its ordinary failure, for the retry
+            // policy, never a question to the operator.
             Err(error)
                 if resumed_input
                     .as_ref()
-                    .is_some_and(|input| input.session.is_some())
+                    .is_some_and(|input| input.session.is_some() && !input.usage_continuation)
                     && error.error_type.as_deref() == Some(agent::RESUME_SESSION_REJECTED) =>
             {
                 let input = resumed_input.expect("guarded above");

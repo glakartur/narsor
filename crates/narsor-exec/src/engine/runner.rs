@@ -104,7 +104,7 @@ use crate::engine::actions::human::{
 use crate::engine::actions::profile::{self as profile_action, ProfileExecutor};
 use crate::engine::actions::{
     ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
-    ScriptExecutor, StepContract, StepScope, SuspendedAction, UsageReporter,
+    ScriptExecutor, StepContract, StepScope, SuspendedAction, UsageLimitStopped, UsageReporter,
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
@@ -159,6 +159,9 @@ pub use metadata::keys::{
 };
 pub use metadata::last_agent_step::LastAgentStep;
 pub use metadata::pending_step::PendingStep;
+pub use metadata::usage_wait::{
+    usage_wait, UsageWait, USAGE_LIMIT_CONTINUATION_PROMPT, USAGE_LIMIT_PAUSE_REASON,
+};
 pub use output::rejection::{owed_reprompt, OutputRejection};
 pub use output::rescue_record::{owed_output_rescue, OutputRescue};
 pub use step::action_kind::ActionKind;

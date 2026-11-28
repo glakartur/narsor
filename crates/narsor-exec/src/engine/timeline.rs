@@ -63,6 +63,9 @@
 //! so the distinction is not lost. A failed attempt with retries left keeps
 //! `Failed` (rule 2) but [`Position::retry_pending`] is set when nothing has
 //! picked it up yet.
+//! An attempt whose harness stopped on an exhausted usage limit is not
+//! over: it stays open (rule 4), with [`Position::waiting_for_usage_limit`]
+//! set until it goes on in its session.
 //!
 //! # Conversation state
 //!
@@ -128,6 +131,7 @@ struct Draft {
     error: Option<String>,
     resumed_harness_session: Option<String>,
     harness_session_interrupted: bool,
+    waiting_for_usage_limit: bool,
     has_agent_event_missing_id: bool,
     harness: Option<String>,
     model: Option<String>,
@@ -323,6 +327,35 @@ pub fn build_timeline(
                     if open_position == Some(idx) {
                         open_position = None;
                     }
+                    links.insert(seq, Link::Position(idx));
+                } else {
+                    links.insert(seq, Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()));
+                }
+            }
+
+            // Not an end of the attempt: it stays open, and says it waits.
+            EventData::ActionWaitingForUsageLimit {
+                action_execution_id,
+                harness_session_id,
+                ..
+            } => {
+                if let Some(&idx) = by_attempt.get(action_execution_id) {
+                    drafts[idx].waiting_for_usage_limit = true;
+                    drafts[idx].harness_session_id = Some(harness_session_id.clone());
+                    links.insert(seq, Link::Position(idx));
+                } else {
+                    links.insert(seq, Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()));
+                }
+            }
+
+            EventData::ActionResumedAfterUsageLimit {
+                action_execution_id,
+                ..
+            } => {
+                if let Some(&idx) = by_attempt.get(action_execution_id) {
+                    drafts[idx].waiting_for_usage_limit = false;
+                    current_visit_last_position = Some(idx);
+                    open_position = Some(idx);
                     links.insert(seq, Link::Position(idx));
                 } else {
                     links.insert(seq, Link::NoLink(reasons::NO_ATTEMPT_YET.to_string()));
@@ -749,6 +782,7 @@ fn push_attempt(
         error: None,
         resumed_harness_session: None,
         harness_session_interrupted: false,
+        waiting_for_usage_limit: false,
         has_agent_event_missing_id: false,
         harness: None,
         model: None,
@@ -891,6 +925,7 @@ fn finalize(
         effort: draft.effort,
         harness_session_id: draft.harness_session_id,
         usage: None,
+        waiting_for_usage_limit: draft.waiting_for_usage_limit,
     }
 }
 

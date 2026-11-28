@@ -328,6 +328,24 @@ pub enum SuspendedAction {
     /// same workflow state can continue. This is not a workflow output and
     /// must therefore never select a transition.
     AwaitingAgentInput(HumanInputRequest),
+    /// The harness stopped because its subscription usage limit is
+    /// exhausted. The session is not over: it goes on once the limit
+    /// resets. Not a failure of the attempt.
+    AwaitingUsageLimit(UsageLimitStopped),
+}
+
+/// A harness session that stopped on an exhausted subscription usage limit.
+#[derive(Debug, Clone)]
+pub struct UsageLimitStopped {
+    /// The harness that stopped.
+    pub harness: String,
+    /// The harness's own session id, which the attempt continues.
+    pub harness_session_id: String,
+    /// When the exhausted window resets, when the harness said.
+    pub resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The error the run is when nothing waits for the limit: a caller
+    /// other than a workflow step returns it, as for any failed run.
+    pub error: ActionError,
 }
 
 /// An attempt that was stopped because it ran out of time.

@@ -47,6 +47,18 @@ pub fn event_line(event: &Event) -> String {
         EventData::ActionRetrying { retry_count, .. } => {
             format!("action_retrying  attempt {retry_count}")
         }
+        EventData::ActionWaitingForUsageLimit {
+            harness, resets_at, ..
+        } => match resets_at {
+            Some(resets_at) => format!(
+                "action_waiting_for_usage_limit  {harness} until {}",
+                resets_at.format("%Y-%m-%d %H:%M UTC")
+            ),
+            None => format!("action_waiting_for_usage_limit  {harness}"),
+        },
+        EventData::ActionResumedAfterUsageLimit { state_id, .. } => {
+            format!("action_resumed_after_usage_limit  {state_id}")
+        }
         EventData::ActionOutputRejected {
             action_execution_id,
             reason,

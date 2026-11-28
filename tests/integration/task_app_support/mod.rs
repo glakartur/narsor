@@ -268,6 +268,7 @@ pub fn position(state: &str, status: PositionStatus) -> Position {
         error: None,
         resumed_harness_session: None,
         harness_session_interrupted: false,
+        waiting_for_usage_limit: false,
         retry_pending: false,
         conversation: ConversationState::NoRecord,
         session_number: Some(1),

@@ -151,6 +151,32 @@ pub enum EventData {
         #[serde(default)]
         answer_tail: Option<String>,
     },
+    /// The harness of an attempt stopped because its subscription usage
+    /// limit is exhausted. The attempt is not over and not failed: the
+    /// execution is parked and the same attempt goes on in the same harness
+    /// session once the limit resets ([`EventData::ActionResumedAfterUsageLimit`]).
+    ActionWaitingForUsageLimit {
+        /// The attempt that waits.
+        action_execution_id: String,
+        /// The state whose action waits.
+        state_id: String,
+        /// The harness that stopped.
+        harness: String,
+        /// The harness's own session id, which the attempt continues.
+        harness_session_id: String,
+        /// When the exhausted window resets, when the harness said.
+        #[serde(default)]
+        resets_at: Option<DateTime<Utc>>,
+    },
+    /// An attempt that waited for the usage limit goes on, in the same
+    /// harness session and under the same `action_execution_id`. Not a new
+    /// attempt and not a retry.
+    ActionResumedAfterUsageLimit {
+        /// The attempt that goes on.
+        action_execution_id: String,
+        /// The state whose action goes on.
+        state_id: String,
+    },
     /// A new attempt asks the agent of a rejected attempt for its output label
     /// again, by resuming its harness session (KTD7).
     ///
@@ -839,6 +865,18 @@ impl Event {
             }
             EventData::ActionOutputRejected { reason, .. } => {
                 format!("Output rejected: {}", first_line(reason))
+            }
+            EventData::ActionWaitingForUsageLimit {
+                harness, resets_at, ..
+            } => match resets_at {
+                Some(resets_at) => format!(
+                    "Waiting for the usage limit of '{harness}' to reset at {}",
+                    resets_at.format("%Y-%m-%d %H:%M UTC")
+                ),
+                None => format!("Waiting for the usage limit of '{harness}' to reset"),
+            },
+            EventData::ActionResumedAfterUsageLimit { .. } => {
+                "The action goes on after the usage limit".to_string()
             }
             EventData::OutputReprompted { by, .. } => {
                 format!("Asked the agent again for its output (by {})", by.name())

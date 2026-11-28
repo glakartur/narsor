@@ -18,6 +18,10 @@ pub(crate) struct AgentInput {
     /// with the answer in the operator recovery note, instead of asking the
     /// owner: so it is for the owner's message a recovery gives.
     pub(crate) restart_if_refused: bool,
+    /// The answer is the continuation after an exhausted usage limit: the
+    /// same attempt goes on in its session, and a refused session is an
+    /// ordinary failure of that attempt.
+    pub(crate) usage_continuation: bool,
     /// The operator recovery note the attempt took with the answer.
     pub(crate) note: Option<String>,
 }
@@ -145,5 +149,27 @@ impl Engine {
         );
         self.store.save_execution(execution)?;
         Ok(())
+    }
+}
+
+/// Puts the continuation of the attempt that waited in `wait` for the usage
+/// limit in `execution`, without saving it: the fixed continuation prompt,
+/// for the session the attempt stopped in.
+pub(crate) fn put_usage_continuation(execution: &mut WorkflowExecution, wait: &UsageWait) {
+    put_agent_input(
+        execution,
+        &wait.state_id,
+        USAGE_LIMIT_CONTINUATION_PROMPT,
+        Some(&wait.harness),
+        Some(&wait.harness_session_id),
+        Vec::new(),
+        PromptAuthor::Engine,
+        false,
+    );
+    if let Some(record) = engine_metadata_mut(execution)
+        .get_mut(METADATA_AGENT_INPUT_KEY)
+        .and_then(Value::as_object_mut)
+    {
+        record.insert("usage_continuation".to_string(), Value::Bool(true));
     }
 }

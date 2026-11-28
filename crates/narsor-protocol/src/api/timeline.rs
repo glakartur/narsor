@@ -61,6 +61,11 @@ pub struct Position {
     /// What the entry's runs used, as far as the harness said.
     #[serde(default)]
     pub usage: Option<PositionUsage>,
+    /// The latest attempt is not over: its harness stopped on an exhausted
+    /// usage limit, and the attempt goes on in the same session once the
+    /// limit resets. The status stays [`PositionStatus::InProgress`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_usage_limit: bool,
 }
 
 impl Position {

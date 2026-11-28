@@ -31,6 +31,10 @@ pub(crate) enum AttemptOutcome {
     /// once, the message already in its note. Not a retry: the policy's
     /// count does not move.
     SessionRefused(String),
+    /// The harness stopped on an exhausted usage limit: the attempt waits,
+    /// parked, to go on in the same session. Not a failure: the policy's
+    /// count does not move.
+    UsageLimitReached(UsageLimitStopped),
 }
 
 /// How the whole action of a state ended, retries included.

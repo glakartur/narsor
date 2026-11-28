@@ -301,6 +301,11 @@ impl Engine {
                     &request.instruction,
                 ))
             }
+            // A reprompt does not wait for a usage limit: its stop is the
+            // harness failure it always was.
+            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingUsageLimit(stopped))) => {
+                RepromptFailure::Failed(stopped.error.message)
+            }
             Err(error) => match OutputRejection::from_error(state, &action_execution_id, &error) {
                 Some(rejection) => RepromptFailure::Rejected(rejection),
                 None => RepromptFailure::Failed(error.message),

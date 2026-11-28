@@ -1091,6 +1091,7 @@ mod tests {
             error: None,
             resumed_harness_session: None,
             harness_session_interrupted: false,
+            waiting_for_usage_limit: false,
             retry_pending: false,
             conversation: ConversationState::Recorded,
             session_number: Some(1),
