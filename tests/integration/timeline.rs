@@ -1114,3 +1114,56 @@ fn the_session_an_attempt_reported_while_it_ran_is_on_its_position() {
     );
     assert_eq!(reported_sessions(&store, EXEC).get("a1"), Some(&session));
 }
+
+#[test]
+fn an_attempt_waiting_for_the_usage_limit_is_in_progress_not_failed() {
+    let mut log = Log::new();
+    log.push(state_entered("work"));
+    log.push(action_started("a1", "work", "agent"));
+    let waiting = log.push(EventData::ActionWaitingForUsageLimit {
+        action_execution_id: "a1".to_string(),
+        state_id: "work".to_string(),
+        harness: "claude-code".to_string(),
+        harness_session_id: "hs-A".to_string(),
+        resets_at: None,
+    });
+    log.push(EventData::WorkflowPaused {
+        reason: "usage_limit".to_string(),
+    });
+
+    let timeline = build_timeline(&log.events, ExecutionStatus::Paused, &presence(&["a1"]));
+    assert_eq!(timeline.positions.len(), 1);
+    let position = &timeline.positions[0];
+    assert_eq!(position.status, PositionStatus::InProgress);
+    assert!(position.waiting_for_usage_limit);
+    assert!(!position.retry_pending);
+    assert_eq!(position.error, None);
+    assert_eq!(position.harness_session_id.as_deref(), Some("hs-A"));
+    assert_eq!(
+        timeline.links.get(&waiting),
+        Some(&EventLink::Position(position.label.clone()))
+    );
+
+    log.push(EventData::WorkflowResumed);
+    log.push(EventData::ActionResumedAfterUsageLimit {
+        action_execution_id: "a1".to_string(),
+        state_id: "work".to_string(),
+    });
+    log.push(EventData::AgentSessionStarted {
+        session_id: "narsor-a1-2".to_string(),
+        harness: "claude-code".to_string(),
+        action_execution_id: Some("a1".to_string()),
+        resumed_session: Some("hs-A".to_string()),
+        model: None,
+        effort: None,
+    });
+    let timeline = build_timeline(&log.events, ExecutionStatus::Running, &presence(&["a1"]));
+    assert_eq!(timeline.positions.len(), 1);
+    assert_eq!(timeline.positions[0].status, PositionStatus::InProgress);
+    assert!(!timeline.positions[0].waiting_for_usage_limit);
+
+    log.push(action_completed("a1", "done"));
+    let timeline = build_timeline(&log.events, ExecutionStatus::Running, &presence(&["a1"]));
+    assert_eq!(timeline.positions.len(), 1);
+    assert_eq!(timeline.positions[0].status, PositionStatus::Succeeded);
+}

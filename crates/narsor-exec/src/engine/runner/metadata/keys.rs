@@ -40,3 +40,6 @@ pub(crate) const METADATA_STEP_REPLIES_KEY: &str = "step_replies";
 pub(crate) const METADATA_STEP_STREAMS_KEY: &str = "step_streams";
 
 pub(crate) const METADATA_STATE_ENTRIES_KEY: &str = "state_entries";
+
+/// Key of the attempt that waits for an exhausted usage limit to reset.
+pub(crate) const METADATA_USAGE_WAIT_KEY: &str = "usage_wait";

@@ -34,8 +34,10 @@ pub fn record_manual_transition(
         None => None,
     };
     // A manual transition abandons a rejected output still owed a reprompt,
-    // a rescue the conductor had not finished, and a failure it diagnoses.
+    // a rescue the conductor had not finished, a failure it diagnoses, and
+    // an attempt that waited for a usage limit.
     clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
+    clear_engine_metadata(execution, METADATA_USAGE_WAIT_KEY);
     clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
     clear_engine_metadata(execution, METADATA_STEP_FAILURE_KEY);
     clear_engine_metadata(execution, METADATA_CONDUCTOR_RETRY_KEY);

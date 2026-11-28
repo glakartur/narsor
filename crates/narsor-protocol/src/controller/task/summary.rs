@@ -109,6 +109,11 @@ pub struct TaskSummary {
     pub panel: Option<PanelOffer>,
     #[serde(default)]
     pub resume: ResumeState,
+    /// Why the control plane paused the task, while the state is `Paused`
+    /// for a reason other than the owner's decision. `None` for an owner's
+    /// pause and from a server before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<PauseReason>,
     /// The observer queue entry of the wait episode the task waits in now
     /// (R21): a client shows one mark while it is there. `None` while the
     /// task waits at no gate with a `watch` block, when the control plane
@@ -168,6 +173,26 @@ pub enum EnvironmentDrift {
     /// The task has ended (finished or archived): its environment is never
     /// used again.
     NotApplicable,
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// Why the control plane paused a task.
+///
+/// A client that meets a reason it does not know reads `Unrecognized` and
+/// shows a plain pause.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PauseReason {
+    /// The harness's usage limit is used up: the control plane resumes the
+    /// task by itself at `resumes_at`.
+    UsageLimit {
+        harness: String,
+        /// When the control plane plans to resume the task: after the
+        /// limit resets, or at the next try when the reset time is not
+        /// known.
+        resumes_at: DateTime<Utc>,
+    },
     #[serde(other)]
     Unrecognized,
 }

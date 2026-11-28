@@ -2070,7 +2070,8 @@ pub(super) fn fit_cells(text: &str, width: usize) -> String {
 }
 
 /// The one line under the header: what an interrupted task waits for — the
-/// automatic resume, or its owner (R6, R7) — or else that the
+/// automatic resume, or its owner (R6, R7) — or why the control plane paused
+/// it and when it resumes, or else that the
 /// installation's default harness cannot be used by this task, and which one
 /// it keeps (R16c), cut to `width`; `None` when there is nothing to say. The
 /// harness's full reason is in *Info*.
@@ -2085,6 +2086,14 @@ fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Optio
             fit_cells(&describe_loss(&loss), usize::from(width)),
             styles.of(greyed(role, stale)),
         ));
+    }
+    if task.state == TaskState::Paused {
+        if let Some(reason) = crate::cli::task_text::pause_reason_text(task) {
+            return Some(Line::styled(
+                fit_cells(&one_line(&reason), usize::from(width)),
+                styles.of(greyed(Role::Calm, stale)),
+            ));
+        }
     }
     let unavailable = task.runner.as_ref()?.default_harness_unavailable.as_ref()?;
     let text = format!(

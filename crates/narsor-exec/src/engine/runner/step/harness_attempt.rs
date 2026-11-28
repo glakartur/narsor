@@ -401,6 +401,10 @@ impl Engine {
                 .get("restart_if_refused")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            usage_continuation: record
+                .get(USAGE_CONTINUATION_KEY)
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             note: None,
         });
         if input.is_some() {

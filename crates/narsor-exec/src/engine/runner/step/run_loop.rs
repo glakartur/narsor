@@ -61,7 +61,20 @@ impl Engine {
                             )
                             .await?
                         }
-                        None => self.enter_state(definition, &mut execution, state).await?,
+                        None => match stored_usage_wait(&execution, &state_id)? {
+                            // A pass that parked on an exhausted usage
+                            // limit: the attempt goes on in its session.
+                            Some(wait) => {
+                                self.continue_after_usage_wait(
+                                    definition,
+                                    &mut execution,
+                                    state,
+                                    wait,
+                                )
+                                .await?
+                            }
+                            None => self.enter_state(definition, &mut execution, state).await?,
+                        },
                     },
                 }
             };

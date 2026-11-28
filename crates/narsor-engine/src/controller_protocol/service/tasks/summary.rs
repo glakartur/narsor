@@ -115,6 +115,7 @@ impl ProtocolService {
             actions: None,
             panel: None,
             resume: record.resume.clone(),
+            pause_reason: pause_reason(record),
             queue_entry: self
                 .task_queue_entry(record)
                 .map(|entry| TaskQueueEntryView {
@@ -198,6 +199,18 @@ impl ProtocolService {
             Freshness::Stale
         })
     }
+}
+
+/// Why the task is paused, when the control plane paused it: a wait for the
+/// harness's usage limit, while it makes the task `Paused`. The planned
+/// resume is the reset time plus the margin, or the next try when the
+/// harness gave no reset time.
+fn pause_reason(record: &TaskRecord) -> Option<PauseReason> {
+    let wait = record.usage_wait.as_ref()?;
+    (record.task_state() == TaskState::Paused).then(|| PauseReason::UsageLimit {
+        harness: wait.harness.clone(),
+        resumes_at: wait.resume_at,
+    })
 }
 
 fn pending_input_view(

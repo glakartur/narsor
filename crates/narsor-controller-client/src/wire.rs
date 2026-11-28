@@ -46,7 +46,7 @@ pub use narsor_protocol::controller::{
     ObserverDecideRequest, ObserverEffectOutcome, ObserverEffectResponse, OperatorCommand,
     OperatorCommandAckRequest, OperatorCommandAckResponse, OperatorCommandView, OwnerCommand,
     OwnerCommandRequest, OwnerCommandResponse, OwnerRef, PanelChoice, PanelForm, PanelFormKind,
-    PanelOffer, PendingInputRefView, QueueView, RefreshEnvironmentRequest,
+    PanelOffer, PauseReason, PendingInputRefView, QueueView, RefreshEnvironmentRequest,
     RefreshEnvironmentResponse, RelayFailure, ReportRequest, ReportResponse,
     RepositoryBranchesResponse, RepositoryListResponse, RepositoryView, ResourceIdentity,
     ResourceProfileRequest, ResumeExhaustion, ResumeState, RotateKeyRequest, RotateKeyResponse,

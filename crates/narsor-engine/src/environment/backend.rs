@@ -43,6 +43,12 @@ pub const DEFAULT_SLOT_RELEASE_READ_EXTENSION_SECS: u64 = 180;
 /// Default idle time after which a reader no longer extends the wait
 /// (`slot_reader_idle_secs`).
 pub const DEFAULT_SLOT_READER_IDLE_SECS: u64 = 120;
+/// Default wait before a task that stopped on a usage limit without a
+/// known reset time is tried again (`usage_wait_retry_secs`).
+pub const DEFAULT_USAGE_WAIT_RETRY_SECS: u64 = 900;
+/// Default safety margin after a reported usage-limit reset before the task
+/// is resumed (`usage_wait_margin_secs`).
+pub const DEFAULT_USAGE_WAIT_MARGIN_SECS: u64 = 60;
 /// Longest period a slot-release setting may have: one day.
 pub const MAX_SLOT_PERIOD_SECS: u64 = 86_400;
 
@@ -113,6 +119,14 @@ pub struct BackendLimits {
     /// Seconds without a read after which a reader stops extending the wait.
     #[serde(default = "default_slot_reader_idle_secs")]
     pub slot_reader_idle_secs: u64,
+    /// Seconds after a usage-limit report without a reset time before the
+    /// task is resumed to try again.
+    #[serde(default = "default_usage_wait_retry_secs")]
+    pub usage_wait_retry_secs: u64,
+    /// Seconds after a reported usage-limit reset before the task is
+    /// resumed.
+    #[serde(default = "default_usage_wait_margin_secs")]
+    pub usage_wait_margin_secs: u64,
 }
 
 fn default_slot_release_grace_secs() -> u64 {
@@ -124,8 +138,15 @@ fn default_slot_release_read_extension_secs() -> u64 {
 fn default_slot_reader_idle_secs() -> u64 {
     DEFAULT_SLOT_READER_IDLE_SECS
 }
+fn default_usage_wait_retry_secs() -> u64 {
+    DEFAULT_USAGE_WAIT_RETRY_SECS
+}
+fn default_usage_wait_margin_secs() -> u64 {
+    DEFAULT_USAGE_WAIT_MARGIN_SECS
+}
 
-/// The periods that decide when a slot is freed, as read from one backend.
+/// The periods that decide when a slot is freed, and when a task that
+/// waits for a usage limit is resumed, as read from one backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotReleaseTimings {
     /// Wait before a task in a transient state frees its slot.
@@ -134,6 +155,11 @@ pub struct SlotReleaseTimings {
     pub read_extension: Duration,
     /// Idle time after which a reader no longer extends the wait.
     pub reader_idle: Duration,
+    /// Wait after a usage-limit report without a reset time before the
+    /// task is resumed to try again.
+    pub usage_wait_retry: Duration,
+    /// Safety margin after a reported usage-limit reset.
+    pub usage_wait_margin: Duration,
 }
 
 impl Default for SlotReleaseTimings {
@@ -142,6 +168,8 @@ impl Default for SlotReleaseTimings {
             grace: Duration::from_secs(DEFAULT_SLOT_RELEASE_GRACE_SECS),
             read_extension: Duration::from_secs(DEFAULT_SLOT_RELEASE_READ_EXTENSION_SECS),
             reader_idle: Duration::from_secs(DEFAULT_SLOT_READER_IDLE_SECS),
+            usage_wait_retry: Duration::from_secs(DEFAULT_USAGE_WAIT_RETRY_SECS),
+            usage_wait_margin: Duration::from_secs(DEFAULT_USAGE_WAIT_MARGIN_SECS),
         }
     }
 }
@@ -156,15 +184,19 @@ impl BackendLimits {
             slot_release_grace_secs: DEFAULT_SLOT_RELEASE_GRACE_SECS,
             slot_release_read_extension_secs: DEFAULT_SLOT_RELEASE_READ_EXTENSION_SECS,
             slot_reader_idle_secs: DEFAULT_SLOT_READER_IDLE_SECS,
+            usage_wait_retry_secs: DEFAULT_USAGE_WAIT_RETRY_SECS,
+            usage_wait_margin_secs: DEFAULT_USAGE_WAIT_MARGIN_SECS,
         }
     }
 
-    /// The slot-release periods.
+    /// The slot-release and usage-wait periods.
     pub fn slot_release_timings(&self) -> SlotReleaseTimings {
         SlotReleaseTimings {
             grace: Duration::from_secs(self.slot_release_grace_secs),
             read_extension: Duration::from_secs(self.slot_release_read_extension_secs),
             reader_idle: Duration::from_secs(self.slot_reader_idle_secs),
+            usage_wait_retry: Duration::from_secs(self.usage_wait_retry_secs),
+            usage_wait_margin: Duration::from_secs(self.usage_wait_margin_secs),
         }
     }
 
@@ -286,6 +318,8 @@ impl BackendRecord {
                 limits.slot_release_read_extension_secs,
             ),
             ("slot_reader_idle_secs", limits.slot_reader_idle_secs),
+            ("usage_wait_retry_secs", limits.usage_wait_retry_secs),
+            ("usage_wait_margin_secs", limits.usage_wait_margin_secs),
         ] {
             if secs == 0 || secs > MAX_SLOT_PERIOD_SECS {
                 problems.push(format!(

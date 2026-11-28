@@ -217,6 +217,22 @@ pub enum TaskEventKind {
         #[serde(default)]
         diff: Box<EnvironmentDiff>,
     },
+    /// The task's step stopped on its harness's exhausted usage limit: the
+    /// control plane frees the slot and resumes the task at `resume_at`,
+    /// which is `resets_at` plus a safety margin, or a retry interval after
+    /// the report when the harness gave no reset time. A client from before
+    /// the wait reads it as [`TaskEventKind::Unrecognized`].
+    UsageWaitScheduled {
+        harness: String,
+        /// When the harness said the limit resets, if it did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resets_at: Option<DateTime<Utc>>,
+        resume_at: DateTime<Utc>,
+    },
+    /// The control plane resumed the task whose usage-limit wait ran out.
+    /// A client from before the wait reads it as
+    /// [`TaskEventKind::Unrecognized`].
+    UsageWaitResumed,
     #[serde(other)]
     Unrecognized,
 }
@@ -389,6 +405,7 @@ pub enum SlotReleaseReason {
     /// The backend's limit of concurrent tasks went below the number of
     /// tasks that run, and this task was the first to reach a safe point.
     LimitLowered,
+    UsageLimit,
     #[serde(other)]
     Unrecognized,
 }

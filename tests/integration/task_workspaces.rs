@@ -86,6 +86,7 @@ fn reported(record: &mut TaskRecord, workspaces: Vec<WorkspaceHeader>) {
             default_harness_unavailable: None,
             workspaces,
             generated_title: None,
+            usage_wait: None,
             observed_at: Utc::now(),
         },
         received_at: Utc::now(),

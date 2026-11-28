@@ -50,7 +50,7 @@ pub use observers::{
     RUN_DEADLINE_MARGIN_SECS, SCRIPT_TIMEOUT_SECS,
 };
 pub use reads::ReaderLeasePass;
-pub use scheduling::{AutoResumePass, SlotReleasePass};
+pub use scheduling::{AutoResumePass, SlotReleasePass, UsageResumePass};
 pub use tasks::{task_actions, task_panel, task_workspaces};
 
 /// The owner every request authenticated by the local daemon token acts

@@ -31,12 +31,13 @@ pub use retry::RetrySchedule;
 pub use runner::{
     execution_episode, manual_override_allowed, owed_output_rescue, owed_reprompt,
     plan_operator_transition, record_manual_transition, resumable_agent_session, step_failure,
-    terminal_status, ActionKind, Engine, EngineError, LastAgentStep, ManualTransition,
+    terminal_status, usage_wait, ActionKind, Engine, EngineError, LastAgentStep, ManualTransition,
     OperatorTransition, OutputDecisionUndo, OutputRejection, OutputRescue, OwnerMessage,
     PendingStep, Recovery, ResumableSession, RunHandle, StepFailure, StepSelection, TransitionPlan,
-    UndoneOutputDecision, DEFAULT_ESCALATION_THRESHOLD, EVENT_CHANNEL_CAPACITY,
+    UndoneOutputDecision, UsageWait, DEFAULT_ESCALATION_THRESHOLD, EVENT_CHANNEL_CAPACITY,
     METADATA_CONDUCTOR_RETRY_KEY, METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY,
     METADATA_OUTPUT_RESCUE_KEY, METADATA_STEP_FAILURE_KEY, METADATA_STEP_LOCALS_KEY,
+    USAGE_LIMIT_CONTINUATION_PROMPT, USAGE_LIMIT_PAUSE_REASON,
 };
 pub use timeline::{
     build_timeline, ConversationState, EventLink, Position, PositionStatus, Timeline,
@@ -54,5 +55,6 @@ pub use actions::{
     OutputProblem, OutputRequirement, PendingHumanInput, PermissionDecision,
     PermissionDecisionKind, PermissionGrantScope, ProfileExecutor, RejectedAnswer,
     ResumedHumanAction, RunObservers, RunStarted, ScriptExecutor, StepContract, StepInWorkflow,
-    StepScope, SuspendedAction, TimedOutAction, UsageReporter, ACTION_ID_ENV_VAR,
+    StepScope, SuspendedAction, TimedOutAction, UsageLimitStopped, UsageReporter,
+    ACTION_ID_ENV_VAR,
 };

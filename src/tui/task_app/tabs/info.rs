@@ -22,7 +22,7 @@ use narsor_protocol::controller::{EnvironmentDrift, QueueReason, TaskState};
 
 use super::super::super::scroll::one_line;
 use super::super::detail::short_age;
-use crate::cli::task_text::{task_state_name, without_slot};
+use crate::cli::task_text::{pause_reason_text, task_state_name, without_slot};
 
 /// What the tab remembers per task: how far it is scrolled and what the
 /// last comparison with the catalogue said.
@@ -251,6 +251,11 @@ pub fn lines(
         Role::Calm,
     );
     sheet.row("stan", task_state_name(task.state), Role::Calm);
+    if task.state == TaskState::Paused {
+        if let Some(reason) = pause_reason_text(task) {
+            sheet.row("pause reason", reason, Role::Calm);
+        }
+    }
     sheet.row("slot", slot_text(task), Role::Calm);
     sheet.row(
         "pozycja",

@@ -43,6 +43,14 @@ harness did not report is left out, never shown as `$0`. A task archived
 without any reported timeline prints `Timeline   storage deleted at archive,
 no steps were kept`. `task steps` is unchanged.
 
+A task whose agent step stopped because the harness usage limit is used up
+(v1: `claude-code`) shows `Paused` with the reason `usage limit of <harness>
+— resumes at HH:MM` in `task list`, `task show`, the TUI and the web. The
+step is not failed and holds no slot. At that time the control plane resumes
+the task by itself, and the step goes on in the same agent session. `task
+resume` tries at once; `task pause` cancels the planned resume. See
+[Scheduling](../operations/remote-backends.md#10-scheduling).
+
 Without `--server` these use the local daemon (trusted mode). For a network
 deployment pass `--server https://…` (or `NARSOR_SERVER`) and an OIDC access
 token via `NARSOR_TOKEN_FILE`, `NARSOR_TOKEN_COMMAND` or `NARSOR_TOKEN`; a

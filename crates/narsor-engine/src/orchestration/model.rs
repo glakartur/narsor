@@ -45,6 +45,23 @@ pub struct ReaderLease {
     pub until: DateTime<Utc>,
 }
 
+/// The wait of a task whose step stopped on its harness's exhausted usage
+/// limit, as the control plane planned it from the runner's report. The
+/// control plane frees the task's slot at once and resumes the task at
+/// `resume_at`; an owner's resume or pause removes the wait.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskUsageWait {
+    /// The harness whose usage limit is used up.
+    pub harness: String,
+    /// When the harness said the limit resets; `None` when it gave no time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<DateTime<Utc>>,
+    /// When the control plane resumes the task: `resets_at` plus the
+    /// backend's safety margin, or the report time plus the backend's retry
+    /// interval when no reset time is known.
+    pub resume_at: DateTime<Utc>,
+}
+
 /// What the execution status of a task's last snapshot means for its slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotReleaseClass {
@@ -57,6 +74,10 @@ pub enum SlotReleaseClass {
     /// after a wait. A matching event resumes the task like an owner's
     /// answer does.
     Transient,
+    /// The execution waits for its harness's usage limit to reset (the
+    /// task has a [`TaskUsageWait`]): the slot is freed at once, and the
+    /// control plane resumes the task at the planned time.
+    UsageWait,
 }
 
 impl SlotReleaseClass {
@@ -77,13 +98,15 @@ impl SlotReleaseClass {
         match self {
             Self::Final => SlotReleaseReason::Terminal,
             Self::Transient => SlotReleaseReason::GraceElapsed,
+            Self::UsageWait => SlotReleaseReason::UsageLimit,
         }
     }
 }
 
 /// Works out the [`TaskState`] of a task from its runner state, the execution
-/// status of the runner's last snapshot (`None`: no snapshot yet) and the
-/// resume policy (D58). The first matching rule wins:
+/// status of the runner's last snapshot (`None`: no snapshot yet), the
+/// resume policy (D58) and whether the task waits for its harness's usage
+/// limit (`usage_wait`). The first matching rule wins:
 ///
 /// 1. `Archived` is `Archived`; 2. `Archiving` is `Finished`;
 /// 3. `Queued` is `Queued`, whatever the last snapshot says;
@@ -91,18 +114,20 @@ impl SlotReleaseClass {
 /// 5. execution `Completed` or `Cancelled` is `Finished`;
 /// 6. execution `Failed` is `Error`;
 /// 7. execution `InputNeeded` is `HumanNeeded`;
-/// 8. execution `WaitingForEvent` (a `wait` step) is `Running`: the work
+/// 8. a wait for the usage limit is `Paused`: the control plane resumes the
+///    task at the planned time, whatever its runner state;
+/// 9. execution `WaitingForEvent` (a `wait` step) is `Running`: the work
 ///    goes on by itself when the event comes, so the owner
 ///    is not told that it waits for them;
-/// 9. `Stopped` or `PauseRequested` is `Paused`;
-/// 10. `Provisioning` without a snapshot is `Queued`;
-/// 11. `Interrupted` with no attempt planned (lost while a pause was
+/// 10. `Stopped` or `PauseRequested` is `Paused`;
+/// 11. `Provisioning` without a snapshot is `Queued`;
+/// 12. `Interrupted` with no attempt planned (lost while a pause was
 ///     requested, which the resume policy leaves to the owner) is `Paused`;
-/// 12. the rest is `Running`: `Running`, `Provisioning` with a snapshot, and
+/// 13. the rest is `Running`: `Running`, `Provisioning` with a snapshot, and
 ///     `Interrupted` while the resume policy still waits to try again.
 ///
-/// Rules 5 to 8 come before 9, so a task stopped to free its slot keeps the
-/// state its work reached. Rule 9 reads `PauseRequested` as the owner's
+/// Rules 5 to 9 come before 10, so a task stopped to free its slot keeps the
+/// state its work reached. Rule 10 reads `PauseRequested` as the owner's
 /// pause only when `pause_by_policy` is false: a stop the slot-release
 /// policy asked for is no decision of the owner, so a task whose work moved
 /// on meanwhile (execution `Running`) stays `Running`.
@@ -111,6 +136,7 @@ pub fn derive_task_state(
     execution: Option<ExecutionStatus>,
     resume: &ResumeState,
     pause_by_policy: bool,
+    usage_wait: bool,
 ) -> TaskState {
     match runner_state {
         RunnerState::Archived => return TaskState::Archived,
@@ -124,6 +150,7 @@ pub fn derive_task_state(
         Some(ExecutionStatus::Completed | ExecutionStatus::Cancelled) => TaskState::Finished,
         Some(ExecutionStatus::Failed) => TaskState::Error,
         Some(ExecutionStatus::InputNeeded) => TaskState::HumanNeeded,
+        _ if usage_wait => TaskState::Paused,
         Some(ExecutionStatus::WaitingForEvent) => TaskState::Running,
         _ => match runner_state {
             RunnerState::PauseRequested if pause_by_policy => TaskState::Running,
@@ -378,6 +405,14 @@ pub struct TaskRecord {
     /// record so a restart of the daemon neither loses nor shortens it.
     #[serde(default)]
     pub slot_release_due_at: Option<DateTime<Utc>>,
+    /// The wait for the harness's usage limit the task's step stopped on,
+    /// and when the control plane resumes the task. Set by the runner
+    /// snapshot that first reports it while the runner works, cleared by a
+    /// later snapshot without it, by any resume and by the owner's pause.
+    /// Lives in the record, so a restart of the daemon keeps the planned
+    /// time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_wait: Option<TaskUsageWait>,
     /// Until when a task stopped by its owner's `Pause` or `Stop` keeps its
     /// slot. Set from `slot_release_due_at` when the owner stops a task that
     /// waits for the owner and the deadline did not pass; the same deadline
@@ -457,17 +492,45 @@ impl TaskRecord {
 
     /// Whether the resume policy may resume the task now: it is
     /// interrupted, its planned attempt is due and the policy has not given
-    /// up on it.
+    /// up on it. A task that waits for its usage limit is left to that
+    /// wait's own resume ([`Self::usage_resume_due`]).
     pub fn auto_resume_due(&self, now: DateTime<Utc>) -> bool {
         self.runner_state == RunnerState::Interrupted
+            && self.usage_wait.is_none()
             && self.resume.exhausted.is_none()
             && self.resume.next_attempt_at.is_some_and(|at| at <= now)
     }
 
-    /// How the last runner snapshot classifies the task's execution for
-    /// its slot; `None` before the first snapshot, and for a status that
-    /// keeps the slot.
+    /// Whether the wait for the usage limit ends now: its planned time came
+    /// and the task has no workload (stopped to free its slot, or its
+    /// runner was lost meanwhile).
+    pub fn usage_resume_due(&self, now: DateTime<Utc>) -> bool {
+        matches!(
+            self.runner_state,
+            RunnerState::Stopped | RunnerState::Interrupted
+        ) && self
+            .usage_wait
+            .as_ref()
+            .is_some_and(|wait| wait.resume_at <= now)
+    }
+
+    /// Whether the task's current generation comes from its owner's pause.
+    pub fn paused_by_owner(&self) -> bool {
+        self.commands.iter().rev().any(|receipt| {
+            receipt.command == OwnerCommand::Pause
+                && receipt.generation_after == self.generation
+                && receipt.actor == CommandActor::Owner
+        })
+    }
+
+    /// How the task's slot is classified: by its wait for the usage limit
+    /// first, else by the execution status of the last runner snapshot;
+    /// `None` before the first snapshot, and for a status that keeps the
+    /// slot.
     pub fn slot_release_class(&self) -> Option<SlotReleaseClass> {
+        if self.usage_wait.is_some() {
+            return Some(SlotReleaseClass::UsageWait);
+        }
         self.runner
             .as_ref()
             .and_then(|runner| SlotReleaseClass::of(runner.snapshot.execution_status))
@@ -680,6 +743,7 @@ impl TaskRecord {
             },
             &self.resume,
             self.pause_requested_by_policy(),
+            self.usage_wait.is_some(),
         )
     }
 
@@ -1791,7 +1855,7 @@ mod tests {
     }
 
     fn derive(runner: RunnerState, execution: Option<ExecutionStatus>) -> TaskState {
-        derive_task_state(runner, execution, &ResumeState::default(), false)
+        derive_task_state(runner, execution, &ResumeState::default(), false, false)
     }
 
     #[test]
@@ -1881,6 +1945,7 @@ mod tests {
                 R::Interrupted,
                 Some(ExecutionStatus::Running),
                 &exhausted(),
+                false,
                 false
             ),
             T::Error
@@ -1894,6 +1959,7 @@ mod tests {
                 R::Interrupted,
                 Some(ExecutionStatus::Running),
                 &planned,
+                false,
                 false
             ),
             T::Running
@@ -1905,7 +1971,13 @@ mod tests {
         // `count_loss` plans nothing for a loss from `PauseRequested`.
         for execution in [Some(ExecutionStatus::Running), None] {
             assert_eq!(
-                derive_task_state(R::Interrupted, execution, &ResumeState::default(), false),
+                derive_task_state(
+                    R::Interrupted,
+                    execution,
+                    &ResumeState::default(),
+                    false,
+                    false
+                ),
                 T::Paused
             );
         }
@@ -1919,6 +1991,7 @@ mod tests {
                 Some(ExecutionStatus::Running),
                 &ResumeState::default(),
                 pause_by_policy,
+                false,
             )
         };
         assert_eq!(derive(false), T::Paused);
@@ -1929,8 +2002,31 @@ mod tests {
                 R::PauseRequested,
                 Some(ExecutionStatus::InputNeeded),
                 &ResumeState::default(),
-                true
+                true,
+                false
             ),
+            T::HumanNeeded
+        );
+    }
+
+    #[test]
+    fn a_usage_limit_wait_reads_as_paused_unless_the_work_ended_or_waits_for_the_owner() {
+        let waiting = |runner, execution| {
+            derive_task_state(runner, execution, &ResumeState::default(), true, true)
+        };
+        for runner in [R::Running, R::PauseRequested, R::Stopped, R::Interrupted] {
+            assert_eq!(
+                waiting(runner, Some(ExecutionStatus::Paused)),
+                T::Paused,
+                "{runner:?}"
+            );
+        }
+        assert_eq!(
+            waiting(R::Stopped, Some(ExecutionStatus::Cancelled)),
+            T::Finished
+        );
+        assert_eq!(
+            waiting(R::Stopped, Some(ExecutionStatus::InputNeeded)),
             T::HumanNeeded
         );
     }

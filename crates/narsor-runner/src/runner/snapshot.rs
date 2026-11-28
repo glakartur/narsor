@@ -22,13 +22,13 @@ use crate::domain::{ExecutionStatus, ParamType, WorkflowDefinition, WorkflowExec
 use crate::engine::conversation_summary::summaries;
 pub(crate) use crate::engine::conversation_summary::ConversationCache;
 use crate::engine::{
-    current_timeline, resumable_agent_session, step_failure, Engine, InputContinuation,
+    current_timeline, resumable_agent_session, step_failure, usage_wait, Engine, InputContinuation,
     PendingHumanInput,
 };
 use crate::persistence::ExecutionStore;
 use narsor_protocol::controller::{
     AttentionItem, AttentionKind, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
-    RunnerProblem,
+    RunnerProblem, UsageLimitWait,
 };
 
 use super::workspaces::WorkspaceTracker;
@@ -85,6 +85,7 @@ pub(crate) fn build(
             default_harness_unavailable: context.default_harness_unavailable.cloned(),
             workspaces: context.workspaces.headers(&BTreeMap::new()),
             generated_title: engine.generated_title(),
+            usage_wait: None,
             observed_at,
         });
     };
@@ -164,8 +165,29 @@ pub(crate) fn build(
         default_harness_unavailable: context.default_harness_unavailable.cloned(),
         workspaces: context.workspaces.headers(&execution.context.workspace_prs),
         generated_title: engine.generated_title(),
+        usage_wait: reported_usage_wait(&execution),
         observed_at,
     })
+}
+
+/// The wait for the harness's usage limit, while the execution is parked on
+/// it. Read from the execution's record, so a runner started after the stop
+/// reports it too. The record outlives a cancel, so only a paused execution
+/// waits.
+fn reported_usage_wait(execution: &WorkflowExecution) -> Option<UsageLimitWait> {
+    if execution.status != ExecutionStatus::Paused {
+        return None;
+    }
+    match usage_wait(execution) {
+        Ok(wait) => wait.map(|wait| UsageLimitWait {
+            harness: wait.harness,
+            resets_at: wait.resets_at,
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "the usage-limit wait of the execution cannot be read");
+            None
+        }
+    }
 }
 
 /// What waits on the owner, oldest first: the request the engine holds
@@ -507,6 +529,92 @@ mod tests {
             let older: narsor_protocol::controller::RunnerSnapshotRequest =
                 serde_json::from_value(request).expect("a request of an older runner");
             assert!(!older.agent_session_resumable, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_snapshot_reports_the_usage_limit_wait_of_a_parked_execution() {
+        use chrono::TimeZone;
+        use narsor_protocol::controller::{RunnerSnapshotRequest, UsageLimitWait};
+
+        let resets_at = Utc.with_ymd_and_hms(2026, 11, 28, 17, 0, 0).unwrap();
+        let record = crate::engine::UsageWait {
+            state_id: "plan".to_string(),
+            action_execution_id: "act-1".to_string(),
+            attempt: 1,
+            harness: "claude-code".to_string(),
+            harness_session_id: "s-1".to_string(),
+            resets_at: Some(resets_at),
+        };
+        let parked = Some(UsageLimitWait {
+            harness: "claude-code".to_string(),
+            resets_at: Some(resets_at),
+        });
+        let cases = [
+            ("parked", ExecutionStatus::Paused, true, parked),
+            (
+                "the continuation has started",
+                ExecutionStatus::Running,
+                false,
+                None,
+            ),
+            (
+                "cancelled while parked",
+                ExecutionStatus::Cancelled,
+                true,
+                None,
+            ),
+        ];
+        for (name, status, recorded, expected) in cases {
+            let root = TempRoot(
+                std::env::temp_dir().join(format!("narsor-usage-wait-{}", uuid::Uuid::new_v4())),
+            );
+            let store = ExecutionStore::new(&root.0);
+            let mut execution = execution("exec-u");
+            execution.status = status;
+            if recorded {
+                execution.metadata = serde_json::json!({ "engine": {
+                    "usage_wait": serde_json::to_value(&record).expect("record"),
+                } });
+            }
+            store.save_execution(&execution).expect("execution");
+            store
+                .event_log("exec-u")
+                .append_next(&execution.id, started("act-1"))
+                .expect("event");
+
+            let engine = Engine::new(store.clone());
+            let workspaces = WorkspaceTracker::new(
+                &crate::runner::storage::TaskStorage::new(&root.0),
+                &crate::domain::TaskWorkspace::none(),
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+            );
+            let snapshot = build(
+                &engine,
+                &mut ConversationCache::default(),
+                SnapshotContext {
+                    workspaces: &workspaces,
+                    execution_id: Some("exec-u"),
+                    pass_active: false,
+                    problem: None,
+                    stopping: false,
+                    conductor_unavailable: Some("no conductor in this test"),
+                    default_harness_unavailable: None,
+                },
+            )
+            .expect("snapshot");
+
+            let mut body =
+                serde_json::to_value(snapshot.to_request().expect("request")).expect("json");
+            let request: RunnerSnapshotRequest =
+                serde_json::from_value(body.clone()).expect("a request");
+            assert_eq!(request.usage_wait, expected, "{name}");
+            body.as_object_mut()
+                .expect("an object")
+                .remove("usage_wait");
+            let older: RunnerSnapshotRequest =
+                serde_json::from_value(body).expect("a request of an older runner");
+            assert_eq!(older.usage_wait, None, "{name}");
         }
     }
 

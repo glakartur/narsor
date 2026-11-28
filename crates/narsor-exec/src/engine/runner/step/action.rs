@@ -208,6 +208,21 @@ impl Engine {
                     )?;
                     continue;
                 }
+                Ok(AttemptOutcome::UsageLimitReached(stopped)) => {
+                    self.park_for_usage_limit(
+                        execution,
+                        state,
+                        UsageWait {
+                            state_id: state.id.clone(),
+                            action_execution_id,
+                            attempt,
+                            harness: stopped.harness,
+                            harness_session_id: stopped.harness_session_id,
+                            resets_at: stopped.resets_at,
+                        },
+                    )?;
+                    return Ok(ActionUpshot::Stopped);
+                }
                 Err(failure) => failure,
             };
 
@@ -252,5 +267,30 @@ impl Engine {
                 },
             )?;
         }
+    }
+
+    /// Parks the execution on the attempt `wait` describes, whose harness
+    /// stopped on an exhausted usage limit: the record and `Paused` in one
+    /// save, then the attempt marked as waiting. Nothing failed: the attempt
+    /// goes on in its session when the execution is resumed.
+    pub(crate) fn park_for_usage_limit(
+        &self,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        wait: UsageWait,
+    ) -> Result<(), EngineError> {
+        write_engine_record(execution, METADATA_USAGE_WAIT_KEY, &wait)?;
+        self.pause_execution(execution, USAGE_LIMIT_PAUSE_REASON)?;
+        self.emit(
+            &execution.id,
+            EventData::ActionWaitingForUsageLimit {
+                action_execution_id: wait.action_execution_id,
+                state_id: state.id.clone(),
+                harness: wait.harness,
+                harness_session_id: wait.harness_session_id,
+                resets_at: wait.resets_at,
+            },
+        )?;
+        Ok(())
     }
 }

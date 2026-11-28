@@ -8,7 +8,9 @@
 //! * the [`AgentSession`] record, with `AgentSessionStarted` (the model and
 //!   the effort that ran) before the run and `AgentSessionCompleted` /
 //!   `AgentSessionFailed` after it, carrying the harness's own session id
-//!   captured from its output;
+//!   captured from its output — or neither, when the harness stopped on an
+//!   exhausted usage limit: that session goes on later
+//!   ([`SuspendedAction::AwaitingUsageLimit`]);
 //! * the warning about an effort the harness does not take;
 //! * the attempt's conversation file ([`conversation`]);
 //! * the harness process ([`process`]): spawned once, its process group
@@ -50,7 +52,7 @@ use super::harness::{
 use super::human::{HumanInputRequest, PermissionDenialDetails, PermissionRequestDetails};
 use super::scope::StepScope;
 use super::script::truncate;
-use super::{ActionOutcome, ActionRequest, SuspendedAction, TimedOutAction};
+use super::{ActionOutcome, ActionRequest, SuspendedAction, TimedOutAction, UsageLimitStopped};
 use crate::domain::{
     ActionError, AgentSession, AgentSessionStatus, Event, EventData, HarnessStepConfig,
 };
@@ -67,7 +69,7 @@ use conversation::UsageRelay;
 pub use conversation::{AgentEventSink, LoggingEventSink, UsageReporter};
 pub(crate) use conversation::{ConversationSink, ReadingTap};
 use denials::split_denials;
-use process::harness_error;
+use process::{harness_error, usage_limit_stopped};
 
 /// The harness used when neither the action nor the configuration names one.
 ///
@@ -467,6 +469,9 @@ impl SessionRunner {
                 harness_error(adapter.as_ref(), failure, &finished, run, resume),
             )
         });
+        // Checked before the failure: a stop on the usage limit of a
+        // resumed session is not a refused session.
+        let usage_limit = usage_limit_stopped(&harness, run, failure.as_ref());
 
         let open = OpenSession {
             runner: self,
@@ -481,6 +486,15 @@ impl SessionRunner {
             open.complete();
             return Ok(SessionEnd::Stopped(ActionOutcome::Suspended(
                 SuspendedAction::AwaitingAgentInput(permission),
+            )));
+        }
+
+        // The session is neither completed nor failed: it goes on once the
+        // limit resets.
+        if let Some(stopped) = usage_limit {
+            open.conversation.finish();
+            return Ok(SessionEnd::Stopped(ActionOutcome::Suspended(
+                SuspendedAction::AwaitingUsageLimit(stopped),
             )));
         }
 

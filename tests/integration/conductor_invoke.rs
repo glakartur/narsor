@@ -1629,3 +1629,27 @@ fn the_autopilot_modes_change_the_task_and_not_the_answer_contract() {
     assert_eq!(contract, best_effort_contract);
     assert_eq!(prompt_in(None), prompt_in(Some(Autopilot::On)));
 }
+
+#[tokio::test]
+async fn a_chat_reply_stopped_on_the_usage_limit_fails_as_a_harness_failure() {
+    let fixture = Fixture::new();
+    let stream = fs::read_to_string(fixtures().join("claude-code/usage_limit_stop.ndjson"))
+        .expect("read the usage-limit stream");
+    fixture.claude.answers(&stream);
+
+    let error = failed(
+        fixture
+            .invoker("claude-code")
+            .invoke_once(&without_episode(
+                &fixture,
+                "chat-1",
+                ConductorPurpose::ReplyToChat,
+            ))
+            .await,
+    );
+
+    assert!(
+        error.starts_with("the conductor's harness 'claude-code' failed"),
+        "{error}"
+    );
+}

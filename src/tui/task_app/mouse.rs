@@ -17,7 +17,6 @@
 //! be hit. A panel inside another is recorded after it, and the last one that
 //! covers a point wins.
 
-
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 

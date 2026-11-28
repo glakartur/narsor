@@ -66,7 +66,21 @@ pub struct RunnerSnapshotRequest {
     /// the last report that has one wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_title: Option<String>,
+    /// The parked execution waits for the harness's usage limit to reset.
+    /// Absent while it does not, and from a runner that does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_wait: Option<UsageLimitWait>,
     pub observed_at: DateTime<Utc>,
+}
+
+/// A step that stopped because its harness's subscription usage limit is
+/// exhausted, and that continues in the same session once the limit resets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageLimitWait {
+    pub harness: String,
+    /// When the exhausted usage window resets, when the harness said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<DateTime<Utc>>,
 }
 
 /// What the control plane knows about the launch of the calling runner.

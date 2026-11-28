@@ -26,6 +26,7 @@ use narsor_engine::engine::actions::agent::{
     output_contract, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
 };
 use narsor_engine::engine::{reconcile, ReconciliationOutcome};
+use narsor_engine::engine::{step_failure, usage_wait, UsageWait, USAGE_LIMIT_PAUSE_REASON};
 use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentEventSink, AgentExecutor,
     ClaudeCodeAdapter, CodexAdapter, DefaultHarnessSource, Engine, HarnessAdapter, HarnessRegistry,
@@ -5336,4 +5337,124 @@ async fn adapters_map_scope_dirs_to_what_they_can_enforce() {
         .await
         .unwrap();
     assert!(!opencode.args(1).iter().any(|arg| arg == "--add-dir"));
+}
+
+const USAGE_LIMIT_WORKFLOW: &str = r#"
+name: usage-limit
+version: 1
+states:
+  work:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: "Implement the feature."
+    choices:
+      - label: implemented
+        description: The feature is implemented.
+    retry_policy:
+      max_attempts: 3
+      backoff: 0
+    transitions:
+      implemented: done
+  done:
+    description: Done.
+terminal_states:
+  done: completed
+"#;
+
+/// The session id of `usage_limit_stop.ndjson`.
+const STOPPED_SESSION: &str = "00000000-0000-4000-8000-000000000301";
+
+fn usage_limit_stream() -> String {
+    fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude-code/usage_limit_stop.ndjson"),
+    )
+    .expect("read the usage-limit stream")
+}
+
+fn count_of(types: &[String], wanted: &str) -> usize {
+    types.iter().filter(|kind| kind.as_str() == wanted).count()
+}
+
+#[tokio::test]
+async fn a_usage_limit_stop_parks_the_step_without_a_failed_attempt() {
+    let fixture = EngineFixture::new();
+    fixture.fake.answers(&usage_limit_stream());
+    let definition = fixture.workflow(USAGE_LIMIT_WORKFLOW);
+
+    let execution = fixture
+        .engine()
+        .start_and_run(&definition, json!({}), fixture.workspace())
+        .await
+        .expect("run the workflow");
+
+    assert_eq!(execution.status, ExecutionStatus::Paused);
+    assert_eq!(fixture.fake.calls(), 1);
+    let types = fixture.event_types(&execution.id);
+    assert_eq!(count_of(&types, "action_started"), 1, "{types:?}");
+    for absent in [
+        "action_retrying",
+        "action_attempt_failed",
+        "action_failed",
+        "agent_session_failed",
+    ] {
+        assert_eq!(count_of(&types, absent), 0, "{absent} in {types:?}");
+    }
+    assert!(events_of(&fixture, &execution.id)
+        .iter()
+        .any(|event| matches!(
+            event,
+            EventData::WorkflowPaused { reason } if reason == USAGE_LIMIT_PAUSE_REASON
+        )));
+    assert_eq!(step_failure(&execution).expect("readable"), None);
+    assert_eq!(
+        usage_wait(&execution).expect("readable"),
+        Some(UsageWait {
+            state_id: "work".to_string(),
+            action_execution_id: attempt_ids(&fixture, &execution.id)[0].clone(),
+            attempt: 1,
+            harness: "claude-code".to_string(),
+            harness_session_id: STOPPED_SESSION.to_string(),
+            resets_at: chrono::DateTime::from_timestamp(1_792_494_000, 0),
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_session_that_stops_on_the_usage_limit_waits_and_starts_no_new_session() {
+    for restart_if_refused in [false, true] {
+        let fixture = EngineFixture::new();
+        fixture.fake.answers(&usage_limit_stream());
+        let definition = fixture.workflow(USAGE_LIMIT_WORKFLOW);
+        let engine = fixture.engine();
+        let mut execution = engine
+            .start(&definition, json!({}), fixture.workspace())
+            .expect("start");
+        execution.status = ExecutionStatus::Paused;
+        execution.current_state = Some("work".to_string());
+        execution.metadata = json!({ "engine": { "agent_input": {
+            "state_id": "work",
+            "answer": "Use the v2 API.",
+            "harness": "claude-code",
+            "session": "s-1",
+            "restart_if_refused": restart_if_refused,
+        } } });
+        fixture.store().save_execution(&execution).expect("save");
+
+        let parked = engine
+            .resume(&definition, &execution.id)
+            .await
+            .expect("resume");
+
+        let case = format!("restart_if_refused: {restart_if_refused}");
+        assert_eq!(parked.status, ExecutionStatus::Paused, "{case}");
+        assert_eq!(fixture.fake.calls(), 1, "{case}: no new session");
+        assert!(has_flag(&fixture.fake.args(1), "--resume", "s-1"), "{case}");
+        let types = fixture.event_types(&execution.id);
+        for absent in ["human_input_requested", "action_attempt_failed"] {
+            assert_eq!(count_of(&types, absent), 0, "{case}: {absent} in {types:?}");
+        }
+        assert!(usage_wait(&parked).expect("readable").is_some(), "{case}");
+    }
 }

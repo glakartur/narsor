@@ -18,7 +18,7 @@ use narsor_engine::domain::{
     ActionConfig, ActionError, ActionResult, Event, ExecutionStatus, HumanInputField,
     HumanInputType, WorkflowDefinition, Workspace,
 };
-use narsor_engine::engine::actions::{HumanInputRequest, SuspendedAction};
+use narsor_engine::engine::actions::{HumanInputRequest, SuspendedAction, UsageLimitStopped};
 use narsor_engine::engine::{ActionExecutor, ActionOutcome, ActionRequest, Engine};
 use narsor_engine::persistence::ExecutionStore;
 use narsor_engine::workflow::load_from_file;
@@ -667,6 +667,7 @@ pub enum AgentTurn {
     Ask(&'static str),
     /// A permission request for one Bash command.
     Permission,
+    UsageLimit,
 }
 
 impl AgentTurn {
@@ -881,6 +882,18 @@ impl ActionExecutor for ScriptedAgentExecutor {
             }),
             AgentTurn::Ask(instruction) => Ok(ActionOutcome::Suspended(
                 SuspendedAction::AwaitingAgentInput(question(instruction, None)),
+            )),
+            AgentTurn::UsageLimit => Ok(ActionOutcome::Suspended(
+                SuspendedAction::AwaitingUsageLimit(UsageLimitStopped {
+                    harness: "claude-code".to_string(),
+                    harness_session_id: "agent-session".to_string(),
+                    resets_at: None,
+                    error: ActionError {
+                        message: "the agent harness 'claude-code' failed: usage limit".to_string(),
+                        error_type: Some("harness_failed".to_string()),
+                        details: None,
+                    },
+                }),
             )),
             AgentTurn::Permission => Ok(ActionOutcome::Suspended(
                 SuspendedAction::AwaitingAgentInput(question(

@@ -1627,3 +1627,104 @@ fn run_of_lines_fed<S: AsRef<str>>(
     }
     parser.finish(0, "")
 }
+
+fn usage_limit_result() -> String {
+    recording("usage_limit_stop.ndjson")
+        .into_iter()
+        .find(|line| line.contains("\"type\":\"result\""))
+        .expect("usage_limit_stop.ndjson has a result line")
+}
+
+#[test]
+fn a_usage_limit_stop_carries_the_session_and_the_reset_time() {
+    let mut parser = parser();
+    for line in recording("usage_limit_stop.ndjson") {
+        parser.on_stdout_line(line.as_bytes());
+    }
+    let run = parser.finish(1, "");
+
+    assert!(run.failure.is_some());
+    let stop = run.usage_limit_stop.expect("a usage-limit stop");
+    assert_eq!(
+        stop.resets_at,
+        Some(DateTime::from_timestamp(1792494000, 0).expect("timestamp"))
+    );
+    assert_eq!(
+        run.session_id.as_deref(),
+        Some("00000000-0000-4000-8000-000000000301")
+    );
+}
+
+#[test]
+fn the_latest_reset_of_the_rejected_windows_is_the_reset_time() {
+    let rejected = rate_limit_event(json!({
+        "status": "rejected", "resetsAt": 1792203000, "rateLimitType": "five_hour",
+        "isUsingOverage": false,
+        "unifiedWindows": {
+            "five_hour": {"utilization": 1.0, "resetsAt": 1792203000, "status": "rejected"},
+            "seven_day": {"utilization": 1.0, "resetsAt": 1792785600, "status": "rejected"},
+        },
+    }));
+    let run = run_of_lines_fed(&[rejected, usage_limit_result()]);
+
+    assert_eq!(
+        run.usage_limit_stop.expect("a usage-limit stop").resets_at,
+        Some(DateTime::from_timestamp(1792785600, 0).expect("timestamp"))
+    );
+}
+
+#[test]
+fn a_rejected_window_without_a_reset_time_gives_a_stop_without_one() {
+    let rejected = rate_limit_event(json!({
+        "status": "rejected", "rateLimitType": "five_hour", "isUsingOverage": false,
+    }));
+    let run = run_of_lines_fed(&[rejected, usage_limit_result()]);
+
+    assert!(run.failure.is_some());
+    assert_eq!(
+        run.usage_limit_stop.expect("a usage-limit stop").resets_at,
+        None
+    );
+}
+
+#[test]
+fn only_a_failed_run_with_both_signals_is_a_usage_limit_stop() {
+    let rejected = |overage: bool| {
+        rate_limit_event(json!({
+            "status": "rejected", "resetsAt": 1792203000, "rateLimitType": "five_hour",
+            "isUsingOverage": overage,
+        }))
+    };
+    let api_error = json!({
+        "type": "result", "subtype": "success", "is_error": true,
+        "terminal_reason": "api_error", "result": "API Error: 400", "session_id": "s-1"
+    })
+    .to_string();
+    let success = json!({
+        "type": "result", "subtype": "success", "is_error": false,
+        "result": "{\"choice\":\"done\"}", "session_id": "s-1"
+    })
+    .to_string();
+    let mut max_turns = recording("max_turns.ndjson");
+    max_turns.insert(0, rejected(false));
+
+    let cases: [(&str, Vec<String>, bool); 4] = [
+        (
+            "an ordinary API error",
+            vec![rejected(false), api_error],
+            true,
+        ),
+        ("a max_turns stop", max_turns, true),
+        ("a successful run", vec![rejected(false), success], false),
+        (
+            "extra usage covers the run",
+            vec![rejected(true), usage_limit_result()],
+            true,
+        ),
+    ];
+    for (case, lines, failed) in cases {
+        let run = run_of_lines_fed(&lines);
+        assert_eq!(run.failure.is_some(), failed, "{case}: {:?}", run.failure);
+        assert!(run.usage_limit_stop.is_none(), "{case}");
+    }
+}

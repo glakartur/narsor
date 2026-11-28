@@ -733,6 +733,47 @@ fn the_task_text_shows_the_state_and_whether_a_slot_is_held() {
     assert!(list_line(&asking).contains("awaiting input · no slot"));
 }
 
+fn local_clock(at: chrono::DateTime<Utc>) -> String {
+    at.with_timezone(&chrono::Local).format("%H:%M").to_string()
+}
+
+#[test]
+fn a_task_waiting_for_the_usage_limit_names_the_harness_and_the_resume_time() {
+    use narsor_engine::orchestration::TaskState;
+    use task_app_support::{usage_limit, usage_waiting};
+
+    let resumes_at = at() + Duration::minutes(195);
+    let waiting = usage_waiting("t-1", 1, usage_limit("claude-code", resumes_at));
+    assert_eq!(waiting.state, TaskState::Paused);
+
+    let hint = state_hint(&waiting).expect("a hint").text;
+    let expected = format!(
+        "usage limit of claude-code — resumes at {}",
+        local_clock(resumes_at)
+    );
+    assert!(hint.contains(&expected), "{hint}");
+    let detail = detail_lines(&waiting, None, None);
+    assert!(
+        detail.iter().any(|line| line.text.contains(&expected)),
+        "{detail:?}"
+    );
+}
+
+#[test]
+fn a_pause_reason_this_version_does_not_know_reads_as_a_plain_pause() {
+    use task_app_support::usage_waiting;
+
+    let unknown = usage_waiting(
+        "t-1",
+        1,
+        json!({ "kind": "credit_exhausted", "until": at() }),
+    );
+    let plain = task("t-1", "local", "stopped", 1);
+    let hint = state_hint(&unknown).expect("a hint");
+    assert_eq!(Some(hint.clone()), state_hint(&plain));
+    assert!(hint.text.starts_with("paused at a safe point"), "{hint:?}");
+}
+
 #[test]
 fn a_summary_without_a_state_reads_as_unknown_and_never_panics() {
     let mut value = serde_json::to_value(task("t-1", "local", "running", 1)).unwrap();

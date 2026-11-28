@@ -81,7 +81,7 @@ use super::request::RunStarted;
 use super::{
     integer_parameter, model_for_tier, reject_option_like, resolve_read_only_path,
     string_parameter, tail, AgentRequest, AgentRunEnding, FinalAnswer, HarnessAdapter, HarnessRun,
-    HarnessStreamParser, PermissionDenial, RunObservers,
+    HarnessStreamParser, PermissionDenial, RunObservers, UsageLimitStop,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
@@ -101,6 +101,10 @@ pub const DEFAULT_PERMISSION_MODE: &str = "acceptEdits";
 
 /// How much of stderr is quoted in a failure message.
 const FAILURE_DETAIL_BYTES: usize = 2 * 1024;
+
+/// The `api_error` of a `result` line that stops on an exhausted
+/// subscription usage limit.
+const USAGE_LIMIT_REACHED: &str = "usage_limit_reached";
 
 /// Tools that schedule a later turn. Under `--print` the CLI does not exit
 /// while one is pending, so the step waits for it long after the answer;
@@ -341,6 +345,13 @@ struct ClaudeCodeStreamParser {
     denial_reasons: std::collections::HashMap<String, (Option<String>, Option<String>)>,
     /// The limits of the last line, when it was a `rate_limit_event`.
     usage: Option<Vec<UsageLimit>>,
+    /// What the last `rate_limit_event` said about an exhausted
+    /// subscription (see [`usage::exhausted`]). Kept for the whole run, unlike
+    /// [`Self::usage`], which goes to the relay once.
+    exhausted: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    /// The last `result` line was an error with
+    /// `api_error: usage_limit_reached`.
+    usage_limit_result: bool,
 }
 
 impl ClaudeCodeStreamParser {
@@ -424,6 +435,8 @@ impl ClaudeCodeStreamParser {
         }
         self.subtype = result.subtype.clone();
         self.reported_error = result.is_error;
+        self.usage_limit_result = result.is_error
+            && object.get("api_error").and_then(Value::as_str) == Some(USAGE_LIMIT_REACHED);
         // The conductor's answer arrives as `structured_output`, an agent's
         // as the closing object of the text. A later `result` line without
         // an answer (a subagent hand-back, a note while a background task
@@ -472,6 +485,7 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
         };
         let kind = object.get("type").and_then(Value::as_str);
         if kind == Some(usage::RATE_LIMIT_EVENT) {
+            self.exhausted = usage::exhausted(&object);
             self.usage = Some(usage::limits(&object));
             return Vec::new();
         }
@@ -551,6 +565,14 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
             None
         };
 
+        // A stop on the usage limit needs both signals, and only a failed run
+        // is one.
+        let usage_limit_stop = match self.exhausted {
+            Some(resets_at) if failure.is_some() && self.usage_limit_result => {
+                Some(UsageLimitStop { resets_at })
+            }
+            _ => None,
+        };
         let reply = if self.reply_text.trim().is_empty() {
             self.result_text.clone()
         } else {
@@ -563,6 +585,7 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
             failure,
             structured_output: self.structured_output,
             permission_denials: self.permission_denials,
+            usage_limit_stop,
         }
     }
 }

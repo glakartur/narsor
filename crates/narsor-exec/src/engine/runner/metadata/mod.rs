@@ -10,6 +10,7 @@ pub(super) mod last_agent_step;
 pub(super) mod pending_step;
 mod state_entries;
 mod step_replies;
+pub(super) mod usage_wait;
 
 pub(super) use agent_session::*;
 pub(super) use engine_record::*;
@@ -18,3 +19,4 @@ pub(super) use last_agent_step::*;
 pub(super) use pending_step::*;
 pub(super) use state_entries::*;
 pub(super) use step_replies::*;
+pub(super) use usage_wait::*;

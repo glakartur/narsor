@@ -292,6 +292,7 @@ impl HarnessStreamParser for OpenCodeStreamParser {
             failure,
             structured_output: None,
             permission_denials: Vec::new(),
+            usage_limit_stop: None,
         }
     }
 }

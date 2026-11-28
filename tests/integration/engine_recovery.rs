@@ -21,8 +21,9 @@ use narsor_engine::domain::{
     ExecutionStatus, RepositoryDefinition, RepositorySource, RepromptedBy, WorkflowExecution,
 };
 use narsor_engine::engine::{
-    owed_output_rescue, resumable_agent_session, step_failure, ActionKind, Engine, EngineError,
-    OwnerMessage, PendingHumanInput, PendingStep, Recovery, StepFailure, StepSelection,
+    owed_output_rescue, resumable_agent_session, step_failure, usage_wait, ActionKind, Engine,
+    EngineError, OwnerMessage, PendingHumanInput, PendingStep, Recovery, StepFailure,
+    StepSelection, UsageWait, USAGE_LIMIT_CONTINUATION_PROMPT,
 };
 use narsor_engine::engine::{reconcile, ReconciliationOutcome};
 use serde_json::json;
@@ -2196,4 +2197,216 @@ async fn a_refused_session_restarts_the_step_with_the_message_as_its_note() {
         "{}",
         calls[1].prompt
     );
+}
+
+async fn parked_on_the_usage_limit(harness: &Harness) -> (WorkflowExecution, UsageWait) {
+    let agent = Arc::new(ScriptedAgentExecutor::new(vec![AgentTurn::UsageLimit]));
+    let parked = harness
+        .engine()
+        .with_executor(ActionKind::Agent, agent)
+        .start_and_run(&workflow("agent_failure"), json!({}), harness.workspace())
+        .await
+        .expect("run up to the usage limit");
+    assert_eq!(parked.status, ExecutionStatus::Paused);
+    let wait = usage_wait(&parked)
+        .expect("a readable record")
+        .expect("the attempt waits for the usage limit");
+    (parked, wait)
+}
+
+async fn resumed_after_the_wait(
+    harness: &Harness,
+    execution_id: &str,
+    turns: Vec<AgentTurn>,
+) -> (Arc<ScriptedAgentExecutor>, WorkflowExecution) {
+    let agent = Arc::new(ScriptedAgentExecutor::new(turns));
+    let finished = harness
+        .engine()
+        .with_executor(ActionKind::Agent, agent.clone())
+        .resume(&workflow("agent_failure"), execution_id)
+        .await
+        .expect("resume after the wait");
+    (agent, finished)
+}
+
+fn count(types: &[String], wanted: &str) -> usize {
+    types.iter().filter(|kind| kind.as_str() == wanted).count()
+}
+
+#[tokio::test]
+async fn reconciliation_leaves_an_execution_parked_on_the_usage_limit_paused() {
+    let harness = Harness::new();
+    let (parked, wait) = parked_on_the_usage_limit(&harness).await;
+
+    let reconciliation = reconcile(&harness.store(), &parked.id).expect("reconcile");
+
+    assert_eq!(reconciliation.status, ExecutionStatus::Paused);
+    let stored = harness.store().load_execution(&parked.id).expect("load");
+    assert_eq!(stored.status, ExecutionStatus::Paused);
+    assert_eq!(usage_wait(&stored).expect("readable"), Some(wait));
+}
+
+#[tokio::test]
+async fn after_the_wait_the_same_attempt_continues_its_session() {
+    let harness = Harness::new();
+    let (parked, wait) = parked_on_the_usage_limit(&harness).await;
+
+    let (agent, finished) = resumed_after_the_wait(
+        &harness,
+        &parked.id,
+        vec![AgentTurn::label("implemented", "done")],
+    )
+    .await;
+
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+    let calls = agent.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].resume_session.as_deref(), Some("agent-session"));
+    assert_eq!(calls[0].prompt, USAGE_LIMIT_CONTINUATION_PROMPT);
+    assert_eq!(calls[0].action_execution_id, wait.action_execution_id);
+    let types = harness.event_types(&parked.id);
+    assert_eq!(count(&types, "action_started"), 1, "{types:?}");
+    assert_eq!(count(&types, "action_resumed_after_usage_limit"), 1);
+    for absent in ["action_retrying", "action_attempt_failed", "action_failed"] {
+        assert_eq!(count(&types, absent), 0, "{absent} in {types:?}");
+    }
+    assert_eq!(usage_wait(&finished).expect("readable"), None);
+}
+
+#[tokio::test]
+async fn a_continuation_that_stops_on_the_limit_again_waits_again_as_the_same_attempt() {
+    let harness = Harness::new();
+    let (parked, wait) = parked_on_the_usage_limit(&harness).await;
+
+    let (_, again) =
+        resumed_after_the_wait(&harness, &parked.id, vec![AgentTurn::UsageLimit]).await;
+
+    assert_eq!(again.status, ExecutionStatus::Paused);
+    assert_eq!(usage_wait(&again).expect("readable"), Some(wait));
+    let types = harness.event_types(&parked.id);
+    assert_eq!(count(&types, "action_waiting_for_usage_limit"), 2);
+    for absent in ["action_retrying", "action_attempt_failed", "action_failed"] {
+        assert_eq!(count(&types, absent), 0, "{absent} in {types:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_continuation_that_fails_otherwise_goes_through_the_retry_policy() {
+    for (case, first) in [
+        ("another error", AgentTurn::Fail),
+        (
+            "a refused session",
+            AgentTurn::FailOfType("resume_session_rejected"),
+        ),
+    ] {
+        let harness = Harness::new();
+        let (parked, wait) = parked_on_the_usage_limit(&harness).await;
+
+        let (agent, finished) =
+            resumed_after_the_wait(&harness, &parked.id, vec![first, AgentTurn::Fail]).await;
+
+        assert_eq!(finished.status, ExecutionStatus::Failed, "{case}");
+        let calls = agent.calls();
+        assert_eq!(calls.len(), 2, "{case}");
+        assert_eq!(
+            calls[0].resume_session.as_deref(),
+            Some("agent-session"),
+            "{case}"
+        );
+        assert_eq!(calls[1].resume_session, None, "{case}: a new session");
+        assert_ne!(
+            calls[1].action_execution_id, wait.action_execution_id,
+            "{case}"
+        );
+        let types = harness.event_types(&parked.id);
+        assert_eq!(
+            count(&types, "human_input_requested"),
+            0,
+            "{case}: {types:?}"
+        );
+        assert_eq!(
+            count(&types, "action_attempt_failed"),
+            1,
+            "{case}: {types:?}"
+        );
+        assert_eq!(count(&types, "action_failed"), 1, "{case}: {types:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_owner_comment_left_during_the_usage_wait_reaches_the_continued_session() {
+    let harness = Harness::new();
+    let (parked, _wait) = parked_on_the_usage_limit(&harness).await;
+    harness
+        .engine()
+        .leave_resume_message(&parked.id, "c-usage", "use the v2 API")
+        .expect("leave the comment");
+
+    let (agent, finished) = resumed_after_the_wait(
+        &harness,
+        &parked.id,
+        vec![AgentTurn::label("implemented", "done")],
+    )
+    .await;
+
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+    let calls = agent.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].resume_session.as_deref(), Some("agent-session"));
+    assert!(calls[0].prompt.contains(USAGE_LIMIT_CONTINUATION_PROMPT));
+    assert!(
+        calls[0].prompt.contains("use the v2 API"),
+        "{}",
+        calls[0].prompt
+    );
+}
+
+#[tokio::test]
+async fn a_usage_limit_stop_while_asking_for_the_label_waits_and_asks_again() {
+    let harness = Harness::new();
+    let agent = Arc::new(ScriptedAgentExecutor::new(vec![
+        AgentTurn::NoLabel {
+            reply: Some("work done"),
+            session: true,
+        },
+        AgentTurn::UsageLimit,
+    ]));
+    let parked = harness
+        .engine()
+        .with_executor(ActionKind::Agent, agent.clone())
+        .start_and_run(&workflow("agent_failure"), json!({}), harness.workspace())
+        .await
+        .expect("run up to the usage limit");
+
+    assert_eq!(parked.status, ExecutionStatus::Paused);
+    let wait = usage_wait(&parked)
+        .expect("a readable record")
+        .expect("the reprompt attempt waits for the usage limit");
+    assert_eq!(
+        wait.action_execution_id,
+        agent.calls()[1].action_execution_id
+    );
+    let types = harness.event_types(&parked.id);
+    for absent in ["action_attempt_failed", "action_failed"] {
+        assert_eq!(count(&types, absent), 0, "{absent} in {types:?}");
+    }
+
+    let (agent, finished) = resumed_after_the_wait(
+        &harness,
+        &parked.id,
+        vec![
+            AgentTurn::NoLabel {
+                reply: None,
+                session: true,
+            },
+            AgentTurn::label("implemented", "done"),
+        ],
+    )
+    .await;
+
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+    let calls = agent.calls();
+    assert_eq!(calls[0].prompt, USAGE_LIMIT_CONTINUATION_PROMPT);
+    assert_eq!(calls[0].resume_session.as_deref(), Some("agent-session"));
+    assert_eq!(calls.len(), 2, "the label is asked for again");
 }

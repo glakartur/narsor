@@ -311,7 +311,10 @@ mod routing {
                 wheel_up(&mut app, x, y);
                 click(&mut app, x, y);
             }
-            assert_eq!((what_the_operator_sees(&app), app.form_confirming()), before);
+            assert_eq!(
+                (what_the_operator_sees(&app), app.form_confirming()),
+                before
+            );
         }
     }
 

@@ -213,3 +213,59 @@ impl Engine {
         }
     }
 }
+
+impl Engine {
+    /// Continues the attempt that waited in `wait` for an exhausted usage
+    /// limit: the same attempt, under its own id and number, in the session
+    /// it stopped in, with the continuation prompt. The record goes in the
+    /// same save as the prompt, so the attempt is continued once.
+    pub(crate) async fn continue_after_usage_wait(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        wait: UsageWait,
+    ) -> Result<Flow, EngineError> {
+        clear_engine_metadata(execution, METADATA_USAGE_WAIT_KEY);
+        let Some(action) = &state.action else {
+            self.fail_action(
+                execution,
+                &wait.action_execution_id,
+                format!("state '{}' is not terminal but has no action", state.id),
+            )?;
+            return Ok(Flow::Stop);
+        };
+        put_usage_continuation(execution, &wait);
+        execution.current_action_execution = Some(wait.action_execution_id.clone());
+        self.store.save_execution(execution)?;
+        self.emit(
+            &execution.id,
+            EventData::ActionResumedAfterUsageLimit {
+                action_execution_id: wait.action_execution_id.clone(),
+                state_id: state.id.clone(),
+            },
+        )?;
+
+        let upshot = self
+            .run_attempts(
+                definition,
+                execution,
+                state,
+                action,
+                AttemptsFrom {
+                    attempt: wait.attempt,
+                    action_execution_id: wait.action_execution_id,
+                    failed: None,
+                },
+            )
+            .await?;
+        match upshot {
+            ActionUpshot::Stopped => Ok(Flow::Stop),
+            ActionUpshot::Transitioned => Ok(Flow::Continue),
+            ActionUpshot::Completed {
+                action_execution_id,
+                result,
+            } => self.record_completion(definition, execution, state, action_execution_id, result),
+        }
+    }
+}

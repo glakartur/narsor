@@ -300,13 +300,23 @@ export function slots(tasks, selected) {
   return { used: own.filter((task) => task.holds_slot).length, limit: null };
 }
 
-/** The line under the header for a lost task or an unavailable harness. */
+export function pauseReasonText(task) {
+  const reason = task.state === 'paused' ? task.pause_reason : null;
+  if (reason?.kind !== 'usage_limit') return null;
+  const date = new Date(reason.resumes_at);
+  const time = Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', hour12: false });
+  return `usage limit of ${reason.harness} — resumes at ${time}`;
+}
+
+/** The line under the header for a lost task, a task the control plane paused or an unavailable harness. */
 export function notice(task) {
   const loss = lossState(task);
   if (loss) {
     const role = lossNeedsOwner(loss) ? Role.problem : Role.attention;
     return { role, text: describeLoss(loss) };
   }
+  const paused = pauseReasonText(task);
+  if (paused) return { role: Role.calm, text: paused };
   const unavailable = task.runner?.default_harness_unavailable;
   if (unavailable) {
     return { role: Role.attention, text: `${unavailable.harness} niedostępny tutaj — zostaje ${unavailable.kept}` };
