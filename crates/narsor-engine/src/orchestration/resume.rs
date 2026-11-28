@@ -34,6 +34,17 @@ pub fn auto_resume_key(generation: u64) -> String {
     format!("{AUTO_RESUME_KEY_PREFIX}{generation}")
 }
 
+/// The prefix of the idempotency keys of the resume that ends a task's wait
+/// for its harness's usage limit (`usage-resume:<generation>`), reserved
+/// like [`AUTO_RESUME_KEY_PREFIX`].
+pub const USAGE_RESUME_KEY_PREFIX: &str = "usage-resume:";
+
+/// The idempotency key of the resume of a task that waits for its usage
+/// limit at `generation`: one per wait, however often the pass sees it due.
+pub fn usage_resume_key(generation: u64) -> String {
+    format!("{USAGE_RESUME_KEY_PREFIX}{generation}")
+}
+
 /// The prefix of the idempotency keys of the slot-release policy's commands
 /// (`slot-release:<generation>`), reserved like [`AUTO_RESUME_KEY_PREFIX`].
 pub const SLOT_RELEASE_KEY_PREFIX: &str = "slot-release:";
@@ -90,8 +101,12 @@ pub fn observer_decide_key(run_id: &str, episode: &str) -> String {
 /// The idempotency key prefixes only a policy may use, each with what it is
 /// reserved for: an owner's command, answer or operator command may not
 /// carry one.
-pub const RESERVED_KEY_PREFIXES: [(&str, &str); 5] = [
+pub const RESERVED_KEY_PREFIXES: [(&str, &str); 6] = [
     (AUTO_RESUME_KEY_PREFIX, "the resume policy"),
+    (
+        USAGE_RESUME_KEY_PREFIX,
+        "the resume after a usage-limit wait",
+    ),
     (SLOT_RELEASE_KEY_PREFIX, "the slot-release policy"),
     (LIMIT_STOP_KEY_PREFIX, "the limit of concurrent tasks"),
     (

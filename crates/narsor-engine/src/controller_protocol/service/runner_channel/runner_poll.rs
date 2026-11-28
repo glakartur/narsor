@@ -121,7 +121,7 @@ impl ProtocolService {
             Some(catalog) => gate_scripts(catalog, queue),
             None => gate_scripts(&self.automation_catalog(), queue),
         };
-        let outcome = self.control.record_runner_snapshot_with(
+        let mut outcome = self.control.record_runner_snapshot_with(
             &known.task_id,
             incarnation,
             launch_generation,
@@ -130,7 +130,37 @@ impl ProtocolService {
             Some(&entry_scripts),
         )?;
         self.follow_gate_episode(&outcome.task, &outcome.gate_change, catalog.as_ref());
+        if outcome.applied {
+            if let Some(task) = self.schedule_usage_wait(&outcome.task) {
+                outcome.task = task;
+            }
+        }
         Ok(outcome)
+    }
+
+    /// Plans the resume of a task whose snapshot just reported a wait for
+    /// the harness's usage limit, with the backend's periods as configured
+    /// now; the task as written, or `None` when nothing was planned.
+    fn schedule_usage_wait(&self, task: &TaskRecord) -> Option<TaskRecord> {
+        let reported = task
+            .runner
+            .as_ref()
+            .is_some_and(|runner| runner.snapshot.usage_wait.is_some());
+        if !reported || task.usage_wait.is_some() {
+            return None;
+        }
+        let timings = self.slot_release_timings(&task.assignment.backend_id);
+        match self.control.schedule_usage_wait(
+            &task.task_id,
+            chrono_duration(timings.usage_wait_retry),
+            chrono_duration(timings.usage_wait_margin),
+        ) {
+            Ok(scheduled) => scheduled,
+            Err(error) => {
+                tracing::warn!(task = %task.task_id, %error, "usage wait: cannot plan the resume");
+                None
+            }
+        }
     }
 
     /// The installation's default harness as it applies to the task of

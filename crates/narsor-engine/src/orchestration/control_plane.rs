@@ -23,7 +23,8 @@ use super::model::{
     CommandOutcome, CommandReceipt, CommandRequest, ControllerReport, LeaseToken, MaterialChange,
     NewTask, Observation, ObservedState, OwnerCommand, OwnerRef, ReaderLease, ReportOutcome,
     ResumeState, RunnerState, SlotReleaseClass, SlotReleaseReason, TaskAssignment, TaskEvent,
-    TaskEventKind, TaskRecord, WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
+    TaskEventKind, TaskRecord, TaskUsageWait, WorkloadLoss, BACKEND_LEASE_VERSION,
+    TASK_RECORD_VERSION,
 };
 use super::position::{key_after, key_at};
 use super::resume::{
@@ -204,6 +205,7 @@ impl ControlPlane {
             workload_epoch: None,
             resume: ResumeState::default(),
             slot_release_due_at: None,
+            usage_wait: None,
             slot_hold_until: None,
             limit_stop_accepted: false,
             reader_lease: None,
@@ -264,7 +266,14 @@ impl ControlPlane {
     /// a `Resume` of a task whose attempt is due
     /// ([`TaskRecord::auto_resume_due`]) and nothing else; its receipt is
     /// announced as [`TaskEventKind::AutoResumed`] instead of
-    /// `OwnerCommandAccepted`, in the same mutation.
+    /// `OwnerCommandAccepted`, in the same mutation. A policy `Resume` keyed
+    /// [`super::resume::usage_resume_key`] ends a wait for the usage limit
+    /// instead: it needs [`TaskRecord::usage_resume_due`] and is announced
+    /// as [`TaskEventKind::UsageWaitResumed`].
+    ///
+    /// Any resume ends a task's wait for the usage limit, and the owner's
+    /// pause removes it, also from a task already stopped to wait (the
+    /// task stays stopped).
     pub fn command(&self, task_id: &TaskId, request: CommandRequest) -> Result<CommandOutcome> {
         self.command_routed(task_id, request, false)
     }
@@ -298,7 +307,11 @@ impl ControlPlane {
             if let Some(expected) = request.expected_generation {
                 record.check_generation(expected)?;
             }
+            let usage_resume = request
+                .idempotency_key
+                .starts_with(super::resume::USAGE_RESUME_KEY_PREFIX);
             let policy_may_act = match request.command {
+                OwnerCommand::Resume if usage_resume => record.usage_resume_due(now),
                 OwnerCommand::Resume => record.auto_resume_due(now),
                 OwnerCommand::Pause => {
                     record.slot_release_due(now)
@@ -352,6 +365,7 @@ impl ControlPlane {
                             .unwrap_or(SlotReleaseReason::GraceElapsed),
                     }
                 }
+                CommandActor::Policy if usage_resume => TaskEventKind::UsageWaitResumed,
                 CommandActor::Policy => TaskEventKind::AutoResumed {
                     attempt: if record.resume.last_loss_uncounted {
                         0
@@ -367,7 +381,21 @@ impl ControlPlane {
                 },
             };
 
-            match command_effect(record.runner_state, request.command) {
+            let effect = match command_effect(record.runner_state, request.command) {
+                // The owner's pause of a task stopped to wait for its usage
+                // limit: the task stays stopped, and the planned resume is
+                // removed below.
+                CommandEffect::Illegal
+                    if request.command == OwnerCommand::Pause
+                        && request.actor == CommandActor::Owner
+                        && record.runner_state == RunnerState::Stopped
+                        && record.usage_wait.is_some() =>
+                {
+                    CommandEffect::Transition(RunnerState::Stopped)
+                }
+                effect => effect,
+            };
+            match effect {
                 CommandEffect::Illegal => {
                     return Err(OrchestrationError::IllegalCommand {
                         task_id: record.task_id.clone(),
@@ -413,6 +441,15 @@ impl ControlPlane {
                     // A new desired state ends whatever the last snapshot
                     // made the policy wait for.
                     record.slot_release_due_at = None;
+                    // A resume, by the owner or at the planned time, ends the
+                    // wait for the usage limit, and the owner's pause removes
+                    // the planned resume: the owner decides from then on.
+                    if request.command == OwnerCommand::Resume
+                        || (request.command == OwnerCommand::Pause
+                            && request.actor == CommandActor::Owner)
+                    {
+                        record.usage_wait = None;
+                    }
                     // Nothing else may read the storage the task's own
                     // runner is about to take (R15): the reader's lease
                     // ends in the very mutation that resumes or archives.
@@ -610,6 +647,66 @@ impl ControlPlane {
             }
         })?;
         Ok(armed.then_some(record))
+    }
+
+    /// Plans the resume of a task whose last runner snapshot reports a wait
+    /// for the harness's usage limit and that has no wait yet: at the
+    /// reported reset plus `margin`, or `retry` from now when the harness
+    /// gave no reset time. The slot is due for release at once. Announces
+    /// the wait; `None` when nothing was planned.
+    ///
+    /// Only a runner that works (`Running`, or `PauseRequested` by a
+    /// policy) gets a wait: after the owner's pause, a late snapshot that
+    /// still reports the wait does not plan a resume the owner did not ask
+    /// for. A snapshot of a runner without an execution, or with a problem,
+    /// says nothing of the wait.
+    pub fn schedule_usage_wait(
+        &self,
+        task_id: &TaskId,
+        retry: Duration,
+        margin: Duration,
+    ) -> Result<Option<TaskRecord>> {
+        let (record, scheduled) = self.mutate(task_id, |record, now| {
+            let reported = record
+                .runner
+                .as_ref()
+                .map(|runner| &runner.snapshot)
+                .filter(|snapshot| {
+                    snapshot.execution_cursor.execution_id.is_some() && snapshot.problem.is_none()
+                })
+                .and_then(|snapshot| snapshot.usage_wait.clone());
+            let Some(reported) = reported else {
+                return Ok(Mutation::Unchanged(false));
+            };
+            if record.usage_wait.is_some()
+                || !matches!(
+                    record.runner_state,
+                    RunnerState::Running | RunnerState::PauseRequested
+                )
+                || record.paused_by_owner()
+            {
+                return Ok(Mutation::Unchanged(false));
+            }
+            let resume_at = reported
+                .resets_at
+                .map_or(now + retry, |resets_at| resets_at + margin);
+            record.usage_wait = Some(TaskUsageWait {
+                harness: reported.harness.clone(),
+                resets_at: reported.resets_at,
+                resume_at,
+            });
+            // The grace is for a transient state; the wait is due at once.
+            refresh_slot_release_due(record, now, Duration::zero());
+            Ok(Mutation::Changed(
+                TaskEventKind::UsageWaitScheduled {
+                    harness: reported.harness,
+                    resets_at: reported.resets_at,
+                    resume_at,
+                },
+                true,
+            ))
+        })?;
+        Ok(scheduled.then_some(record))
     }
 
     /// A read of the task's details moves its slot-release deadline to
@@ -1195,7 +1292,8 @@ impl ControlPlane {
 /// Sets or clears the slot-release deadline from the runner state and the
 /// last snapshot (D62). Only a `Running` task has one:
 ///
-/// * a final execution state makes it due now (or keeps an earlier one);
+/// * a final execution state, or a wait for the usage limit, makes it due
+///   now (or keeps an earlier one);
 /// * a transient one plans `now + grace`, unless a deadline exists already,
 ///   so repeated snapshots of the same wait do not push it back;
 /// * anything else clears it.
@@ -1206,11 +1304,13 @@ pub(crate) fn refresh_slot_release_due(
 ) {
     let class = record.slot_release_class();
     record.slot_release_due_at = match (record.runner_state, class) {
-        (RunnerState::Running, Some(SlotReleaseClass::Final)) => Some(
-            record
-                .slot_release_due_at
-                .map_or(now, |due_at| due_at.min(now)),
-        ),
+        (RunnerState::Running, Some(SlotReleaseClass::Final | SlotReleaseClass::UsageWait)) => {
+            Some(
+                record
+                    .slot_release_due_at
+                    .map_or(now, |due_at| due_at.min(now)),
+            )
+        }
         (RunnerState::Running, Some(SlotReleaseClass::Transient)) => {
             record.slot_release_due_at.or(Some(now + grace))
         }

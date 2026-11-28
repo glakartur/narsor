@@ -1263,10 +1263,25 @@ pub fn event_line(event: &TaskEvent) -> String {
                 "slot freed: the task waited for its owner too long; the runner is asked to stop"
                     .to_string()
             }
+            SlotReleaseReason::UsageLimit => {
+                "slot freed: the task waits for the usage limit to reset; the runner is asked to stop"
+                    .to_string()
+            }
             SlotReleaseReason::Unrecognized => {
                 "slot freed for a reason this version does not know".to_string()
             }
         },
+        TaskEventKind::UsageWaitScheduled {
+            harness,
+            resume_at,
+            ..
+        } => format!(
+            "the usage limit of {harness} is used up; the task resumes at {}",
+            resume_at.format("%H:%M:%S")
+        ),
+        TaskEventKind::UsageWaitResumed => {
+            "resumed automatically after the usage-limit wait".to_string()
+        }
         TaskEventKind::ReaderLeased { until } => format!(
             "a read-only runner is wanted for the stopped task until {}",
             until.format("%H:%M:%S")

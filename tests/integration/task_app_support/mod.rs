@@ -103,6 +103,7 @@ pub fn served_state(task: &TaskSummary) -> TaskState {
         task.runner.as_ref().map(|runner| runner.execution_status),
         &task.resume,
         false,
+        false,
     )
 }
 

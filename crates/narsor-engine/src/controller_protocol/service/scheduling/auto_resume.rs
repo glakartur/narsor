@@ -122,7 +122,7 @@ impl ProtocolService {
 
     /// Whether a controller holds the backend's lease; an unreadable lease
     /// counts as offline.
-    fn controller_online(&self, backend_id: &BackendId) -> bool {
+    pub(super) fn controller_online(&self, backend_id: &BackendId) -> bool {
         self.control
             .controller_online(backend_id)
             .unwrap_or_else(|error| {

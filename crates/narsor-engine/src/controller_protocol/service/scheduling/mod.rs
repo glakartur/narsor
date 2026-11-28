@@ -7,7 +7,9 @@ mod backends;
 mod concurrency;
 mod harness_usage;
 mod slot_release;
+mod usage_resume;
 
 pub use auto_resume::AutoResumePass;
 pub(crate) use harness_usage::HarnessUsages;
 pub use slot_release::SlotReleasePass;
+pub use usage_resume::UsageResumePass;

@@ -6367,3 +6367,301 @@ fn a_queued_or_interrupted_task_is_refreshed_in_place_and_old_policy_commands_go
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The wait for a harness's usage limit
+// ---------------------------------------------------------------------------
+
+mod usage_wait {
+    use super::*;
+    use narsor_engine::controller_protocol::{OwnerCommandRequest, ProtocolError, ProtocolService};
+    use narsor_engine::orchestration::{SlotReleaseReason, TaskState, TaskUsageWait};
+    use narsor_protocol::controller::UsageLimitWait;
+
+    fn at(hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 3, hour, minute, second)
+            .unwrap()
+    }
+
+    fn set_clock(fx: &Fixture, to: DateTime<Utc>) {
+        let now = fx.control.now();
+        assert!(to >= now, "the clock only moves forward");
+        fx.clock.advance(to - now);
+    }
+
+    /// The central as the daemon runs it, on the fixture's state and clock;
+    /// a new one reads everything from disk.
+    fn central(fx: &Fixture, slots: Option<u32>) -> ProtocolService {
+        ProtocolService::new(
+            fx.reopen(),
+            crate::environment_support::seeded_resolver(fx.root.path()),
+        )
+        .with_max_concurrent_tasks(slots)
+    }
+
+    /// The task's runner reports its execution parked on the usage limit of
+    /// `claude-code` (`wait`), or no wait, through the central.
+    fn runner_reports_wait(
+        fx: &Fixture,
+        central: &ProtocolService,
+        id: &str,
+        resets_at: Option<Option<DateTime<Utc>>>,
+    ) -> TaskRecord {
+        let record = fx.control.task(&task(id)).unwrap();
+        let launch_generation = launch_generation_of(&record);
+        let sequence = record
+            .runner
+            .as_ref()
+            .map_or(1, |runner| runner.snapshot.snapshot_sequence + 1);
+        let mut snapshot = safe_point_snapshot(sequence);
+        snapshot.safe_point = false;
+        snapshot.execution_cursor.execution_id = Some("exec-1".to_string());
+        snapshot.execution_status = ExecutionStatus::Paused;
+        snapshot.usage_wait = resets_at.map(|resets_at| UsageLimitWait {
+            harness: "claude-code".to_string(),
+            resets_at,
+        });
+        central
+            .record_runner_snapshot(
+                &task(id),
+                &format!("pod-g{launch_generation}"),
+                launch_generation,
+                snapshot,
+                Duration::seconds(300),
+            )
+            .expect("runner snapshot")
+            .task
+    }
+
+    /// A running task whose runner reported a wait for a reset at 15:00
+    /// and that the central then stopped to free its slot.
+    fn stopped_waiting(fx: &Fixture, central: &ProtocolService, id: &str, lease: &BackendLease) {
+        fx.running(id, lease);
+        runner_reports_wait(fx, central, id, Some(Some(at(15, 0, 0))));
+        central.slot_release_pass();
+        fx.observe(id, lease, Observation::PausedAtSafePoint)
+            .expect("the runner stops at its safe point");
+        assert_eq!(
+            fx.control.task(&task(id)).unwrap().runner_state,
+            RunnerState::Stopped
+        );
+    }
+
+    fn events(fx: &Fixture, id: &str) -> Vec<TaskEventKind> {
+        fx.control
+            .events_since(&task(id), 0)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect()
+    }
+
+    #[test]
+    fn a_reported_wait_plans_the_resume_and_frees_the_slot_at_once() {
+        let cases = [
+            ("reset at 15:00", Some(at(15, 0, 0)), at(15, 1, 0)),
+            ("no reset time", None, at(12, 15, 0)),
+        ];
+        for (case, resets_at, resume_at) in cases {
+            let fx = Fixture::new();
+            let central = central(&fx, None);
+            let lease = long_lease(&fx, "controller-a");
+            fx.running("task-1", &lease);
+
+            let waiting = runner_reports_wait(&fx, &central, "task-1", Some(resets_at));
+
+            assert_eq!(
+                waiting.usage_wait,
+                Some(TaskUsageWait {
+                    harness: "claude-code".to_string(),
+                    resets_at,
+                    resume_at,
+                }),
+                "{case}"
+            );
+            assert_eq!(waiting.task_state(), TaskState::Paused, "{case}");
+            assert!(
+                events(&fx, "task-1").contains(&TaskEventKind::UsageWaitScheduled {
+                    harness: "claude-code".to_string(),
+                    resets_at,
+                    resume_at,
+                })
+            );
+            // No grace: the pass at the very same instant frees the slot.
+            assert_eq!(
+                central.slot_release_pass().released,
+                vec![task("task-1")],
+                "{case}"
+            );
+            assert!(
+                events(&fx, "task-1").contains(&TaskEventKind::SlotReleased {
+                    reason: SlotReleaseReason::UsageLimit
+                })
+            );
+            fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
+                .expect("safe point");
+            let stopped = fx.control.task(&task("task-1")).unwrap();
+            assert_eq!(stopped.runner_state, RunnerState::Stopped, "{case}");
+            assert!(!stopped.holds_capacity(), "{case}");
+            assert_eq!(stopped.task_state(), TaskState::Paused, "{case}");
+            assert_eq!(
+                stopped.usage_wait.map(|wait| wait.resume_at),
+                Some(resume_at)
+            );
+        }
+    }
+
+    #[test]
+    fn a_wait_survives_a_restart_of_the_central_and_resumes_at_its_planned_time() {
+        let fx = Fixture::new();
+        let lease = long_lease(&fx, "controller-a");
+        stopped_waiting(&fx, &central(&fx, None), "task-1", &lease);
+        let generation = fx.control.task(&task("task-1")).unwrap().generation;
+
+        // The central restarts at 14:00: everything is read from disk again.
+        set_clock(&fx, at(14, 0, 0));
+        let restarted = central(&fx, None);
+        set_clock(&fx, at(15, 0, 59));
+        assert!(restarted.usage_resume_pass().resumed.is_empty());
+        assert_eq!(
+            fx.control.task(&task("task-1")).unwrap().runner_state,
+            RunnerState::Stopped
+        );
+
+        set_clock(&fx, at(15, 1, 0));
+        assert_eq!(restarted.usage_resume_pass().resumed, vec![task("task-1")]);
+        assert!(restarted.usage_resume_pass().resumed.is_empty());
+
+        let resumed = fx.control.task(&task("task-1")).unwrap();
+        assert_eq!(resumed.runner_state, RunnerState::Provisioning);
+        assert_eq!(resumed.usage_wait, None);
+        let receipt = resumed.commands.last().unwrap();
+        assert_eq!(
+            (
+                receipt.command,
+                receipt.idempotency_key.as_str(),
+                receipt.actor
+            ),
+            (
+                OwnerCommand::Resume,
+                format!("usage-resume:{generation}").as_str(),
+                CommandActor::Policy
+            )
+        );
+    }
+
+    #[test]
+    fn a_runner_lost_during_the_wait_is_resumed_at_the_planned_time_not_by_the_loss_policy() {
+        let fx = Fixture::new();
+        let central = central(&fx, None);
+        let lease = long_lease(&fx, "controller-a");
+        fx.running("task-1", &lease);
+        runner_reports_wait(&fx, &central, "task-1", Some(Some(at(15, 0, 0))));
+        lose(&fx, "task-1", &lease, true, "the pod was evicted");
+
+        set_clock(&fx, at(13, 0, 0));
+        assert!(central.auto_resume_pass().resumed.is_empty());
+        let lost = fx.control.task(&task("task-1")).unwrap();
+        assert_eq!(lost.runner_state, RunnerState::Interrupted);
+        assert_eq!(lost.task_state(), TaskState::Paused);
+
+        set_clock(&fx, at(15, 1, 0));
+        assert!(central.auto_resume_pass().resumed.is_empty());
+        assert_eq!(central.usage_resume_pass().resumed, vec![task("task-1")]);
+        assert_eq!(
+            fx.control.task(&task("task-1")).unwrap().runner_state,
+            RunnerState::Provisioning
+        );
+    }
+
+    #[test]
+    fn on_a_full_backend_the_planned_resume_waits_in_the_queue_at_its_own_place() {
+        let fx = Fixture::new();
+        let central = central(&fx, Some(1));
+        let lease = long_lease(&fx, "controller-a");
+        stopped_waiting(&fx, &central, "task-1", &lease);
+        fx.running("task-2", &lease);
+        let before = fx.control.task(&task("task-1")).unwrap();
+
+        set_clock(&fx, at(15, 1, 0));
+        assert_eq!(central.usage_resume_pass().resumed, vec![task("task-1")]);
+
+        let queued = fx.control.task(&task("task-1")).unwrap();
+        assert_eq!(queued.runner_state, RunnerState::Queued);
+        assert_eq!(queued.position_key, before.position_key);
+        assert_eq!(queued.usage_wait, None);
+    }
+
+    #[test]
+    fn the_owner_decides_over_the_planned_resume() {
+        // An owner's pause before the policy stopped the task removes the
+        // wait, and a later snapshot that still reports it does not bring
+        // it back.
+        let fx = Fixture::new();
+        let central_a = central(&fx, None);
+        let lease = long_lease(&fx, "controller-a");
+        fx.running("task-1", &lease);
+        runner_reports_wait(&fx, &central_a, "task-1", Some(Some(at(15, 0, 0))));
+        let paused = fx.command("task-1", OwnerCommand::Pause, "pause-1");
+        assert_eq!(paused.usage_wait, None);
+        let late = runner_reports_wait(&fx, &central_a, "task-1", Some(Some(at(15, 0, 0))));
+        assert_eq!(late.usage_wait, None);
+        fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
+            .expect("safe point");
+
+        // An owner's pause of a task the policy already stopped removes the
+        // wait as well.
+        stopped_waiting(&fx, &central_a, "task-2", &lease);
+        let paused = fx.command("task-2", OwnerCommand::Pause, "pause-2");
+        assert_eq!(paused.usage_wait, None);
+        assert_eq!(paused.task_state(), TaskState::Paused);
+
+        set_clock(&fx, at(15, 1, 0));
+        assert!(central_a.usage_resume_pass().resumed.is_empty());
+        for id in ["task-1", "task-2"] {
+            assert_eq!(
+                fx.control.task(&task(id)).unwrap().runner_state,
+                RunnerState::Stopped,
+                "{id}"
+            );
+        }
+
+        // An owner's resume during the wait resumes at once.
+        let fx = Fixture::new();
+        let central_b = central(&fx, None);
+        let lease = long_lease(&fx, "controller-a");
+        stopped_waiting(&fx, &central_b, "task-1", &lease);
+        set_clock(&fx, at(14, 0, 0));
+        let owner = OwnerRef::new("oidc:https://issuer|artur");
+        let resumed = central_b
+            .command(
+                &owner,
+                "task-1",
+                OwnerCommandRequest {
+                    command: OwnerCommand::Resume,
+                    idempotency_key: "resume-1".to_string(),
+                    expected_generation: None,
+                },
+            )
+            .expect("the owner's resume");
+        assert_eq!(resumed.task.runner_state, RunnerState::Provisioning);
+        assert_eq!(fx.control.task(&task("task-1")).unwrap().usage_wait, None);
+
+        // The policy's key is not the owner's to use.
+        let forged = central_b
+            .command(
+                &owner,
+                "task-1",
+                OwnerCommandRequest {
+                    command: OwnerCommand::Pause,
+                    idempotency_key: "usage-resume:9".to_string(),
+                    expected_generation: None,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&forged, ProtocolError::BadRequest { code, .. } if *code == "reserved_idempotency_key"),
+            "{forged:?}"
+        );
+    }
+}

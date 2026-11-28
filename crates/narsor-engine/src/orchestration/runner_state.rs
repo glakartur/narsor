@@ -114,6 +114,9 @@ impl ControlPlane {
             unavailable.kept = without_unsafe_chars(&unavailable.kept);
             unavailable.reason = without_unsafe_chars(&unavailable.reason);
         }
+        if let Some(wait) = &mut snapshot.usage_wait {
+            wait.harness = without_unsafe_chars(&wait.harness);
+        }
         // The runner's title is bounded like its other free text.
         snapshot.generated_title = snapshot
             .generated_title
@@ -151,12 +154,19 @@ impl ControlPlane {
             // and the episode must outlive the problem (R17). Any other
             // runner with an execution says where it waits, or that it
             // waits at no watched gate.
-            let gate_change =
-                if snapshot.execution_cursor.execution_id.is_some() && snapshot.problem.is_none() {
-                    follow_watched_gate(record, &snapshot, now, entry_scripts)
-                } else {
-                    GateChange::default()
-                };
+            let speaks_of_execution =
+                snapshot.execution_cursor.execution_id.is_some() && snapshot.problem.is_none();
+            let gate_change = if speaks_of_execution {
+                follow_watched_gate(record, &snapshot, now, entry_scripts)
+            } else {
+                GateChange::default()
+            };
+            // The same holds for the wait for the usage limit: only a runner
+            // whose execution no longer waits ends it. A new wait is planned
+            // after this write ([`ControlPlane::schedule_usage_wait`]).
+            if speaks_of_execution && snapshot.usage_wait.is_none() {
+                record.usage_wait = None;
+            }
             // Obsolete answers change in the same revision: the one event
             // says what the runner reported, and the input statuses that
             // follow from it are on the record that event points at. After

@@ -37,9 +37,10 @@ pub use error::{OrchestrationError, Result};
 pub use model::*;
 pub use resume::{
     auto_resume_key, exhaustion_loss, limit_requeue_key, limit_stop_key, loss_state,
-    observer_decide_key, slot_release_key, work_resume_key, LossState, ResumePolicy,
-    AUTO_RESUME_KEY_PREFIX, EXHAUSTION_REASON_PREFIX, LIMIT_STOP_KEY_PREFIX, OBSERVER_KEY_PREFIX,
-    RESERVED_KEY_PREFIXES, SLOT_RELEASE_KEY_PREFIX, UNSPECIFIED_LOSS, WORK_RESUME_KEY_PREFIX,
+    observer_decide_key, slot_release_key, usage_resume_key, work_resume_key, LossState,
+    ResumePolicy, AUTO_RESUME_KEY_PREFIX, EXHAUSTION_REASON_PREFIX, LIMIT_STOP_KEY_PREFIX,
+    OBSERVER_KEY_PREFIX, RESERVED_KEY_PREFIXES, SLOT_RELEASE_KEY_PREFIX, UNSPECIFIED_LOSS,
+    USAGE_RESUME_KEY_PREFIX, WORK_RESUME_KEY_PREFIX,
 };
 pub use runner_state::EntryScripts;
 pub use store::OrchestrationStore;

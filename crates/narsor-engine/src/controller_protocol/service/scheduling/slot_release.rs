@@ -1,14 +1,16 @@
 //! The slot-release policy's triggers (D62, R1-R7, R17): a task whose work
-//! ended, or waits for its owner, gives its slot back to the queue.
+//! ended, waits for its owner, or waits for its harness's usage limit to
+//! reset, gives its slot back to the queue.
 //!
 //! The control plane records a deadline on the task when a runner snapshot
 //! shows such a state (see
 //! [`crate::orchestration::ControlPlane::record_runner_snapshot_with`]); this
-//! module only acts on it. A final execution state (completed, cancelled) is
-//! due at once, so the snapshot's own request frees the slot; a transient
-//! one (input needed, failed) is due after the backend's wait, which the
-//! periodic pass finds, also after a restart of the daemon. A read of the
-//! task's details moves the deadline later.
+//! module only acts on it. A final execution state (completed, cancelled)
+//! and a wait for the usage limit are due at once, so the snapshot's own
+//! request frees the slot; a transient one (input needed, failed) is due
+//! after the backend's wait, which the periodic pass finds, also after a
+//! restart of the daemon. A read of the task's details moves the deadline
+//! later.
 //!
 //! Freeing a slot is the owner's pause, issued by the policy
 //! ([`crate::orchestration::ControlPlane::release_slot`]): the runner stops
